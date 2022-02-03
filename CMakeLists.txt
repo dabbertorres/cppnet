@@ -24,22 +24,20 @@ project(
     LANGUAGES C CXX
 )
 
-file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
+include(CTest)
 
+file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
 add_library(net ${sources})
 
 target_include_directories(net
-    PUBLIC "include/"
+    PUBLIC
+        "include/"
 )
-
-#target_link_libraries(net
-#    PRIVATE CURL::libcurl
-#)
 
 target_compile_features(net
     PRIVATE cxx_std_20
 )
 
-target_compile_options(net
-    PRIVATE -O2
-)
+if(BUILD_TESTING)
+    add_subdirectory("test/")
+endif()
