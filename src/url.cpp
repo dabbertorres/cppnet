@@ -317,6 +317,8 @@ std::string url::encode(std::string_view str, std::string_view reserved_characte
         str = str.substr(idx + 1);
     }
 
+    out << str;
+
     return out.str();
 }
 

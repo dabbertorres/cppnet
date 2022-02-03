@@ -241,3 +241,21 @@ TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][urlparse]")
             });
     REQUIRE(u.fragment.empty());
 }
+
+TEST_CASE("url encoding 'foo%bar' <=> 'foo%25bar'", "[url][urlencoding]")
+{
+    constexpr auto input  = "foo%bar";
+    constexpr auto expect = "foo%25bar";
+
+    SECTION("encode")
+    {
+        auto result = net::url::encode(input);
+        REQUIRE(result == expect);
+    }
+
+    SECTION("decode")
+    {
+        auto result = net::url::decode(expect);
+        REQUIRE(result == input);
+    }
+}
