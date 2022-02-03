@@ -1,8 +1,5 @@
 #pragma once
 
-#include <concepts>
-#include <type_traits>
-
 #if defined(__clang__)
 #    define NET_PACKED __attribute__((packed))
 #elif defined(__GNUC__) || defined(__GNUG__)
@@ -12,6 +9,9 @@
 #else
 #    error "could not determine compiler type"
 #endif
+
+#include <concepts>
+#include <type_traits>
 
 namespace net::util
 {
@@ -23,8 +23,10 @@ public:
     using result_type = Result;
     using error_type  = Error;
 
-    constexpr result(Result&& value) noexcept : value{value}, is_error{false} {}
-    constexpr result(Error&& error) noexcept : error{error}, is_error{true} {}
+    constexpr result() = delete;
+
+    constexpr result(Result value) noexcept : value{value}, is_error{false} {}
+    constexpr result(Error error) noexcept : error{error}, is_error{true} {}
 
     constexpr result(const result& other) noexcept(
         std::is_nothrow_copy_constructible_v<Result>&& std::is_nothrow_copy_constructible_v<Error>)
@@ -116,6 +118,24 @@ public:
         }
 
         return *this;
+    }
+
+    template<std::invocable F>
+    requires std::is_same_v<std::invoke_result_t<F>, Result>
+    constexpr auto or_else(F&& f) const noexcept
+    {
+        if (is_error)
+            return f();
+        else
+            return value;
+    }
+
+    constexpr auto or_else(Result other) const noexcept
+    {
+        if (is_error)
+            return other;
+        else
+            return value;
     }
 
 private:
