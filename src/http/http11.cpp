@@ -1,4 +1,4 @@
-#include "http/http_11.hpp"
+#include "http/http11.hpp"
 
 #include "encoding.hpp"
 
@@ -9,7 +9,7 @@ void response_encode(writer& w, const response& r)
 {
     for (auto& kv : r.headers)
     {
-        w << kv.first << ": " << kv.second << '\n';
+        w << kv.first << ": " << kv.second << "\r\n";
     }
 }
 
