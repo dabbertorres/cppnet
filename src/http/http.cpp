@@ -9,6 +9,33 @@
 namespace net::http
 {
 
+method parse_method(std::string_view str) noexcept
+{
+    using enum method;
+
+    if (str == "CONNECT") return CONNECT;
+    if (str == "DELETE") return DELETE;
+    if (str == "GET") return GET;
+    if (str == "HEAD") return HEAD;
+    if (str == "OPTIONS") return OPTIONS;
+    if (str == "PATCH") return PATCH;
+    if (str == "POST") return POST;
+    if (str == "PUT") return PUT;
+    if (str == "TRACE") return TRACE;
+    return NONE;
+}
+
+status parse_status(std::string_view str) noexcept
+{
+    using enum status;
+
+    uint32_t v;
+    auto     res = std::from_chars(str.begin(), str.end(), v);
+    if (res.ptr != str.end()) return static_cast<status>(0);
+
+    return static_cast<status>(v);
+}
+
 constexpr std::string_view method_string(method m) noexcept
 {
     using enum method;
@@ -36,22 +63,6 @@ constexpr std::string_view method_string(method m) noexcept
     default:
         return "NONE";
     }
-}
-
-constexpr method parse_method(std::string_view str) noexcept
-{
-    using enum method;
-
-    if (str == "CONNECT") return CONNECT;
-    if (str == "DELETE") return DELETE;
-    if (str == "GET") return GET;
-    if (str == "HEAD") return HEAD;
-    if (str == "OPTIONS") return OPTIONS;
-    if (str == "PATCH") return PATCH;
-    if (str == "POST") return POST;
-    if (str == "PUT") return PUT;
-    if (str == "TRACE") return TRACE;
-    return NONE;
 }
 
 constexpr std::string_view status_string(status s) noexcept
@@ -189,17 +200,6 @@ constexpr std::string_view status_string(status s) noexcept
     default:
         return "Unknown";
     }
-}
-
-constexpr status parse_status(std::string_view str) noexcept
-{
-    using enum status;
-
-    uint32_t v;
-    auto     res = std::from_chars(str.begin(), str.end(), v);
-    if (res.ptr != str.end()) return static_cast<status>(0);
-
-    return static_cast<status>(v);
 }
 
 }

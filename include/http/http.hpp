@@ -1,15 +1,14 @@
 #pragma once
 
 #include <cstdint>
-#include <iosfwd>
+#include <istream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "url.hpp"
-/* #include "reader.hpp" */
-/* #include "writer.hpp" */
 
 namespace net::http
 {
@@ -100,11 +99,11 @@ enum class status : uint32_t
     NETWORK_CONNECT_TIMEOUT_ERROR   = 599,
 };
 
-constexpr std::string_view method_string(method m) noexcept;
-constexpr method           parse_method(std::string_view str) noexcept;
+method parse_method(std::string_view str) noexcept;
+status parse_status(std::string_view str) noexcept;
 
+constexpr std::string_view method_string(method m) noexcept;
 constexpr std::string_view status_string(status s) noexcept;
-constexpr status           parse_status(std::string_view str) noexcept;
 
 constexpr bool status_is_information(status s) noexcept
 {
@@ -133,23 +132,21 @@ struct request
 {
     // request(method method, reader& body) : body{body} {}
 
-    method                                       method;
-    std::string                                  protocol;
-    std::string                                  host;
-    std::string                                  path;
-    std::unordered_map<std::string, std::string> params;
-    headers                                      headers;
+    method   method;
+    uint32_t protocol_major;
+    uint32_t protocol_minor;
+    url      uri;
+    headers  headers;
 
-    // reader& body;
+    std::istream& body;
 };
 
 struct response
 {
-    // response(writer& body) : body{body} {}
-
+    url     uri;
     headers headers;
 
-    // writer& body;
+    std::istream& body;
 };
 
 }
