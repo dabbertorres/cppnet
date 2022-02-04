@@ -1,60 +1,98 @@
 #include "http/http11.hpp"
 
-#include <istream>
-#include <ostream>
-#include <sstream>
-#include <string>
-
 #include "encoding.hpp"
 #include "http/http.hpp"
 
 namespace
 {
 
-// source https://en.wikipedia.org/wiki/Whitespace_character#Unicode
-static constexpr auto whitespace =
-    " \b\f\n\r\t\v\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202f\u205f\u3000";
+using namespace std::string_view_literals;
 
-static std::string_view trim_string(std::string_view s) noexcept
-{
-    auto first_not_space = s.find_first_not_of(whitespace);
-    auto last_not_space  = s.find_last_not_of(whitespace);
-
-    s.remove_suffix(s.size() - (last_not_space + 1));
-    s.remove_prefix(first_not_space);
-    return s;
-}
-
-}
-
-namespace net::http::http11
-{
+using namespace net;
+using namespace net::http;
 
 using util::result;
 
-std::error_condition response_encode(std::ostream& w, const response& r) noexcept
+// source https://en.wikipedia.org/wiki/Whitespace_character#Unicode
+static constexpr auto whitespace =
+    " \b\f\n\r\t\v\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202f\u205f\u3000"sv;
+
+static std::string_view trim_string(std::string_view str) noexcept
 {
-    // TODO
+    auto first_not_space = str.find_first_not_of(whitespace);
+    auto last_not_space  = str.find_last_not_of(whitespace);
+
+    str.remove_suffix(str.size() - (last_not_space + 1));
+    str.remove_prefix(first_not_space);
+    return str;
 }
 
-std::error_condition request_encode(std::ostream& w, const request& r) noexcept
+static std::errc from_chars(std::string_view str, uint32_t& value) noexcept
 {
-    // TODO
+    auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
+    return err;
 }
 
-result<response, std::error_condition> response_decode(std::istream& r) noexcept
+static result<version, std::error_condition> parse_http_version(std::string_view str)
 {
-    // TODO
+    static constexpr auto name = "HTTP/"sv;
+
+    if (!str.starts_with(name))
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    str.remove_prefix(name.size());
+
+    auto split_idx = str.find('.');
+    if (split_idx == std::string_view::npos)
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    version v;
+
+    if (auto err = from_chars(str.substr(0, split_idx), v.major); err != std::errc{})
+        return {std::make_error_condition(err)};
+
+    if (auto err = from_chars(str.substr(split_idx + 1), v.minor); err != std::errc{})
+        return {std::make_error_condition(err)};
+
+    return {v};
 }
 
-result<request, std::error_condition> request_decode(std::istream& r) noexcept
+static std::error_condition parse_status_line(std::istream& in, response& resp) noexcept
 {
-    request req{
-        .body = r,
-    };
-
     std::string line;
-    std::getline(r, line);
+    if (std::getline(in, line).bad())
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    auto view = static_cast<std::string_view>(line);
+
+    auto version_end = view.find(' ');
+    if (version_end == std::string::npos)
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    if (auto res = parse_http_version(view.substr(0, version_end)); res.has_error())
+        return {res.to_error()};
+    else
+        resp.version = res.to_value();
+
+    auto status_start = version_end + 1;
+    auto status_end   = view.find(' ', status_start);
+    if (status_end == std::string::npos)
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    resp.status = parse_status(view.substr(status_start, status_end));
+    if (resp.status == status::NONE)
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    // we can just ignore the reason
+
+    return {};
+}
+
+static std::error_condition parse_request_line(std::istream& in, request& req) noexcept
+{
+    std::string line;
+    if (std::getline(in, line).bad())
+        return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
     auto view = static_cast<std::string_view>(line);
 
@@ -83,10 +121,18 @@ result<request, std::error_condition> request_decode(std::istream& r) noexcept
             .if_error([&](auto) { req.uri.path = "/"; });
     }
 
-    auto protocol_raw = view.substr(uri_end + 1);
-    // TODO
+    if (auto res = parse_http_version(view.substr(uri_end + 1)); res.has_error())
+        return {res.to_error()};
+    else
+        req.version = res.to_value();
 
-    while (std::getline(r, line))
+    return {};
+}
+
+static void parse_headers(headers& headers, std::istream& in) noexcept
+{
+    std::string line;
+    while (std::getline(in, line))
     {
         if (line == "") break;
 
@@ -95,11 +141,51 @@ result<request, std::error_condition> request_decode(std::istream& r) noexcept
 
         auto key = line.substr(0, split_idx);
         auto val = trim_string(line.substr(split_idx + 1));
-        req.headers[std::string{key}].emplace_back(val);
+        headers[std::string{key}].emplace_back(val);
     }
+}
+
+}
+
+namespace net::http::http11
+{
+
+using util::result;
+
+std::error_condition response_encode(std::ostream& out, const response& resp) noexcept
+{
+    // TODO
+}
+
+std::error_condition request_encode(std::ostream& out, const request& in) noexcept
+{
+    // TODO
+}
+
+result<response, std::error_condition> response_decode(std::istream& in) noexcept
+{
+    response resp{
+        .body = in,
+    };
+
+    parse_headers(resp.headers, in);
+
+    return {resp};
+}
+
+result<request, std::error_condition> request_decode(std::istream& in) noexcept
+{
+    request req{
+        .body = in,
+    };
+
+    auto err = parse_request_line(in, req);
+    if (err) return {err};
+
+    parse_headers(req.headers, in);
 
     // TODO wrap the body up to correctly identify "EOF"
-    return result<request, std::error_condition>{req};
+    return {req};
 }
 
 }

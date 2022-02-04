@@ -351,9 +351,9 @@ url::parse_result url::parse(std::string_view s) noexcept
     url  u;
     auto end_state = url_parse(s, u);
     if (end_state != parse_state::done)
-        return parse_result{url_parse_failure{end_state}};
+        return {url_parse_failure{end_state}};
     else
-        return parse_result{std::move(u)};
+        return {u};
 }
 
 std::string url::build() const noexcept
