@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdexcept>
+#include <system_error>
 
 namespace net
 {
@@ -11,6 +12,12 @@ public:
     using std::runtime_error::runtime_error;
     exception();
     exception(int status);
+};
+
+struct io_result
+{
+    size_t               count;
+    std::error_condition err;
 };
 
 }

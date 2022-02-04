@@ -2,8 +2,6 @@
 
 #include "http/http.hpp"
 
-#include "encoding.hpp"
-
 namespace
 {
 
@@ -150,25 +148,14 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition response_encode(std::ostream& out, const response& resp) noexcept
-{
-    // TODO
-}
-
 std::error_condition request_encode(std::ostream& out, const request& in) noexcept
 {
     // TODO
 }
 
-result<response, std::error_condition> response_decode(std::istream& in) noexcept
+std::error_condition response_encode(std::ostream& out, const response& resp) noexcept
 {
-    response resp{
-        .body = in,
-    };
-
-    parse_headers(resp.headers, in);
-
-    return {resp};
+    // TODO
 }
 
 result<request, std::error_condition> request_decode(std::istream& in) noexcept
@@ -184,6 +171,21 @@ result<request, std::error_condition> request_decode(std::istream& in) noexcept
 
     // TODO wrap the body up to correctly identify "EOF"
     return {req};
+}
+
+result<response, std::error_condition> response_decode(std::istream& in) noexcept
+{
+    response resp{
+        .body = in,
+    };
+
+    auto err = parse_status_line(in, resp);
+    if (err) return {err};
+
+    parse_headers(resp.headers, in);
+
+    // TODO wrap the body up to correctly identify "EOF"
+    return {resp};
 }
 
 }

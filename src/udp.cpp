@@ -62,7 +62,7 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, addr_protoc
     if (fd == invalid_fd) throw exception{"failed to bind"};
 }
 
-size_t udp_socket::read(uint8_t* data, size_t length) noexcept
+io_result udp_socket::read(uint8_t* data, size_t length) noexcept
 {
     // size_t rcvd = 0;
     // while (rcvd < length)
@@ -76,10 +76,10 @@ size_t udp_socket::read(uint8_t* data, size_t length) noexcept
     //     }
     //     rcvd += num;
     // }
-    return 0;
+    return {0};
 }
 
-size_t udp_socket::write(const uint8_t* data, size_t length) noexcept
+io_result udp_socket::write(const uint8_t* data, size_t length) noexcept
 {
     // size_t sent = 0;
     // while (sent < length)
@@ -89,7 +89,7 @@ size_t udp_socket::write(const uint8_t* data, size_t length) noexcept
     //         return false;
     //     sent += num;
     // }
-    return 0;
+    return {0};
 }
 
 }

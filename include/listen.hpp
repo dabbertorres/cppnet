@@ -39,7 +39,7 @@ public:
             host, port, net, proto, std::chrono::duration_cast<std::chrono::microseconds>(timeout))
     {}
 
-    bool       listen(size_t max_pending) const noexcept;
+    bool       listen(uint16_t max_pending) const noexcept;
     tcp_socket accept() const;
 
 private:

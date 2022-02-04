@@ -10,25 +10,29 @@ using namespace net;
 // assumes c is a valid hex character
 uint8_t parse_hex(char c) noexcept
 {
-    c = std::toupper(c);
+    c = static_cast<char>(std::toupper(c));
 
     if ('0' <= c && c <= '9')
-        return c - '0';
+        return static_cast<uint8_t>(c - '0');
     else if ('A' <= c && c <= 'F')
-        return c - 'A' + 0xa;
+        return static_cast<uint8_t>(c - 'A' + 0xa);
     else
         ; // TODO what do?
 }
 
 // assumes s.size() == 2
-std::string_view::value_type parse_hex(std::string_view s) noexcept { return (parse_hex(s[0]) << 4) | parse_hex(s[1]); }
-
-std::string to_hex(uint8_t b) noexcept
+uint8_t parse_hex(std::string_view s) noexcept
 {
-    constexpr auto nibble_to_hex = [](uint8_t v) -> char { return v < 0xa ? v + '0' : v - 0xa + 'A'; };
+    return static_cast<uint8_t>(parse_hex(s[0]) << 4) | parse_hex(s[1]);
+}
 
-    uint8_t top = (b & 0xf0) >> 4;
-    uint8_t bot = b & 0x0f;
+std::string to_hex(char c) noexcept
+{
+    constexpr auto nibble_to_hex = [](uint8_t v) -> char
+    { return static_cast<char>(v < 0xa ? v + '0' : v - 0xa + 'A'); };
+
+    uint8_t top = (c & 0xf0) >> 4;
+    uint8_t bot = c & 0x0f;
 
     return {nibble_to_hex(top), nibble_to_hex(bot)};
 }
@@ -255,7 +259,7 @@ done:
 
     while (!raw_query.empty())
     {
-        size_t end = raw_query.find('&');
+        end = raw_query.find('&');
 
         auto kv     = raw_query.substr(0, end);
         auto eq_idx = kv.find('=');
@@ -285,12 +289,12 @@ done:
 namespace net
 {
 
-std::string url::encode(std::string_view str, std::string_view reserved_characters) noexcept
+std::string url::encode(std::string_view str, std::string_view reserved) noexcept
 {
     std::ostringstream out;
 
     size_t idx = 0;
-    while ((idx = str.find_first_of(reserved_characters, idx)) != std::string::npos)
+    while ((idx = str.find_first_of(reserved, idx)) != std::string::npos)
     {
         out << str.substr(0, idx);
         out << '%' << to_hex(str[idx]);

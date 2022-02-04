@@ -1,7 +1,6 @@
 #pragma once
 
 #include <chrono>
-#include <streambuf>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,13 +19,10 @@ enum class addr_protocol
     ipv6,
 };
 
-class socket : public std::basic_streambuf<uint8_t>, public reader, public writer
+class socket : public reader, public writer
 {
 public:
-    using streambuf = std::basic_streambuf<uint8_t>;
-
     socket();
-    socket(size_t buf_size);
     socket(int fd, size_t buf_size = 256);
 
     // non-copyable
@@ -43,20 +39,16 @@ public:
     std::string local_addr() const;
     std::string remote_addr() const;
 
-    int underflow() override;
-    int overflow(int ch) override;
-    int sync() override;
-
-    void flush() noexcept override { sync(); }
-
 protected:
     static constexpr int invalid_fd = -1;
+
+    socket(size_t buf_size);
 
     int fd;
 
 private:
-    std::vector<streambuf::char_type> read_buf;
-    std::vector<streambuf::char_type> write_buf;
+    std::vector<uint8_t> read_buf;
+    std::vector<uint8_t> write_buf;
 };
 
 }

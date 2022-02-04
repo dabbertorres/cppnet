@@ -16,8 +16,8 @@ public:
                addr_protocol    proto = addr_protocol::not_care);
     virtual ~udp_socket() = default;
 
-    size_t read(uint8_t* data, size_t length) noexcept override;
-    size_t write(const uint8_t* data, size_t length) noexcept override;
+    io_result read(uint8_t* data, size_t length) noexcept override;
+    io_result write(const uint8_t* data, size_t length) noexcept override;
 };
 
 }

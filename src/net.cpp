@@ -1,5 +1,6 @@
 #include "net.hpp"
 
+#include <limits.h>
 #include <unistd.h>
 
 namespace net
@@ -7,10 +8,13 @@ namespace net
 
 std::string hostname() noexcept
 {
-    static size_t len = sysconf(_SC_HOST_NAME_MAX) + 1;
+    size_t len = static_cast<size_t>(sysconf(_SC_HOST_NAME_MAX) + 1);
+    if (len < 0) len = _POSIX_HOST_NAME_MAX;
 
     std::string name(len, '\0');
-    gethostname(name.data(), name.size());
+    auto        err = gethostname(name.data(), name.size());
+    if (err != 0)
+        ; // TODO
 
     auto end = name.find_first_of('\0');
     if (end != std::string::npos)

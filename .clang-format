@@ -72,19 +72,17 @@ ForEachMacros: []
 IfMacros: []
 IncludeBlocks: Regroup
 IncludeCategories:
-- Regex: ^<[a-z_]+>$
+- Regex: ^<([[:alnum:]]|_)+>$
   Priority: 1
-- Regex: ^<experimental/[a-z]+>$
+- Regex: ^<experimental/([[:alnum:]]|_)+>$
   Priority: 2
-- Regex: ^<[a-z]+\.h>$
+- Regex: ^<([[:alnum:]]|_)+\.h>$
   Priority: 11
-- Regex: ^<glad/[a-zA-Z0-9]+\.h>$
+- Regex: ^<([[:alnum:]]|_)+/([[:alnum:]]|_)+\.h(pp)?>$
   Priority: 12
-- Regex: ^<[a-zA-Z]+/[[:alnum:]]+\.h>$
-  Priority: 13
-- Regex: ^".+/.+"$
+- Regex: ^"([[:alnum:]]|_)+/([[:alnum:]]|_)+"$
   Priority: 98
-- Regex: ^".+"$
+- Regex: ^"([[:alnum:]]|_)+"$
   Priority: 99
 IncludeIsMainRegex: '(_test)?$'
 IncludeIsMainSourceRegex: ''

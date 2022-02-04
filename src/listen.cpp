@@ -70,7 +70,7 @@ listener::listener(std::string_view          host,
             .tv_sec  = 0,
             .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()),
         };
-        sts = ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        sts = ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         if (sts != 0)
         {
             ::close(fd);
@@ -94,7 +94,10 @@ listener::listener(std::string_view          host,
     if (fd == invalid_fd) throw exception{"failed to bind"};
 }
 
-bool listener::listen(size_t max_pending) const noexcept { return ::listen(fd, max_pending) == 0; }
+bool listener::listen(uint16_t max_pending) const noexcept
+{
+    return ::listen(fd, max_pending) == 0;
+}
 
 tcp_socket listener::accept() const
 {
