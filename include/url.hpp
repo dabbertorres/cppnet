@@ -31,24 +31,15 @@ constexpr std::string_view parse_state_string(parse_state s) noexcept
 
     switch (s)
     {
-    case scheme:
-        return "scheme";
-    case authority:
-        return "authority";
-    case userinfo:
-        return "userinfo";
-    case host:
-        return "host";
-    case port:
-        return "port";
-    case path:
-        return "path";
-    case query:
-        return "query";
-    case fragment:
-        return "fragment";
-    case done:
-        return "done";
+    case scheme: return "scheme";
+    case authority: return "authority";
+    case userinfo: return "userinfo";
+    case host: return "host";
+    case port: return "port";
+    case path: return "path";
+    case query: return "query";
+    case fragment: return "fragment";
+    case done: return "done";
     }
 }
 

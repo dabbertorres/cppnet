@@ -5,16 +5,17 @@
 #include <string>
 #include <string_view>
 
-#include "listen.hpp"
 #include "http/http.hpp"
 #include "http/router.hpp"
+
+#include "listen.hpp"
 
 namespace net::http
 {
 
 struct server_config
 {
-    size_t max_header_bytes;
+    size_t               max_header_bytes;
     std::chrono::seconds header_read_timeout;
     // TODO logging?
 };
@@ -30,7 +31,7 @@ public:
     void listen(handler&) const;
 
 private:
-    net::listener listener;
+    net::listener    listener;
     std::atomic_bool serve;
 
     const size_t max_header_bytes;

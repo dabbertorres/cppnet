@@ -33,11 +33,11 @@ enum class frame_flags : uint8_t
 
 struct NET_PACKED frame_header
 {
-    uint32_t    length:24;
+    uint32_t    length : 24;
     frame_type  type;
     frame_flags flags;
-    uint32_t    R:1;
-    uint32_t    stream_identifier:31;
+    uint32_t    R                 : 1;
+    uint32_t    stream_identifier : 31;
 };
 
 static_assert(sizeof(frame_header) == 9);

@@ -27,14 +27,15 @@ void router::handle(const request& req, response& resp)
     }
 }
 
-router::route_matcher::route_matcher(std::unique_ptr<::net::http::matcher>&& m, std::unique_ptr<::net::http::handler>&& h) noexcept
-    : matcher{std::move(m)},
-      handler{std::move(h)}
+router::route_matcher::route_matcher(std::unique_ptr<::net::http::matcher>&& m,
+                                     std::unique_ptr<::net::http::handler>&& h) noexcept :
+    matcher{std::move(m)},
+    handler{std::move(h)}
 {}
 
-router::route_matcher::route_matcher(route_matcher&& other) noexcept
-    : matcher{std::move(other.matcher)},
-      handler{std::move(other.handler)}
+router::route_matcher::route_matcher(route_matcher&& other) noexcept :
+    matcher{std::move(other.matcher)},
+    handler{std::move(other.handler)}
 {}
 
 router::route_matcher& router::route_matcher::operator=(route_matcher&& other) noexcept

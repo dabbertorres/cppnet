@@ -1,9 +1,9 @@
 #pragma once
 
 #include <chrono>
+#include <streambuf>
 #include <string>
 #include <string_view>
-#include <streambuf>
 #include <vector>
 
 #include "exception.hpp"
@@ -39,7 +39,7 @@ public:
 
     virtual ~socket();
 
-    bool valid() const noexcept;
+    bool        valid() const noexcept;
     std::string local_addr() const;
     std::string remote_addr() const;
 

@@ -16,81 +16,73 @@
 namespace net::util
 {
 
-template<typename Result, typename Error>
+template<typename Value, typename Error>
+    requires(!std::is_same_v<Value, Error>)
 class result
 {
 public:
-    using result_type = Result;
+    using result_type = Value;
     using error_type  = Error;
 
     constexpr result() = delete;
 
-    constexpr result(Result value) noexcept : value{value}, is_error{false} {}
+    constexpr result(Value value) noexcept : value{value}, is_error{false} {}
     constexpr result(Error error) noexcept : error{error}, is_error{true} {}
 
     constexpr result(const result& other) noexcept(
-        std::is_nothrow_copy_constructible_v<Result>&& std::is_nothrow_copy_constructible_v<Error>)
+        std::is_nothrow_copy_constructible_v<Value>&& std::is_nothrow_copy_constructible_v<Error>)
     {
         is_error = other.is_error;
-        if (other.is_error)
-            error = other.error;
-        else
-            value = other.value;
+        value    = other.value;
     }
 
-    constexpr result(result&& other) noexcept
+    constexpr result(result&& other) noexcept(
+        std::is_nothrow_move_constructible_v<Value>&& std::is_nothrow_move_constructible_v<Error>)
     {
         is_error = other.is_error;
-        if (other.is_error)
-            error = std::move(other.error);
-        else
-            value = std::move(other.value);
+        value    = std::move(other.value);
     }
 
     constexpr result& operator=(const result& other) noexcept(
-        std::is_nothrow_copy_constructible_v<Result>&& std::is_nothrow_copy_constructible_v<Error>)
+        std::is_nothrow_copy_assignable_v<Value>&& std::is_nothrow_copy_assignable_v<Error>)
     {
         is_error = other.is_error;
-        if (other.is_error)
-            error = other.error;
-        else
-            value = other.value;
+        value    = other.value;
     }
 
-    constexpr result& operator=(result&& other) noexcept
+    constexpr result& operator=(result&& other) noexcept(
+        std::is_nothrow_move_assignable_v<Value>&& std::is_nothrow_move_assignable_v<Error>)
     {
         is_error = other.is_error;
-        if (other.is_error)
-            error = std::move(other.error);
-        else
-            value = std::move(other.value);
+        value    = std::move(other.value);
     }
 
     constexpr ~result() noexcept(
-        std::is_nothrow_destructible_v<Result>&& std::is_nothrow_destructible_v<Error>)
+        std::is_nothrow_destructible_v<Value>&& std::is_nothrow_destructible_v<Error>)
     {
         if (is_error)
             error.~Error();
         else
-            value.~Result();
+            value.~Value();
     }
 
     constexpr      operator bool() const noexcept { return !is_error; }
     constexpr bool has_value() const noexcept { return !is_error; }
+    constexpr bool has_error() const noexcept { return is_error; }
 
-    explicit constexpr operator Result() const noexcept { return value; }
-    constexpr Result   to_value() const noexcept { return value; }
+    explicit constexpr operator Value() const noexcept { return value; }
+    constexpr Value    to_value() const noexcept { return value; }
 
     explicit constexpr operator Error() const noexcept { return error; }
     constexpr Error    to_error() const noexcept { return error; }
 
     template<typename F>
-    requires std::invocable<F, Result>
+        requires std::invocable<F, Value>
     constexpr auto if_value(F&& f) const noexcept
     {
         if (!is_error)
         {
-            if constexpr (std::is_void_v<std::invoke_result_t<F, Result>>)
+            if constexpr (std::is_void_v<std::invoke_result_t<F, Value>>)
             {
                 f(value);
                 return *this;
@@ -103,7 +95,7 @@ public:
     }
 
     template<typename F>
-    requires std::invocable<F, Error>
+        requires std::invocable<F, Error>
     constexpr auto if_error(F&& f) const noexcept
     {
         if (is_error)
@@ -121,7 +113,7 @@ public:
     }
 
     template<std::invocable F>
-    requires std::is_same_v<std::invoke_result_t<F>, Result>
+        requires std::is_same_v<std::invoke_result_t<F>, Value>
     constexpr auto or_else(F&& f) const noexcept
     {
         if (is_error)
@@ -130,7 +122,7 @@ public:
             return value;
     }
 
-    constexpr auto or_else(Result other) const noexcept
+    constexpr auto or_else(Value other) const noexcept
     {
         if (is_error)
             return other;
@@ -141,8 +133,8 @@ public:
 private:
     union
     {
-        Result value;
-        Error  error;
+        Value value;
+        Error error;
     };
     bool is_error;
 };

@@ -1,7 +1,8 @@
 #include "http/http11.hpp"
 
-#include "encoding.hpp"
 #include "http/http.hpp"
+
+#include "encoding.hpp"
 
 namespace
 {
@@ -69,7 +70,8 @@ static std::error_condition parse_status_line(std::istream& in, response& resp) 
     if (version_end == std::string::npos)
         return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
-    if (auto res = parse_http_version(view.substr(0, version_end)); res.has_error())
+    auto res = parse_http_version(view.substr(0, version_end));
+    if (res.has_error())
         return {res.to_error()};
     else
         resp.version = res.to_value();
@@ -111,15 +113,11 @@ static std::error_condition parse_request_line(std::istream& in, request& req) n
 
     auto uri = view.substr(uri_start, uri_end - uri_start);
     if (uri == "*")
-    {
         req.uri.host = "*";
-    }
     else
-    {
         url::parse(uri) //
             .if_value([&](const url& u) { req.uri = u; })
             .if_error([&](auto) { req.uri.path = "/"; });
-    }
 
     if (auto res = parse_http_version(view.substr(uri_end + 1)); res.has_error())
         return {res.to_error()};

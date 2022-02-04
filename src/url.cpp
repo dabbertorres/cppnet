@@ -21,16 +21,11 @@ uint8_t parse_hex(char c) noexcept
 }
 
 // assumes s.size() == 2
-std::string_view::value_type parse_hex(std::string_view s) noexcept
-{
-    return (parse_hex(s[0]) << 4) | parse_hex(s[1]);
-}
+std::string_view::value_type parse_hex(std::string_view s) noexcept { return (parse_hex(s[0]) << 4) | parse_hex(s[1]); }
 
 std::string to_hex(uint8_t b) noexcept
 {
-    constexpr auto nibble_to_hex = [](uint8_t v) -> char {
-        return v < 0xa ? v + '0' : v - 0xa + 'A';
-    };
+    constexpr auto nibble_to_hex = [](uint8_t v) -> char { return v < 0xa ? v + '0' : v - 0xa + 'A'; };
 
     uint8_t top = (b & 0xf0) >> 4;
     uint8_t bot = b & 0x0f;
@@ -149,9 +144,7 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                 end    = start;
                 switch (s[idx])
                 {
-                case ':':
-                    state = parse_state::port;
-                    break;
+                case ':': state = parse_state::port; break;
 
                 case '/':
                     state = parse_state::path;
@@ -160,13 +153,9 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                     end   = start;
                     break;
 
-                case '?':
-                    state = parse_state::query;
-                    break;
+                case '?': state = parse_state::query; break;
 
-                case '#':
-                    state = parse_state::fragment;
-                    break;
+                case '#': state = parse_state::fragment; break;
                 }
             }
             else
@@ -193,13 +182,9 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                     end   = start;
                     break;
 
-                case '?':
-                    state = parse_state::query;
-                    break;
+                case '?': state = parse_state::query; break;
 
-                case '#':
-                    state = parse_state::fragment;
-                    break;
+                case '#': state = parse_state::fragment; break;
                 }
             }
             else
@@ -219,13 +204,9 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                 end    = start;
                 switch (s[idx])
                 {
-                case '?':
-                    state = parse_state::query;
-                    break;
+                case '?': state = parse_state::query; break;
 
-                case '#':
-                    state = parse_state::fragment;
-                    break;
+                case '#': state = parse_state::fragment; break;
                 }
             }
             else
@@ -259,8 +240,7 @@ parse_state url_parse(std::string_view s, url& u) noexcept
             state      = parse_state::done;
             break;
 
-        case parse_state::done:
-            goto done;
+        case parse_state::done: goto done;
         }
     }
 

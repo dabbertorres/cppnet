@@ -18,13 +18,13 @@ concept HandlerFunc = requires(T& t, const request& req, response& resp)
 
 struct handler
 {
-    virtual ~handler() = default;
+    virtual ~handler()                             = default;
     virtual void handle(const request&, response&) = 0;
 };
 
 struct matcher
 {
-    virtual ~matcher() = default;
+    virtual ~matcher()                 = default;
     virtual bool match(const request&) = 0;
 };
 
@@ -36,7 +36,7 @@ public:
     template<HandlerFunc Func>
     router& route(method m, std::string_view path, Func&& func) noexcept
     {
-        auto match = std::make_unique<method_path_matcher>(m, path);
+        auto match  = std::make_unique<method_path_matcher>(m, path);
         auto handle = std::make_unique<handler_func>(func);
         return route(std::move(match), std::move(handle));
     }
@@ -55,16 +55,14 @@ public:
 private:
     struct method_path_matcher : public matcher
     {
-        method_path_matcher(method m, std::string_view p)
-            : method{m}, path{p}
-        {}
+        method_path_matcher(method m, std::string_view p) : method{m}, path{p} {}
 
-        const method method;
+        const method      method;
         const std::string path;
 
         bool match(const request& req) override final
         {
-            return req.path == path && method == req.method;
+            return req.uri.path == path && method == req.method;
         }
     };
 
@@ -72,10 +70,7 @@ private:
     {
         const std::function<void(const request&, response&)> func;
 
-        void handle(const request& req, response& resp) override final
-        {
-            func(req, resp);
-        }
+        void handle(const request& req, response& resp) override final { func(req, resp); }
     };
 
     struct route_matcher
@@ -86,7 +81,7 @@ private:
         route_matcher(route_matcher&&) noexcept;
 
         route_matcher& operator=(const route_matcher&) = delete;
-        route_matcher& operator=(route_matcher&&) noexcept;
+        route_matcher& operator                        =(route_matcher&&) noexcept;
 
         ~route_matcher() = default;
 

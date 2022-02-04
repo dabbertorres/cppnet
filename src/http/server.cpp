@@ -2,8 +2,9 @@
 
 #include <string>
 
-#include "exception.hpp"
 #include "http/http.hpp"
+
+#include "exception.hpp"
 
 namespace net::http
 {

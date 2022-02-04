@@ -1,36 +1,33 @@
 #include "socket.hpp"
 
 #include <cerrno>
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
 #include <iostream>
+
+#include <fcntl.h>
+#include <netdb.h>
+#include <unistd.h>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 #include "exception.hpp"
 
 namespace net
 {
 
-socket::socket()
-    : fd{invalid_fd}
-{}
+socket::socket() : fd{invalid_fd} {}
 
-socket::socket(size_t buf_size)
-    : fd{invalid_fd}, read_buf(buf_size), write_buf(buf_size)
-{}
+socket::socket(size_t buf_size) : fd{invalid_fd}, read_buf(buf_size), write_buf(buf_size) {}
 
-socket::socket(int fd, size_t buf_size)
-    : fd{fd}, read_buf(buf_size), write_buf(buf_size)
+socket::socket(int fd, size_t buf_size) : fd{fd}, read_buf(buf_size), write_buf(buf_size)
 {
     setg(read_buf.data(), read_buf.data(), &read_buf.back());
     setp(write_buf.data(), &write_buf.back());
 }
 
-socket::socket(socket&& other) noexcept
-    : fd{other.fd},
+socket::socket(socket&& other) noexcept :
+    fd{other.fd},
     read_buf{std::move(other.read_buf)},
     write_buf{std::move(other.write_buf)}
 {
@@ -40,13 +37,12 @@ socket::socket(socket&& other) noexcept
 
 socket& socket::operator=(socket&& other) noexcept
 {
-    if (fd != invalid_fd)
-        ::close(fd);
+    if (fd != invalid_fd) ::close(fd);
 
-    fd = other.fd;
+    fd       = other.fd;
     other.fd = invalid_fd;
 
-    read_buf = std::move(other.read_buf);
+    read_buf  = std::move(other.read_buf);
     write_buf = std::move(other.write_buf);
     this->swap(other);
 
@@ -55,14 +51,10 @@ socket& socket::operator=(socket&& other) noexcept
 
 socket::~socket()
 {
-    if (fd != invalid_fd)
-        ::close(fd);
+    if (fd != invalid_fd) ::close(fd);
 }
 
-bool socket::valid() const noexcept
-{
-    return fd != invalid_fd;
-}
+bool socket::valid() const noexcept { return fd != invalid_fd; }
 
 std::string addr_name(sockaddr* addr)
 {
@@ -82,31 +74,28 @@ std::string addr_name(sockaddr* addr)
     }
 
     auto ptr = inet_ntop(addr->sa_family, addr_type, ret.data(), ret.size());
-    if (ptr == nullptr)
-        throw exception{};
+    if (ptr == nullptr) throw exception{};
 
     return ret;
 }
 
 std::string socket::local_addr() const
 {
-    sockaddr addr;
+    sockaddr  addr;
     socklen_t size = sizeof(addr);
 
     int sts = getsockname(fd, &addr, &size);
-    if (sts != 0)
-        throw exception{};
+    if (sts != 0) throw exception{};
     return addr_name(&addr);
 }
 
 std::string socket::remote_addr() const
 {
-    sockaddr addr;
+    sockaddr  addr;
     socklen_t size = sizeof(addr);
 
     int sts = getpeername(fd, &addr, &size);
-    if (sts != 0)
-        throw exception{};
+    if (sts != 0) throw exception{};
     return addr_name(&addr);
 }
 
@@ -128,8 +117,7 @@ int socket::overflow(int ch)
     else
         return std::char_traits<streambuf::char_type>::eof();
 
-    if (ch != std::char_traits<streambuf::char_type>::eof())
-        write_buf[0] = ch;
+    if (ch != std::char_traits<streambuf::char_type>::eof()) write_buf[0] = ch;
 
     setp(write_buf.data(), &write_buf.back() + 1);
     return 1;
