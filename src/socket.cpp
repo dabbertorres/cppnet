@@ -69,7 +69,7 @@ std::string addr_name(sockaddr* addr)
 
     auto ptr =
         inet_ntop(addr->sa_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
-    if (ptr == nullptr) throw exception{};
+    if (ptr == nullptr) throw system_error_from_errno(errno);
 
     return ret;
 }
@@ -80,7 +80,7 @@ std::string socket::local_addr() const
     socklen_t size = sizeof(addr);
 
     int sts = getsockname(fd, &addr, &size);
-    if (sts != 0) throw exception{};
+    if (sts != 0) throw system_error_from_errno(errno);
     return addr_name(&addr);
 }
 
@@ -90,7 +90,7 @@ std::string socket::remote_addr() const
     socklen_t size = sizeof(addr);
 
     int sts = getpeername(fd, &addr, &size);
-    if (sts != 0) throw exception{};
+    if (sts != 0) throw system_error_from_errno(errno);
     return addr_name(&addr);
 }
 

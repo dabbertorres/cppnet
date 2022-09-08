@@ -12,7 +12,7 @@
 namespace net
 {
 
-enum class addr_protocol
+enum class protocol
 {
     not_care,
     ipv4,

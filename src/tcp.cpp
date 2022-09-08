@@ -16,7 +16,7 @@ tcp_socket::tcp_socket(int fd, size_t buf_size) : socket(fd, buf_size) {}
 
 tcp_socket::tcp_socket(std::string_view          host,
                        std::string_view          port,
-                       addr_protocol             proto,
+                       protocol                  proto,
                        size_t                    buf_size,
                        std::chrono::microseconds timeout) :
     socket(buf_size)
@@ -28,23 +28,9 @@ tcp_socket::tcp_socket(std::string_view          host,
 
     switch (proto)
     {
-    case addr_protocol::not_care:
-    {
-        hints.ai_family = AF_UNSPEC;
-        break;
-    }
-
-    case addr_protocol::ipv4:
-    {
-        hints.ai_family = AF_INET;
-        break;
-    }
-
-    case addr_protocol::ipv6:
-    {
-        hints.ai_family = AF_INET6;
-        break;
-    }
+    case protocol::not_care: hints.ai_family = AF_UNSPEC; break;
+    case protocol::ipv4: hints.ai_family = AF_INET; break;
+    case protocol::ipv6: hints.ai_family = AF_INET6; break;
     }
 
     hints.ai_flags    = AI_PASSIVE;
@@ -52,7 +38,7 @@ tcp_socket::tcp_socket(std::string_view          host,
 
     addrinfo* servinfo;
     auto sts = ::getaddrinfo(host != "" ? host.data() : nullptr, port.data(), &hints, &servinfo);
-    if (sts != 0) throw exception{sts};
+    if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!
 

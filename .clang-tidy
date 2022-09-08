@@ -1,0 +1,62 @@
+# vim: ft=yaml
+
+Checks: >-
+  bugprone-*,
+  -bugprone-branch-clone,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-vararg,
+  google-*,
+  -google-explicit-constructor,
+  -google-readability-todo,
+  -google-readability-braces-around-statements,
+  -google-readability-namespace-comments,
+  misc-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-braces-around-statements,
+  -readability-convert-member-functions-to-static,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+WarningsAsErrors: false
+AnalyzeTemporaryDtors: true
+CheckOptions:
+- key:   cert-dcl16-c.NewSuffixes
+  value: 'L;LL;LU;LLU'
+- key:   cert-oop54-cpp.WarnOnlyIfThisHasSuspiciousField
+  value: '0'
+- key:   cppcoreguidelines-explicit-virtual-functions.IgnoreDestructors
+  value: '1'
+- key:   cppcoreguidelines-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+  value: '1'
+- key:   google-readability-function-size.StatementThreshold
+  value: '800'
+- key:   misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+  value: '1'
+- key:   misc-non-private-member-variables-in-classes.IgnorePublicMemberVariables
+  value: '1'
+- key:   modernize-loop-convert.MaxCopySize
+  value: '16'
+- key:   modernize-loop-convert.MinConfidence
+  value: reasonable
+- key:   modernize-loop-convert.NamingStyle
+  value: CamelCase
+- key:   modernize-pass-by-value.IncludeStyle
+  value: llvm
+- key:   modernize-replace-auto-ptr.IncludeStyle
+  value: llvm
+- key:   modernize-use-nullptr.NullMacros
+  value: 'NULL'

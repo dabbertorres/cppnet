@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "util.hpp"
+#include "packed.hpp"
 
 namespace net::http2
 {

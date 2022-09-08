@@ -1,9 +1,11 @@
 # vim: ft=yaml
 Language: Cpp
 Standard: Latest
+
 AccessModifierOffset: -4
+
 AlignAfterOpenBracket: Align
-AlignArrayOfStructures: Right
+AlignArrayOfStructures: Left
 AlignConsecutiveAssignments: Consecutive
 AlignConsecutiveBitFields: Consecutive
 AlignConsecutiveDeclarations: Consecutive
@@ -11,24 +13,29 @@ AlignConsecutiveMacros: Consecutive
 AlignEscapedNewlines: Left
 AlignOperands: AlignAfterOperator
 AlignTrailingComments: true
-AllowAllArgumentsOnNextLine: true
-AllowAllConstructorInitializersOnNextLine: false
+
+AllowAllArgumentsOnNextLine: false
+# AllowAllConstructorInitializersOnNextLine: false # deprecated
 AllowAllParametersOfDeclarationOnNextLine: true
-AllowShortBlocksOnASingleLine: Always
+AllowShortBlocksOnASingleLine: Empty
 AllowShortCaseLabelsOnASingleLine: true
-AllowShortEnumsOnASingleLine: true
+AllowShortEnumsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: All
-AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
 AllowShortLambdasOnASingleLine: All
 AllowShortLoopsOnASingleLine: true
+
 AlwaysBreakAfterDefinitionReturnType: None
 AlwaysBreakAfterReturnType: None
 AlwaysBreakBeforeMultilineStrings: false
 AlwaysBreakTemplateDeclarations: Yes
+
 AttributeMacros: []
+
 BinPackArguments: false
 BinPackParameters: false
 BitFieldColonSpacing: Both
+
 BraceWrapping:
   AfterCaseLabel:        true
   AfterClass:            true
@@ -47,69 +54,111 @@ BraceWrapping:
   SplitEmptyFunction:    false
   SplitEmptyNamespace:   false
   SplitEmptyRecord:      false
+
 BreakBeforeBinaryOperators: NonAssignment
 BreakBeforeBraces: Custom
+# BreakBeforeConceptDeclarations: Always # v14 expects a boolean?
 BreakBeforeConceptDeclarations: true
-BreakBeforeInheritanceComma: false
-BreakBeforeTernaryOperators: false
-BreakConstructorInitializers: AfterColon
-BreakInheritanceList: AfterColon
+# BreakBeforeInheritanceComma: false
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeComma
+BreakInheritanceList: BeforeComma
 BreakStringLiterals: false
-ColumnLimit: 100
+
+ColumnLimit: 120
 CommentPragmas:  '^ IWYU pragma:'
 CompactNamespaces: false
-ConstructorInitializerAllOnOneLineOrOnePerLine: true
+
+# ConstructorInitializerAllOnOneLineOrOnePerLine: true # deprecated
 ConstructorInitializerIndentWidth: 4
 ContinuationIndentWidth: 4
 Cpp11BracedListStyle: true
 DeriveLineEnding: false
 DerivePointerAlignment: false
-DisableFormat:   false
+DisableFormat: false
 EmptyLineAfterAccessModifier: Never
 EmptyLineBeforeAccessModifier: LogicalBlock
 FixNamespaceComments: false
+
 ForEachMacros: []
+
 IfMacros: []
+
 IncludeBlocks: Regroup
+
 IncludeCategories:
 - Regex: ^<([[:alnum:]]|_)+>$
   Priority: 1
 - Regex: ^<experimental/([[:alnum:]]|_)+>$
   Priority: 2
-- Regex: ^<([[:alnum:]]|_)+\.h>$
+- Regex: ^<([[:alnum:]]|_)+\.h(pp)?>$
   Priority: 11
-- Regex: ^<([[:alnum:]]|_)+/([[:alnum:]]|_)+\.h(pp)?>$
+- Regex: ^<([[:alnum:]]|_)+/([[:alnum:]]|_)+(\.h(pp)?)?>$
   Priority: 12
-- Regex: ^"([[:alnum:]]|_)+/([[:alnum:]]|_)+"$
+- Regex: ^"([[:alnum:]]|_)+/([[:alnum:]]|_)+(\.h(pp)?)?"$
   Priority: 98
-- Regex: ^"([[:alnum:]]|_)+"$
+- Regex: ^"([[:alnum:]]|_)+(\.h(pp)?)?"$
   Priority: 99
+
 IncludeIsMainRegex: '(_test)?$'
 IncludeIsMainSourceRegex: ''
+
 IndentAccessModifiers: false
 IndentCaseBlocks: false
 IndentCaseLabels: false
 IndentExternBlock: NoIndent
-IndentGotoLabels: true
+IndentGotoLabels: false
 IndentPPDirectives: AfterHash
-IndentRequires: true
+IndentRequires: true # changed to IndentRequiresClause in v15
 IndentWidth: 4
 IndentWrappedFunctionNames: false
+
+# InsertBraces: false # available in v15
 InsertTrailingCommas: Wrapped
 KeepEmptyLinesAtTheStartOfBlocks: false
 LambdaBodyIndentation: Signature
+
 MacroBlockBegin: '^.+_(BEGIN|HEAD|START)$'
 MacroBlockEnd:   '^.+_(END|STOP)$'
+
 MaxEmptyLinesToKeep: 1
 NamespaceIndentation: Inner
+
 NamespaceMacros: []
+
 PPIndentWidth: -1
+PackConstructorInitializers: Never
+
 PointerAlignment: Left
+
+QualifierAlignment: Custom
+QualifierOrder:
+- static
+- inline
+- const
+- constexpr
+- volatile
+- restrict
+- type
+
+# RawStringFormats:
+# - Language: Cpp
+#   Delimiters:
+#   - 'cc'
+#   - 'cpp'
+#   BasedOnStyle: llvm
+#   CanonicalDelimiters: 'cc'
+
 ReferenceAlignment: Pointer
 ReflowComments: true
+RemoveBracesLLVM: false
+# RequiresClausePosition: WithPreceding # available in v15
+SeparateDefinitionBlocks: Leave
 ShortNamespaceLines: 1
+
 SortIncludes: CaseSensitive
 SortUsingDeclarations: true
+
 SpaceAfterCStyleCast: false
 SpaceAfterLogicalNot: false
 SpaceAfterTemplateKeyword: false
@@ -120,6 +169,16 @@ SpaceBeforeCpp11BracedList: false
 SpaceBeforeCtorInitializerColon: true
 SpaceBeforeInheritanceColon: true
 SpaceBeforeParens: ControlStatements
+# SpaceBeforeParensOptions:
+#   AfterControlStatements: true
+#   AfterForeachMacros: true
+#   AfterFunctionDeclarationName: false
+#   AfterFuncDefinitionName: false
+#   AfterIfMacros: true
+#   AfterOverloadedOperator: false
+#   AfterRequiresInClause: true
+#   AfterRequiresInExpression: true
+#   BeforeNonEmptyParentheses: false
 SpaceBeforeRangeBasedForLoopColon: true
 SpaceBeforeSquareBrackets: false
 SpaceInEmptyBlock: false
@@ -134,25 +193,30 @@ SpacesInLineCommentPrefix:
   Maximum: -1
 SpacesInParentheses: false
 SpacesInSquareBrackets: false
+
 StatementAttributeLikeMacros: []
+
 StatementMacros:
 - TEST_CASE
 - SECTION
+
 TabWidth: 4
+
 TypenameMacros: []
+
 UseCRLF: false
 UseTab: Never
+
 WhitespaceSensitiveMacros: []
 
-# not available until clang-format 14
-#PackConstructorInitializers: NextLine
-#QualifierAlignment: Custom
-#QualifierOrder:
-#- static
-#- inline
-#- const
-#- constexpr
-#- volatile
-#- restrict
-#- type
-#SeparateDefinitionBlocks: Always
+# Penalty settings
+# PenaltyBreakAssignment: 0
+# PenaltyBreakBeforeFirstCallParameter: 0
+# PenaltyBreakComment: 0
+# PenaltyBreakFirstLessLess: 0
+# PenaltyBreakOpenParenthesis: 0
+# PenaltyBreakString: 0
+# PenaltyBreakTemplateDeclaration: 0
+# PenaltyExcessCharacter: 0
+# PenaltyIndentedWhitespace: 0
+# PenaltyReturnTypeOnItsOwnLine: 0

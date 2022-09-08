@@ -1,8 +1,11 @@
 #pragma once
 
+#include <concepts>
 #include <functional>
 #include <memory>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "http/http.hpp"
@@ -11,85 +14,85 @@ namespace net::http
 {
 
 template<typename T>
-concept HandlerFunc = requires(T& t, const request& req, response& resp)
+concept HandlerInvocable = std::invocable<T, const request&, response&>;
+
+template<typename T>
+concept MatcherInvocable =
+    std::invocable<T, const request&> && std::same_as<bool, std::invoke_result_t<T, const request&>>;
+
+using handler = std::function<void(const request&, response&)>;
+using matcher = std::function<bool(const request&)>;
+
+struct route
 {
-    t(req, resp);
+    route() = delete;
+    route(method method, std::string prefix, std::string suffix, matcher&& m, handler&& h) noexcept
+        : prefix{std::move(prefix)}
+        , suffix{std::move(suffix)}
+        , method{method}
+        , matcher{std::move(m)}
+        , handler{std::move(h)}
+    {}
+
+    route(const route&) = delete;
+
+    route(route&& other) noexcept
+        : prefix{std::move(other.prefix)}
+        , suffix{std::move(other.suffix)}
+        , method{other.method}
+        , matcher{std::move(other.matcher)}
+        , handler{std::move(other.handler)}
+    {}
+
+    route& operator=(const route&) = delete;
+    route& operator=(route&& other) noexcept
+    {
+        prefix  = std::move(other.prefix);
+        suffix  = std::move(other.suffix);
+        method  = other.method;
+        matcher = std::move(other.matcher);
+        handler = std::move(other.handler);
+
+        return *this;
+    }
+
+    ~route() = default;
+
+    std::string prefix;
+    std::string suffix; // may be empty
+    method      method;
+
+    std::function<bool(const request&)>            matcher;
+    std::function<void(const request&, response&)> handler;
 };
 
-struct handler
-{
-    virtual ~handler()                             = default;
-    virtual void handle(const request&, response&) = 0;
-};
-
-struct matcher
-{
-    virtual ~matcher()                 = default;
-    virtual bool match(const request&) = 0;
-};
-
-class router final : public handler
+class router final
 {
 public:
-    router& route(method m, std::string_view path, std::unique_ptr<handler> h) noexcept;
+    router& add(route&& route) noexcept;
 
-    template<HandlerFunc Func>
-    router& route(method m, std::string_view path, Func&& func) noexcept
-    {
-        auto match  = std::make_unique<method_path_matcher>(m, path);
-        auto handle = std::make_unique<handler_func>(func);
-        return route(std::move(match), std::move(handle));
-    }
+    /* template<HandlerInvocable Handler> */
+    /* router& add(matcher&& m, Handler&& func) noexcept */
+    /* { */
+    /*     return add(std::make_unique<matcher>(std::move(m)), std::forward<Handler>(func)); */
+    /* } */
 
-    template<HandlerFunc Func>
-    router& route(std::unique_ptr<matcher> m, Func&& func) noexcept
-    {
-        auto handle = std::make_unique<handler_func>(func);
-        return route(m, std::move(handle));
-    }
+    /* template<MatcherInvocable Matcher> */
+    /* router& add(Matcher&& m, handler&& h) noexcept */
+    /* { */
+    /*     return add(std::forward<Matcher>(m), std::make_unique<handler>(std::move(h))); */
+    /* } */
 
-    router& route(std::unique_ptr<matcher> m, std::unique_ptr<handler> h) noexcept;
+    /* template<MatcherInvocable Matcher, HandlerInvocable Handler> */
+    /* router& add(Matcher&& m, Handler&& h) noexcept */
+    /* { */
+    /*     return add(std::forward<Matcher>(m), std::forward<Handler>(h)); */
+    /* } */
 
-    void handle(const request&, response&) override final;
+    void operator()(const request& req, response& resp);
 
 private:
-    struct method_path_matcher : public matcher
-    {
-        method_path_matcher(method m, std::string_view p) : method{m}, path{p} {}
-
-        const method      method;
-        const std::string path;
-
-        bool match(const request& req) override final
-        {
-            return req.uri.path == path && method == req.method;
-        }
-    };
-
-    struct handler_func : public handler
-    {
-        const std::function<void(const request&, response&)> func;
-
-        void handle(const request& req, response& resp) override final { func(req, resp); }
-    };
-
-    struct route_matcher
-    {
-        route_matcher() = delete;
-        route_matcher(std::unique_ptr<matcher>&&, std::unique_ptr<handler>&&) noexcept;
-        route_matcher(const route_matcher&) = delete;
-        route_matcher(route_matcher&&) noexcept;
-
-        route_matcher& operator=(const route_matcher&) = delete;
-        route_matcher& operator                        =(route_matcher&&) noexcept;
-
-        ~route_matcher() = default;
-
-        std::unique_ptr<matcher> matcher;
-        std::unique_ptr<handler> handler;
-    };
-
-    std::vector<route_matcher> routes;
+    std::vector<route> routes;
 };
 
 }

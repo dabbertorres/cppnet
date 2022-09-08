@@ -2,9 +2,8 @@
 
 #include <sstream>
 
-#include <catch2/catch.hpp>
-
 #include "http/http.hpp"
+#include <catch.hpp>
 
 using namespace net::http;
 

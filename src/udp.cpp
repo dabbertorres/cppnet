@@ -11,9 +11,9 @@
 namespace net
 {
 
-udp_socket::udp_socket(std::string_view port, addr_protocol proto) : udp_socket("", port, proto) {}
+udp_socket::udp_socket(std::string_view port, protocol proto) : udp_socket("", port, proto) {}
 
-udp_socket::udp_socket(std::string_view host, std::string_view port, addr_protocol proto)
+udp_socket::udp_socket(std::string_view host, std::string_view port, protocol proto)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -24,30 +24,16 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, addr_protoc
 
     switch (proto)
     {
-    case addr_protocol::not_care:
-    {
-        hints.ai_family = AF_UNSPEC;
-        break;
-    }
-
-    case addr_protocol::ipv4:
-    {
-        hints.ai_family = AF_INET;
-        break;
-    }
-
-    case addr_protocol::ipv6:
-    {
-        hints.ai_family = AF_INET6;
-        break;
-    }
+    case protocol::not_care: hints.ai_family = AF_UNSPEC; break;
+    case protocol::ipv4: hints.ai_family = AF_INET; break;
+    case protocol::ipv6: hints.ai_family = AF_INET6; break;
     }
 
     hints.ai_socktype = SOCK_DGRAM;
 
     ::addrinfo* servinfo;
     int sts = ::getaddrinfo(host != "" ? host.data() : nullptr, port.data(), &hints, &servinfo);
-    if (sts != 0) throw exception{sts};
+    if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!
 
@@ -76,7 +62,7 @@ io_result udp_socket::read(uint8_t* data, size_t length) noexcept
     //     }
     //     rcvd += num;
     // }
-    return {0};
+    return {.count = 0, .err = {}};
 }
 
 io_result udp_socket::write(const uint8_t* data, size_t length) noexcept
@@ -89,7 +75,7 @@ io_result udp_socket::write(const uint8_t* data, size_t length) noexcept
     //         return false;
     //     sent += num;
     // }
-    return {0};
+    return {.count = 0, .err = {}};
 }
 
 }

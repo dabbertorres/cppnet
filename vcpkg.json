@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "cppnet",
+  "version-semver": "0.1.0",
+  "builtin-baseline": "55112eb54a1c4cfaec5dd2592a39cea72f78ed56",
+  "dependencies": [
+    {
+      "name": "catch2",
+      "version>=": "2.13.8"
+    },
+    {
+      "name": "fmt",
+      "version>=": "8.1.1"
+    },
+    {
+      "name": "cxxopts",
+      "version>=": "3.0.0"
+    }
+  ]
+}

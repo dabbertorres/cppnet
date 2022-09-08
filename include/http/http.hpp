@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <istream>
+#include <iterator>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -11,6 +14,20 @@
 #include <vector>
 
 #include "url.hpp"
+
+namespace
+{
+
+constexpr bool equal_ignore_case(std::string_view lhs, std::string_view rhs) noexcept
+{
+    return std::equal(std::begin(lhs),
+                      std::end(lhs),
+                      std::begin(rhs),
+                      std::end(rhs),
+                      [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); });
+}
+
+}
 
 namespace net::http
 {
@@ -130,15 +147,9 @@ struct response
     std::istream& body;
 };
 
-constexpr bool status_is_information(status s) noexcept
-{
-    return status::CONTINUE <= s && s < status::OK;
-}
+constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }
 
-constexpr bool status_is_success(status s) noexcept
-{
-    return status::OK <= s && s < status::MULTIPLE_CHOICES;
-}
+constexpr bool status_is_success(status s) noexcept { return status::OK <= s && s < status::MULTIPLE_CHOICES; }
 
 constexpr bool status_is_redirection(status s) noexcept
 {
@@ -158,16 +169,17 @@ constexpr bool status_is_server_error(status s) noexcept
 constexpr method parse_method(std::string_view str) noexcept
 {
     using enum method;
+    using namespace std::literals::string_view_literals;
 
-    if (str == "CONNECT") return CONNECT;
-    if (str == "DELETE") return DELETE;
-    if (str == "GET") return GET;
-    if (str == "HEAD") return HEAD;
-    if (str == "OPTIONS") return OPTIONS;
-    if (str == "PATCH") return PATCH;
-    if (str == "POST") return POST;
-    if (str == "PUT") return PUT;
-    if (str == "TRACE") return TRACE;
+    if (equal_ignore_case(str, "CONNECT"sv)) return CONNECT;
+    if (equal_ignore_case(str, "DELETE"sv)) return DELETE;
+    if (equal_ignore_case(str, "GET"sv)) return GET;
+    if (equal_ignore_case(str, "HEAD"sv)) return HEAD;
+    if (equal_ignore_case(str, "OPTIONS"sv)) return OPTIONS;
+    if (equal_ignore_case(str, "PATCH"sv)) return PATCH;
+    if (equal_ignore_case(str, "POST"sv)) return POST;
+    if (equal_ignore_case(str, "PUT"sv)) return PUT;
+    if (equal_ignore_case(str, "TRACE"sv)) return TRACE;
     return NONE;
 }
 

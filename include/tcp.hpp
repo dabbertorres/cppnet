@@ -17,7 +17,7 @@ public:
 
     tcp_socket(std::string_view          host,
                std::string_view          port,
-               addr_protocol             proto    = addr_protocol::not_care,
+               protocol                  proto    = protocol::not_care,
                size_t                    buf_size = 256,
                std::chrono::microseconds timeout  = 5s);
 

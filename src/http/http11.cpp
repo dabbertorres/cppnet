@@ -1,6 +1,7 @@
 #include "http/http11.hpp"
 
 #include "http/http.hpp"
+#include "result.hpp"
 
 namespace
 {

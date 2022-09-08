@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "exception.hpp"
+#include "io.hpp"
 
 namespace net
 {
