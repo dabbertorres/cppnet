@@ -30,8 +30,12 @@ bool throw_for_gai_error(int err)
     case EAI_SERVICE: throw exception{"unsupported port for selected network type"};
     case EAI_SOCKTYPE: throw exception{"selected network is not supported"};
     case EAI_SYSTEM: throw system_error_from_errno(errno);
+#ifdef EAI_BADHINTS
     case EAI_BADHINTS: throw exception{"internal error: bad hints value"};
+#endif
+#ifdef EAI_PROTOCOL
     case EAI_PROTOCOL: throw exception{"resolved protocol is unknown"};
+#endif
     case EAI_OVERFLOW: throw exception{"internal error: argument buffer overflow"};
     default: throw exception{"EAI error code: " + std::to_string(err)};
     }
