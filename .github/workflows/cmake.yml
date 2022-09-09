@@ -6,25 +6,37 @@ on:
   pull_request:
     branches: [ master ]
 
-env:
-  BUILD_TYPE: Release
-
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # os: [ubuntu-22.04, macos-12]
+        os: [ubuntu-22.04]
+        cc: [gcc-11, clang-14]
+        cxx: [g++-11, clang++-14]
+        exclude:
+        - cc: gcc-11
+          cxx: clang++-14
+        - cc: clang-14
+          cxx: g++-11
+
+    runs-on: ${{ matrix.os }}
 
     defaults:
       run:
-        working-directory: ${{github.workspace}}
+        working-directory: ${{ github.workspace }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 0
 
     - name: Configure CMake
-      run: cmake -B build/
+      run: cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DBUILD_TESTING=TRUE -DBUILD_EXAMPLE=TRUE -DCMAKE_MAKE_PROGRAM=make -B build/
 
     - name: Build
-      run: cmake --build build/ --config ${{env.BUILD_TYPE}}
+      run: cmake --build build/
 
     - name: Test
-      run: ctest -C ${{env.BUILD_TYPE}} build/
+      run: ctest --test-dir build/
