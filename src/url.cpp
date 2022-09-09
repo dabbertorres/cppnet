@@ -5,8 +5,8 @@
 namespace
 {
 
-using net::parse_state;
 using net::url;
+using net::url_parse_state;
 
 // assumes c is a valid hex character
 uint8_t parse_hex(char c) noexcept
@@ -33,15 +33,15 @@ std::string to_hex(char c) noexcept
     return {nibble_to_hex(top), nibble_to_hex(bot)};
 }
 
-parse_state& operator++(parse_state& p)
+url_parse_state& operator++(url_parse_state& p)
 {
-    p = static_cast<parse_state>(static_cast<uint8_t>(p) + 1);
+    p = static_cast<url_parse_state>(static_cast<uint8_t>(p) + 1);
     return p;
 }
 
-parse_state url_parse(std::string_view s, url& u) noexcept
+url_parse_state url_parse(std::string_view s, url& u) noexcept
 {
-    auto state = parse_state::scheme;
+    auto state = url_parse_state::scheme;
 
     // indices into s representing where we're parsing
     size_t           start = 0;
@@ -52,7 +52,7 @@ parse_state url_parse(std::string_view s, url& u) noexcept
     {
         switch (state)
         {
-        case parse_state::scheme:
+        case url_parse_state::scheme:
             if (s.at(end) != ':')
             {
                 ++end;
@@ -68,17 +68,17 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                     if (s.starts_with("//"))
                     {
                         // start of authority/host
-                        state = parse_state::authority;
+                        state = url_parse_state::authority;
                     }
                     else if (s.front() == '/')
                     {
                         // probably an absolute path
-                        state = parse_state::path;
+                        state = url_parse_state::path;
                     }
                     else
                     {
                         // probably the host
-                        state = parse_state::host;
+                        state = url_parse_state::host;
                     }
                 }
             }
@@ -91,23 +91,23 @@ parse_state url_parse(std::string_view s, url& u) noexcept
             }
             break;
 
-        case parse_state::authority:
+        case url_parse_state::authority:
             ++end;
             if (end < s.size() && s.at(start) == '/' && s.at(end) == '/')
             {
-                state = parse_state::userinfo;
+                state = url_parse_state::userinfo;
                 start = end + 1;
                 end   = start;
             }
             else
             {
-                state = parse_state::path;
+                state = url_parse_state::path;
                 // backtrack, since this was actually part of the path
                 end = start;
             }
             break;
 
-        case parse_state::userinfo:
+        case url_parse_state::userinfo:
             if (auto idx = s.find('@', start); idx != std::string_view::npos)
             {
                 end = idx;
@@ -124,18 +124,18 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                     u.userinfo.username = userinfo;
                 }
 
-                state = parse_state::host;
+                state = url_parse_state::host;
                 start = end + 1;
                 end   = start;
             }
             else
             {
                 // no userinfo
-                state = parse_state::host;
+                state = url_parse_state::host;
             }
             break;
 
-        case parse_state::host:
+        case url_parse_state::host:
             // anything up to either the port, path, query, fragment, or end is the host
             if (auto idx = s.find_first_of(":/?#", start); idx != std::string_view::npos)
             {
@@ -144,29 +144,29 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                 end    = start;
                 switch (s[idx])
                 {
-                case ':': state = parse_state::port; break;
+                case ':': state = url_parse_state::port; break;
 
                 case '/':
-                    state = parse_state::path;
+                    state = url_parse_state::path;
                     // include in the path
                     start = idx;
                     end   = start;
                     break;
 
-                case '?': state = parse_state::query; break;
+                case '?': state = url_parse_state::query; break;
 
-                case '#': state = parse_state::fragment; break;
+                case '#': state = url_parse_state::fragment; break;
                 }
             }
             else
             {
                 u.host = s.substr(start);
-                state  = parse_state::done;
+                state  = url_parse_state::done;
                 end    = s.size();
             }
             break;
 
-        case parse_state::port:
+        case url_parse_state::port:
             // anything up to either the path, query, fragment, or end is the port
             if (auto idx = s.find_first_of("/?#", start); idx != std::string_view::npos)
             {
@@ -176,26 +176,26 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                 switch (s[idx])
                 {
                 case '/':
-                    state = parse_state::path;
+                    state = url_parse_state::path;
                     // include in the path
                     start = idx;
                     end   = start;
                     break;
 
-                case '?': state = parse_state::query; break;
+                case '?': state = url_parse_state::query; break;
 
-                case '#': state = parse_state::fragment; break;
+                case '#': state = url_parse_state::fragment; break;
                 }
             }
             else
             {
                 u.port = s.substr(start);
-                state  = parse_state::done;
+                state  = url_parse_state::done;
                 end    = s.size();
             }
             break;
 
-        case parse_state::path:
+        case url_parse_state::path:
             // anything up to either the query, fragment, or end is the path
             if (auto idx = s.find_first_of("?#", start); idx != std::string_view::npos)
             {
@@ -204,43 +204,43 @@ parse_state url_parse(std::string_view s, url& u) noexcept
                 end    = start;
                 switch (s[idx])
                 {
-                case '?': state = parse_state::query; break;
+                case '?': state = url_parse_state::query; break;
 
-                case '#': state = parse_state::fragment; break;
+                case '#': state = url_parse_state::fragment; break;
                 }
             }
             else
             {
                 u.path = s.substr(start);
-                state  = parse_state::done;
+                state  = url_parse_state::done;
                 end    = s.size();
             }
             break;
 
-        case parse_state::query:
+        case url_parse_state::query:
             // anything up to either the fragment, or end is the path
             if (auto idx = s.find_first_of('#', start); idx != std::string_view::npos)
             {
                 raw_query = s.substr(start, idx - start);
-                state     = parse_state::fragment;
+                state     = url_parse_state::fragment;
                 start     = idx + 1;
                 end       = start;
             }
             else
             {
                 raw_query = s.substr(start);
-                state     = parse_state::done;
+                state     = url_parse_state::done;
                 end       = s.size();
             }
             break;
 
-        case parse_state::fragment:
+        case url_parse_state::fragment:
             // everything else!
             u.fragment = s.substr(start);
-            state      = parse_state::done;
+            state      = url_parse_state::done;
             break;
 
-        case parse_state::done: end = s.size(); break;
+        case url_parse_state::done: end = s.size(); break;
         }
     }
 
@@ -329,7 +329,7 @@ url::parse_result url::parse(std::string_view s) noexcept
 {
     url  u;
     auto end_state = url_parse(s, u);
-    if (end_state != parse_state::done) return {url_parse_failure{end_state}};
+    if (end_state != url_parse_state::done) return {url_parse_failure{end_state}};
     return {u};
 }
 
