@@ -47,26 +47,9 @@ else()
   target_compile_options(
     net
     PRIVATE
-    -fstack-usage
-    -pedantic-errors
     -Wall
-    -Wconversion
-    -Wdocumentation
-    -Wdouble-promotion
     -Wextra
-    -Wformat-pedantic
-    -Wloop-analysis
-    -Wold-style-cast
-    -Wpacked
-    # -Wpadded
-    -Wpedantic
-    -Wshadow
-    -Wsuggest-override
-    -Wthread-safety
-    -Wundef
-    -Wundefined-func-template
-    -Wundefined-reinterpret-cast
-    -Wunreachable-code-aggressive
+    -pedantic
   )
 endif()
 

@@ -23,31 +23,21 @@ target_compile_features(
   PRIVATE cxx_std_20
 )
 
-target_compile_options(
-  tests
-  PRIVATE
-  -O0 -g
-  -fstack-usage
-  -pedantic-errors
-  -Wall
-  -Wconversion
-  -Wdocumentation
-  -Wdouble-promotion
-  -Wextra
-  -Wformat-pedantic
-  -Wloop-analysis
-  -Wold-style-cast
-  -Wpacked
-  # -Wpadded
-  -Wpedantic
-  -Wshadow
-  -Wsuggest-override
-  -Wthread-safety
-  -Wundef
-  -Wundefined-func-template
-  -Wundefined-reinterpret-cast
-  -Wunreachable-code-aggressive
-)
+if(MSVC)
+  target_compile_options(
+    tests
+    PRIVATE
+    /W4
+  )
+else()
+  target_compile_options(
+    tests
+    PRIVATE
+    -Wall
+    -Wextra
+    -pedantic
+  )
+endif()
 
 target_link_libraries(
   tests
