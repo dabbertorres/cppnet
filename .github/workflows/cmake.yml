@@ -31,8 +31,26 @@ jobs:
         submodules: recursive
         fetch-depth: 0
 
+    - name: Select Linux Compilers
+      if: runner.os == 'Linux'
+      run: |
+        echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+        echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+
+    - name: Select MacOS Compilers (Clang)
+      if: runner.os == 'MacOS' && matrix.cc == 'clang-14'
+      run: |
+        echo "CC=$(brew --prefix llvm@14)/bin/clang" >> $GITHUB_ENV
+        echo "CXX=$(brew --prefix llvm@14)/bin/clang++" >> $GITHUB_ENV
+
+    - name: Select MacOS Compilers (GCC)
+      if: runner.os == 'MacOS' && matrix.cc == 'gcc-11'
+      run: |
+        echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+        echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+
     - name: Configure CMake
-      run: cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DBUILD_TESTING=TRUE -DBUILD_EXAMPLE=TRUE -DCMAKE_MAKE_PROGRAM=make -B build/
+      run: cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ env.CC }} -DCMAKE_CXX_COMPILER=${{ env.CXX }} -DBUILD_TESTING=TRUE -DBUILD_EXAMPLE=TRUE -DCMAKE_MAKE_PROGRAM=make -B build/
 
     - name: Build
       run: cmake --build build/
