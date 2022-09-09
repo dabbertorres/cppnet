@@ -13,26 +13,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include "string_util.hpp"
 #include "url.hpp"
-
-namespace
-{
-
-constexpr bool equal_ignore_case(std::string_view lhs, std::string_view rhs) noexcept
-{
-    return std::equal(std::begin(lhs),
-                      std::end(lhs),
-                      std::begin(rhs),
-                      std::end(rhs),
-                      [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); });
-}
-
-}
 
 namespace net::http
 {
 
-enum class method
+enum class request_method
 {
     CONNECT,
     DELETE,
@@ -122,7 +109,7 @@ enum class status : uint32_t
 
 using headers = std::unordered_map<std::string, std::vector<std::string>>;
 
-struct version
+struct protocol_version
 {
     uint32_t major;
     uint32_t minor;
@@ -130,19 +117,19 @@ struct version
 
 struct request
 {
-    method  method;
-    version version;
-    url     uri;
-    headers headers;
+    request_method   method;
+    protocol_version version;
+    url              uri;
+    headers          headers;
 
     std::istream& body;
 };
 
 struct response
 {
-    version version;
-    status  status;
-    headers headers;
+    protocol_version version;
+    status           status;
+    headers          headers;
 
     std::istream& body;
 };
@@ -166,20 +153,20 @@ constexpr bool status_is_server_error(status s) noexcept
     return status::INTERNAL_SERVER_ERROR <= s && s < static_cast<status>(600);
 }
 
-constexpr method parse_method(std::string_view str) noexcept
+constexpr request_method parse_method(std::string_view str) noexcept
 {
-    using enum method;
+    using enum request_method;
     using namespace std::literals::string_view_literals;
 
-    if (equal_ignore_case(str, "CONNECT"sv)) return CONNECT;
-    if (equal_ignore_case(str, "DELETE"sv)) return DELETE;
-    if (equal_ignore_case(str, "GET"sv)) return GET;
-    if (equal_ignore_case(str, "HEAD"sv)) return HEAD;
-    if (equal_ignore_case(str, "OPTIONS"sv)) return OPTIONS;
-    if (equal_ignore_case(str, "PATCH"sv)) return PATCH;
-    if (equal_ignore_case(str, "POST"sv)) return POST;
-    if (equal_ignore_case(str, "PUT"sv)) return PUT;
-    if (equal_ignore_case(str, "TRACE"sv)) return TRACE;
+    if (util::equal_ignore_case(str, "CONNECT"sv)) return CONNECT;
+    if (util::equal_ignore_case(str, "DELETE"sv)) return DELETE;
+    if (util::equal_ignore_case(str, "GET"sv)) return GET;
+    if (util::equal_ignore_case(str, "HEAD"sv)) return HEAD;
+    if (util::equal_ignore_case(str, "OPTIONS"sv)) return OPTIONS;
+    if (util::equal_ignore_case(str, "PATCH"sv)) return PATCH;
+    if (util::equal_ignore_case(str, "POST"sv)) return POST;
+    if (util::equal_ignore_case(str, "PUT"sv)) return PUT;
+    if (util::equal_ignore_case(str, "TRACE"sv)) return TRACE;
     return NONE;
 }
 
@@ -194,9 +181,9 @@ constexpr status parse_status(std::string_view str) noexcept
     return static_cast<status>(v);
 }
 
-constexpr std::string_view method_string(method m) noexcept
+constexpr std::string_view method_string(request_method m) noexcept
 {
-    using enum method;
+    using enum request_method;
 
     switch (m)
     {

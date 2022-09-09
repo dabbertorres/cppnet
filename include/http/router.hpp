@@ -26,7 +26,7 @@ using matcher = std::function<bool(const request&)>;
 struct route
 {
     route() = delete;
-    route(method method, std::string prefix, std::string suffix, matcher&& m, handler&& h) noexcept
+    route(request_method method, std::string prefix, std::string suffix, matcher&& m, handler&& h) noexcept
         : prefix{std::move(prefix)}
         , suffix{std::move(suffix)}
         , method{method}
@@ -58,9 +58,9 @@ struct route
 
     ~route() = default;
 
-    std::string prefix;
-    std::string suffix; // may be empty
-    method      method;
+    std::string    prefix;
+    std::string    suffix; // may be empty
+    request_method method;
 
     std::function<bool(const request&)>            matcher;
     std::function<void(const request&, response&)> handler;

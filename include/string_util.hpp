@@ -32,4 +32,33 @@ generator<String> split_string(String input, CharT sep, typename String::size_ty
     }
 }
 
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string_view<CharT, Traits>>
+constexpr bool equal_ignore_case(String lhs, String rhs) noexcept
+{
+    return std::equal(std::begin(lhs),
+                      std::end(lhs),
+                      std::begin(rhs),
+                      std::end(rhs),
+                      [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); });
+}
+
+template<typename CharT = char, typename Traits = std::char_traits<CharT>>
+constexpr auto trim_string(std::basic_string_view<CharT, Traits> str) noexcept
+{
+    using namespace std::literals::string_view_literals;
+
+    // source https://en.wikipedia.org/wiki/Whitespace_character#Unicode
+    constexpr auto whitespace =
+        " \b\f\n\r\t\v\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202f\u205f\u3000"sv;
+
+    auto first_not_space = str.find_first_not_of(whitespace);
+    auto last_not_space  = str.find_last_not_of(whitespace);
+
+    str.remove_suffix(str.size() - (last_not_space + 1));
+    str.remove_prefix(first_not_space);
+    return str;
+}
+
 }
