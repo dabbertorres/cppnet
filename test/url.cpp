@@ -2,15 +2,14 @@
 
 #include <catch.hpp>
 
-TEST_CASE("url::parse '/'", "[url][urlparse]")
+#include <catch2/catch_test_macros.hpp>
+
+TEST_CASE("url::parse '/'", "[url][parse]")
 {
     auto result = net::url::parse("/");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme.empty());
@@ -23,15 +22,12 @@ TEST_CASE("url::parse '/'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'foo/'", "[url][urlparse]")
+TEST_CASE("url::parse 'foo/'", "[url][parse]")
 {
     auto result = net::url::parse("foo/");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme.empty());
@@ -44,15 +40,12 @@ TEST_CASE("url::parse 'foo/'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'foo:9123/'", "[url][urlparse]")
+TEST_CASE("url::parse 'foo:9123/'", "[url][parse]")
 {
     auto result = net::url::parse("foo:9123/");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "foo");
@@ -65,15 +58,12 @@ TEST_CASE("url::parse 'foo:9123/'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'http:///'", "[url][urlparse]")
+TEST_CASE("url::parse 'http:///'", "[url][parse]")
 {
     auto result = net::url::parse("http:///");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -86,15 +76,12 @@ TEST_CASE("url::parse 'http:///'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'http://foo/'", "[url][urlparse]")
+TEST_CASE("url::parse 'http://foo/'", "[url][parse]")
 {
     auto result = net::url::parse("http://foo/");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -107,15 +94,12 @@ TEST_CASE("url::parse 'http://foo/'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'http://foo:9123/'", "[url][urlparse]")
+TEST_CASE("url::parse 'http://foo:9123/'", "[url][parse]")
 {
     auto result = net::url::parse("http://foo:9123/");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -128,15 +112,12 @@ TEST_CASE("url::parse 'http://foo:9123/'", "[url][urlparse]")
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar#fragment'", "[url][urlparse]")
+TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar#fragment'", "[url][parse]")
 {
     auto result = net::url::parse("http://user:password@host:9123/path?foo=bar#fragment");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -152,15 +133,12 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar#fragment'", "
     REQUIRE(u.fragment == "fragment");
 }
 
-TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar'", "[url][urlparse]")
+TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar'", "[url][parse]")
 {
     auto result = net::url::parse("http://user:password@host:9123/path?foo=bar");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -176,15 +154,12 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar'", "[url][url
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse 'http://user:password@host:9123/path#fragment'", "[url][urlparse]")
+TEST_CASE("url::parse 'http://user:password@host:9123/path#fragment'", "[url][parse]")
 {
     auto result = net::url::parse("http://user:password@host:9123/path#fragment");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme == "http");
@@ -197,15 +172,12 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path#fragment'", "[url][ur
     REQUIRE(u.fragment == "fragment");
 }
 
-TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][urlparse]")
+TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][parse]")
 {
     auto result = net::url::parse("/path?foo=bar&baz=xyzzy&qux=plugh");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme.empty());
@@ -216,22 +188,19 @@ TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][urlparse]")
     REQUIRE(u.path == "/path");
     REQUIRE(u.query
             == net::url::query_values{
-                {"foo",   {"bar"}},
+                {"foo", {"bar"}  },
                 {"baz", {"xyzzy"}},
                 {"qux", {"plugh"}},
     });
     REQUIRE(u.fragment.empty());
 }
 
-TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][urlparse]")
+TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][parse]")
 {
     auto result = net::url::parse("/path?foo=bar&foo=baz&xyzzy=plugh&foo=qux");
 
     if (!result.has_value())
-    {
-        FAIL("expected value, but had an error: "
-             << net::parse_state_string(result.to_error().failed_at));
-    }
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
 
     auto u = result.to_value();
     REQUIRE(u.scheme.empty());
@@ -242,10 +211,33 @@ TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][urlparse]")
     REQUIRE(u.path == "/path");
     REQUIRE(u.query
             == net::url::query_values{
-                {  "foo", {"bar", "baz", "qux"}},
-                {"xyzzy",             {"plugh"}},
+                {"foo",   {"bar", "baz", "qux"}},
+                {"xyzzy", {"plugh"}            },
     });
     REQUIRE(u.fragment.empty());
+}
+
+// crazy weird url: https://daniel.haxx.se/blog/2022/09/08/http-http-http-http-http-http-http/
+TEST_CASE("url::parse 'http://http://http://@http://http://?http://#http://'", "[url][parse]")
+{
+    auto result = net::url::parse("http://http://http://@http://http://?http://#http://");
+
+    if (!result.has_value())
+        FAIL("expected value, but had an error: " << net::parse_state_string(result.to_error().failed_at));
+
+    auto u = result.to_value();
+
+    REQUIRE(u.scheme == "http");
+    REQUIRE(u.userinfo.username == "http");
+    REQUIRE(u.userinfo.password == "//http://");
+    REQUIRE(u.host == "http");
+    REQUIRE(u.port.empty());
+    REQUIRE(u.path == "//http://");
+    REQUIRE(u.query
+            == net::url::query_values{
+                {"http://", {}},
+    });
+    REQUIRE(u.fragment == "http://");
 }
 
 TEST_CASE("url encoding 'foo%bar' <=> 'foo%25bar'", "[url][urlencoding]")
