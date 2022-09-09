@@ -24,6 +24,7 @@ target_link_libraries(
   PRIVATE
   cxxopts::cxxopts
   fmt::fmt
+  net
 )
 
 target_compile_features(

@@ -8,10 +8,14 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "exception.hpp"
+
 namespace net
 {
 
-udp_socket::udp_socket(std::string_view port, protocol proto) : udp_socket("", port, proto) {}
+udp_socket::udp_socket(std::string_view port, protocol proto)
+    : udp_socket("", port, proto)
+{}
 
 udp_socket::udp_socket(std::string_view host, std::string_view port, protocol proto)
 {
@@ -20,7 +24,7 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, protocol pr
     ::addrinfo hints = {0};
 #pragma clang diagnostic pop
 
-    if (host == "") hints.ai_flags = AI_PASSIVE;
+    if (host.empty()) hints.ai_flags = AI_PASSIVE;
 
     switch (proto)
     {
@@ -31,8 +35,8 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, protocol pr
 
     hints.ai_socktype = SOCK_DGRAM;
 
-    ::addrinfo* servinfo;
-    int sts = ::getaddrinfo(host != "" ? host.data() : nullptr, port.data(), &hints, &servinfo);
+    addrinfo* servinfo = nullptr;
+    int       sts      = ::getaddrinfo(!host.empty() ? host.data() : nullptr, port.data(), &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!

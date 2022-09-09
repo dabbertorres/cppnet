@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <string_view>
 /* #include <vector> */
 
@@ -28,26 +29,24 @@ enum class network
 class listener
 {
 public:
-    template<typename Rep, typename Period>
-    listener(std::string_view                   port,
-             network                            net,
-             protocol                           proto   = protocol::not_care,
-             std::chrono::duration<Rep, Period> timeout = 5s) :
-        listener(
-            "", port, net, proto, std::chrono::duration_cast<std::chrono::microseconds>(timeout))
+    listener(const std::string&        port,
+             network                   net,
+             protocol                  proto   = protocol::not_care,
+             std::chrono::microseconds timeout = 5s)
+        : listener("", port, net, proto, timeout)
     {}
 
-    template<typename Rep, typename Period>
-    listener(std::string_view                   host,
-             std::string_view                   port,
-             network                            net,
-             protocol                           proto   = protocol::not_care,
-             std::chrono::duration<Rep, Period> timeout = 5s) :
-        listener(
-            host, port, net, proto, std::chrono::duration_cast<std::chrono::microseconds>(timeout))
-    {}
+    listener(const std::string&        host,
+             const std::string&        port,
+             network                   net,
+             protocol                  proto   = protocol::not_care,
+             std::chrono::microseconds timeout = 5s);
 
-    listener(const listener&) = delete;
+    listener(const listener&)            = delete;
+    listener& operator=(const listener&) = delete;
+
+    listener(listener&&) noexcept;
+    listener& operator=(listener&&) noexcept;
 
     ~listener() noexcept;
 
@@ -55,12 +54,6 @@ public:
     tcp_socket accept() const;
 
 private:
-    listener(std::string_view          host,
-             std::string_view          port,
-             network                   net,
-             protocol                  proto,
-             std::chrono::microseconds timeout);
-
     std::atomic_bool is_listening;
     int              main_fd;
     /* std::vector<pollfd> fds; */

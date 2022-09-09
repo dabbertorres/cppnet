@@ -14,11 +14,10 @@ namespace net::http
 {
 
 template<typename T>
-concept HandlerInvocable = std::invocable<T, const request&, response&>;
+concept Handler = std::invocable<T, const request&, response&>;
 
 template<typename T>
-concept MatcherInvocable =
-    std::invocable<T, const request&> && std::same_as<bool, std::invoke_result_t<T, const request&>>;
+concept Matcher = std::invocable<T, const request&> && std::same_as<bool, std::invoke_result_t<T, const request&>>;
 
 using handler = std::function<void(const request&, response&)>;
 using matcher = std::function<bool(const request&)>;
@@ -89,7 +88,7 @@ public:
     /*     return add(std::forward<Matcher>(m), std::forward<Handler>(h)); */
     /* } */
 
-    void operator()(const request& req, response& resp);
+    void operator()(const request& req, response& resp) const;
 
 private:
     std::vector<route> routes;

@@ -44,8 +44,10 @@ constexpr bool equal_ignore_case(String lhs, String rhs) noexcept
                       [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); });
 }
 
-template<typename CharT = char, typename Traits = std::char_traits<CharT>>
-constexpr auto trim_string(std::basic_string_view<CharT, Traits> str) noexcept
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string_view<CharT, Traits>>
+constexpr auto trim_string(String str) noexcept
 {
     using namespace std::literals::string_view_literals;
 
@@ -56,8 +58,9 @@ constexpr auto trim_string(std::basic_string_view<CharT, Traits> str) noexcept
     auto first_not_space = str.find_first_not_of(whitespace);
     auto last_not_space  = str.find_last_not_of(whitespace);
 
-    str.remove_suffix(str.size() - (last_not_space + 1));
-    str.remove_prefix(first_not_space);
+    if (last_not_space != String::npos) str.remove_suffix(str.size() - (last_not_space + 1));
+    if (first_not_space != String::npos) str.remove_prefix(first_not_space);
+
     return str;
 }
 

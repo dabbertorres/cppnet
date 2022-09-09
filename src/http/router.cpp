@@ -9,9 +9,9 @@ router& router::add(route&& route) noexcept
     return *this;
 }
 
-void router::operator()(const request& req, response& resp)
+void router::operator()(const request& req, response& resp) const
 {
-    for (auto& r : routes)
+    for (const auto& r : routes)
     {
         if (r.matcher(req))
         {

@@ -11,6 +11,12 @@ namespace net
 class writer
 {
 public:
+    writer(const writer&)                     = default;
+    writer& operator=(const writer&) noexcept = default;
+
+    writer(writer&&)                     = default;
+    writer& operator=(writer&&) noexcept = default;
+
     virtual ~writer() = default;
 
     virtual io_result            write(const uint8_t* data, size_t length) noexcept = 0;

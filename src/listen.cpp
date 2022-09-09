@@ -19,12 +19,9 @@ namespace net
 
 constexpr int invalid_fd = -1;
 
-listener::listener(std::string_view          host,
-                   std::string_view          port,
-                   network                   net,
-                   protocol                  proto,
-                   std::chrono::microseconds timeout) :
-    main_fd{invalid_fd}
+listener::listener(
+    const std::string& host, const std::string& port, network net, protocol proto, std::chrono::microseconds timeout)
+    : main_fd{invalid_fd}
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -39,7 +36,7 @@ listener::listener(std::string_view          host,
     default: throw exception{"invalid protocol"};
     }
 
-    if (host == "") hints.ai_flags = AI_PASSIVE;
+    if (host.empty()) hints.ai_flags = AI_PASSIVE;
 
     switch (net)
     {
@@ -48,8 +45,8 @@ listener::listener(std::string_view          host,
     default: throw exception{"invalid network type"};
     }
 
-    addrinfo* servinfo;
-    int sts = ::getaddrinfo(host != "" ? host.data() : nullptr, port.data(), &hints, &servinfo);
+    addrinfo* servinfo = nullptr;
+    int       sts      = ::getaddrinfo(!host.empty() ? host.data() : nullptr, port.data(), &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it
@@ -114,7 +111,38 @@ listener::listener(std::string_view          host,
     // TODO report the reasons why we couldn't bind a socket?
 }
 
-listener::~listener() noexcept { ::close(main_fd); }
+listener::listener(listener&& other) noexcept
+    : is_listening(other.is_listening.exchange(false))
+    , main_fd(other.main_fd)
+{
+    other.main_fd = invalid_fd;
+}
+
+listener& listener::operator=(listener&& other) noexcept
+{
+    if (is_listening && main_fd != invalid_fd)
+    {
+        is_listening = false;
+        is_listening.notify_all();
+        ::close(main_fd);
+    }
+
+    is_listening  = other.is_listening.exchange(false);
+    main_fd       = other.main_fd;
+    other.main_fd = invalid_fd;
+
+    return *this;
+}
+
+listener::~listener() noexcept
+{
+    if (is_listening && main_fd != invalid_fd)
+    {
+        is_listening = false;
+        is_listening.notify_all();
+        ::close(main_fd);
+    }
+}
 
 void listener::listen(uint16_t max_backlog) const
 {

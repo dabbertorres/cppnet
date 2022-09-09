@@ -22,6 +22,7 @@ Checks: >-
   -google-readability-braces-around-statements,
   -google-readability-namespace-comments,
   misc-*,
+  -misc-non-private-member-variables-in-classes,
   modernize-*,
   -modernize-use-trailing-return-type,
   performance-*,

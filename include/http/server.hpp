@@ -6,8 +6,8 @@
 #include <string>
 #include <string_view>
 
-#include "http/http.hpp"
 #include "http/router.hpp"
+
 #include "listen.hpp"
 
 namespace net::http
@@ -26,20 +26,30 @@ struct server_config
 class server
 {
 public:
-    server(std::string_view port, const server_config& cfg);
-    server(std::string_view host, std::string_view port, const server_config& cfg);
-    server(const server&) = delete;
-    ~server()             = default;
+    server(const std::string& port, const server_config& cfg);
+    server(const std::string& host, const std::string& port, const server_config& cfg);
+
+    server(const server&)            = delete;
+    server& operator=(const server&) = delete;
+
+    server(server&&) noexcept;
+    server& operator=(server&&) noexcept;
+
+    ~server() = default;
 
     void close();
-    void listen(handler&) const;
+    void serve(const handler&) const;
+    void serve(router& router) const
+    {
+        /* serve([&](const request& req, response& resp) { router(req, resp); }); */
+        serve([&](const request& req, response& resp) { router(req, resp); });
+    }
 
 private:
     net::listener    listener;
-    std::atomic_bool serve;
+    std::atomic_bool is_serving;
 
-    const size_t   max_header_bytes;
-    const uint16_t max_pending_connections;
+    size_t   max_header_bytes;
+    uint16_t max_pending_connections;
 };
-
 }

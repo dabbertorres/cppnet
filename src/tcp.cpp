@@ -9,17 +9,18 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "exception.hpp"
+
 namespace net
 {
 
-tcp_socket::tcp_socket(int fd, size_t buf_size) : socket(fd, buf_size) {}
+tcp_socket::tcp_socket(int fd, size_t buf_size)
+    : socket(fd, buf_size)
+{}
 
-tcp_socket::tcp_socket(std::string_view          host,
-                       std::string_view          port,
-                       protocol                  proto,
-                       size_t                    buf_size,
-                       std::chrono::microseconds timeout) :
-    socket(buf_size)
+tcp_socket::tcp_socket(
+    std::string_view host, std::string_view port, protocol proto, size_t buf_size, std::chrono::microseconds timeout)
+    : socket(buf_size)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -36,13 +37,13 @@ tcp_socket::tcp_socket(std::string_view          host,
     hints.ai_flags    = AI_PASSIVE;
     hints.ai_socktype = SOCK_STREAM;
 
-    addrinfo* servinfo;
-    auto sts = ::getaddrinfo(host != "" ? host.data() : nullptr, port.data(), &hints, &servinfo);
+    addrinfo* servinfo = nullptr;
+    auto      sts      = ::getaddrinfo(!host.empty() ? host.data() : nullptr, port.data(), &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!
 
-    for (auto info = servinfo; info != nullptr; info = info->ai_next)
+    for (auto* info = servinfo; info != nullptr; info = info->ai_next)
     {
         fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
         if (fd < 0) continue;
@@ -88,13 +89,12 @@ io_result tcp_socket::read(uint8_t* data, size_t length) noexcept
             continue;
         }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            continue;
-        else
-            return {
-                .count = received,
-                .err   = std::error_condition{errno, std::system_category()},
-            };
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+
+        return {
+            .count = received,
+            .err   = std::error_condition{errno, std::system_category()},
+        };
     }
 }
 
@@ -111,13 +111,12 @@ io_result tcp_socket::write(const uint8_t* data, size_t length) noexcept
             continue;
         }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            continue;
-        else
-            return {
-                .count = written,
-                .err   = std::error_condition{errno, std::system_category()},
-            };
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+
+        return {
+            .count = written,
+            .err   = std::error_condition{errno, std::system_category()},
+        };
     }
 }
 

@@ -16,16 +16,26 @@
 namespace net
 {
 
-socket::socket() : fd{invalid_fd} {}
+socket::socket()
+    : fd{invalid_fd}
+{}
 
-socket::socket(size_t buf_size) : fd{invalid_fd}, read_buf(buf_size), write_buf(buf_size) {}
+socket::socket(size_t buf_size)
+    : fd{invalid_fd}
+    , read_buf(buf_size)
+    , write_buf(buf_size)
+{}
 
-socket::socket(int fd, size_t buf_size) : fd{fd}, read_buf(buf_size), write_buf(buf_size) {}
+socket::socket(int fd, size_t buf_size)
+    : fd{fd}
+    , read_buf(buf_size)
+    , write_buf(buf_size)
+{}
 
-socket::socket(socket&& other) noexcept :
-    fd{other.fd},
-    read_buf{std::move(other.read_buf)},
-    write_buf{std::move(other.write_buf)}
+socket::socket(socket&& other) noexcept
+    : fd{other.fd}
+    , read_buf{std::move(other.read_buf)}
+    , write_buf{std::move(other.write_buf)}
 {
     other.fd = invalid_fd;
 }
@@ -67,8 +77,7 @@ std::string addr_name(sockaddr* addr)
         break;
     }
 
-    auto ptr =
-        inet_ntop(addr->sa_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
+    const char* ptr = inet_ntop(addr->sa_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
     if (ptr == nullptr) throw system_error_from_errno(errno);
 
     return ret;

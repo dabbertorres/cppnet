@@ -21,7 +21,13 @@ public:
                size_t                    buf_size = 256,
                std::chrono::microseconds timeout  = 5s);
 
-    virtual ~tcp_socket() = default;
+    tcp_socket(const tcp_socket&)            = delete;
+    tcp_socket& operator=(const tcp_socket&) = delete;
+
+    tcp_socket(tcp_socket&&) noexcept            = default;
+    tcp_socket& operator=(tcp_socket&&) noexcept = default;
+
+    ~tcp_socket() override = default;
 
     io_result            read(uint8_t* data, size_t length) noexcept override;
     io_result            write(const uint8_t* data, size_t length) noexcept override;

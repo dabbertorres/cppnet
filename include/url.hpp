@@ -61,8 +61,7 @@ public:
 
     static constexpr auto reserved_characters = "!#$%&'()*+,/:;=?@[]";
 
-    static std::string encode(std::string_view str,
-                              std::string_view reserved = reserved_characters) noexcept;
+    static std::string encode(std::string_view str, std::string_view reserved = reserved_characters) noexcept;
     static std::string decode(std::string_view str) noexcept;
 
     using parse_result = util::result<url, url_parse_failure>;
@@ -71,7 +70,7 @@ public:
     static parse_result parse(const std::string&) noexcept;
     static parse_result parse(std::string_view) noexcept;
 
-    std::string build() const noexcept;
+    [[nodiscard]] std::string build() const noexcept;
     /* bool        is_valid() const noexcept; */
 
     // decoded/unescaped parts of the URL
