@@ -5,7 +5,6 @@
 
 #include <catch.hpp>
 
-#include <__iterator/default_sentinel.h>
 #include <catch2/catch_test_macros.hpp>
 
 using namespace std::literals::string_view_literals;

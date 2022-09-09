@@ -5,26 +5,22 @@
 namespace
 {
 
-using namespace net;
+using net::parse_state;
+using net::url;
 
 // assumes c is a valid hex character
 uint8_t parse_hex(char c) noexcept
 {
     c = static_cast<char>(std::toupper(c));
 
-    if ('0' <= c && c <= '9')
-        return static_cast<uint8_t>(c - '0');
-    else if ('A' <= c && c <= 'F')
-        return static_cast<uint8_t>(c - 'A' + 0xa);
-    else
-        ; // TODO what do?
+    if ('0' <= c && c <= '9') return static_cast<uint8_t>(c - '0');
+    if ('A' <= c && c <= 'F') return static_cast<uint8_t>(c - 'A' + 0xa);
+
+    // TODO what do?
 }
 
 // assumes s.size() == 2
-uint8_t parse_hex(std::string_view s) noexcept
-{
-    return static_cast<uint8_t>(parse_hex(s[0]) << 4) | parse_hex(s[1]);
-}
+uint8_t parse_hex(std::string_view s) noexcept { return static_cast<uint8_t>(parse_hex(s[0]) << 4) | parse_hex(s[1]); }
 
 std::string to_hex(char c) noexcept
 {
@@ -244,11 +240,10 @@ parse_state url_parse(std::string_view s, url& u) noexcept
             state      = parse_state::done;
             break;
 
-        case parse_state::done: goto done;
+        case parse_state::done: end = s.size(); break;
         }
     }
 
-done:
     if (!u.scheme.empty()) u.scheme = url::decode(u.scheme);
     if (!u.userinfo.username.empty()) u.userinfo.username = url::decode(u.userinfo.username);
     if (!u.userinfo.password.empty()) u.userinfo.password = url::decode(u.userinfo.password);
@@ -334,10 +329,8 @@ url::parse_result url::parse(std::string_view s) noexcept
 {
     url  u;
     auto end_state = url_parse(s, u);
-    if (end_state != parse_state::done)
-        return {url_parse_failure{end_state}};
-    else
-        return {u};
+    if (end_state != parse_state::done) return {url_parse_failure{end_state}};
+    return {u};
 }
 
 std::string url::build() const noexcept

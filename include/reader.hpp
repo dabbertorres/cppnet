@@ -3,8 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <experimental/coroutine>
-
 #include "io.hpp"
 
 namespace net

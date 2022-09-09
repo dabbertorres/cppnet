@@ -107,7 +107,7 @@ enum class status : uint32_t
     NETWORK_CONNECT_TIMEOUT_ERROR   = 599,
 };
 
-using headers = std::unordered_map<std::string, std::vector<std::string>>;
+using headers_map = std::unordered_map<std::string, std::vector<std::string>>;
 
 struct protocol_version
 {
@@ -120,7 +120,7 @@ struct request
     request_method   method;
     protocol_version version;
     url              uri;
-    headers          headers;
+    headers_map      headers;
 
     std::istream& body;
 };
@@ -128,8 +128,8 @@ struct request
 struct response
 {
     protocol_version version;
-    status           status;
-    headers          headers;
+    status           status_code;
+    headers_map      headers;
 
     std::istream& body;
 };
@@ -170,7 +170,7 @@ constexpr request_method parse_method(std::string_view str) noexcept
     return NONE;
 }
 
-constexpr status parse_status(std::string_view str) noexcept
+inline status parse_status(std::string_view str) noexcept
 {
     using enum status;
 

@@ -9,7 +9,7 @@ namespace
 {
 
 using net::url;
-using net::http::headers;
+using net::http::headers_map;
 using net::http::parse_method;
 using net::http::parse_status;
 using net::http::protocol_version;
@@ -68,8 +68,8 @@ std::error_condition parse_status_line(std::istream& in, response& resp) noexcep
     auto status_end   = view.find(' ', status_start);
     if (status_end == std::string::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
-    resp.status = parse_status(view.substr(status_start, status_end));
-    if (resp.status == status::NONE) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    resp.status_code = parse_status(view.substr(status_start, status_end));
+    if (resp.status_code == status::NONE) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
     // we can just ignore the reason
 
@@ -107,7 +107,7 @@ std::error_condition parse_request_line(std::istream& in, request& req) noexcept
     return {};
 }
 
-void parse_headers(headers& headers, std::istream& in) noexcept
+void parse_headers(headers_map& headers, std::istream& in) noexcept
 {
     std::string line;
     while (std::getline(in, line))
