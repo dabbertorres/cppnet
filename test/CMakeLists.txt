@@ -18,6 +18,14 @@ target_include_directories(
   Catch2::Catch2
 )
 
+target_link_libraries(
+  tests
+  PRIVATE
+  Catch2::Catch2
+  Catch2::Catch2WithMain
+  net
+)
+
 target_compile_features(
   tests
   PRIVATE cxx_std_20
@@ -38,14 +46,6 @@ else()
     -pedantic
   )
 endif()
-
-target_link_libraries(
-  tests
-  PRIVATE
-  Catch2::Catch2
-  Catch2::Catch2WithMain
-  net
-)
 
 include(Catch)
 catch_discover_tests(tests)

@@ -76,3 +76,76 @@ TEST_CASE("range-based for loop", "[util][split_string]")
 
     REQUIRE(i == 4);
 }
+
+TEST_CASE("both lowercase", "[util][equal_ignore_case]")
+{
+    REQUIRE(net::util::equal_ignore_case("foobarbaz"sv, "foobarbaz"sv));
+}
+
+TEST_CASE("both uppercase", "[util][equal_ignore_case]")
+{
+    REQUIRE(net::util::equal_ignore_case("FOOBARBAZ"sv, "FOOBARBAZ"sv));
+}
+
+TEST_CASE("opposite case", "[util][equal_ignore_case]")
+{
+    REQUIRE(net::util::equal_ignore_case("foobarbaz"sv, "FOOBARBAZ"sv));
+}
+
+TEST_CASE("mixed case", "[util][equal_ignore_case]")
+{
+    REQUIRE(net::util::equal_ignore_case("FoObArBaZ"sv, "fOoBaRbAz"sv));
+}
+
+TEST_CASE("different", "[util][equal_ignore_case]")
+{
+    REQUIRE_FALSE(net::util::equal_ignore_case("xyzzy"sv, "foobarbaz"sv));
+}
+
+TEST_CASE("empty", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string(""sv);
+    REQUIRE(actual == ""sv);
+}
+
+TEST_CASE("already trimmed", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string("foo"sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("single prefix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string(" foo"sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("single suffix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string("foo "sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("single prefix and suffix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string(" foo "sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("multiple prefix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string("  \tfoo"sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("multiple suffix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string("foo\t   "sv);
+    REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("multiple prefix and suffix", "[util][trim_string]")
+{
+    auto actual = net::util::trim_string("\t   foo\t   "sv);
+    REQUIRE(actual == "foo"sv);
+}
