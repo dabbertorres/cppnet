@@ -1,0 +1,103 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 18,
+    "patch": 0
+  },
+  "include": [],
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Dev Config",
+      "description": "Build with tests and example using Ninja Multi-Config",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "BUILD_EXAMPLE": "ON",
+        "CMAKE_MAKE_PROGRAM": "ninja"
+      },
+      "warnings": {
+        "dev": true,
+        "deprecated": true,
+        "uninitialized": true
+      }
+    },
+    {
+      "name": "lib",
+      "displayName": "Build Library",
+      "description": "Build just the library",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "BUILD_TESTING": "OFF",
+        "BUILD_EXAMPLE": "OFF",
+        "CMAKE_MAKE_PROGRAM": "ninja"
+      }
+    },
+    {
+      "name": "use-clang",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "use-gcc",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "dev-clang",
+      "inherits": [
+        "dev",
+        "use-clang"
+      ]
+    },
+    {
+      "name": "dev-gcc",
+      "inherits": [
+        "dev",
+        "use-gcc"
+      ]
+    },
+    {
+      "name": "lib-clang",
+      "inherits": [
+        "lib",
+        "use-clang"
+      ]
+    },
+    {
+      "name": "lib-gcc",
+      "inherits": [
+        "lib",
+        "use-gcc"
+      ]
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "lib"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": true
+      }
+    }
+  ]
+}
