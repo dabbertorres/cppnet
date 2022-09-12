@@ -1,6 +1,8 @@
 #include "udp.hpp"
 
 #include <cerrno>
+#include <cstdint>
+#include <system_error>
 
 #include <netdb.h>
 #include <unistd.h>
@@ -50,36 +52,6 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, protocol pr
     freeaddrinfo(servinfo);
 
     if (fd == invalid_fd) throw exception{"failed to bind"};
-}
-
-io_result udp_socket::read(uint8_t* data, size_t length) noexcept
-{
-    // size_t rcvd = 0;
-    // while (rcvd < length)
-    //{
-    //     int num = ::recv(fd, data + rcvd, length - rcvd, 0);
-    //     if (num < 0)
-    //     {
-    //         if (errno == EAGAIN)
-    //             continue;
-    //         return false;
-    //     }
-    //     rcvd += num;
-    // }
-    return {.count = 0, .err = {}};
-}
-
-io_result udp_socket::write(const uint8_t* data, size_t length) noexcept
-{
-    // size_t sent = 0;
-    // while (sent < length)
-    //{
-    //     int num = ::sendto(fd, data + sent, length - sent, 0);
-    //     if (num < 0)
-    //         return false;
-    //     sent += num;
-    // }
-    return {.count = 0, .err = {}};
 }
 
 }

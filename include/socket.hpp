@@ -1,10 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "io.hpp"
 #include "reader.hpp"
 #include "writer.hpp"
 
@@ -19,12 +21,12 @@ enum class protocol
 };
 
 class socket
-    : public reader
-    , public writer
+    : public reader<std::byte>
+    , public writer<std::byte>
 {
 public:
     socket();
-    socket(int fd, size_t buf_size = 256);
+    socket(int fd);
 
     // non-copyable
     socket(const socket&)            = delete;
@@ -40,16 +42,14 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
+    io_result read(std::byte* data, size_t length) noexcept override;
+    io_result write(const std::byte* data, size_t length) noexcept override;
+
 protected:
     static constexpr int invalid_fd = -1;
 
-    socket(size_t buf_size);
-
-    int fd;
-
 private:
-    std::vector<uint8_t> read_buf;
-    std::vector<uint8_t> write_buf;
+    int fd;
 };
 
 }

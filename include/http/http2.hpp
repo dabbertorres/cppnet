@@ -1,20 +1,17 @@
 #pragma once
 
+#include <cstddef>
+#include <string>
+
+#include "reader.hpp"
 #include "result.hpp"
-
-namespace net
-{
-
-class reader;
-class writer;
-
-}
+#include "writer.hpp"
 
 namespace net::http
 {
 
 struct request;
-struct response;
+struct server_response;
 
 }
 
@@ -25,10 +22,10 @@ using util::result;
 
 using TODO = std::void_t<>;
 
-result<std::void_t<>, std::string> response_encode(writer& w, const response& r) noexcept;
-result<std::void_t<>, std::string> request_encode(writer& w, const request& r) noexcept;
+result<std::void_t<>, std::string> response_encode(net::writer<std::byte>& w, const server_response& r) noexcept;
+result<std::void_t<>, std::string> request_encode(net::writer<std::byte>& w, const request& r) noexcept;
 
-result<response, TODO> response_decode(reader& r) noexcept;
-result<request, TODO>  request_decode(reader& r) noexcept;
+result<server_response, TODO> response_decode(net::reader<std::byte>& r) noexcept;
+result<request, TODO>         request_decode(net::reader<std::byte>& r) noexcept;
 
 }

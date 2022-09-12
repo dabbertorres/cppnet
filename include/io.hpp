@@ -7,8 +7,8 @@ namespace net
 
 struct io_result
 {
-    size_t               count;
-    std::error_condition err;
+    size_t               count{};
+    std::error_condition err{};
 };
 
 }

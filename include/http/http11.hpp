@@ -5,21 +5,16 @@
 #include <system_error>
 #include <type_traits>
 
+#include "reader.hpp"
 #include "result.hpp"
-
-namespace net
-{
-
-class reader;
-class writer;
-
-}
+#include "writer.hpp"
 
 namespace net::http
 {
 
 struct request;
-struct response;
+struct server_response;
+struct client_response;
 
 }
 
@@ -28,11 +23,11 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition request_encode(std::ostream& w, const request& req) noexcept;
-std::error_condition response_encode(std::ostream& w, const response& resp) noexcept;
+std::error_condition request_encode(net::writer<std::byte>& writer, const request& req) noexcept;
+std::error_condition response_encode(net::writer<std::byte>& writer, const server_response& resp) noexcept;
 
-result<request, std::error_condition>  request_decode(std::istream& r) noexcept;
-result<response, std::error_condition> response_decode(std::istream& r) noexcept;
+result<request, std::error_condition>         request_decode(net::reader<std::byte>& reader) noexcept;
+result<client_response, std::error_condition> response_decode(net::reader<std::byte>& reader) noexcept;
 
 class body_streambuf : public std::streambuf
 {

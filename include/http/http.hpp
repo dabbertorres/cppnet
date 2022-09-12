@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <istream>
 #include <iterator>
@@ -13,8 +14,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "reader.hpp"
 #include "string_util.hpp"
 #include "url.hpp"
+#include "writer.hpp"
 
 namespace net::http
 {
@@ -122,16 +125,25 @@ struct request
     url              uri;
     headers_map      headers;
 
-    std::istream& body;
+    net::reader<std::byte>& body;
 };
 
-struct response
+struct server_response
 {
     protocol_version version;
     status           status_code;
     headers_map      headers;
 
-    std::istream& body;
+    net::writer<std::byte>& body;
+};
+
+struct client_response
+{
+    protocol_version version;
+    status           status_code;
+    headers_map      headers;
+
+    net::reader<std::byte>& body;
 };
 
 constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }

@@ -8,29 +8,29 @@
 #include <utility>
 #include <vector>
 
+#include "http/handler.hpp"
 #include "http/http.hpp"
 
 namespace net::http
 {
 
-template<typename T>
-concept Handler = std::invocable<T, const request&, response&>;
+// NOTE: clangd seems to think Handler isn't being used - so make it explicit.
+using net::http::Handler;
 
 template<typename T>
 concept Matcher = std::invocable<T, const request&> && std::same_as<bool, std::invoke_result_t<T, const request&>>;
 
-using handler = std::function<void(const request&, response&)>;
-using matcher = std::function<bool(const request&)>;
-
 struct route
 {
     route() = delete;
-    route(request_method method, std::string prefix, std::string suffix, matcher&& m, handler&& h) noexcept
+
+    template<Handler H, Matcher M>
+    route(request_method method, std::string prefix, std::string suffix, H&& handler, M&& matcher) noexcept
         : prefix{std::move(prefix)}
         , suffix{std::move(suffix)}
         , method{method}
-        , matcher{std::move(m)}
-        , handler{std::move(h)}
+        , matcher{std::forward<H>(handler)}
+        , handler{std::forward<M>(matcher)}
     {}
 
     route(const route&) = delete;
@@ -61,34 +61,37 @@ struct route
     std::string    suffix; // may be empty
     request_method method;
 
-    std::function<bool(const request&)>            matcher;
-    std::function<void(const request&, response&)> handler;
+    std::function<bool(const request&)>                   matcher;
+    std::function<void(const request&, server_response&)> handler;
 };
 
 class router final
 {
 public:
-    router& add(route&& route) noexcept;
+    router& add(route&& route) noexcept
+    {
+        routes.emplace_back(std::move(route));
+        return *this;
+    }
 
-    /* template<HandlerInvocable Handler> */
-    /* router& add(matcher&& m, Handler&& func) noexcept */
-    /* { */
-    /*     return add(std::make_unique<matcher>(std::move(m)), std::forward<Handler>(func)); */
-    /* } */
+    template<typename... Args>
+    router& add(Args&&... args) noexcept
+    {
+        routes.emplace_back(std::forward<Args...>(args...));
+        return *this;
+    }
 
-    /* template<MatcherInvocable Matcher> */
-    /* router& add(Matcher&& m, handler&& h) noexcept */
-    /* { */
-    /*     return add(std::forward<Matcher>(m), std::make_unique<handler>(std::move(h))); */
-    /* } */
-
-    /* template<MatcherInvocable Matcher, HandlerInvocable Handler> */
-    /* router& add(Matcher&& m, Handler&& h) noexcept */
-    /* { */
-    /*     return add(std::forward<Matcher>(m), std::forward<Handler>(h)); */
-    /* } */
-
-    void operator()(const request& req, response& resp) const;
+    void operator()(const request& req, server_response& resp) const
+    {
+        for (const auto& r : routes)
+        {
+            if (r.matcher(req))
+            {
+                r.handler(req, resp);
+                return;
+            }
+        }
+    }
 
 private:
     std::vector<route> routes;

@@ -19,7 +19,7 @@ int main(int argc, char** argv)
     };
 
     server.serve(
-        [](const net::http::request& req, net::http::response& resp)
+        [](const net::http::request& req, net::http::server_response& resp)
         { std::cout << "handled: " << net::http::method_string(req.method) << " " << req.uri.build() << '\n'; });
 
     return 0;

@@ -8,16 +8,16 @@
 namespace net
 {
 
-template<typename T>
-concept Encoder = requires(const T& t, writer& w)
+template<typename T, typename D>
+concept Encoder = requires(const T& t, writer<D>& w)
 {
     // clang-format off
     { t.encode(w) } -> std::same_as<void>;
     // clang-format on
 };
 
-template<typename T>
-concept Decoder = requires(T& t, reader& r)
+template<typename T, typename D>
+concept Decoder = requires(T& t, reader<D>& r)
 {
     // clang-format off
     { t.decode(r) } -> std::same_as<void>;

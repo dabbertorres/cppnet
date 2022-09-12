@@ -8,19 +8,19 @@
 namespace net
 {
 
+template<typename D>
 class writer
 {
 public:
     writer(const writer&)                     = default;
     writer& operator=(const writer&) noexcept = default;
 
-    writer(writer&&)                     = default;
+    writer(writer&&) noexcept            = default;
     writer& operator=(writer&&) noexcept = default;
 
     virtual ~writer() = default;
 
-    virtual io_result            write(const uint8_t* data, size_t length) noexcept = 0;
-    virtual std::error_condition flush() noexcept                                   = 0;
+    virtual io_result write(const D* data, size_t length) = 0;
 
 protected:
     writer() = default;

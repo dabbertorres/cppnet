@@ -1,5 +1,7 @@
 #include "http/http11.hpp"
 
+#include <cstddef>
+
 #include "http/http.hpp"
 
 #include "result.hpp"
@@ -9,21 +11,25 @@ namespace
 {
 
 using net::url;
+using net::http::client_response;
 using net::http::headers_map;
 using net::http::parse_method;
 using net::http::parse_status;
 using net::http::protocol_version;
 using net::http::request;
 using net::http::request_method;
-using net::http::response;
+using net::http::server_response;
 using net::http::status;
 using net::util::result;
 using net::util::trim_string;
 
-std::errc from_chars(std::string_view str, uint32_t& value) noexcept
+result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 {
+    uint32_t value;
     auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
-    return err;
+
+    if (static_cast<int>(err) != 0) return {err};
+    return {value};
 }
 
 result<protocol_version, std::error_condition> parse_http_version(std::string_view str)
@@ -39,21 +45,24 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
     auto split_idx = str.find('.');
     if (split_idx == std::string_view::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
-    protocol_version v;
+    auto major_res = from_chars(str.substr(0, split_idx));
+    if (major_res.has_error()) return {std::make_error_condition(major_res.to_error())};
 
-    if (auto err = from_chars(str.substr(0, split_idx), v.major); err != std::errc{})
-        return {std::make_error_condition(err)};
+    auto minor_res = from_chars(str.substr(split_idx + 1));
+    if (minor_res.has_error()) return {std::make_error_condition(minor_res.to_error())};
 
-    if (auto err = from_chars(str.substr(split_idx + 1), v.minor); err != std::errc{})
-        return {std::make_error_condition(err)};
+    protocol_version version{
+        .major = major_res.to_value(),
+        .minor = minor_res.to_value(),
+    };
 
-    return {v};
+    return {version};
 }
 
-std::error_condition parse_status_line(std::istream& in, response& resp) noexcept
+std::error_condition parse_status_line(net::reader<std::byte>& reader, client_response& resp) noexcept
 {
     std::string line;
-    if (std::getline(in, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
     auto view = static_cast<std::string_view>(line);
 
@@ -76,10 +85,10 @@ std::error_condition parse_status_line(std::istream& in, response& resp) noexcep
     return {};
 }
 
-std::error_condition parse_request_line(std::istream& in, request& req) noexcept
+std::error_condition parse_request_line(net::reader<std::byte>& reader, request& req) noexcept
 {
     std::string line;
-    if (std::getline(in, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
 
     auto view = static_cast<std::string_view>(line);
 
@@ -107,10 +116,10 @@ std::error_condition parse_request_line(std::istream& in, request& req) noexcept
     return {};
 }
 
-void parse_headers(headers_map& headers, std::istream& in) noexcept
+void parse_headers(headers_map& headers, net::reader<std::byte>& reader) noexcept
 {
     std::string line;
-    while (std::getline(in, line))
+    while (std::getline(reader, line))
     {
         if (line.empty()) break;
 
@@ -132,41 +141,41 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition request_encode(std::ostream& w, const request& req) noexcept
+std::error_condition request_encode(net::writer<std::byte>& writer, const request& req) noexcept
 {
     // TODO
 }
 
-std::error_condition response_encode(std::ostream& w, const response& resp) noexcept
+std::error_condition response_encode(net::writer<std::byte>& writer, const server_response& resp) noexcept
 {
     // TODO
 }
 
-result<request, std::error_condition> request_decode(std::istream& r) noexcept
+result<request, std::error_condition> request_decode(net::reader<std::byte>& reader) noexcept
 {
     request req{
-        .body = r,
+        .body = reader,
     };
 
-    auto err = parse_request_line(r, req);
+    auto err = parse_request_line(reader, req);
     if (err) return {err};
 
-    parse_headers(req.headers, r);
+    parse_headers(req.headers, reader);
 
     // TODO wrap the body up to correctly identify "EOF"
     return {req};
 }
 
-result<response, std::error_condition> response_decode(std::istream& r) noexcept
+result<client_response, std::error_condition> response_decode(net::reader<std::byte>& reader) noexcept
 {
-    response resp{
-        .body = r,
+    client_response resp{
+        .body = reader,
     };
 
-    auto err = parse_status_line(r, resp);
+    auto err = parse_status_line(reader, resp);
     if (err) return {err};
 
-    parse_headers(resp.headers, r);
+    parse_headers(resp.headers, reader);
 
     // TODO wrap the body up to correctly identify "EOF"
     return {resp};

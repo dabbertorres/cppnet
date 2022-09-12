@@ -2,8 +2,6 @@
 
 #include <string>
 
-#include "http/http11.hpp"
-
 namespace net::http
 {
 
@@ -48,33 +46,5 @@ server& server::operator=(server&& other) noexcept
 }
 
 void server::close() { is_serving = false; }
-
-void server::serve(const handler& handler) const
-{
-    listener.listen(max_pending_connections);
-
-    while (is_serving)
-    {
-        try
-        {
-            auto client_sock = listener.accept();
-
-            // TODO: http/2
-
-            /* net::http::http11::request_decode(client_sock); */
-
-            /* request req{client_sock}; */
-            /* parse_headers(client_sock, req); */
-
-            /* response resp{client_sock}; */
-            /* handler.handle(req, resp); */
-            client_sock.flush();
-        }
-        catch (...)
-        {
-            // TODO
-        }
-    }
-}
 
 }
