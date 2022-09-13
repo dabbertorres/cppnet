@@ -3,9 +3,9 @@
 #include <cstddef>
 #include <string>
 
-#include "reader.hpp"
-#include "result.hpp"
-#include "writer.hpp"
+#include "io/reader.hpp"
+#include "io/writer.hpp"
+#include "util/result.hpp"
 
 namespace net::http
 {
@@ -22,10 +22,10 @@ using util::result;
 
 using TODO = std::void_t<>;
 
-result<std::void_t<>, std::string> response_encode(net::writer<std::byte>& w, const server_response& r) noexcept;
-result<std::void_t<>, std::string> request_encode(net::writer<std::byte>& w, const request& r) noexcept;
+result<std::void_t<>, std::string> response_encode(io::writer<std::byte>& w, const server_response& r) noexcept;
+result<std::void_t<>, std::string> request_encode(io::writer<std::byte>& w, const request& r) noexcept;
 
-result<server_response, TODO> response_decode(net::reader<std::byte>& r) noexcept;
-result<request, TODO>         request_decode(net::reader<std::byte>& r) noexcept;
+result<server_response, TODO> response_decode(io::reader<std::byte>& r) noexcept;
+result<request, TODO>         request_decode(io::reader<std::byte>& r) noexcept;
 
 }

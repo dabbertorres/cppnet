@@ -5,7 +5,7 @@
 #include "reader.hpp"
 #include "writer.hpp"
 
-namespace net
+namespace net::io
 {
 
 template<typename T, typename D>

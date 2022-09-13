@@ -10,9 +10,9 @@
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
 
-#include "buffered_reader.hpp"
-#include "buffered_writer.hpp"
 #include "listen.hpp"
 
 namespace net::http
@@ -58,9 +58,9 @@ public:
 
             try
             {
-                auto            client_sock = listener.accept();
-                buffered_reader reader{client_sock};
-                buffered_writer writer{client_sock};
+                auto                client_sock = listener.accept();
+                io::buffered_reader reader{client_sock};
+                io::buffered_writer writer{client_sock};
 
                 // TODO: http/2
 

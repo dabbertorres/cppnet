@@ -14,10 +14,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "reader.hpp"
-#include "string_util.hpp"
+#include "io/reader.hpp"
+#include "io/writer.hpp"
+#include "util/string_util.hpp"
+
 #include "url.hpp"
-#include "writer.hpp"
 
 namespace net::http
 {
@@ -125,7 +126,7 @@ struct request
     url              uri;
     headers_map      headers;
 
-    net::reader<std::byte>& body;
+    io::reader<std::byte>& body;
 };
 
 struct server_response
@@ -134,7 +135,7 @@ struct server_response
     status           status_code;
     headers_map      headers;
 
-    net::writer<std::byte>& body;
+    io::writer<std::byte>& body;
 };
 
 struct client_response
@@ -143,7 +144,7 @@ struct client_response
     status           status_code;
     headers_map      headers;
 
-    net::reader<std::byte>& body;
+    io::reader<std::byte>& body;
 };
 
 constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }

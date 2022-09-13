@@ -6,7 +6,7 @@
 
 #include "io.hpp"
 
-namespace net
+namespace net::io
 {
 
 template<typename D>
@@ -21,7 +21,7 @@ public:
 
     virtual ~reader() = default;
 
-    virtual io_result read(D* data, size_t length) = 0;
+    virtual result read(D* data, size_t length) = 0;
 
 protected:
     reader() = default;

@@ -2,10 +2,10 @@
 
 #include <system_error>
 
-namespace net
+namespace net::io
 {
 
-struct io_result
+struct result
 {
     size_t               count{};
     std::error_condition err{};

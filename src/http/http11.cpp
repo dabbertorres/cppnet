@@ -3,9 +3,9 @@
 #include <cstddef>
 
 #include "http/http.hpp"
-
-#include "result.hpp"
-#include "string_util.hpp"
+#include "io/buffered_reader.hpp"
+#include "util/result.hpp"
+#include "util/string_util.hpp"
 
 namespace
 {
@@ -20,6 +20,7 @@ using net::http::request;
 using net::http::request_method;
 using net::http::server_response;
 using net::http::status;
+using net::io::buffered_reader;
 using net::util::result;
 using net::util::trim_string;
 
@@ -59,10 +60,33 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
     return {version};
 }
 
-std::error_condition parse_status_line(net::reader<std::byte>& reader, client_response& resp) noexcept
+std::error_condition parse_status_line(buffered_reader<char>& reader, client_response& resp) noexcept
 {
+    using namespace std::string_view_literals;
+
     std::string line;
-    if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+
+    // TODO: pull out into a helper function
+    for (;;)
+    {
+        auto io_res = reader.ensure();
+        if (io_res.err) return io_res.err;
+
+        auto result = reader.read_until("\r\n"sv);
+        if (result.has_value())
+        {
+            line.append(result.to_value());
+            break;
+        }
+
+        auto old_len = line.size();
+        auto add_len = result.to_error();
+
+        line.resize(line.size() + add_len);
+        reader.read(line.data() + old_len, add_len);
+    }
+
+    /* if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)}; */
 
     auto view = static_cast<std::string_view>(line);
 
@@ -85,10 +109,10 @@ std::error_condition parse_status_line(net::reader<std::byte>& reader, client_re
     return {};
 }
 
-std::error_condition parse_request_line(net::reader<std::byte>& reader, request& req) noexcept
+std::error_condition parse_request_line(buffered_reader<std::byte>& reader, request& req) noexcept
 {
     std::string line;
-    if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    /* if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)}; */
 
     auto view = static_cast<std::string_view>(line);
 
@@ -116,10 +140,11 @@ std::error_condition parse_request_line(net::reader<std::byte>& reader, request&
     return {};
 }
 
-void parse_headers(headers_map& headers, net::reader<std::byte>& reader) noexcept
+void parse_headers(headers_map& headers, buffered_reader<std::byte>& reader) noexcept
 {
     std::string line;
-    while (std::getline(reader, line))
+    /* while (std::getline(reader, line)) */
+    while (false)
     {
         if (line.empty()) break;
 
@@ -141,41 +166,45 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition request_encode(net::writer<std::byte>& writer, const request& req) noexcept
+std::error_condition request_encode(io::writer<std::byte>& writer, const request& req) noexcept
 {
     // TODO
 }
 
-std::error_condition response_encode(net::writer<std::byte>& writer, const server_response& resp) noexcept
+std::error_condition response_encode(io::writer<std::byte>& writer, const server_response& resp) noexcept
 {
     // TODO
 }
 
-result<request, std::error_condition> request_decode(net::reader<std::byte>& reader) noexcept
+result<request, std::error_condition> request_decode(io::reader<std::byte>& reader) noexcept
 {
+    io::buffered_reader buffer(reader);
+
     request req{
-        .body = reader,
+        .body = buffer,
     };
 
-    auto err = parse_request_line(reader, req);
+    auto err = parse_request_line(buffer, req);
     if (err) return {err};
 
-    parse_headers(req.headers, reader);
+    parse_headers(req.headers, buffer);
 
     // TODO wrap the body up to correctly identify "EOF"
     return {req};
 }
 
-result<client_response, std::error_condition> response_decode(net::reader<std::byte>& reader) noexcept
+result<client_response, std::error_condition> response_decode(io::reader<std::byte>& reader) noexcept
 {
+    io::buffered_reader buffer(reader);
+
     client_response resp{
-        .body = reader,
+        .body = buffer,
     };
 
-    auto err = parse_status_line(reader, resp);
+    auto err = parse_status_line(buffer, resp);
     if (err) return {err};
 
-    parse_headers(resp.headers, reader);
+    parse_headers(resp.headers, buffer);
 
     // TODO wrap the body up to correctly identify "EOF"
     return {resp};

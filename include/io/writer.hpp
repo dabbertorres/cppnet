@@ -5,7 +5,7 @@
 
 #include "io.hpp"
 
-namespace net
+namespace net::io
 {
 
 template<typename D>
@@ -20,7 +20,7 @@ public:
 
     virtual ~writer() = default;
 
-    virtual io_result write(const D* data, size_t length) = 0;
+    virtual result write(const D* data, size_t length) = 0;
 
 protected:
     writer() = default;

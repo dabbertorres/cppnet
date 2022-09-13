@@ -1,11 +1,9 @@
-#include "string_util.hpp"
+#include "util/string_util.hpp"
 
 #include <sstream>
 #include <string_view>
 
 #include <catch.hpp>
-
-#include <catch2/catch_test_macros.hpp>
 
 using namespace std::literals::string_view_literals;
 

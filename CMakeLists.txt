@@ -50,24 +50,24 @@ else()
     -Wall
     -Wextra
     -pedantic
-    # -fstack-usage
-    # -pedantic-errors
-    # -Wconversion
-    # -Wdocumentation
-    # -Wdouble-promotion
-    # -Wformat-pedantic
-    # -Wloop-analysis
-    # -Wold-style-cast
-    # -Wpacked
+    -fstack-usage
+    -pedantic-errors
+    -Wconversion
+    -Wdocumentation
+    -Wdouble-promotion
+    -Wformat-pedantic
+    -Wloop-analysis
+    -Wold-style-cast
+    -Wpacked
+    -Wpedantic
+    -Wshadow
+    -Wsuggest-override
+    -Wthread-safety
+    -Wundef
+    -Wundefined-func-template
+    -Wundefined-reinterpret-cast
+    -Wunreachable-code-aggressive
     # -Wpadded
-    # -Wpedantic
-    # -Wshadow
-    # -Wsuggest-override
-    # -Wthread-safety
-    # -Wundef
-    # -Wundefined-func-template
-    # -Wundefined-reinterpret-cast
-    # -Wunreachable-code-aggressive
   )
 endif()
 
