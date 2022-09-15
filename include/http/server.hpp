@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <string>
 #include <string_view>
 
@@ -12,6 +14,7 @@
 #include "http/http2.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
+#include "io/string_writer.hpp"
 
 #include "listen.hpp"
 
@@ -43,13 +46,18 @@ public:
     server(server&&) noexcept;
     server& operator=(server&&) noexcept;
 
-    ~server() = default;
+    ~server();
 
     void close();
 
     template<Handler H>
-    void serve(H&& handler) const
+    void serve(H&& handler)
     {
+        if (is_serving.exchange(true))
+        {
+            // TODO: throw "already serving"
+        }
+
         listener.listen(max_pending_connections);
 
         while (is_serving)
@@ -58,17 +66,29 @@ public:
 
             try
             {
+                std::cout << "waiting for connection...\n";
                 auto                client_sock = listener.accept();
                 io::buffered_reader reader{client_sock};
-                io::buffered_writer writer{client_sock};
+
+                std::cout << "connection accepted: " << client_sock.remote_addr() << " -> " << client_sock.local_addr()
+                          << '\n';
+
+                /* auto writer = std::make_unique<io::buffered_writer<char>>(client_sock); */
+                io::string_writer<char> out;
+
+                auto writer = std::make_unique<io::buffered_writer<char>>(out);
 
                 // TODO: http/2
+
+                std::cout << "decoding request...\n";
 
                 auto req_result = http11::request_decode(reader);
                 /* http2::request_decode(client_sock); */
 
+                std::cout << "request decoded\n";
                 if (req_result.has_error())
                 {
+                    std::cout << "request decode error: " << req_result.to_error().message() << '\n';
                     // TODO
                 }
 
@@ -76,10 +96,13 @@ public:
 
                 server_response resp{
                     .version = req.version,
-                    .body    = writer,
+                    .body    = std::move(writer),
                 };
 
+                std::cout << "calling handler\n";
                 handler(req, resp);
+
+                std::cout << "handler returned\n";
 
                 // TODO: this needs to start happening before the handler
                 // e.g. large responses should be streamed, rather than
@@ -89,16 +112,18 @@ public:
                 //   * coroutine?
                 //   * server_response interface only exposes methods for
                 //     setting response code, headers, writing the body, etc
-                if (auto err = http11::response_encode(writer, resp); err)
+                std::cout << "flushing writer\n";
+                writer->flush();
+                std::cout << "encoding response\n";
+                if (auto err = http11::response_encode(out, resp); err)
                 {
-                    // TODO
+                    std::cout << "error encoding response: " << err.message() << '\n';
                 }
-
-                writer.flush();
             }
-            catch (...)
+            catch (const std::exception& ex)
             {
                 // TODO
+                std::cout << "exception: " << ex.what() << '\n';
             }
         }
     }

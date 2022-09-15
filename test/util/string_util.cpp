@@ -5,6 +5,8 @@
 
 #include <catch.hpp>
 
+#include <catch2/catch_test_macros.hpp>
+
 using namespace std::literals::string_view_literals;
 
 TEST_CASE("split on '/'", "[util][split_string]")
@@ -146,4 +148,12 @@ TEST_CASE("multiple prefix and suffix", "[util][trim_string]")
 {
     auto actual = net::util::trim_string("\t   foo\t   "sv);
     REQUIRE(actual == "foo"sv);
+}
+
+TEST_CASE("multiple strings", "[util][join]")
+{
+    constexpr auto expect = "foo,bar,baz"sv;
+    auto           actual = net::util::join(","sv, {"foo"sv, "bar"sv, "baz"sv});
+
+    REQUIRE(expect == actual);
 }

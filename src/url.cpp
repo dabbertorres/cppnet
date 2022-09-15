@@ -24,11 +24,10 @@ uint8_t parse_hex(std::string_view s) noexcept { return static_cast<uint8_t>(par
 
 std::string to_hex(char c) noexcept
 {
-    constexpr auto nibble_to_hex = [](uint8_t v) -> char
-    { return static_cast<char>(v < 0xa ? v + '0' : v - 0xa + 'A'); };
+    constexpr auto nibble_to_hex = [](char v) -> char { return v < 0xa ? v + '0' : v - 0xa + 'A'; };
 
-    uint8_t top = (c & 0xf0) >> 4;
-    uint8_t bot = c & 0x0f;
+    char top = (c & 0xf0) >> 4;
+    char bot = c & 0x0f;
 
     return {nibble_to_hex(top), nibble_to_hex(bot)};
 }
@@ -286,7 +285,7 @@ namespace net
 
 std::string url::encode(std::string_view str, std::string_view reserved) noexcept
 {
-    std::ostringstream out;
+    std::basic_ostringstream<char> out;
 
     size_t idx = 0;
     while ((idx = str.find_first_of(reserved, idx)) != std::string::npos)
@@ -303,7 +302,7 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
 
 std::string url::decode(std::string_view str) noexcept
 {
-    std::ostringstream out;
+    std::basic_ostringstream<char> out;
 
     size_t idx = 0;
     while ((idx = str.find('%')) != std::string::npos)
@@ -321,7 +320,7 @@ std::string url::decode(std::string_view str) noexcept
     return out.str();
 }
 
-url::parse_result url::parse(const char* s) noexcept { return parse(std::string_view{s}); }
+url::parse_result url::parse(const char* s) noexcept { return parse(std::string_view(s)); }
 
 url::parse_result url::parse(const std::string& s) noexcept { return parse(std::string_view{s}); }
 
@@ -342,5 +341,23 @@ std::string url::build() const noexcept
 /* { */
 /*     // TODO */
 /* } */
+
+bool operator==(const url::user_info& lhs, const url::user_info& rhs) noexcept
+{
+    return lhs.username == rhs.username && lhs.password == rhs.password;
+}
+
+bool operator==(const url& lhs, const url& rhs) noexcept
+{
+    // clang-format off
+    return lhs.scheme == rhs.scheme
+            && lhs.userinfo == rhs.userinfo
+            && lhs.host == rhs.host
+            && lhs.port == rhs.port
+            && lhs.path == rhs.path
+            && lhs.query == rhs.query
+            && lhs.fragment == rhs.fragment;
+    // clang-format on
+}
 
 }

@@ -90,7 +90,7 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(std::byte* data, size_t length) noexcept
+io::result socket::read(char* data, size_t length) noexcept
 {
     size_t rcvd = 0;
     while (rcvd < length)
@@ -104,12 +104,16 @@ io::result socket::read(std::byte* data, size_t length) noexcept
                 .err   = std::error_condition{errno, std::system_category()}
             };
         }
+
+        // client closed connection
+        if (num == 0) return {.count = rcvd};
+
         rcvd += static_cast<size_t>(num);
     }
     return {.count = rcvd};
 }
 
-io::result socket::write(const std::byte* data, size_t length) noexcept
+io::result socket::write(const char* data, size_t length) noexcept
 {
     size_t sent = 0;
     while (sent < length)
@@ -123,6 +127,10 @@ io::result socket::write(const std::byte* data, size_t length) noexcept
                 .err   = std::error_condition{errno, std::system_category()}
             };
         }
+
+        // client closed connection
+        if (num == 0) return {.count = sent};
+
         sent += static_cast<size_t>(num);
     }
     return {.count = sent};

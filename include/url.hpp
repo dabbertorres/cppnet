@@ -83,4 +83,7 @@ public:
     std::string  fragment;
 };
 
+bool operator==(const url::user_info& lhs, const url::user_info& rhs) noexcept;
+bool operator==(const url& lhs, const url& rhs) noexcept;
+
 }

@@ -50,7 +50,7 @@ public:
 
     ~listener() noexcept;
 
-    void       listen(uint16_t max_backlog) const;
+    void       listen(uint16_t max_backlog);
     tcp_socket accept() const;
 
 private:

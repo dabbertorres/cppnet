@@ -2,6 +2,7 @@
 
 #include <cstddef>
 
+#include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
 #include "util/result.hpp"
@@ -12,7 +13,7 @@ namespace
 
 using net::url;
 using net::http::client_response;
-using net::http::headers_map;
+using net::http::headers;
 using net::http::parse_method;
 using net::http::parse_status;
 using net::http::protocol_version;
@@ -26,11 +27,47 @@ using net::util::trim_string;
 
 result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 {
-    uint32_t value;
-    auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
+    uint32_t    value;
+    const char* begin = reinterpret_cast<const char*>(str.data());
+    auto [_, err]     = std::from_chars(begin, begin + str.size(), value);
 
     if (static_cast<int>(err) != 0) return {err};
     return {value};
+}
+
+result<std::string, std::error_condition> readline(buffered_reader<char>& reader) noexcept
+{
+    using namespace std::string_view_literals;
+
+    std::string line;
+
+    for (;;)
+    {
+        auto io_res = reader.ensure();
+        if (io_res.err) return io_res.err;
+        if (io_res.count == 0) return {""};
+
+        auto result = reader.read_until<std::string>("\r\n"sv);
+        if (result.has_value())
+        {
+            line.append(result.to_value());
+            break;
+        }
+
+        auto add_len = result.to_error();
+        if (add_len == 0)
+        {
+            // nothing more to read
+            // TODO: need to better indicate that \r\n wasn't found...
+            break;
+        }
+
+        auto old_len = line.size();
+        line.resize(line.size() + add_len);
+        reader.read(line.data() + old_len, add_len);
+    }
+
+    return line;
 }
 
 result<protocol_version, std::error_condition> parse_http_version(std::string_view str)
@@ -62,76 +99,58 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
 
 std::error_condition parse_status_line(buffered_reader<char>& reader, client_response& resp) noexcept
 {
-    using namespace std::string_view_literals;
+    auto result = readline(reader);
+    if (result.has_error()) return result.to_error();
 
-    std::string line;
-
-    // TODO: pull out into a helper function
-    for (;;)
-    {
-        auto io_res = reader.ensure();
-        if (io_res.err) return io_res.err;
-
-        auto result = reader.read_until("\r\n"sv);
-        if (result.has_value())
-        {
-            line.append(result.to_value());
-            break;
-        }
-
-        auto old_len = line.size();
-        auto add_len = result.to_error();
-
-        line.resize(line.size() + add_len);
-        reader.read(line.data() + old_len, add_len);
-    }
-
-    /* if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)}; */
-
+    auto line = result.to_value();
     auto view = static_cast<std::string_view>(line);
 
     auto version_end = view.find(' ');
-    if (version_end == std::string::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (version_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto res = parse_http_version(view.substr(0, version_end));
-    if (res.has_error()) return {res.to_error()};
+    if (res.has_error()) return res.to_error();
     resp.version = res.to_value();
 
     auto status_start = version_end + 1;
     auto status_end   = view.find(' ', status_start);
-    if (status_end == std::string::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (status_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     resp.status_code = parse_status(view.substr(status_start, status_end));
-    if (resp.status_code == status::NONE) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (resp.status_code == status::NONE) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     // we can just ignore the reason
 
     return {};
 }
 
-std::error_condition parse_request_line(buffered_reader<std::byte>& reader, request& req) noexcept
+std::error_condition parse_request_line(buffered_reader<char>& reader, request& req) noexcept
 {
-    std::string line;
-    /* if (std::getline(reader, line).bad()) return {std::make_error_condition(std::errc::illegal_byte_sequence)}; */
+    auto result = readline(reader);
+    if (result.has_error()) return result.to_error();
 
+    auto line = result.to_value();
     auto view = static_cast<std::string_view>(line);
 
     auto method_end = view.find(' ');
-    if (method_end == std::string::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (method_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     req.method = parse_method(view.substr(0, method_end));
-    if (req.method == request_method::NONE) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (req.method == request_method::NONE) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto uri_start = method_end + 1;
     auto uri_end   = view.find(' ', uri_start);
-    if (uri_end == std::string::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
+    if (uri_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto uri = view.substr(uri_start, uri_end - uri_start);
-    if (uri == "*") req.uri.host = "*";
+    // clang-format off
+    if (uri == "*")
+        req.uri.host = "*";
     else
-        url::parse(uri) //
+        url::parse(uri)
             .if_value([&](const url& u) { req.uri = u; })
             .if_error([&](auto) { req.uri.path = "/"; });
+    // clang-format on
 
     auto res = parse_http_version(view.substr(uri_end + 1));
     if (res.has_error()) return {res.to_error()};
@@ -140,12 +159,14 @@ std::error_condition parse_request_line(buffered_reader<std::byte>& reader, requ
     return {};
 }
 
-void parse_headers(headers_map& headers, buffered_reader<std::byte>& reader) noexcept
+std::error_condition parse_headers(buffered_reader<char>& reader, headers& headers) noexcept
 {
-    std::string line;
-    /* while (std::getline(reader, line)) */
-    while (false)
+    for (;;)
     {
+        auto result = readline(reader);
+        if (result.has_error()) return result.to_error();
+
+        auto line = result.to_value();
         if (line.empty()) break;
 
         auto split_idx = line.find(':');
@@ -155,8 +176,10 @@ void parse_headers(headers_map& headers, buffered_reader<std::byte>& reader) noe
 
         auto key = view.substr(0, split_idx);
         auto val = trim_string(view.substr(split_idx + 1));
-        headers[std::string{key}].emplace_back(val);
+        headers.set(key, val);
     }
+
+    return {};
 }
 
 }
@@ -166,48 +189,42 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition request_encode(io::writer<std::byte>& writer, const request& req) noexcept
+std::error_condition request_encode(io::writer<char>& writer, const request& req) noexcept
 {
     // TODO
 }
 
-std::error_condition response_encode(io::writer<std::byte>& writer, const server_response& resp) noexcept
+std::error_condition response_encode(io::writer<char>& writer, const server_response& resp) noexcept
 {
     // TODO
 }
 
-result<request, std::error_condition> request_decode(io::reader<std::byte>& reader) noexcept
+result<request, std::error_condition> request_decode(io::reader<char>& reader) noexcept
 {
-    io::buffered_reader buffer(reader);
+    auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
 
-    request req{
-        .body = buffer,
-    };
+    request req;
 
-    auto err = parse_request_line(buffer, req);
-    if (err) return {err};
-
-    parse_headers(req.headers, buffer);
+    if (auto err = parse_request_line(*buffer, req); err) return {err};
+    if (auto err = parse_headers(*buffer, req.headers); err) return {err};
 
     // TODO wrap the body up to correctly identify "EOF"
-    return {req};
+    req.body = std::move(buffer);
+    return {std::move(req)};
 }
 
-result<client_response, std::error_condition> response_decode(io::reader<std::byte>& reader) noexcept
+result<client_response, std::error_condition> response_decode(io::reader<char>& reader) noexcept
 {
-    io::buffered_reader buffer(reader);
+    auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
 
-    client_response resp{
-        .body = buffer,
-    };
+    client_response resp;
 
-    auto err = parse_status_line(buffer, resp);
-    if (err) return {err};
-
-    parse_headers(resp.headers, buffer);
+    if (auto err = parse_status_line(*buffer, resp); err) return {err};
+    if (auto err = parse_headers(*buffer, resp.headers); err) return {err};
 
     // TODO wrap the body up to correctly identify "EOF"
-    return {resp};
+    resp.body = std::move(buffer);
+    return {std::move(resp)};
 }
 
 }

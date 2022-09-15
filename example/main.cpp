@@ -8,6 +8,7 @@
 int main(int argc, char** argv)
 {
     using namespace std::chrono_literals;
+    using namespace std::string_view_literals;
 
     net::http::server server{
         "8080",
@@ -18,9 +19,16 @@ int main(int argc, char** argv)
           }
     };
 
+    std::cout << "starting...\n";
     server.serve(
         [](const net::http::request& req, net::http::server_response& resp)
-        { std::cout << "handled: " << net::http::method_string(req.method) << " " << req.uri.build() << '\n'; });
+        {
+            resp.status_code = net::http::status::OK;
+            resp.headers.set("X-Msg"sv, "Hello"sv);
+            resp.body->write("hello world", 11);
+            std::cout << "handled: " << net::http::method_string(req.method) << " " << req.uri.build() << '\n';
+        });
+    std::cout << "exiting...\n";
 
     return 0;
 }

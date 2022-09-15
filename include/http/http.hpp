@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "http/headers.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 #include "util/string_util.hpp"
@@ -111,40 +112,43 @@ enum class status : uint32_t
     NETWORK_CONNECT_TIMEOUT_ERROR   = 599,
 };
 
-using headers_map = std::unordered_map<std::string, std::vector<std::string>>;
-
 struct protocol_version
 {
     uint32_t major;
     uint32_t minor;
 };
 
+inline bool operator==(protocol_version lhs, protocol_version rhs) noexcept
+{
+    return lhs.major == rhs.major && lhs.minor == rhs.minor;
+}
+
 struct request
 {
     request_method   method;
     protocol_version version;
     url              uri;
-    headers_map      headers;
+    headers          headers;
 
-    io::reader<std::byte>& body;
+    std::unique_ptr<io::reader<char>> body;
 };
 
 struct server_response
 {
     protocol_version version;
     status           status_code;
-    headers_map      headers;
+    headers          headers;
 
-    io::writer<std::byte>& body;
+    std::unique_ptr<io::writer<char>> body;
 };
 
 struct client_response
 {
     protocol_version version;
     status           status_code;
-    headers_map      headers;
+    headers          headers;
 
-    io::reader<std::byte>& body;
+    std::unique_ptr<io::reader<char>> body;
 };
 
 constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }
@@ -187,10 +191,11 @@ inline status parse_status(std::string_view str) noexcept
 {
     using enum status;
 
-    uint32_t v;
-    auto     res = std::from_chars(str.begin(), str.end(), v);
-    if (res.ptr != str.end()) return static_cast<status>(0);
+    uint32_t    v;
+    const char* begin = reinterpret_cast<const char*>(str.data());
+    auto [_, err]     = std::from_chars(begin, begin + str.size(), v);
 
+    if (static_cast<int>(err) != 0) return static_cast<status>(0);
     return static_cast<status>(v);
 }
 

@@ -43,32 +43,33 @@ if(MSVC)
     PRIVATE
     /W4
   )
+
+  # target_link_options(
+  #   net
+  #   PRIVATE
+  # )
 else()
+  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    add_compile_options(-fdiagnostics-color=always)
+  elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+    add_compile_options(-fcolor-diagnostics)
+  endif()
+
   target_compile_options(
     net
     PRIVATE
     -Wall
     -Wextra
     -pedantic
-    -fstack-usage
-    -pedantic-errors
-    -Wconversion
-    -Wdocumentation
-    -Wdouble-promotion
-    -Wformat-pedantic
-    -Wloop-analysis
-    -Wold-style-cast
-    -Wpacked
-    -Wpedantic
-    -Wshadow
-    -Wsuggest-override
-    -Wthread-safety
-    -Wundef
-    -Wundefined-func-template
-    -Wundefined-reinterpret-cast
-    -Wunreachable-code-aggressive
-    # -Wpadded
+    # PUBLIC
+    # -fsanitize=address
   )
+
+  # target_link_options(
+  #   net
+  #   PUBLIC
+  #   -fsanitize=address
+  # )
 endif()
 
 if(BUILD_TESTING)

@@ -1,7 +1,32 @@
 # vim: ft=yaml
 
+CompileFlags:
+  CompilationDatabase: ./build/
+  Add:
+  - -fstack-usage
+  - -pedantic-errors
+  - -Wconversion
+  - -Wdocumentation
+  - -Wdouble-promotion
+  - -Wformat-pedantic
+  - -Wloop-analysis
+  - -Wold-style-cast
+  - -Wpacked
+  # - -Wpadded
+  - -Wpedantic
+  - -Wshadow
+  - -Wsuggest-override
+  - -Wthread-safety
+  - -Wundef
+  - -Wundefined-func-template
+  - -Wundefined-reinterpret-cast
+  - -Wunreachable-code-aggressive
+  Remove:
+  - -Werror
 Diagnostics:
   UnusedIncludes: Strict
+  Suppress:
+  - -Wpadded
 InlayHints:
   Enabled: Yes
   ParameterNames: Yes

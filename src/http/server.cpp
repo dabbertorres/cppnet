@@ -33,8 +33,7 @@ server& server::operator=(server&& other) noexcept
 {
     if (is_serving)
     {
-        is_serving = false;
-        is_serving.notify_all();
+        close();
         listener.~listener();
     }
 
@@ -45,6 +44,12 @@ server& server::operator=(server&& other) noexcept
     return *this;
 }
 
-void server::close() { is_serving = false; }
+server::~server() { close(); }
+
+void server::close()
+{
+    is_serving = false;
+    is_serving.notify_all();
+}
 
 }

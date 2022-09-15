@@ -65,17 +65,17 @@ listener::listener(
             continue;
         }
 
-        struct timeval tv = {
-            .tv_sec  = 0,
-            .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()),
-        };
-        sts = ::setsockopt(main_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (sts != 0)
-        {
-            ::close(main_fd);
-            main_fd = invalid_fd;
-            continue;
-        }
+        /* struct timeval tv = { */
+        /*     .tv_sec  = 0, */
+        /*     .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()), */
+        /* }; */
+        /* sts = ::setsockopt(main_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); */
+        /* if (sts != 0) */
+        /* { */
+        /*     ::close(main_fd); */
+        /*     main_fd = invalid_fd; */
+        /*     continue; */
+        /* } */
 
         /* int flags = ::fcntl(main_fd, F_GETFL); */
         /* if (flags != 0) */
@@ -144,8 +144,14 @@ listener::~listener() noexcept
     }
 }
 
-void listener::listen(uint16_t max_backlog) const
+void listener::listen(uint16_t max_backlog)
 {
+    if (is_listening.exchange(true))
+    {
+        // TODO: throw "already listening"
+        return;
+    }
+
     int res = ::listen(main_fd, max_backlog);
     if (res == -1) throw system_error_from_errno(errno);
     /* fds.push_back(pollfd{ */

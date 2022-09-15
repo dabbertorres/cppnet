@@ -23,8 +23,7 @@ public:
 
     result write(const D* data, size_t length) override
     {
-        // TODO: bypass writing to the buffer when feasible (length - total > buf.capacity())
-        // See buffered_reader
+        if (length == 0) return {.count = 0};
 
         size_t total = 0;
 
@@ -90,8 +89,11 @@ public:
     void reset(writer<D>* other)
     {
         if (other != nullptr) impl = other;
-        buf.resize(0);
+        reset();
     }
+
+    // reset clears the buffer.
+    void reset() { buf.resize(0); }
 
 private:
     result flush_available()
@@ -100,9 +102,11 @@ private:
         if (res.count < buf.size())
         {
             // if short, adjust
-            auto end = buf.begin() + res.count;
-            std::copy_backward(end, buf.end(), end);
-            buf.resize(buf.size() - res.count);
+            auto end      = buf.begin() + res.count;
+            auto leftover = buf.size() - res.count;
+
+            std::copy_backward(end, buf.end(), buf.begin() + leftover);
+            buf.resize(leftover);
         }
         else
         {

@@ -20,6 +20,8 @@ public:
 
     result read(CharT* data, size_t length) override
     {
+        if (idx == view.length()) return {.count = 0};
+
         auto amount = std::min(view.length() - idx, length);
         auto start  = view.begin() + idx;
         std::copy_n(start, amount, data);

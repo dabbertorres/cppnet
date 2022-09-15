@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <type_traits>
 #include <vector>
 
 #include "util/result.hpp"
@@ -12,6 +13,15 @@
 
 namespace net::io
 {
+
+template<typename T>
+concept ReadUntilContainer = requires(T& t)
+{
+    std::is_constructible_v<T, size_t>;
+    t.data();
+    t.size();
+    t.resize(0);
+};
 
 template<typename D>
 class buffered_reader : public reader<D>
@@ -26,14 +36,18 @@ public:
 
     result read(D* data, size_t length) override
     {
+        if (length == 0) return {.count = 0};
+
         // easy way out
         if (length <= buf.size())
         {
             std::copy_n(buf.begin(), length, data);
-            auto end = buf.begin() + length;
 
-            std::copy_backward(end, buf.end(), end);
-            buf.resize(buf.size() - length);
+            auto end      = buf.begin() + length;
+            auto leftover = buf.size() - length;
+
+            std::copy_backward(end, buf.end(), buf.begin() + leftover);
+            buf.resize(leftover);
 
             return {.count = length};
         }
@@ -91,14 +105,15 @@ public:
         return {.count = total};
     }
 
-    // read_until returns the data up to end (consuming it, but not returning it).
+    // read_until returns the data up to until (consuming it, but not returning it).
     //
     // An error is returned if a read error occurs, which will have the error.
-    // No more data than the buffer size will be read. If the buffer does not contain end,
-    // an error a the amount of data in the buffer is returned.
+    // No more data than the buffer size will be read. If the buffer does not contain until,
+    // the amount of data in the buffer is returned.
     //
     // NOTE: no new data is read. Use ensure() to fill the buffer.
-    util::result<std::basic_string<D>, size_t> read_until(std::basic_string_view<D> until)
+    template<ReadUntilContainer C>
+    util::result<C, size_t> read_until(std::basic_string_view<D> until)
     {
         const auto end = buf.end();
         for (auto iter = buf.begin(); iter != end; ++iter)
@@ -108,15 +123,16 @@ public:
                 size_t length = std::distance(buf.begin(), iter);
 
                 // read up to and including until, but then discard the until part
-                std::basic_string<D> out(length + until.length(), 0);
+                C out(length + until.length(), D{});
                 read(out.data(), out.size());
 
-                return {.value = out.substr(0, length)};
+                out.resize(length);
+                return {out};
             }
         }
 
         // not found
-        return {.error = buf.size()};
+        return {buf.size()};
     }
 
     // peek returns the next element if available.
@@ -180,6 +196,8 @@ public:
         if (buf.size() == buf.capacity()) return {.count = buf.size()};
         if (n != 0 && buf.size() >= n) return {.count = buf.size()};
 
+        if (n == 0) n = buf.capacity();
+
         auto start     = buf.size();
         auto read_more = n - start;
         buf.resize(read_more);
@@ -199,6 +217,9 @@ public:
         if (other != nullptr) impl = other;
         buf.resize(0);
     }
+
+    // reset clears the buffer.
+    void reset() { buf.resize(0); }
 
 private:
     reader<D>*     impl;

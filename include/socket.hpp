@@ -21,8 +21,8 @@ enum class protocol
 };
 
 class socket
-    : public io::reader<std::byte>
-    , public io::writer<std::byte>
+    : public io::reader<char>
+    , public io::writer<char>
 {
 public:
     socket();
@@ -42,8 +42,8 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
-    io::result read(std::byte* data, size_t length) noexcept override;
-    io::result write(const std::byte* data, size_t length) noexcept override;
+    io::result read(char* data, size_t length) noexcept override;
+    io::result write(const char* data, size_t length) noexcept override;
 
 protected:
     static constexpr int invalid_fd = -1;

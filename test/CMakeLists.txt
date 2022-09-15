@@ -37,6 +37,11 @@ if(MSVC)
     PRIVATE
     /W4
   )
+
+  # target_link_options(
+  #   net
+  #   PRIVATE
+  # )
 else()
   target_compile_options(
     tests
@@ -44,7 +49,15 @@ else()
     -Wall
     -Wextra
     -pedantic
+    # PUBLIC
+    # -fsanitize=address
   )
+
+  #   target_link_options(
+  #     net
+  #     PRIVATE
+  #     -fsanitize=address
+  #   )
 endif()
 
 include(Catch)
