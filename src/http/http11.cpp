@@ -1,6 +1,7 @@
 #include "http/http11.hpp"
 
 #include <cstddef>
+#include <optional>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
@@ -11,6 +12,8 @@
 namespace
 {
 
+using namespace std::string_view_literals;
+
 using net::url;
 using net::http::client_response;
 using net::http::headers;
@@ -19,17 +22,16 @@ using net::http::parse_status;
 using net::http::protocol_version;
 using net::http::request;
 using net::http::request_method;
-using net::http::server_response;
 using net::http::status;
 using net::io::buffered_reader;
 using net::util::result;
+using net::util::split_string;
 using net::util::trim_string;
 
 result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 {
-    uint32_t    value;
-    const char* begin = reinterpret_cast<const char*>(str.data());
-    auto [_, err]     = std::from_chars(begin, begin + str.size(), value);
+    uint32_t value;
+    auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
 
     if (static_cast<int>(err) != 0) return {err};
     return {value};
@@ -37,8 +39,6 @@ result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 
 result<std::string, std::error_condition> readline(buffered_reader<char>& reader) noexcept
 {
-    using namespace std::string_view_literals;
-
     std::string line;
 
     for (;;)
@@ -89,7 +89,7 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
     auto minor_res = from_chars(str.substr(split_idx + 1));
     if (minor_res.has_error()) return {std::make_error_condition(minor_res.to_error())};
 
-    protocol_version version{
+    const protocol_version version{
         .major = major_res.to_value(),
         .minor = minor_res.to_value(),
     };
@@ -99,6 +99,8 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
 
 std::error_condition parse_status_line(buffered_reader<char>& reader, client_response& resp) noexcept
 {
+    // TODO: max bytes to read
+
     auto result = readline(reader);
     if (result.has_error()) return result.to_error();
 
@@ -126,6 +128,8 @@ std::error_condition parse_status_line(buffered_reader<char>& reader, client_res
 
 std::error_condition parse_request_line(buffered_reader<char>& reader, request& req) noexcept
 {
+    // TODO: max bytes to read
+
     auto result = readline(reader);
     if (result.has_error()) return result.to_error();
 
@@ -159,23 +163,41 @@ std::error_condition parse_request_line(buffered_reader<char>& reader, request& 
     return {};
 }
 
-std::error_condition parse_headers(buffered_reader<char>& reader, headers& headers) noexcept
+std::error_condition parse_headers(buffered_reader<char>& reader, size_t max_read, headers& headers) noexcept
 {
-    for (;;)
-    {
-        auto result = readline(reader);
-        if (result.has_error()) return result.to_error();
+    size_t      amount_read = 0;
+    std::string line;
 
-        auto line = result.to_value();
-        if (line.empty()) break;
+    while (amount_read < max_read)
+    {
+        auto ensure_amount = std::min(max_read - amount_read, reader.capacity());
+        auto [_, err]      = reader.ensure(ensure_amount);
+        if (err) return err;
+
+        auto next_eol = reader.find("\r\n"sv).value_or(0);
+        if (next_eol == 0)
+        {
+            // blank line - we're done
+            break;
+        }
+
+        // consume the newline characters too
+        line.resize(next_eol + 2);
+        reader.read(line.data(), line.size());
+
+        amount_read += line.size();
 
         auto split_idx = line.find(':');
         if (split_idx == std::string::npos) continue; // invalid header
 
         auto view = static_cast<std::string_view>(line);
 
-        auto key = view.substr(0, split_idx);
+        auto key = trim_string(view.substr(0, split_idx));
         auto val = trim_string(view.substr(split_idx + 1));
+
+        // TODO: validate key
+        // TODO: check for list values
+
         headers.set(key, val);
     }
 
@@ -199,30 +221,47 @@ std::error_condition response_encode(io::writer<char>& writer, const server_resp
     // TODO
 }
 
-result<request, std::error_condition> request_decode(io::reader<char>& reader) noexcept
+std::error_condition read_headers(io::buffered_reader<char>& reader, request& req, size_t max_read) noexcept
+{
+    if (auto err = parse_request_line(reader, req); err) return err;
+    if (auto err = parse_headers(reader, max_read, req.headers); err) return err;
+
+    return {};
+}
+
+std::error_condition read_headers(io::buffered_reader<char>& reader, client_response& resp, size_t max_read) noexcept
+{
+    if (auto err = parse_status_line(reader, resp); err) return err;
+    if (auto err = parse_headers(reader, max_read, resp.headers); err) return err;
+
+    return {};
+}
+
+result<request, std::error_condition> request_decode(io::reader<char>& reader, size_t max_header_bytes) noexcept
 {
     auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
 
     request req;
 
     if (auto err = parse_request_line(*buffer, req); err) return {err};
-    if (auto err = parse_headers(*buffer, req.headers); err) return {err};
+    if (auto err = parse_headers(*buffer, max_header_bytes, req.headers); err) return {err};
 
-    // TODO wrap the body up to correctly identify "EOF"
+    // TODO wrap the body up to correctly identify "end of request"
     req.body = std::move(buffer);
     return {std::move(req)};
 }
 
-result<client_response, std::error_condition> response_decode(io::reader<char>& reader) noexcept
+result<client_response, std::error_condition> response_decode(io::reader<char>& reader,
+                                                              size_t            max_header_bytes) noexcept
 {
     auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
 
     client_response resp;
 
     if (auto err = parse_status_line(*buffer, resp); err) return {err};
-    if (auto err = parse_headers(*buffer, resp.headers); err) return {err};
+    if (auto err = parse_headers(*buffer, max_header_bytes, resp.headers); err) return {err};
 
-    // TODO wrap the body up to correctly identify "EOF"
+    // TODO wrap the body up to correctly identify "end of request"
     resp.body = std::move(buffer);
     return {std::move(resp)};
 }

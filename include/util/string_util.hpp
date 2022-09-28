@@ -1,10 +1,6 @@
 #pragma once
 
 #include <coroutine>
-#include <exception>
-#include <memory>
-#include <numeric>
-#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -112,6 +108,22 @@ String join(Args join_with, std::initializer_list<Args> strings) noexcept
     }
 
     return out;
+}
+
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string_view<CharT, Traits>>
+constexpr auto unquote(String str) noexcept
+{
+    // need at least 2 characters to be quoted
+    if (str.size() < 3) return str;
+
+    auto first = str.front();
+
+    if (first != '"' && first != '\'') return str; // not quoted
+    if (first != str.back()) return str;           // not the same quote
+
+    return str.substr(1, str.size() - 2);
 }
 
 }

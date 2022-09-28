@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <limits>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -15,13 +17,12 @@ namespace net::io
 {
 
 template<typename T>
-concept ReadUntilContainer = requires(T& t)
-{
-    std::is_constructible_v<T, size_t>;
-    t.data();
-    t.size();
-    t.resize(0);
-};
+concept ReadUntilContainer = requires(T& t) {
+                                 std::is_constructible_v<T, size_t>;
+                                 t.data();
+                                 t.size();
+                                 t.resize(0);
+                             };
 
 template<typename D>
 class buffered_reader : public reader<D>
@@ -113,26 +114,47 @@ public:
     //
     // NOTE: no new data is read. Use ensure() to fill the buffer.
     template<ReadUntilContainer C>
-    util::result<C, size_t> read_until(std::basic_string_view<D> until)
+    util::result<C, size_t> read_until(std::basic_string_view<D> until,
+                                       size_t                    max_look = std::numeric_limits<size_t>::max())
     {
-        const auto end = buf.end();
+        std::optional<size_t> maybe = find(until, max_look);
+        if (!maybe.has_value()) return {buf.size()};
+
+        C out(maybe.value(), D{});
+        read(out.data(), out.size() + until.size()); // won't fail, as everything is in the buffer
+        out.resize(maybe.value());
+        return {out};
+    }
+
+    // find returns the amount of data between the current position and until (inclusive).
+    // If it is not found, an empty optional is returned.
+    // max_look may be specified to limit how far the search will go.
+    std::optional<size_t> find(std::basic_string_view<D> until, size_t max_look = std::numeric_limits<size_t>::max())
+    {
+        if (until.size() > buf.size()) return std::nullopt;
+
+        auto end = buf.end();
+        if (max_look != std::numeric_limits<size_t>::max())
+        {
+            end = buf.begin();
+            std::advance(end, max_look - until.length());
+        }
+        else
+        {
+            // only look forward as long as there are enough characters left in the buffer.
+            std::advance(end, -until.length() - 1);
+        }
+
         for (auto iter = buf.begin(); iter != end; ++iter)
         {
             if (std::equal(until.begin(), until.end(), iter))
             {
                 size_t length = std::distance(buf.begin(), iter);
-
-                // read up to and including until, but then discard the until part
-                C out(length + until.length(), D{});
-                read(out.data(), out.size());
-
-                out.resize(length);
-                return {out};
+                return {length};
             }
         }
 
-        // not found
-        return {buf.size()};
+        return std::nullopt;
     }
 
     // peek returns the next element if available.

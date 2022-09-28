@@ -8,10 +8,15 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <sys/_select.h>
+#include <sys/select.h>
+#include <sys/signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
 #include "exception.hpp"
+
+#include <sys/_types/_socklen_t.h>
 
 namespace net
 {
@@ -40,12 +45,18 @@ socket& socket::operator=(socket&& other) noexcept
     return *this;
 }
 
-socket::~socket()
-{
-    if (valid()) ::close(fd);
-}
+socket::~socket() { close(); }
 
-bool socket::valid() const noexcept { return fd != invalid_fd; }
+bool socket::valid() const noexcept
+{
+    if (fd == invalid_fd) return false;
+
+    int       error_code;
+    socklen_t error_code_size = sizeof(error_code);
+
+    int sts = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error_code, &error_code_size);
+    return sts != 0 || error_code != 0;
+}
 
 std::string addr_name(sockaddr_storage* addr)
 {
@@ -118,6 +129,9 @@ io::result socket::write(const char* data, size_t length) noexcept
     size_t sent = 0;
     while (sent < length)
     {
+        /* ::select(int, fd_set *, fd_set *, fd_set *, struct timeval *); */
+        /* ::pselect(int, fd_set *, fd_set *, fd_set *, const struct timespec *, const sigset_t *); */
+
         int64_t num = ::send(fd, data + sent, length - sent, 0);
         if (num < 0)
         {
@@ -134,6 +148,22 @@ io::result socket::write(const char* data, size_t length) noexcept
         sent += static_cast<size_t>(num);
     }
     return {.count = sent};
+}
+
+void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept
+{
+    if (!valid()) return;
+
+    if (graceful)
+    {
+        struct linger linger = {
+            .l_onoff  = 1,
+            .l_linger = static_cast<int>(graceful_timeout.count()),
+        };
+        set_option(SO_LINGER, &linger);
+    }
+
+    ::close(fd);
 }
 
 }

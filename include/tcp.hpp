@@ -17,8 +17,9 @@ public:
 
     tcp_socket(std::string_view          host,
                std::string_view          port,
-               protocol                  proto   = protocol::not_care,
-               std::chrono::microseconds timeout = 5s);
+               protocol                  proto     = protocol::not_care,
+               bool                      keepalive = true,
+               std::chrono::microseconds timeout   = 5s);
 };
 
 }

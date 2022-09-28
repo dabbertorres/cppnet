@@ -4,9 +4,15 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
-#include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+
+#include <spdlog/logger.h>
+#include <spdlog/spdlog.h>
 
 #include "http/handler.hpp"
 #include "http/http.hpp"
@@ -26,10 +32,15 @@ using net::http::Handler;
 
 struct server_config
 {
-    size_t               max_header_bytes;
-    std::chrono::seconds header_read_timeout;
-    uint16_t             max_pending_connections;
-    // TODO: logging
+    std::string                     host                    = "localhost";
+    std::string                     port                    = "8080";
+    size_t                          max_header_bytes        = 8192;
+    std::chrono::seconds            header_read_timeout     = 5s;
+    uint16_t                        max_pending_connections = 512;
+    std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
+    bool                            http11                  = true;
+    bool                            http2                   = false;
+    bool                            http3                   = false;
     // TODO: threading
     // TODO: coroutines
 };
@@ -37,8 +48,7 @@ struct server_config
 class server
 {
 public:
-    server(const std::string& port, const server_config& cfg);
-    server(const std::string& host, const std::string& port, const server_config& cfg);
+    server(const server_config& cfg = server_config{});
 
     server(const server&)            = delete;
     server& operator=(const server&) = delete;
@@ -56,6 +66,7 @@ public:
         if (is_serving.exchange(true))
         {
             // TODO: throw "already serving"
+            throw std::runtime_error("already serving");
         }
 
         listener.listen(max_pending_connections);
@@ -66,71 +77,85 @@ public:
 
             try
             {
-                std::cout << "waiting for connection...\n";
-                auto                client_sock = listener.accept();
-                io::buffered_reader reader{client_sock};
+                logger->trace("waiting for connection");
+                auto client_sock = listener.accept();
+                logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
-                std::cout << "connection accepted: " << client_sock.remote_addr() << " -> " << client_sock.local_addr()
-                          << '\n';
-
-                /* auto writer = std::make_unique<io::buffered_writer<char>>(client_sock); */
-                io::string_writer<char> out;
-
-                auto writer = std::make_unique<io::buffered_writer<char>>(out);
-
-                // TODO: http/2
-
-                std::cout << "decoding request...\n";
-
-                auto req_result = http11::request_decode(reader);
-                /* http2::request_decode(client_sock); */
-
-                std::cout << "request decoded\n";
-                if (req_result.has_error())
                 {
-                    std::cout << "request decode error: " << req_result.to_error().message() << '\n';
-                    // TODO
-                }
+                    std::lock_guard guard(connections_mu);
+                    connections.emplace_back(
+                        [this, &handler](tcp_socket&& socket)
+                        {
+                            // TODO: pull from a queue when connection closes
+                            // TODO: pull from ready sockets via coroutines
 
-                auto req = req_result.to_value();
+                            io::buffered_reader reader(socket, max_header_bytes);
 
-                server_response resp{
-                    .version = req.version,
-                    .body    = std::move(writer),
-                };
+                            auto writer = std::make_unique<io::buffered_writer<char>>(socket);
 
-                std::cout << "calling handler\n";
-                handler(req, resp);
+                            while (is_serving && socket.valid())
+                            {
+                                logger->trace("decoding request");
 
-                std::cout << "handler returned\n";
+                                auto req_result = http11::request_decode(reader);
+                                /* TODO http2::request_decode(client_sock); */
 
-                // TODO: this needs to start happening before the handler
-                // e.g. large responses should be streamed, rather than
-                // written to memory, and then written again.
-                //
-                // Options:
-                //   * coroutine?
-                //   * server_response interface only exposes methods for
-                //     setting response code, headers, writing the body, etc
-                std::cout << "flushing writer\n";
-                writer->flush();
-                std::cout << "encoding response\n";
-                if (auto err = http11::response_encode(out, resp); err)
-                {
-                    std::cout << "error encoding response: " << err.message() << '\n';
+                                logger->trace("request decoded");
+                                if (req_result.has_error())
+                                {
+                                    logger->error("request decode error: {}", req_result.to_error().message());
+                                }
+
+                                auto req = req_result.to_value();
+
+                                server_response resp{
+                                    .version = req.version,
+                                    .body    = std::make_unique<io::string_writer<char>>(),
+                                };
+
+                                logger->trace("calling handler");
+                                handler(req, resp);
+                                logger->trace("handler returned");
+
+                                // TODO: this needs to start happening before the handler
+                                // e.g. large responses should be streamed, rather than
+                                // written to memory, and then written again.
+                                //
+                                // Options:
+                                //   * coroutine?
+                                //   * server_response interface only exposes methods for
+                                //     setting response code, headers, writing the body, etc
+                                /* logger->trace("flushing writer"); */
+                                /* resp.body->flush(); */
+                                logger->trace("encoding response");
+
+                                if (auto err = http11::response_encode(*writer, resp); err)
+                                {
+                                    logger->error("response encoding: {}", err.message());
+                                }
+
+                                logger->trace("response sent");
+                            }
+                        },
+                        std::move(client_sock));
                 }
             }
             catch (const std::exception& ex)
             {
                 // TODO
-                std::cout << "exception: " << ex.what() << '\n';
+                logger->critical("exception", ex.what());
             }
         }
     }
 
 private:
-    net::listener    listener;
-    std::atomic_bool is_serving;
+    bool enforce_protocol(const request& req, server_response& resp) noexcept;
+
+    net::listener                   listener;
+    std::atomic_bool                is_serving;
+    std::shared_ptr<spdlog::logger> logger;
+    std::vector<std::thread>        connections;
+    std::mutex                      connections_mu;
 
     size_t   max_header_bytes;
     uint16_t max_pending_connections;

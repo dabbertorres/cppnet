@@ -18,7 +18,8 @@ tcp_socket::tcp_socket(int fd)
     : socket(fd)
 {}
 
-tcp_socket::tcp_socket(std::string_view host, std::string_view port, protocol proto, std::chrono::microseconds timeout)
+tcp_socket::tcp_socket(
+    std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)
     : socket(invalid_fd)
 {
 #pragma clang diagnostic push
@@ -51,12 +52,23 @@ tcp_socket::tcp_socket(std::string_view host, std::string_view port, protocol pr
             .tv_sec  = 0,
             .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()),
         };
-        sts = ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (sts != 0)
+
+        if (!set_option(SO_RCVTIMEO, &tv))
         {
             ::close(fd);
             fd = invalid_fd;
             continue;
+        }
+
+        if (keepalive)
+        {
+            int yes = 1;
+            if (!set_option(SO_RCVTIMEO, &yes))
+            {
+                ::close(fd);
+                fd = invalid_fd;
+                continue;
+            }
         }
 
         sts = ::connect(fd, info->ai_addr, info->ai_addrlen);

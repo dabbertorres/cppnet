@@ -15,6 +15,10 @@
     {
       "name": "cxxopts",
       "version>=": "3.0.0"
+    },
+    {
+      "name": "spdlog",
+      "version>=": "1.9.2"
     }
   ]
 }

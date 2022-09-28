@@ -19,7 +19,6 @@
         "CMAKE_MAKE_PROGRAM": "ninja"
       },
       "warnings": {
-        "dev": true,
         "deprecated": true,
         "uninitialized": true
       }

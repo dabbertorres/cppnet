@@ -5,7 +5,7 @@ Standard: Latest
 AccessModifierOffset: -4
 
 AlignAfterOpenBracket: Align
-AlignArrayOfStructures: Left
+AlignArrayOfStructures: Right
 AlignConsecutiveAssignments: Consecutive
 AlignConsecutiveBitFields: Consecutive
 AlignConsecutiveDeclarations: Consecutive
@@ -36,6 +36,7 @@ BinPackArguments: false
 BinPackParameters: false
 BitFieldColonSpacing: Both
 
+BreakBeforeBraces: Custom
 BraceWrapping:
   AfterCaseLabel:        true
   AfterClass:            true
@@ -56,10 +57,7 @@ BraceWrapping:
   SplitEmptyRecord:      false
 
 BreakBeforeBinaryOperators: NonAssignment
-BreakBeforeBraces: Custom
-# BreakBeforeConceptDeclarations: Always # v14 expects a boolean?
-BreakBeforeConceptDeclarations: true
-# BreakBeforeInheritanceComma: false
+BreakBeforeConceptDeclarations: Always
 BreakBeforeTernaryOperators: true
 BreakConstructorInitializers: BeforeComma
 BreakInheritanceList: BeforeComma
@@ -109,11 +107,11 @@ IndentCaseLabels: false
 IndentExternBlock: NoIndent
 IndentGotoLabels: false
 IndentPPDirectives: AfterHash
-IndentRequires: true # changed to IndentRequiresClause in v15
+IndentRequiresClause: true
 IndentWidth: 4
 IndentWrappedFunctionNames: false
 
-# InsertBraces: false # available in v15
+InsertBraces: false
 InsertTrailingCommas: Wrapped
 KeepEmptyLinesAtTheStartOfBlocks: false
 LambdaBodyIndentation: Signature
@@ -152,7 +150,7 @@ QualifierOrder:
 ReferenceAlignment: Pointer
 ReflowComments: true
 RemoveBracesLLVM: false
-# RequiresClausePosition: WithPreceding # available in v15
+RequiresClausePosition: WithPreceding
 SeparateDefinitionBlocks: Leave
 ShortNamespaceLines: 1
 

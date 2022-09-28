@@ -18,6 +18,8 @@ project(
   LANGUAGES C CXX
 )
 
+find_package(spdlog CONFIG REQUIRED)
+
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
 add_library(net ${sources})
 
@@ -30,6 +32,7 @@ target_include_directories(
 target_link_libraries(
   net
   PRIVATE
+  spdlog::spdlog
 )
 
 target_compile_features(
@@ -49,11 +52,30 @@ if(MSVC)
   #   PRIVATE
   # )
 else()
+  # find_program(MOLD "mold")
+  # if(MOLD)
+  #   target_link_options(
+  #     net
+  #     PUBLIC
+  #     -fuse-ld=mold
+  #   )
+  # endif()
+
   if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-    add_compile_options(-fdiagnostics-color=always)
+    target_compile_options(
+      net
+      PRIVATE
+      -fdiagnostics-color=always
+    )
   elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
-    add_compile_options(-fcolor-diagnostics)
+    target_compile_options(
+      net
+      PRIVATE
+      -fcolor-diagnostics
+    )
   endif()
+
+  set(SANITIZERS address,undefined)
 
   target_compile_options(
     net
@@ -61,15 +83,15 @@ else()
     -Wall
     -Wextra
     -pedantic
-    # PUBLIC
-    # -fsanitize=address
+    PUBLIC
+    $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
   )
 
-  # target_link_options(
-  #   net
-  #   PUBLIC
-  #   -fsanitize=address
-  # )
+  target_link_options(
+    net
+    PUBLIC
+    $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
+  )
 endif()
 
 if(BUILD_TESTING)

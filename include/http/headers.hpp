@@ -11,6 +11,18 @@
 namespace net::http
 {
 
+struct content_type
+{
+    std::string                                  type;
+    std::unordered_map<std::string, std::string> parameters;
+    [[nodiscard]] std::optional<std::string>     charset() const noexcept
+    {
+        auto it = parameters.find("charset");
+        if (it != parameters.end()) return it->second;
+        return std::nullopt;
+    }
+};
+
 class headers
 {
 private:
@@ -56,6 +68,14 @@ public:
     [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
 
     [[nodiscard]] std::optional<values_range> get_all(const std::string& key) const;
+
+    // getters for well-known common headers
+
+    [[nodiscard]] std::optional<size_t>       get_content_length() const;
+    [[nodiscard]] std::optional<content_type> get_content_type() const;
+    [[nodiscard]] bool                        is_compressed() const;
+    [[nodiscard]] bool                        is_deflated() const;
+    [[nodiscard]] bool                        is_gziped() const;
 
     [[nodiscard]] keys_iterator begin() const;
     [[nodiscard]] keys_iterator end() const;

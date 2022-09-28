@@ -16,13 +16,10 @@ using namespace std::string_view_literals;
 
 TEST_CASE("just a request line", "[http][1.1]")
 {
-    net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n");
+    net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
 
     auto result = net::http::http11::request_decode(content);
-    SECTION("decoding is successful")
-    {
-        REQUIRE(result.has_value());
-    }
+    REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
     REQUIRE(route.has_value());
@@ -47,18 +44,15 @@ TEST_CASE("with headers", "[http][1.1]")
                                          "\r\n");
 
     auto result = net::http::http11::request_decode(content);
-    SECTION("decoding is successful")
-    {
-        REQUIRE(result.has_value());
-    }
+    REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
     REQUIRE(route.has_value());
     const auto expected_route = route.to_value();
 
     const net::http::headers expect_headers{
-        {"Accept",  {"application/json"}},
-        {"X-Hello", {"hello world"}     },
+        { "Accept", {"application/json"}},
+        {"X-Hello",      {"hello world"}},
     };
 
     auto request = result.to_value();
@@ -83,19 +77,16 @@ TEST_CASE("with headers and body", "[http][1.1]")
                                          "\r\n");
 
     auto result = net::http::http11::request_decode(content);
-    SECTION("decoding is successful")
-    {
-        REQUIRE(result.has_value());
-    }
+    REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
     REQUIRE(route.has_value());
     const auto expected_route = route.to_value();
 
     const net::http::headers expect_headers{
-        {"Accept",       {"application/json"}},
-        {"X-Hello",      {"hello world"}     },
-        {"Content-Type", {"text/plain"}      },
+        {      "Accept", {"application/json"}},
+        {     "X-Hello",      {"hello world"}},
+        {"Content-Type",       {"text/plain"}},
     };
 
     auto request = result.to_value();
@@ -104,7 +95,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
 
     auto read_result = request.body->read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
-    CHECK(read_result.count == 21);
+    CHECK(read_result.count == 23);
 
     body = body.substr(0, read_result.count);
     body = net::util::trim_string(body);
@@ -133,19 +124,16 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
                                          "\r\n");
 
     auto result = net::http::http11::request_decode(content);
-    SECTION("decoding is successful")
-    {
-        REQUIRE(result.has_value());
-    }
+    REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
     REQUIRE(route.has_value());
     const auto expected_route = route.to_value();
 
     const net::http::headers expect_headers{
-        {"Accept",       {"application/json"}},
-        {"X-Hello",      {"hello world"}     },
-        {"Content-Type", {"text/plain"}      },
+        {      "Accept", {"application/json"}},
+        {     "X-Hello",      {"hello world"}},
+        {"Content-Type",       {"text/plain"}},
     };
 
     auto request = result.to_value();
@@ -154,7 +142,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
 
     auto read_result = request.body->read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
-    CHECK(read_result.count == 41);
+    CHECK(read_result.count == 43);
 
     body = body.substr(0, read_result.count);
     body = net::util::trim_string(body);

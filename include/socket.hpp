@@ -6,12 +6,16 @@
 #include <string_view>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 
 namespace net
 {
+
+using namespace std::chrono_literals;
 
 enum class protocol
 {
@@ -45,8 +49,17 @@ public:
     io::result read(char* data, size_t length) noexcept override;
     io::result write(const char* data, size_t length) noexcept override;
 
+    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
+
 protected:
     static constexpr int invalid_fd = -1;
+
+    template<typename T>
+    bool set_option(int flag, T* value) noexcept
+    {
+        int sts = ::setsockopt(fd, SOL_SOCKET, flag, value, sizeof(T));
+        return sts == 0;
+    }
 
     int fd;
 };

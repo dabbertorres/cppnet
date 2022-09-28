@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <concepts>
 #include <coroutine>
 #include <mutex>
 #include <thread>
@@ -21,6 +22,9 @@ public:
     thread_pool& operator=(thread_pool&&) noexcept;
 
     ~thread_pool();
+
+    template<std::invocable F>
+    void schedule(F&& f);
 
 private:
     std::vector<std::thread> threads;
