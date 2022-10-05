@@ -1,21 +1,12 @@
 #pragma once
 
-#include <algorithm>
-#include <cctype>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <istream>
-#include <iterator>
-#include <memory>
-#include <ostream>
-#include <string>
 #include <string_view>
-#include <unordered_map>
-#include <vector>
+#include <type_traits>
 
 #include "http/headers.hpp"
-#include "io/reader.hpp"
+#include "io/limit_reader.hpp"
 #include "io/writer.hpp"
 #include "util/string_util.hpp"
 
@@ -118,7 +109,7 @@ struct protocol_version
     uint32_t minor;
 };
 
-inline bool operator==(protocol_version lhs, protocol_version rhs) noexcept
+constexpr bool operator==(protocol_version lhs, protocol_version rhs) noexcept
 {
     return lhs.major == rhs.major && lhs.minor == rhs.minor;
 }
@@ -130,7 +121,7 @@ struct request
     url              uri;
     headers          headers;
 
-    std::unique_ptr<io::reader<char>> body;
+    io::limit_reader<char> body;
 };
 
 struct server_response
@@ -139,7 +130,7 @@ struct server_response
     status           status_code;
     headers          headers;
 
-    std::unique_ptr<io::writer<char>> body;
+    io::writer<char>& body;
 };
 
 struct client_response
@@ -148,7 +139,7 @@ struct client_response
     status           status_code;
     headers          headers;
 
-    std::unique_ptr<io::reader<char>> body;
+    io::limit_reader<char> body;
 };
 
 constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }
@@ -167,7 +158,7 @@ constexpr bool status_is_client_error(status s) noexcept
 
 constexpr bool status_is_server_error(status s) noexcept
 {
-    return status::INTERNAL_SERVER_ERROR <= s && s < static_cast<status>(600);
+    return status::INTERNAL_SERVER_ERROR <= s && static_cast<std::underlying_type_t<status>>(s) < 600;
 }
 
 constexpr request_method parse_method(std::string_view str) noexcept
@@ -187,17 +178,7 @@ constexpr request_method parse_method(std::string_view str) noexcept
     return NONE;
 }
 
-inline status parse_status(std::string_view str) noexcept
-{
-    using enum status;
-
-    uint32_t    v;
-    const char* begin = reinterpret_cast<const char*>(str.data());
-    auto [_, err]     = std::from_chars(begin, begin + str.size(), v);
-
-    if (static_cast<int>(err) != 0) return static_cast<status>(0);
-    return static_cast<status>(v);
-}
+status parse_status(std::string_view str) noexcept;
 
 constexpr std::string_view method_string(request_method m) noexcept
 {
@@ -213,8 +194,11 @@ constexpr std::string_view method_string(request_method m) noexcept
     case PATCH: return "PATCH";
     case POST: return "POST";
     case PUT: return "PUT";
-    case TRACE: return "TRACE";
-    default: return "NONE";
+    case TRACE:
+        return "TRACE";
+
+    [[unlikely]] default:
+        return "NONE";
     }
 }
 
@@ -286,8 +270,11 @@ constexpr std::string_view status_string(status s) noexcept
     case LOOP_DETECTED: return "Loop Detected";
     case NOT_EXTENDED: return "Not Extended";
     case NETWORK_AUTHENTICATION_REQUIRED: return "Network Authentication Required";
-    case NETWORK_CONNECT_TIMEOUT_ERROR: return "Network Connect Timeout Error";
-    default: return "Unknown";
+    case NETWORK_CONNECT_TIMEOUT_ERROR:
+        return "Network Connect Timeout Error";
+
+    [[unlikely]] default:
+        return "Unknown";
     }
 }
 

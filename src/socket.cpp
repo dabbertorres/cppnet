@@ -1,7 +1,9 @@
 #include "socket.hpp"
 
+#include <cassert>
 #include <cerrno>
 #include <iostream>
+#include <utility>
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -15,8 +17,6 @@
 #include <sys/types.h>
 
 #include "exception.hpp"
-
-#include <sys/_types/_socklen_t.h>
 
 namespace net
 {
@@ -55,24 +55,27 @@ bool socket::valid() const noexcept
     socklen_t error_code_size = sizeof(error_code);
 
     int sts = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error_code, &error_code_size);
-    return sts != 0 || error_code != 0;
+    return sts != -1 && error_code == 0;
 }
 
 std::string addr_name(sockaddr_storage* addr)
 {
     std::string ret;
-    const void* addr_type = nullptr;
+    void*       addr_type = nullptr;
     switch (addr->ss_family)
     {
     case AF_INET:
         ret.resize(INET_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in*>(&addr)->sin_addr;
+        addr_type = &reinterpret_cast<sockaddr_in*>(addr)->sin_addr;
         break;
 
     case AF_INET6:
         ret.resize(INET6_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in6*>(&addr)->sin6_addr;
+        addr_type = &reinterpret_cast<sockaddr_in6*>(addr)->sin6_addr;
         break;
+
+    [[unlikely]] default:
+        std::unreachable();
     }
 
     const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
@@ -103,13 +106,22 @@ std::string socket::remote_addr() const
 
 io::result socket::read(char* data, size_t length) noexcept
 {
-    size_t rcvd = 0;
-    while (rcvd < length)
+    size_t rcvd     = 0;
+    size_t attempts = 0;
+
+    while (true)
     {
-        int64_t num = ::recv(fd, data + rcvd, length - rcvd, 0);
+        const int64_t num = ::recv(fd, data + rcvd, length - rcvd, 0);
         if (num < 0)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                ++attempts;
+
+                if (attempts < 5) continue;
+                return {.count = rcvd};
+            }
+
             return {
                 .count = rcvd,
                 .err   = std::error_condition{errno, std::system_category()}
@@ -120,6 +132,7 @@ io::result socket::read(char* data, size_t length) noexcept
         if (num == 0) return {.count = rcvd};
 
         rcvd += static_cast<size_t>(num);
+        break;
     }
     return {.count = rcvd};
 }
@@ -132,7 +145,7 @@ io::result socket::write(const char* data, size_t length) noexcept
         /* ::select(int, fd_set *, fd_set *, fd_set *, struct timeval *); */
         /* ::pselect(int, fd_set *, fd_set *, fd_set *, const struct timespec *, const sigset_t *); */
 
-        int64_t num = ::send(fd, data + sent, length - sent, 0);
+        const int64_t num = ::send(fd, data + sent, length - sent, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;

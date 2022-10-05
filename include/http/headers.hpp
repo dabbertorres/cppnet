@@ -64,6 +64,8 @@ public:
     headers& set(std::string_view key, std::initializer_list<std::string_view> vals);
     headers& add(std::string_view key, std::string_view val);
 
+    headers& set_content_length(size_t length);
+
     [[nodiscard]] std::optional<std::string_view> get(const std::string& key) const;
     [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
 

@@ -55,6 +55,8 @@ public:
     {
         std::string username;
         std::string password;
+
+        [[nodiscard]] bool empty() const;
     };
 
     using query_values = std::unordered_map<std::string, std::vector<std::string>>;

@@ -1,11 +1,13 @@
 #include "http/http11.hpp"
 
+#include <charconv>
 #include <cstddef>
 #include <optional>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/limit_reader.hpp"
 #include "util/result.hpp"
 #include "util/string_util.hpp"
 
@@ -25,7 +27,6 @@ using net::http::request_method;
 using net::http::status;
 using net::io::buffered_reader;
 using net::util::result;
-using net::util::split_string;
 using net::util::trim_string;
 
 result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
@@ -147,6 +148,7 @@ std::error_condition parse_request_line(buffered_reader<char>& reader, request& 
     if (uri_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto uri = view.substr(uri_start, uri_end - uri_start);
+
     // clang-format off
     if (uri == "*")
         req.uri.host = "*";
@@ -170,11 +172,18 @@ std::error_condition parse_headers(buffered_reader<char>& reader, size_t max_rea
 
     while (amount_read < max_read)
     {
-        auto ensure_amount = std::min(max_read - amount_read, reader.capacity());
-        auto [_, err]      = reader.ensure(ensure_amount);
-        if (err) return err;
+        auto maybe_next_eol = reader.find("\r\n"sv);
+        if (!maybe_next_eol.has_value())
+        {
+            auto ensure_amount = std::min(max_read - amount_read, reader.capacity());
+            auto [_, err]      = reader.ensure(ensure_amount);
+            if (err) return err;
 
-        auto next_eol = reader.find("\r\n"sv).value_or(0);
+            // try finding eol again
+            continue;
+        }
+
+        auto next_eol = maybe_next_eol.value();
         if (next_eol == 0)
         {
             // blank line - we're done
@@ -214,11 +223,13 @@ using util::result;
 std::error_condition request_encode(io::writer<char>& writer, const request& req) noexcept
 {
     // TODO
+    return {};
 }
 
 std::error_condition response_encode(io::writer<char>& writer, const server_response& resp) noexcept
 {
     // TODO
+    return {};
 }
 
 std::error_condition read_headers(io::buffered_reader<char>& reader, request& req, size_t max_read) noexcept
@@ -237,32 +248,29 @@ std::error_condition read_headers(io::buffered_reader<char>& reader, client_resp
     return {};
 }
 
-result<request, std::error_condition> request_decode(io::reader<char>& reader, size_t max_header_bytes) noexcept
+result<request, std::error_condition> request_decode(io::buffered_reader<char>& reader,
+                                                     size_t                     max_header_bytes) noexcept
 {
-    auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
-
     request req;
 
-    if (auto err = parse_request_line(*buffer, req); err) return {err};
-    if (auto err = parse_headers(*buffer, max_header_bytes, req.headers); err) return {err};
+    if (auto err = parse_request_line(reader, req); err) return {err};
+    if (auto err = parse_headers(reader, max_header_bytes, req.headers); err) return {err};
 
-    // TODO wrap the body up to correctly identify "end of request"
-    req.body = std::move(buffer);
+    const size_t content_length = req.headers.get_content_length().value_or(0);
+    req.body                    = io::limit_reader(&reader, content_length);
     return {std::move(req)};
 }
 
-result<client_response, std::error_condition> response_decode(io::reader<char>& reader,
-                                                              size_t            max_header_bytes) noexcept
+result<client_response, std::error_condition> response_decode(io::buffered_reader<char>& reader,
+                                                              size_t                     max_header_bytes) noexcept
 {
-    auto buffer = std::make_unique<io::buffered_reader<char>>(reader);
-
     client_response resp;
 
-    if (auto err = parse_status_line(*buffer, resp); err) return {err};
-    if (auto err = parse_headers(*buffer, max_header_bytes, resp.headers); err) return {err};
+    if (auto err = parse_status_line(reader, resp); err) return {err};
+    if (auto err = parse_headers(reader, max_header_bytes, resp.headers); err) return {err};
 
-    // TODO wrap the body up to correctly identify "end of request"
-    resp.body = std::move(buffer);
+    const size_t content_length = resp.headers.get_content_length().value_or(0);
+    resp.body                   = io::limit_reader(&reader, content_length);
     return {std::move(resp)};
 }
 

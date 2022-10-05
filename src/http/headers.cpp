@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include "util/string_util.hpp"
@@ -70,10 +71,7 @@ headers& headers::set(const std::string& key, std::initializer_list<std::string_
     value_type tmp;
     tmp.resize(vals.size());
 
-    std::transform(vals.begin(),
-                   vals.end(),
-                   tmp.begin(),
-                   [](std::string_view view) -> std::string { return std::string(view); });
+    std::transform(vals.begin(), vals.end(), tmp.begin(), [](std::string_view view) { return std::string(view); });
 
     values[key] = tmp;
     return *this;
@@ -93,6 +91,8 @@ headers& headers::set(std::string_view key, std::initializer_list<std::string_vi
 }
 
 headers& headers::add(std::string_view key, std::string_view val) { return add(std::string(key), val); }
+
+headers& headers::set_content_length(size_t length) { return set("Content-Length"sv, std::to_string(length)); }
 
 [[nodiscard]] std::optional<std::string_view> headers::get(const std::string& key) const
 {
@@ -133,8 +133,8 @@ headers& headers::add(std::string_view key, std::string_view val) { return add(s
     auto maybe = get("Content-Type");
     if (!maybe.has_value()) return std::nullopt;
 
-    std::string_view type  = maybe.value();
-    size_t           split = type.find(';');
+    const std::string_view type  = maybe.value();
+    const size_t           split = type.find(';');
     if (split == std::string_view::npos) return content_type{.type = std::string{type}};
 
     content_type out{.type = std::string{type}};

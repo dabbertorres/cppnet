@@ -17,8 +17,9 @@ using namespace std::string_view_literals;
 TEST_CASE("just a request line", "[http][1.1]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
+    net::io::buffered_reader     buf_reader(content);
 
-    auto result = net::http::http11::request_decode(content);
+    auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -42,8 +43,9 @@ TEST_CASE("with headers", "[http][1.1]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "\r\n");
+    net::io::buffered_reader     buf_reader(content);
 
-    auto result = net::http::http11::request_decode(content);
+    auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -75,8 +77,9 @@ TEST_CASE("with headers and body", "[http][1.1]")
                                          "\r\n"
                                          "this is a request\r\n"
                                          "\r\n");
+    net::io::buffered_reader     buf_reader(content);
 
-    auto result = net::http::http11::request_decode(content);
+    auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -93,7 +96,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body.data(), body.size());
+    auto read_result = request.body.read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 23);
 
@@ -122,8 +125,9 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
                                          "multiple\n"
                                          "lines\r\n"
                                          "\r\n");
+    net::io::buffered_reader     buf_reader(content);
 
-    auto result = net::http::http11::request_decode(content);
+    auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -140,7 +144,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body.data(), body.size());
+    auto read_result = request.body.read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 43);
 

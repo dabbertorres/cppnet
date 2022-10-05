@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include <sys/fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -69,6 +70,13 @@ tcp_socket::tcp_socket(
                 fd = invalid_fd;
                 continue;
             }
+        }
+
+        if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        {
+            ::close(fd);
+            fd = invalid_fd;
+            continue;
         }
 
         sts = ::connect(fd, info->ai_addr, info->ai_addrlen);

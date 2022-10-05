@@ -150,7 +150,7 @@ QualifierOrder:
 ReferenceAlignment: Pointer
 ReflowComments: true
 RemoveBracesLLVM: false
-RequiresClausePosition: WithPreceding
+RequiresClausePosition: OwnLine
 SeparateDefinitionBlocks: Leave
 ShortNamespaceLines: 1
 

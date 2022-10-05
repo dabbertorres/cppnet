@@ -283,9 +283,11 @@ url_parse_state url_parse(std::string_view s, url& u) noexcept
 namespace net
 {
 
+bool url::user_info::empty() const { return username.empty() && password.empty(); }
+
 std::string url::encode(std::string_view str, std::string_view reserved) noexcept
 {
-    std::basic_ostringstream<char> out;
+    std::ostringstream out;
 
     size_t idx = 0;
     while ((idx = str.find_first_of(reserved, idx)) != std::string::npos)
@@ -302,7 +304,7 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
 
 std::string url::decode(std::string_view str) noexcept
 {
-    std::basic_ostringstream<char> out;
+    std::ostringstream out;
 
     size_t idx = 0;
     while ((idx = str.find('%')) != std::string::npos)
@@ -334,7 +336,40 @@ url::parse_result url::parse(std::string_view s) noexcept
 
 std::string url::build() const noexcept
 {
+    std::ostringstream out;
+
     // TODO url encode as necessary
+
+    if (!scheme.empty()) out << scheme << "://";
+    if (!userinfo.empty())
+    {
+        if (!userinfo.username.empty()) out << userinfo.username;
+        out << ':';
+        if (!userinfo.password.empty()) out << userinfo.password;
+        out << '@';
+    }
+
+    if (!host.empty()) out << host;
+    if (!port.empty()) out << ':' << port;
+    if (!path.empty()) out << path;
+
+    if (!query.empty())
+    {
+        char sep = '?';
+        for (const auto& param : query)
+        {
+            for (const auto& val : param.second)
+            {
+                out << sep;
+                sep = '&'; // only the first "separator" is a '?'
+                out << param.first << '=' << val;
+            }
+        }
+    }
+
+    if (!fragment.empty()) out << '#' << fragment;
+
+    return out.str();
 }
 
 /* bool url::is_valid() const noexcept */
