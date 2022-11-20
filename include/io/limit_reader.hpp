@@ -6,17 +6,15 @@
 namespace net::io
 {
 
-template<typename D>
-class limit_reader : public reader<D>
+class limit_reader : public reader
 {
 public:
-    constexpr limit_reader() = default;
-    constexpr limit_reader(reader<D>* reader, size_t limit)
+    constexpr limit_reader(reader* reader, size_t limit)
         : parent{reader}
         , limit{limit}
     {}
 
-    result read(D* data, size_t length) override
+    result read(byte* data, size_t length) override
     {
         if (progress >= limit) return {};
 
@@ -27,10 +25,12 @@ public:
         return res;
     }
 
+    using reader::read;
+
 private:
-    reader<D>* parent   = nullptr;
-    size_t     limit    = 0;
-    size_t     progress = 0;
+    reader* parent   = nullptr;
+    size_t  limit    = 0;
+    size_t  progress = 0;
 };
 
 }

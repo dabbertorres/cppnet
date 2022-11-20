@@ -11,14 +11,20 @@ namespace net::io
 {
 
 template<typename CharT, typename Traits = std::char_traits<CharT>, typename Allocator = std::allocator<CharT>>
-class string_writer : public writer<CharT>
+class string_writer : public writer
 {
 public:
     using string = std::basic_string<CharT, Traits, Allocator>;
 
-    result write(const CharT* data, size_t length) override
+    result write(const CharT* data, size_t length)
     {
         parts.emplace_back(data, length);
+        return {.count = length};
+    }
+
+    result write(const byte* data, size_t length) override
+    {
+        parts.emplace_back(reinterpret_cast<const CharT*>(data), length);
         return {.count = length};
     }
 

@@ -73,6 +73,15 @@ else()
       PRIVATE
       -fcolor-diagnostics
     )
+
+    if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+      target_link_options(
+        net
+        PUBLIC
+        -L/usr/local/opt/llvm/lib/c++
+        -Wl,-rpath,/usr/local/opt/llvm/lib/c++
+      )
+    endif()
   endif()
 
   set(SANITIZERS address,undefined)

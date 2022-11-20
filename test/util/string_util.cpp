@@ -157,3 +157,38 @@ TEST_CASE("multiple strings", "[util][join]")
 
     REQUIRE(expect == actual);
 }
+
+TEST_CASE("occurs once at front", "[util][replace]")
+{
+    auto actual = net::util::replace("barfoo"sv, "bar"sv, "foo"sv);
+
+    REQUIRE("foofoo"sv == actual);
+}
+
+TEST_CASE("occurs once at end", "[util][replace]")
+{
+    auto actual = net::util::replace("foobar"sv, "bar"sv, "foo"sv);
+
+    REQUIRE("foofoo"sv == actual);
+}
+
+TEST_CASE("whole string", "[util][replace]")
+{
+    auto actual = net::util::replace("bar"sv, "bar"sv, "foo"sv);
+
+    REQUIRE("foo"sv == actual);
+}
+
+TEST_CASE("more than once", "[util][replace]")
+{
+    auto actual = net::util::replace("barfoobar"sv, "bar"sv, "foo"sv);
+
+    REQUIRE("foofoofoo"sv == actual);
+}
+
+TEST_CASE("sequential", "[util][replace]")
+{
+    auto actual = net::util::replace("barbar"sv, "bar"sv, "foo"sv);
+
+    REQUIRE("foofoo"sv == actual);
+}

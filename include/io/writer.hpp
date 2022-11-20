@@ -1,14 +1,12 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
 
 #include "io.hpp"
 
 namespace net::io
 {
 
-template<typename D>
 class writer
 {
 public:
@@ -20,7 +18,8 @@ public:
 
     virtual ~writer() = default;
 
-    virtual result write(const D* data, size_t length) = 0;
+    virtual result write(const byte* data, size_t length) = 0;
+    result         write(const char* data, size_t length) { return write(reinterpret_cast<const byte*>(data), length); }
 
 protected:
     writer() = default;

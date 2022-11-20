@@ -28,12 +28,19 @@ class headers
 private:
     struct keyhash
     {
-        size_t operator()(const std::string& key) const noexcept;
+        using is_transparent = void;
+
+        std::size_t operator()(const std::string& key) const noexcept;
+        std::size_t operator()(std::string_view key) const noexcept;
     };
 
     struct keyequal
     {
+        using is_transparent = void;
+
         bool operator()(const std::string& lhs, const std::string& rhs) const noexcept;
+        bool operator()(std::string_view lhs, const std::string& rhs) const noexcept;
+        bool operator()(const std::string& lhs, std::string_view rhs) const noexcept;
     };
 
     using value_type = std::vector<std::string>;
@@ -42,8 +49,22 @@ private:
 
 public:
     using value_iterator = value_type::const_iterator;
-    using values_range   = std::pair<value_iterator, value_iterator>;
     using keys_iterator  = map_type::const_iterator;
+
+    struct values_range
+    {
+        values_range(value_iterator begin, value_iterator end)
+            : begin_it(begin)
+            , end_it(end)
+        {}
+
+        [[nodiscard]] value_iterator begin() const;
+        [[nodiscard]] value_iterator end() const;
+
+    private:
+        value_iterator begin_it;
+        value_iterator end_it;
+    };
 
     headers() = default;
     headers(std::initializer_list<map_type::value_type> init);
@@ -64,16 +85,19 @@ public:
     headers& set(std::string_view key, std::initializer_list<std::string_view> vals);
     headers& add(std::string_view key, std::string_view val);
 
-    headers& set_content_length(size_t length);
+    headers& set_content_length(std::size_t length);
 
     [[nodiscard]] std::optional<std::string_view> get(const std::string& key) const;
+    [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const;
     [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
+    [[nodiscard]] std::optional<std::string_view> operator[](std::string_view& key) const;
 
     [[nodiscard]] std::optional<values_range> get_all(const std::string& key) const;
+    [[nodiscard]] std::optional<values_range> get_all(std::string_view key) const;
 
     // getters for well-known common headers
 
-    [[nodiscard]] std::optional<size_t>       get_content_length() const;
+    [[nodiscard]] std::optional<std::size_t>  get_content_length() const;
     [[nodiscard]] std::optional<content_type> get_content_type() const;
     [[nodiscard]] bool                        is_compressed() const;
     [[nodiscard]] bool                        is_deflated() const;
@@ -82,8 +106,8 @@ public:
     [[nodiscard]] keys_iterator begin() const;
     [[nodiscard]] keys_iterator end() const;
 
-    [[nodiscard]] bool   empty() const noexcept;
-    [[nodiscard]] size_t size() const noexcept;
+    [[nodiscard]] bool        empty() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
 
 private:
     map_type values;

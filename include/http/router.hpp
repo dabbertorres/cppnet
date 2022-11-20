@@ -3,95 +3,73 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "http/handler.hpp"
-#include "http/http.hpp"
+#include "http/request.hpp"
+#include "http/response.hpp"
 
 namespace net::http
 {
 
-// NOTE: clangd seems to think Handler isn't being used - so make it explicit.
-using net::http::Handler;
+template<typename T>
+concept matcher =
+    std::invocable<T, const server_request&> && std::same_as<std::invoke_result_t<T, const server_request&>, bool>;
 
 template<typename T>
-concept Matcher = std::invocable<T, const request&> && std::same_as<bool, std::invoke_result_t<T, const request&>>;
+concept handler = std::invocable<T, const server_request&, response_writer&>;
+
+using matcher_func = std::function<bool(const server_request&)>;
+using handler_func = std::function<void(const server_request&, response_writer&)>;
+
+class router;
 
 struct route
 {
-    route() = delete;
+public:
+    route() = default;
 
-    template<Handler H, Matcher M>
-    route(request_method method, std::string prefix, std::string suffix, H&& handler, M&& matcher) noexcept
-        : prefix{std::move(prefix)}
-        , suffix{std::move(suffix)}
-        , method{method}
-        , matcher{std::forward<H>(handler)}
-        , handler{std::forward<M>(matcher)}
-    {}
+    route& prefix(const std::string& prefix);
+    route& absolute(const std::string& path);
+    route& on_method(request_method method);
+    route& on_content_type(const std::string& content_type);
 
-    route(const route&) = delete;
-
-    route(route&& other) noexcept
-        : prefix{std::move(other.prefix)}
-        , suffix{std::move(other.suffix)}
-        , method{other.method}
-        , matcher{std::move(other.matcher)}
-        , handler{std::move(other.handler)}
-    {}
-
-    route& operator=(const route&) = delete;
-    route& operator=(route&& other) noexcept
+    template<matcher matcher_type>
+    route& on(matcher_type&& m)
     {
-        prefix  = std::move(other.prefix);
-        suffix  = std::move(other.suffix);
-        method  = other.method;
-        matcher = std::move(other.matcher);
-        handler = std::move(other.handler);
-
+        conditions.push_back(std::forward<matcher_type>(m));
         return *this;
     }
 
-    ~route() = default;
+    template<handler handler_type>
+    route& use(handler_type&& h)
+    {
+        handler = std::forward<handler_type>(h);
+        return *this;
+    }
 
-    std::string    prefix;
-    std::string    suffix; // may be empty
-    request_method method;
+    [[nodiscard]] bool matches(const server_request& req) const;
 
-    std::function<bool(const request&)>                   matcher;
-    std::function<void(const request&, server_response&)> handler;
+private:
+    friend class router;
+
+    std::vector<matcher_func> conditions;
+    handler_func              handler;
 };
 
 class router final
 {
 public:
-    router& add(route&& route) noexcept
-    {
-        routes.emplace_back(std::move(route));
-        return *this;
-    }
+    void   add(const route& r);
+    route& add();
+    route& prefix(const std::string& prefix);
+    route& path(const std::string& path);
 
-    template<typename... Args>
-    router& add(Args&&... args) noexcept
-    {
-        routes.emplace_back(std::forward<Args...>(args...));
-        return *this;
-    }
-
-    void operator()(const request& req, server_response& resp) const
-    {
-        for (const auto& r : routes)
-        {
-            if (r.matcher(req))
-            {
-                r.handler(req, resp);
-                return;
-            }
-        }
-    }
+    [[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
+    route_request(const server_request& req) const;
 
 private:
     std::vector<route> routes;

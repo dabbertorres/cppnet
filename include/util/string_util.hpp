@@ -1,6 +1,8 @@
 #pragma once
 
 #include <coroutine>
+#include <cstddef>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -35,11 +37,8 @@ template<typename CharT  = char,
          typename String = std::basic_string_view<CharT, Traits>>
 constexpr bool equal_ignore_case(String lhs, String rhs) noexcept
 {
-    return std::equal(std::begin(lhs),
-                      std::end(lhs),
-                      std::begin(rhs),
-                      std::end(rhs),
-                      [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); });
+    constexpr auto compare = [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); };
+    return std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
 }
 
 template<typename CharT  = char,
@@ -47,17 +46,14 @@ template<typename CharT  = char,
          typename String = std::basic_string_view<CharT, Traits>>
 constexpr bool less_ignore_case(String lhs, String rhs) noexcept
 {
-    return std::equal(std::begin(lhs),
-                      std::end(lhs),
-                      std::begin(rhs),
-                      std::end(rhs),
-                      [](unsigned char l, unsigned char r) { return std::tolower(l) < std::tolower(r); });
+    constexpr auto compare = [](unsigned char l, unsigned char r) { return std::tolower(l) < std::tolower(r); };
+    return std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
 }
 
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
-constexpr auto trim_string(String str) noexcept
+constexpr String trim_string(String str) noexcept
 {
     using namespace std::literals::string_view_literals;
 
@@ -113,7 +109,7 @@ String join(Args join_with, std::initializer_list<Args> strings) noexcept
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
-constexpr auto unquote(String str) noexcept
+constexpr String unquote(String str) noexcept
 {
     // need at least 2 characters to be quoted
     if (str.size() < 3) return str;
@@ -124,6 +120,31 @@ constexpr auto unquote(String str) noexcept
     if (first != str.back()) return str;           // not the same quote
 
     return str.substr(1, str.size() - 2);
+}
+
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string<CharT, Traits>,
+         typename View   = std::basic_string_view<CharT, Traits>>
+constexpr String replace(View view, View replace, View with_this)
+{
+    std::basic_stringstream<CharT, Traits> ss;
+
+    while (!view.empty())
+    {
+        if (view.starts_with(replace))
+        {
+            ss << with_this;
+            view = view.substr(replace.length());
+        }
+        else
+        {
+            ss << view.front();
+            view = view.substr(1);
+        }
+    }
+
+    return ss.str();
 }
 
 }

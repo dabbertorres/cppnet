@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <system_error>
 
 namespace net::io
 {
+
+using byte = std::byte;
 
 struct result
 {

@@ -3,29 +3,26 @@
 #include <cstddef>
 #include <string>
 
-#include "io/reader.hpp"
+#include "http/request.hpp"
+#include "http/response.hpp"
+#include "io/buffered_reader.hpp"
 #include "io/writer.hpp"
 #include "util/result.hpp"
-
-namespace net::http
-{
-
-struct request;
-struct server_response;
-
-}
 
 namespace net::http::http2
 {
 
 using util::result;
 
-using TODO = std::void_t<>;
+std::error_condition request_encode(io::writer& writer, const client_request& req) noexcept;
+std::error_condition response_encode(const server_response& resp) noexcept;
 
-result<std::void_t<>, std::string> response_encode(io::writer<std::byte>& w, const server_response& r) noexcept;
-result<std::void_t<>, std::string> request_encode(io::writer<std::byte>& w, const request& r) noexcept;
+result<server_request, std::error_condition>
+request_decode(io::buffered_reader& reader,
+               std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
-result<server_response, TODO> response_decode(io::reader<std::byte>& r) noexcept;
-result<request, TODO>         request_decode(io::reader<std::byte>& r) noexcept;
+result<server_response, std::error_condition>
+response_decode(io::buffered_reader& reader,
+                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 }

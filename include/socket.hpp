@@ -25,11 +25,10 @@ enum class protocol
 };
 
 class socket
-    : public io::reader<char>
-    , public io::writer<char>
+    : public io::reader
+    , public io::writer
 {
 public:
-    socket();
     socket(int fd);
 
     // non-copyable
@@ -46,8 +45,8 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
-    io::result read(char* data, size_t length) noexcept override;
-    io::result write(const char* data, size_t length) noexcept override;
+    io::result read(io::byte* data, size_t length) noexcept override;
+    io::result write(const io::byte* data, size_t length) noexcept override;
 
     void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
 
@@ -55,12 +54,13 @@ protected:
     static constexpr int invalid_fd = -1;
 
     template<typename T>
-    bool set_option(int flag, T* value) noexcept
+    static bool set_option(int fd, int flag, T* value) noexcept
     {
         int sts = ::setsockopt(fd, SOL_SOCKET, flag, value, sizeof(T));
         return sts == 0;
     }
 
+private:
     int fd;
 };
 

@@ -1,7 +1,7 @@
 # vim: ft=yaml
 
 CompileFlags:
-  CompilationDatabase: ./build/
+  CompilationDatabase: build/
   Add:
   - -fstack-usage
   - -pedantic-errors

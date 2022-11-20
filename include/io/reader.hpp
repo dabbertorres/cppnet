@@ -1,15 +1,12 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
-#include <string_view>
 
 #include "io.hpp"
 
 namespace net::io
 {
 
-template<typename D>
 class reader
 {
 public:
@@ -21,7 +18,8 @@ public:
 
     virtual ~reader() = default;
 
-    virtual result read(D* data, size_t length) = 0;
+    virtual result read(byte* data, size_t length) = 0;
+    result         read(char* data, size_t length) { return read(reinterpret_cast<byte*>(data), length); }
 
 protected:
     reader() = default;

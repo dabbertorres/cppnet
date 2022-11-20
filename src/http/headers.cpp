@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
@@ -14,15 +15,20 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-size_t headers::keyhash::operator()(const std::string& key) const noexcept
+std::size_t headers::keyhash::operator()(const std::string& key) const noexcept
+{
+    return operator()(static_cast<std::string_view>(key));
+}
+
+std::size_t headers::keyhash::operator()(std::string_view key) const noexcept
 {
     // variant of Fowler-Noll-Vo
 
-    size_t result = 2166136261;
+    std::size_t result = 2166136261;
 
     for (auto c : key)
     {
-        result = (result * 16777619) ^ static_cast<size_t>(std::tolower(c));
+        result = (result * 16777619) ^ static_cast<std::size_t>(std::tolower(c));
     }
 
     return result;
@@ -31,6 +37,16 @@ size_t headers::keyhash::operator()(const std::string& key) const noexcept
 bool headers::keyequal::operator()(const std::string& lhs, const std::string& rhs) const noexcept
 {
     return net::util::equal_ignore_case(lhs, rhs);
+}
+
+bool headers::keyequal::operator()(std::string_view lhs, const std::string& rhs) const noexcept
+{
+    return net::util::equal_ignore_case(lhs, static_cast<std::string_view>(rhs));
+}
+
+bool headers::keyequal::operator()(const std::string& lhs, std::string_view rhs) const noexcept
+{
+    return net::util::equal_ignore_case(static_cast<std::string_view>(lhs), rhs);
 }
 
 headers::headers(std::initializer_list<map_type::value_type> init)
@@ -92,9 +108,19 @@ headers& headers::set(std::string_view key, std::initializer_list<std::string_vi
 
 headers& headers::add(std::string_view key, std::string_view val) { return add(std::string(key), val); }
 
-headers& headers::set_content_length(size_t length) { return set("Content-Length"sv, std::to_string(length)); }
+headers& headers::set_content_length(std::size_t length) { return set("Content-Length"sv, std::to_string(length)); }
 
 [[nodiscard]] std::optional<std::string_view> headers::get(const std::string& key) const
+{
+    auto iter = values.find(key);
+    if (iter == values.end()) return std::nullopt;
+    if (iter->second.empty()) return std::nullopt;
+
+    std::string_view view = iter->second.front();
+    return {view};
+}
+
+[[nodiscard]] std::optional<std::string_view> headers::get(std::string_view key) const
 {
     auto iter = values.find(key);
     if (iter == values.end()) return std::nullopt;
@@ -116,12 +142,12 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
     };
 }
 
-[[nodiscard]] std::optional<size_t> headers::get_content_length() const
+[[nodiscard]] std::optional<std::size_t> headers::get_content_length() const
 {
-    auto maybe = get("Content-Length");
+    auto maybe = get("Content-Length"sv);
     if (!maybe.has_value()) return std::nullopt;
 
-    size_t length;
+    std::size_t length;
     auto [_, err] = std::from_chars(maybe->begin(), maybe->end(), length);
 
     if (static_cast<int>(err) != 0) return std::nullopt;
@@ -130,11 +156,11 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
 
 [[nodiscard]] std::optional<content_type> headers::get_content_type() const
 {
-    auto maybe = get("Content-Type");
+    auto maybe = get("Content-Type"sv);
     if (!maybe.has_value()) return std::nullopt;
 
     const std::string_view type  = maybe.value();
-    const size_t           split = type.find(';');
+    const std::size_t      split = type.find(';');
     if (split == std::string_view::npos) return content_type{.type = std::string{type}};
 
     content_type out{.type = std::string{type}};
@@ -176,7 +202,7 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
 
 [[nodiscard]] bool headers::is_compressed() const
 {
-    auto maybe = get("Content-Encoding");
+    auto maybe = get("Content-Encoding"sv);
     if (!maybe.has_value()) return false;
 
     auto val = maybe.value();
@@ -185,7 +211,7 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
 
 [[nodiscard]] bool headers::is_deflated() const
 {
-    auto maybe = get("Content-Encoding");
+    auto maybe = get("Content-Encoding"sv);
     if (!maybe.has_value()) return false;
 
     auto val = maybe.value();
@@ -194,7 +220,7 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
 
 [[nodiscard]] bool headers::is_gziped() const
 {
-    auto maybe = get("Content-Encoding");
+    auto maybe = get("Content-Encoding"sv);
     if (!maybe.has_value()) return false;
 
     auto val = maybe.value();
@@ -206,7 +232,7 @@ headers& headers::set_content_length(size_t length) { return set("Content-Length
 
 [[nodiscard]] bool headers::empty() const noexcept { return values.empty(); }
 
-[[nodiscard]] size_t headers::size() const noexcept { return values.size(); }
+[[nodiscard]] std::size_t headers::size() const noexcept { return values.size(); }
 
 bool operator==(const headers& lhs, const headers& rhs) noexcept
 {

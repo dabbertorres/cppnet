@@ -1,29 +1,27 @@
 #include <algorithm>
 #include <iostream>
 
-#include "http/http.hpp"
 #include "http/server.hpp"
 
-int main(int argc, char** argv)
+int main()
 {
     using namespace std::chrono_literals;
     using namespace std::string_view_literals;
 
-    const net::http::server_config config{};
+    net::http::server_config config{};
+    config.router.add().use(
+        [](const net::http::server_request& req, net::http::response_writer& resp)
+        {
+            resp.headers().set("X-Msg"sv, "Hello"sv);
+            resp.send(net::http::status::OK, 11).write("hello world", 11);
+            std::cout << "handled: " << net::http::method_string(req.method) << " " << req.uri.build() << '\n';
+        });
     config.logger->set_level(spdlog::level::trace);
 
     net::http::server server{config};
 
     std::cout << "starting...\n";
-    server.serve(
-        [](const net::http::request& req, net::http::server_response& resp)
-        {
-            resp.status_code = net::http::status::OK;
-            resp.headers.set("X-Msg"sv, "Hello"sv);
-            resp.headers.set_content_length(11);
-            resp.body.write("hello world", 11);
-            std::cout << "handled: " << net::http::method_string(req.method) << " " << req.uri.build() << '\n';
-        });
+    server.serve();
     std::cout << "exiting...\n";
 
     return 0;

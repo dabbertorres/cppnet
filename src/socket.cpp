@@ -21,10 +21,6 @@
 namespace net
 {
 
-socket::socket()
-    : socket(invalid_fd)
-{}
-
 socket::socket(int fd)
     : fd{fd}
 {}
@@ -104,7 +100,7 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(char* data, size_t length) noexcept
+io::result socket::read(io::byte* data, size_t length) noexcept
 {
     size_t rcvd     = 0;
     size_t attempts = 0;
@@ -137,7 +133,7 @@ io::result socket::read(char* data, size_t length) noexcept
     return {.count = rcvd};
 }
 
-io::result socket::write(const char* data, size_t length) noexcept
+io::result socket::write(const io::byte* data, size_t length) noexcept
 {
     size_t sent = 0;
     while (sent < length)
@@ -173,7 +169,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcep
             .l_onoff  = 1,
             .l_linger = static_cast<int>(graceful_timeout.count()),
         };
-        set_option(SO_LINGER, &linger);
+        set_option(fd, SO_LINGER, &linger);
     }
 
     ::close(fd);

@@ -10,18 +10,17 @@
 namespace net::io
 {
 
-template<typename D>
-class buffered_writer : public writer<D>
+class buffered_writer : public writer
 {
 public:
-    buffered_writer(writer<D>& underlying, size_t bufsize = 1024)
+    buffered_writer(writer& underlying, size_t bufsize = 1024)
         : impl{&underlying}
         , buf(bufsize)
     {
         buf.resize(0);
     }
 
-    result write(const D* data, size_t length) override
+    result write(const byte* data, size_t length) override
     {
         if (length == 0) return {.count = 0};
 
@@ -30,7 +29,8 @@ public:
         // fill up the buffer as much as possible first...
         if (buf.size() < buf.capacity())
         {
-            auto start     = buf.begin() + buf.size();
+            auto start = buf.begin();
+            std::advance(start, buf.size());
             auto available = std::min(buf.capacity() - buf.size(), length);
             buf.resize(buf.size() + available);
             std::copy_n(data, available, start);
@@ -74,6 +74,8 @@ public:
         return {.count = total};
     }
 
+    using writer::write;
+
     result flush()
     {
         if (buf.empty()) return {};
@@ -86,7 +88,7 @@ public:
     // reset clears the buffer, and if other is not null, switches to it.
     // If other is null, the current writer is kept.
     // This allows re-use of the buffer's memory with other writers.
-    void reset(writer<D>* other)
+    void reset(writer* other)
     {
         if (other != nullptr) impl = other;
         reset();
@@ -102,10 +104,14 @@ private:
         if (res.count < buf.size())
         {
             // if short, adjust
-            auto end      = buf.begin() + res.count;
-            auto leftover = buf.size() - res.count;
+            auto end = buf.begin();
+            std::advance(end, res.count);
 
-            std::copy_backward(end, buf.end(), buf.begin() + leftover);
+            auto leftover = buf.size() - res.count;
+            auto new_end  = buf.begin();
+            std::advance(new_end, leftover);
+
+            std::copy_backward(end, buf.end(), new_end);
             buf.resize(leftover);
         }
         else
@@ -116,8 +122,8 @@ private:
         return res;
     }
 
-    writer<D>*     impl;
-    std::vector<D> buf;
+    writer*           impl;
+    std::vector<byte> buf;
 };
 
 }

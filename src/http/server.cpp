@@ -1,6 +1,9 @@
 #include "http/server.hpp"
 
 #include "http/http11.hpp"
+#include "http/http2.hpp"
+#include "io/buffered_writer.hpp"
+#include "util/thread_pool.hpp"
 
 namespace net::http
 {
@@ -12,42 +15,13 @@ server::server(const server_config& cfg)
                protocol::not_care,
                std::chrono::duration_cast<std::chrono::microseconds>(cfg.header_read_timeout))
     , is_serving{false}
+    , router(cfg.router)
     , logger{cfg.logger}
+    , threads(cfg.num_threads)
     , max_header_bytes{cfg.max_header_bytes}
     , max_pending_connections{cfg.max_pending_connections}
 {
-    connections.resize(8);
-}
-
-server::server(server&& other) noexcept
-    : listener{std::move(other.listener)}
-    , is_serving{other.is_serving.exchange(false)}
-    , logger{std::move(other.logger)}
-    , connections{std::move(other.connections)}
-    , max_header_bytes{other.max_header_bytes}
-    , max_pending_connections{other.max_pending_connections}
-{
-    other.connections.clear();
-}
-
-server& server::operator=(server&& other) noexcept
-{
-    if (is_serving)
-    {
-        close();
-        listener.~listener();
-    }
-
-    listener                = std::move(other.listener);
-    is_serving              = other.is_serving.exchange(false);
-    logger                  = std::move(other.logger);
-    connections             = std::move(other.connections);
-    max_header_bytes        = other.max_header_bytes;
-    max_pending_connections = other.max_pending_connections;
-
-    other.connections.clear();
-
-    return *this;
+    connections.resize(cfg.num_threads);
 }
 
 server::~server() { close(); }
@@ -59,29 +33,114 @@ void server::close()
     logger->flush();
 }
 
-io::result server::response_body::write(const char* data, size_t length)
+void server::serve()
 {
-    if (!is_write_started)
+    if (is_serving.exchange(true))
     {
-        is_write_started = true;
-
-        if (!resp.headers.get_content_length().has_value())
-        {
-            // TODO: buffer the response data since the user didn't specify the length
-            // Let the server complete the response encoding once the handler returns.
-            // On the other hand, should the API effectively call manually setting the
-            // content-length required, and call not setting it undefined behavior?
-            // (or more accurately, non-compliant with HTTP)
-        }
-
-        if (auto err = http11::response_encode(*parent, resp); err) return {.err = err};
+        throw std::runtime_error("already serving");
     }
 
-    // TODO: what to do if handler writes more data than they said they would?
-    return parent->write(data, length);
+    listener.listen(max_pending_connections);
+
+    while (is_serving)
+    {
+        // TODO: thread pool and coroutines
+
+        try
+        {
+            logger->trace("waiting for connection");
+            auto client_sock = listener.accept();
+            logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
+
+            const std::lock_guard guard(connections_mu);
+            connections.emplace_back(
+                [this](tcp_socket&& socket)
+                {
+                    logger->trace("new connection handler started");
+
+                    // TODO: pull from a queue when connection closes
+                    // TODO: pull from ready sockets via coroutines
+
+                    io::buffered_reader reader(socket, max_header_bytes);
+
+                    logger->trace("ready to read from connection");
+
+                    io::buffered_writer writer(socket);
+
+                    logger->trace("ready to write to connection");
+
+                    try
+                    {
+                        while (is_serving && socket.valid())
+                        {
+                            logger->trace("decoding request");
+
+                            auto req_result = http11::request_decode(reader);
+                            /* TODO http2::request_decode(client_sock); */
+
+                            logger->trace("request decoded");
+                            if (req_result.has_error())
+                            {
+                                logger->error("request decode error: {}", req_result.to_error().message());
+                                break;
+                            }
+
+                            auto req = req_result.to_value();
+
+                            auto maybe_handler = router.route_request(req);
+                            if (!maybe_handler.has_value())
+                            {
+                                // TODO: respond 404
+                            }
+
+                            const auto& handler = maybe_handler->get();
+
+                            threads.schedule(
+                                [this, req, &handler, &writer]
+                                {
+                                    server_response resp{
+                                        .version = req.version,
+                                        .body    = &writer,
+                                    };
+
+                                    response_encoder encode = nullptr;
+                                    switch (req.version.major)
+                                    {
+                                    case 1: encode = http11::response_encode; break;
+                                    case 2: encode = http2::response_encode; break;
+                                    default: [[unlikely]]; break; // TODO it should fail before this point, but....?
+                                    }
+
+                                    response_writer rw(resp, encode);
+
+                                    logger->trace("calling handler");
+                                    handler(req, rw);
+                                    logger->trace("handler returned");
+
+                                    logger->trace("flushing writer");
+                                    writer.flush();
+                                    logger->trace("response sent");
+                                });
+                        }
+                    }
+                    catch (const std::exception& ex)
+                    {
+                        logger->error("fatal exception in connection handler: {}", ex.what());
+                    }
+
+                    logger->trace("connection closing");
+                },
+                std::move(client_sock));
+        }
+        catch (const std::exception& ex)
+        {
+            // TODO
+            logger->critical("exception", ex.what());
+        }
+    }
 }
 
-bool server::enforce_protocol(const request& req, server_response& resp) noexcept
+bool server::enforce_protocol(const server_request& req, response_writer& resp) noexcept
 {
     // TODO:
     // Field values containing CR, LF, or NUL characters are invalid and dangerous, due to the

@@ -15,13 +15,8 @@
 namespace net
 {
 
-tcp_socket::tcp_socket(int fd)
-    : socket(fd)
-{}
-
-tcp_socket::tcp_socket(
+int tcp_socket::open(
     std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)
-    : socket(invalid_fd)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -43,6 +38,7 @@ tcp_socket::tcp_socket(
     if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!
+    int fd = -1;
 
     for (auto* info = servinfo; info != nullptr; info = info->ai_next)
     {
@@ -54,7 +50,7 @@ tcp_socket::tcp_socket(
             .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()),
         };
 
-        if (!set_option(SO_RCVTIMEO, &tv))
+        if (!set_option(fd, SO_RCVTIMEO, &tv))
         {
             ::close(fd);
             fd = invalid_fd;
@@ -64,7 +60,7 @@ tcp_socket::tcp_socket(
         if (keepalive)
         {
             int yes = 1;
-            if (!set_option(SO_RCVTIMEO, &yes))
+            if (!set_option(fd, SO_RCVTIMEO, &yes))
             {
                 ::close(fd);
                 fd = invalid_fd;
@@ -93,6 +89,17 @@ tcp_socket::tcp_socket(
     freeaddrinfo(servinfo);
 
     if (fd == invalid_fd) throw exception{"failed to bind"};
+
+    return fd;
 }
+
+tcp_socket::tcp_socket(int fd) noexcept
+    : socket(fd)
+{}
+
+tcp_socket::tcp_socket(
+    std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)
+    : socket(open(host, port, proto, keepalive, timeout))
+{}
 
 }

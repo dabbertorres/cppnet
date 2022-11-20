@@ -15,11 +15,19 @@
 namespace net
 {
 
+udp_socket::udp_socket(int fd) noexcept
+    : socket(fd)
+{}
+
 udp_socket::udp_socket(std::string_view port, protocol proto)
     : udp_socket("", port, proto)
 {}
 
 udp_socket::udp_socket(std::string_view host, std::string_view port, protocol proto)
+    : socket(open(host, port, proto))
+{}
+
+int udp_socket::open(std::string_view host, std::string_view port, protocol proto)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -42,6 +50,7 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, protocol pr
     if (sts != 0) throw_for_gai_error(sts);
 
     // find first valid addr, and use it!
+    int fd = -1;
 
     for (::addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
@@ -51,7 +60,9 @@ udp_socket::udp_socket(std::string_view host, std::string_view port, protocol pr
 
     freeaddrinfo(servinfo);
 
-    if (fd == invalid_fd) throw exception{"failed to bind"};
+    if (fd == -1) throw exception{"failed to bind"};
+
+    return fd;
 }
 
 }
