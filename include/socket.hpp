@@ -48,7 +48,7 @@ public:
     io::result read(io::byte* data, size_t length) noexcept override;
     io::result write(const io::byte* data, size_t length) noexcept override;
 
-    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
+    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) const noexcept;
 
 protected:
     static constexpr int invalid_fd = -1;

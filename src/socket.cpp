@@ -10,7 +10,6 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
-#include <sys/_select.h>
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
@@ -71,7 +70,11 @@ std::string addr_name(sockaddr_storage* addr)
         break;
 
     [[unlikely]] default:
+#ifdef __cpp_lib_unreachable
         std::unreachable();
+#else
+;
+#endif
     }
 
     const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
@@ -159,7 +162,7 @@ io::result socket::write(const io::byte* data, size_t length) noexcept
     return {.count = sent};
 }
 
-void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept
+void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const noexcept
 {
     if (!valid()) return;
 
