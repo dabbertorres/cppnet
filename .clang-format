@@ -12,7 +12,9 @@ AlignConsecutiveDeclarations: Consecutive
 AlignConsecutiveMacros: Consecutive
 AlignEscapedNewlines: Left
 AlignOperands: AlignAfterOperator
-AlignTrailingComments: true
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
 
 AllowAllArgumentsOnNextLine: false
 # AllowAllConstructorInitializersOnNextLine: false # deprecated
@@ -56,8 +58,10 @@ BraceWrapping:
   SplitEmptyNamespace:   false
   SplitEmptyRecord:      false
 
+BreakAfterAttributes: Leave
 BreakBeforeBinaryOperators: NonAssignment
 BreakBeforeConceptDeclarations: Always
+BreakBeforeInlineASMColon: OnlyMultiline
 BreakBeforeTernaryOperators: true
 BreakConstructorInitializers: BeforeComma
 BreakInheritanceList: BeforeComma
@@ -112,9 +116,16 @@ IndentWidth: 4
 IndentWrappedFunctionNames: false
 
 InsertBraces: false
+InsertNewlineAtEOF: true
 InsertTrailingCommas: Wrapped
+IntegerLiteralSeparator:
+  Binary: 4
+  Decimal: 3
+  Hex: 2
 KeepEmptyLinesAtTheStartOfBlocks: false
 LambdaBodyIndentation: Signature
+
+LineEnding: DeriveLF
 
 MacroBlockBegin: '^.+_(BEGIN|HEAD|START)$'
 MacroBlockEnd:   '^.+_(END|STOP)$'
@@ -150,7 +161,9 @@ QualifierOrder:
 ReferenceAlignment: Pointer
 ReflowComments: true
 RemoveBracesLLVM: false
+RemoveSemicolon: true
 RequiresClausePosition: OwnLine
+RequiresExpressionIndentation: OuterScope
 SeparateDefinitionBlocks: Leave
 ShortNamespaceLines: 1
 

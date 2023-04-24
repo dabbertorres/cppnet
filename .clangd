@@ -23,13 +23,21 @@ CompileFlags:
   - -Wunreachable-code-aggressive
   Remove:
   - -Werror
+Index:
+  Background: Build
+  StandardLibrary: Yes
+Style:
+  FullyQualifiedNamespaces: No
 Diagnostics:
   UnusedIncludes: Strict
   Suppress:
   - -Wpadded
+Completion:
+  AllScopes: false
 InlayHints:
   Enabled: Yes
   ParameterNames: Yes
   DeducedTypes: Yes
+  Designators: Yes
 Hover:
   ShowAKA: Yes
