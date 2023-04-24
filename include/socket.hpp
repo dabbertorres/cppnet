@@ -17,13 +17,6 @@ namespace net
 
 using namespace std::chrono_literals;
 
-enum class protocol
-{
-    not_care,
-    ipv4,
-    ipv6,
-};
-
 class socket
     : public io::reader
     , public io::writer

@@ -2,6 +2,7 @@
 
 #include <string_view>
 
+#include "ip_addr.hpp"
 #include "socket.hpp"
 
 namespace net

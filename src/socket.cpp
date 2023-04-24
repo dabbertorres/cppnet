@@ -105,12 +105,12 @@ std::string socket::remote_addr() const
 
 io::result socket::read(io::byte* data, size_t length) noexcept
 {
-    size_t rcvd     = 0;
+    size_t received = 0;
     size_t attempts = 0;
 
     while (true)
     {
-        const int64_t num = ::recv(fd, data + rcvd, length - rcvd, 0);
+        const int64_t num = ::recv(fd, data + received, length - received, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -118,22 +118,22 @@ io::result socket::read(io::byte* data, size_t length) noexcept
                 ++attempts;
 
                 if (attempts < 5) continue;
-                return {.count = rcvd};
+                return {.count = received};
             }
 
             return {
-                .count = rcvd,
+                .count = received,
                 .err   = std::error_condition{errno, std::system_category()}
             };
         }
 
         // client closed connection
-        if (num == 0) return {.count = rcvd};
+        if (num == 0) return {.count = received};
 
-        rcvd += static_cast<size_t>(num);
+        received += static_cast<size_t>(num);
         break;
     }
-    return {.count = rcvd};
+    return {.count = received};
 }
 
 io::result socket::write(const io::byte* data, size_t length) noexcept
@@ -168,7 +168,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const n
 
     if (graceful)
     {
-        struct linger linger = {
+        linger linger = {
             .l_onoff  = 1,
             .l_linger = static_cast<int>(graceful_timeout.count()),
         };

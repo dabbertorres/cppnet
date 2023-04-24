@@ -13,6 +13,7 @@
 /* #    error "TODO Windows I/O Completion Ports" */
 /* #endif */
 
+#include "ip_addr.hpp"
 #include "tcp.hpp"
 
 namespace net
@@ -50,8 +51,8 @@ public:
 
     ~listener() noexcept;
 
-    void       listen(uint16_t max_backlog);
-    tcp_socket accept() const;
+    void                     listen(uint16_t max_backlog);
+    [[nodiscard]] tcp_socket accept() const;
 
 private:
     std::atomic_bool is_listening;
