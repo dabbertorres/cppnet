@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -45,7 +47,7 @@ public:
 
     [[nodiscard]] std::string to_string() const;
 
-    [[nodiscard]] constexpr explicit operator std::uint32_t() const
+    [[nodiscard]] constexpr explicit operator std::uint32_t() const noexcept
     {
         // clang-format off
         return static_cast<std::uint32_t>(data[0]) << 24
@@ -69,17 +71,31 @@ public:
         // clang-format on
     }
 
-    friend constexpr auto operator<=>(const ipv4_addr& lhs, const ipv4_addr& rhs) noexcept = default;
+    friend constexpr auto operator<=>(const ipv4_addr& lhs, const ipv4_addr& rhs) noexcept;
+    friend constexpr bool operator==(const ipv4_addr& lhs, const ipv4_addr& rhs) noexcept = default;
 
 private:
+    // NOTE: network-byte-order
     alignas(std::uint32_t) std::array<std::uint8_t, 4> data;
 };
+
+constexpr auto operator<=>(const ipv4_addr& lhs, const ipv4_addr& rhs) noexcept
+{
+    for (auto i = 0U; i < lhs.data.size(); ++i)
+    {
+        auto cmp = lhs.data[i] <=> rhs.data[i];
+        if (std::is_lt(cmp)) return std::partial_ordering::less;
+        if (std::is_gt(cmp)) return std::partial_ordering::greater;
+    }
+
+    return std::partial_ordering::equivalent;
+}
 
 class ipv6_addr
 {
 public:
     static std::optional<ipv6_addr> parse(std::string_view str) noexcept;
-    static constexpr ipv6_addr      loopback() noexcept;
+    static constexpr ipv6_addr      loopback() noexcept { return ipv6_addr(0, 0, 0, 0, 0, 0, 0, 1); }
 
     constexpr ipv6_addr() noexcept = default;
 
@@ -129,6 +145,26 @@ public:
         : data(parts)
     {}
 
+    // NOLINTNEXTLINE(*-avoid-c-arrays)
+    constexpr explicit ipv6_addr(const std::uint8_t (&parts)[16]) noexcept
+        : data{parts[0],
+               parts[1],
+               parts[2],
+               parts[3],
+               parts[4],
+               parts[5],
+               parts[6],
+               parts[7],
+               parts[8],
+               parts[9],
+               parts[10],
+               parts[11],
+               parts[12],
+               parts[13],
+               parts[14],
+               parts[15]}
+    {}
+
     constexpr explicit ipv6_addr(std::uint16_t p0,
                                  std::uint16_t p1,
                                  std::uint16_t p2,
@@ -157,9 +193,28 @@ public:
         }
     {}
 
+    constexpr explicit ipv6_addr(std::uint8_t p0,
+                                 std::uint8_t p1,
+                                 std::uint8_t p2,
+                                 std::uint8_t p3,
+                                 std::uint8_t p4,
+                                 std::uint8_t p5,
+                                 std::uint8_t p6,
+                                 std::uint8_t p7,
+                                 std::uint8_t p8,
+                                 std::uint8_t p9,
+                                 std::uint8_t p10,
+                                 std::uint8_t p11,
+                                 std::uint8_t p12,
+                                 std::uint8_t p13,
+                                 std::uint8_t p14,
+                                 std::uint8_t p15) noexcept
+        : data{p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15}
+    {}
+
     [[nodiscard]] std::string to_string() const;
 
-    [[nodiscard]] constexpr std::uint64_t subnet_prefix() const
+    [[nodiscard]] constexpr std::uint64_t subnet_prefix() const noexcept
     {
         // clang-format off
             return static_cast<std::uint64_t>(data[0]) << 56
@@ -173,7 +228,7 @@ public:
         // clang-format on
     }
 
-    [[nodiscard]] constexpr std::uint64_t interface_identifier() const
+    [[nodiscard]] constexpr std::uint64_t interface_identifier() const noexcept
     {
         // clang-format off
             return static_cast<std::uint64_t>(data[8])  << 56
@@ -190,11 +245,39 @@ public:
     // NOTE: not null-terminated
     [[nodiscard]] explicit constexpr operator const std::uint8_t*() const noexcept { return data.data(); }
 
-    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ipv6_addr& rhs) noexcept = default;
+    [[nodiscard]] constexpr bool is_loopback() const noexcept
+    {
+        return data.back() == 1 && std::all_of(data.begin(), data.end() - 1, [](auto b) { return b == 0; });
+    }
+
+    [[nodiscard]] constexpr bool is_unique_local() const noexcept { return (data[0] & 0xfc) == 0b1111'1100; }
+    [[nodiscard]] constexpr bool is_link_local() const noexcept
+    {
+        return data[0] == 0b1111'1110 && data[1] == 0b1000'0000
+            && std::all_of(data.begin() + 2, data.end() - 8, [](auto b) { return b == 0; });
+    }
+
+    [[nodiscard]] constexpr bool is_multicast() const noexcept { return data[0] == 0b1111'1111; }
+
+    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ipv6_addr& rhs) noexcept;
+    friend constexpr bool operator==(const ipv6_addr& lhs, const ipv6_addr& rhs) noexcept = default;
 
 private:
+    // NOTE: network-byte-order
     alignas(std::uint64_t) std::array<std::uint8_t, 16> data;
 };
+
+constexpr auto operator<=>(const ipv6_addr& lhs, const ipv6_addr& rhs) noexcept
+{
+    for (auto i = 0U; i < lhs.data.size(); ++i)
+    {
+        auto cmp = lhs.data[i] <=> rhs.data[i];
+        if (std::is_lt(cmp)) return std::partial_ordering::less;
+        if (std::is_gt(cmp)) return std::partial_ordering::greater;
+    }
+
+    return std::partial_ordering::equivalent;
+}
 
 class ip_addr
 {
@@ -230,10 +313,25 @@ public:
         return std::visit([](const auto& v) { return v.to_string(); }, addr);
     }
 
-    friend constexpr auto operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept = default;
+    friend constexpr auto operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept;
+
+    friend constexpr auto operator<=>(const ip_addr& lhs, const ipv6_addr& rhs) noexcept;
+    friend constexpr auto operator<=>(const ip_addr& lhs, const ipv4_addr& rhs) noexcept;
+
+    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
+    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
+
+    friend constexpr bool operator==(const ip_addr& lhs, const ip_addr& rhs) noexcept = default;
 
 private:
     std::variant<ipv4_addr, ipv6_addr> addr;
 };
+
+constexpr auto operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept
+{
+    if (lhs.is_ipv4() && rhs.is_ipv4()) return lhs.to_ipv4() <=> rhs.to_ipv4();
+    if (lhs.is_ipv6() && rhs.is_ipv6()) return lhs.to_ipv6() <=> rhs.to_ipv6();
+    return std::partial_ordering::unordered;
+}
 
 }
