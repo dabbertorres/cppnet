@@ -82,6 +82,11 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
     auto      sts      = ::getaddrinfo(hostname.data(), nullptr, &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
+    // Keep track of previous addresses to remove duplicates.
+    // This assumes the addresses are given into us in a sorted
+    // order, which appears to typically be the case.
+    // Even if that turns out to not always be the case, this is fine,
+    // since this is just a lightweight "best effort" attempt.
     std::size_t prev_hash = 0;
 
     for (auto* next = servinfo; next != nullptr; next = next->ai_next)
