@@ -9,14 +9,6 @@
       "version>=": "2.13.8"
     },
     {
-      "name": "fmt",
-      "version>=": "8.1.1"
-    },
-    {
-      "name": "cxxopts",
-      "version>=": "3.0.0"
-    },
-    {
       "name": "spdlog",
       "version>=": "1.9.2"
     },

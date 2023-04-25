@@ -1,46 +1,39 @@
 cmake_minimum_required(VERSION 3.18)
 
 # use vcpkg for dependency management
-include("../cmake/vcpkg.cmake")
+include("../../cmake/vcpkg.cmake")
 
 # for use with clangd and other libclang tools
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(cxxopts CONFIG REQUIRED)
-find_package(fmt CONFIG REQUIRED)
-
-add_executable(net-example main.cpp)
+add_executable(net-example-ip-resolv main.cpp)
 
 target_include_directories(
-  net-example
+  net-example-ip-resolv
   PRIVATE
   "${CMAKE_SOURCE_DIR}/include/"
-  cxxopts::cxxopts
-  fmt::fmt
 )
 
 target_link_libraries(
-  net-example
+  net-example-ip-resolv
   PRIVATE
-  cxxopts::cxxopts
-  fmt::fmt
   net
 )
 
 target_compile_features(
-  net-example
-  PRIVATE cxx_std_20
+  net-example-ip-resolv
+  PRIVATE cxx_std_23
 )
 
 if(MSVC)
   target_compile_options(
-    net-example
+    net-example-ip-resolv
     PRIVATE
     /W4
   )
 else()
   target_compile_options(
-    net-example
+    net-example-ip-resolv
     PRIVATE
     -Wall
     -Wextra
