@@ -121,7 +121,7 @@ InsertTrailingCommas: Wrapped
 IntegerLiteralSeparator:
   Binary: 4
   Decimal: 3
-  Hex: 2
+  Hex: 4
 KeepEmptyLinesAtTheStartOfBlocks: false
 LambdaBodyIndentation: Signature
 

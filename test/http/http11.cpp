@@ -74,9 +74,9 @@ TEST_CASE("with headers and body", "[http][1.1]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "Content-Type: text/plain\r\n"
+                                         "Content-Length: 18\r\n"
                                          "\r\n"
-                                         "this is a request\r\n"
-                                         "\r\n");
+                                         "this is a request\n");
     net::io::buffered_reader     buf_reader(content);
 
     auto result = net::http::http11::request_decode(buf_reader);
@@ -87,9 +87,10 @@ TEST_CASE("with headers and body", "[http][1.1]")
     const auto expected_route = route.to_value();
 
     const net::http::headers expect_headers{
-        {      "Accept", {"application/json"}},
-        {     "X-Hello",      {"hello world"}},
-        {"Content-Type",       {"text/plain"}},
+        {        "Accept", {"application/json"}},
+        {       "X-Hello",      {"hello world"}},
+        {  "Content-Type",       {"text/plain"}},
+        {"Content-Length",               {"18"}},
     };
 
     auto request = result.to_value();
@@ -98,7 +99,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
 
     auto read_result = request.body.read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
-    CHECK(read_result.count == 23);
+    CHECK(read_result.count == 18);
 
     body = body.substr(0, read_result.count);
     body = net::util::trim_string(body);
@@ -119,12 +120,12 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "Content-Type: text/plain\r\n"
+                                         "Content-Length: 38\r\n"
                                          "\r\n"
                                          "this is a request\n"
                                          "with\n"
                                          "multiple\n"
-                                         "lines\r\n"
-                                         "\r\n");
+                                         "lines\n");
     net::io::buffered_reader     buf_reader(content);
 
     auto result = net::http::http11::request_decode(buf_reader);
@@ -135,9 +136,10 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
     const auto expected_route = route.to_value();
 
     const net::http::headers expect_headers{
-        {      "Accept", {"application/json"}},
-        {     "X-Hello",      {"hello world"}},
-        {"Content-Type",       {"text/plain"}},
+        {        "Accept", {"application/json"}},
+        {       "X-Hello",      {"hello world"}},
+        {  "Content-Type",       {"text/plain"}},
+        {"Content-Length",               {"38"}},
     };
 
     auto request = result.to_value();
@@ -146,7 +148,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
 
     auto read_result = request.body.read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
-    CHECK(read_result.count == 43);
+    CHECK(read_result.count == 38);
 
     body = body.substr(0, read_result.count);
     body = net::util::trim_string(body);

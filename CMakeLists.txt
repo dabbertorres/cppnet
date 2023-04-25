@@ -31,7 +31,7 @@ target_include_directories(
 
 target_link_libraries(
   net
-  PRIVATE
+  PUBLIC
   spdlog::spdlog
 )
 
@@ -46,40 +46,22 @@ if(MSVC)
     PRIVATE
     /W4
   )
-
-  # target_link_options(
-  #   net
-  #   PRIVATE
-  # )
 else()
-  # find_program(MOLD "mold")
-  # if(MOLD)
-  #   target_link_options(
-  #     net
-  #     PUBLIC
-  #     -fuse-ld=mold
-  #   )
-  # endif()
-
   if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-    target_compile_options(
-      net
-      PRIVATE
-      -fdiagnostics-color=always
+    set(
+      COMPILER_SPECIFIC_FLAGS
+      "-fdiagnostics-color=always"
     )
   elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
-    target_compile_options(
-      net
-      PRIVATE
-      -fcolor-diagnostics
+    set(
+      COMPILER_SPECIFIC_FLAGS
+      "-fcolor-diagnostics"
     )
 
     if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-      target_link_options(
-        net
-        PUBLIC
-        -L/usr/local/opt/llvm/lib/c++
-        -Wl,-rpath,/usr/local/opt/llvm/lib/c++
+      set(
+        LINKER_OS_FLAGS
+        "-L/usr/local/opt/llvm/lib/c++ -Wl,-rpath,/usr/local/opt/llvm/lib/c++"
       )
     endif()
   endif()
@@ -92,12 +74,15 @@ else()
     -Wall
     -Wextra
     -pedantic
+    ${COMPILER_SPECIFIC_FLAGS}
     PUBLIC
     $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
   )
 
   target_link_options(
     net
+    PRIVATE
+    ${LINKER_OS_FLAGS}
     PUBLIC
     $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
   )
@@ -109,5 +94,12 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_EXAMPLE)
-  add_subdirectory("example/")
+  file(GLOB example_dirs LIST_DIRECTORIES true "example/*")
+  foreach(dir ${example_dirs})
+    if(IS_DIRECTORY ${dir})
+      add_subdirectory(${dir})
+    else()
+      continue()
+    endif()
+  endforeach()
 endif()

@@ -182,7 +182,6 @@ std::error_condition parse_request_line(buffered_reader& reader, server_request&
 std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read, headers& headers) noexcept
 {
     std::size_t amount_read = 0;
-    std::string line;
 
     while (amount_read < max_read)
     {
@@ -196,12 +195,12 @@ std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read
             break;
         }
 
-        amount_read += line.size();
+        amount_read += next_line.size();
 
-        auto split_idx = line.find(':');
+        auto split_idx = next_line.find(':');
         if (split_idx == std::string::npos) continue; // invalid header
 
-        auto view = static_cast<std::string_view>(line);
+        auto view = static_cast<std::string_view>(next_line);
 
         auto key = trim_string(view.substr(0, split_idx));
         auto val = trim_string(view.substr(split_idx + 1));
@@ -237,9 +236,7 @@ std::error_condition response_encode(const server_response& resp) noexcept
 result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
                                                             size_t               max_header_bytes) noexcept
 {
-    server_request req{
-        .body = io::limit_reader(nullptr, 0),
-    };
+    server_request req;
 
     if (auto err = parse_request_line(reader, req); err) return {err};
     if (auto err = parse_headers(reader, max_header_bytes, req.headers); err) return {err};
@@ -252,9 +249,7 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
 result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
                                                               std::size_t          max_header_bytes) noexcept
 {
-    client_response resp{
-        .body = io::limit_reader(nullptr, 0),
-    };
+    client_response resp;
 
     if (auto err = parse_status_line(reader, resp); err) return {err};
     if (auto err = parse_headers(reader, max_header_bytes, resp.headers); err) return {err};

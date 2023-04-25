@@ -17,10 +17,6 @@
         "BUILD_TESTING": "ON",
         "BUILD_EXAMPLE": "ON",
         "CMAKE_MAKE_PROGRAM": "ninja"
-      },
-      "warnings": {
-        "deprecated": true,
-        "uninitialized": true
       }
     },
     {

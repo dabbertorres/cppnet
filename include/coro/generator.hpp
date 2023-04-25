@@ -33,7 +33,7 @@ public:
         // disallow co_await in generator coroutines.
         void await_transform() = delete;
 
-        [[noreturn]] static void unhandled_exception() { throw; }
+        [[noreturn]] void unhandled_exception() { throw; }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;

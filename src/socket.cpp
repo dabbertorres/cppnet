@@ -69,12 +69,12 @@ std::string addr_name(sockaddr_storage* addr)
         addr_type = &reinterpret_cast<sockaddr_in6*>(addr)->sin6_addr;
         break;
 
-    [[unlikely]] default:
+    default:
+        [[unlikely]]
 #ifdef __cpp_lib_unreachable
-        std::unreachable();
-#else
-;
+        std::unreachable()
 #endif
+            ;
     }
 
     const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));

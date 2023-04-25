@@ -9,6 +9,10 @@ namespace net::io
 class limit_reader : public reader
 {
 public:
+    constexpr limit_reader()
+        : limit_reader(nullptr, 0)
+    {}
+
     constexpr limit_reader(reader* reader, size_t limit)
         : parent{reader}
         , limit{limit}
