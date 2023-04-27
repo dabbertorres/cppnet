@@ -22,7 +22,7 @@ target_link_libraries(
 
 target_compile_features(
   net-example-ip-resolv
-  PRIVATE cxx_std_23
+  PRIVATE cxx_std_20
 )
 
 if(MSVC)

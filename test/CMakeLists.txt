@@ -28,7 +28,7 @@ target_link_libraries(
 
 target_compile_features(
   tests
-  PRIVATE cxx_std_23
+  PRIVATE cxx_std_20
 )
 
 if(MSVC)
