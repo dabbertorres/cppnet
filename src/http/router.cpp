@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <ranges>
 
-#include "util/iterator.hpp"
-
 namespace net::http
 {
 
@@ -51,7 +49,8 @@ route& router::path(const std::string& path) { return add().path(path); }
 router::route_request(const server_request& req) const
 {
     auto route = std::ranges::find_if(routes, [&](const auto& route) { return route.matches(req); });
-    return util::optional_from_iterator(routes, route).transform([](const auto& route) { return route.handler; });
+    if (route != routes.end()) return route->handler;
+    return std::nullopt;
 }
 
 }

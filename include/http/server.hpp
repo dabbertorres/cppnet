@@ -30,7 +30,7 @@ struct server_config
     std::string                     host = "localhost";
     std::string                     port = "8080";
     router                          router;
-    std::size_t                     max_header_bytes        = 8192;
+    std::size_t                     max_header_bytes        = 8'192;
     std::chrono::seconds            header_read_timeout     = 5s;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
@@ -58,6 +58,7 @@ public:
     void serve();
 
 private:
+    void serve_connection(tcp_socket& client_sock) noexcept;
     bool enforce_protocol(const server_request& req, response_writer& resp) noexcept;
 
     net::listener                   listener;

@@ -47,8 +47,12 @@ struct NET_PACKED frame_header
 
 static_assert(sizeof(frame_header) == 9);
 
-std::error_condition request_encode(io::writer& writer, const client_request& req) noexcept {}
-std::error_condition response_encode(const server_response& resp) noexcept {}
+util::result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept
+{}
+
+util::result<io::writer*, std::error_condition> response_encode(io::writer*            writer,
+                                                                const server_response& resp) noexcept
+{}
 
 result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
                                                             std::size_t          max_header_bytes) noexcept

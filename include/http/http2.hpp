@@ -14,8 +14,10 @@ namespace net::http::http2
 
 using util::result;
 
-std::error_condition request_encode(io::writer& writer, const client_request& req) noexcept;
-std::error_condition response_encode(const server_response& resp) noexcept;
+util::result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept;
+
+util::result<io::writer*, std::error_condition> response_encode(io::writer*            writer,
+                                                                const server_response& resp) noexcept;
 
 result<server_request, std::error_condition>
 request_decode(io::buffered_reader& reader,

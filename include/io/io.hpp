@@ -6,8 +6,6 @@
 namespace net::io
 {
 
-using byte = std::byte;
-
 struct result
 {
     size_t               count{};

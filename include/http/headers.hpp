@@ -86,11 +86,12 @@ public:
     headers& add(std::string_view key, std::string_view val);
 
     headers& set_content_length(std::size_t length);
+    headers& set_content_type(const content_type& content_type);
 
     [[nodiscard]] std::optional<std::string_view> get(const std::string& key) const;
     [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const;
     [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
-    [[nodiscard]] std::optional<std::string_view> operator[](std::string_view& key) const;
+    [[nodiscard]] std::optional<std::string_view> operator[](std::string_view key) const;
 
     [[nodiscard]] std::optional<values_range> get_all(const std::string& key) const;
     [[nodiscard]] std::optional<values_range> get_all(std::string_view key) const;
@@ -109,10 +110,10 @@ public:
     [[nodiscard]] bool        empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
 
+    friend bool operator==(const headers& lhs, const headers& rhs) noexcept = default;
+
 private:
     map_type values;
 };
-
-bool operator==(const headers& lhs, const headers& rhs) noexcept;
 
 }

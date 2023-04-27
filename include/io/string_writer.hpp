@@ -22,7 +22,7 @@ public:
         return {.count = length};
     }
 
-    result write(const byte* data, size_t length) override
+    result write(const std::byte* data, size_t length) override
     {
         parts.emplace_back(reinterpret_cast<const CharT*>(data), length);
         return {.count = length};

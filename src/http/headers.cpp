@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstddef>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -24,11 +25,11 @@ std::size_t headers::keyhash::operator()(std::string_view key) const noexcept
 {
     // variant of Fowler-Noll-Vo
 
-    std::size_t result = 2166136261;
+    std::size_t result = 2'166'136'261;
 
     for (auto c : key)
     {
-        result = (result * 16777619) ^ static_cast<std::size_t>(std::tolower(c));
+        result = (result * 16'777'619) ^ static_cast<std::size_t>(std::tolower(c));
     }
 
     return result;
@@ -110,6 +111,20 @@ headers& headers::add(std::string_view key, std::string_view val) { return add(s
 
 headers& headers::set_content_length(std::size_t length) { return set("Content-Length"sv, std::to_string(length)); }
 
+headers& headers::set_content_type(const content_type& content_type)
+{
+    // nothing to add
+    if (content_type.type.empty()) return *this;
+
+    std::ostringstream ss;
+    ss << content_type.type;
+
+    std::ranges::for_each(content_type.parameters,
+                          [&](const auto& param) { ss << ": " << param.first << '=' << param.second; });
+
+    return set("Content-Type"sv, ss.str());
+}
+
 [[nodiscard]] std::optional<std::string_view> headers::get(const std::string& key) const
 {
     auto iter = values.find(key);
@@ -131,8 +146,14 @@ headers& headers::set_content_length(std::size_t length) { return set("Content-L
 }
 
 [[nodiscard]] std::optional<std::string_view> headers::operator[](const std::string& key) const { return get(key); }
+[[nodiscard]] std::optional<std::string_view> headers::operator[](std::string_view key) const { return get(key); }
 
 [[nodiscard]] std::optional<headers::values_range> headers::get_all(const std::string& key) const
+{
+    return get_all(std::string_view{key});
+}
+
+[[nodiscard]] std::optional<headers::values_range> headers::get_all(std::string_view key) const
 {
     auto iter = values.find(key);
     if (iter == values.end()) return std::nullopt;
@@ -147,10 +168,10 @@ headers& headers::set_content_length(std::size_t length) { return set("Content-L
     auto maybe = get("Content-Length"sv);
     if (!maybe.has_value()) return std::nullopt;
 
-    std::size_t length;
+    std::size_t length; // NOLINT(cppcoreguidelines-init-variables)
     auto [_, err] = std::from_chars(maybe->begin(), maybe->end(), length);
 
-    if (static_cast<int>(err) != 0) return std::nullopt;
+    if (err != std::errc()) return std::nullopt;
     return length;
 }
 
@@ -233,10 +254,5 @@ headers& headers::set_content_length(std::size_t length) { return set("Content-L
 [[nodiscard]] bool headers::empty() const noexcept { return values.empty(); }
 
 [[nodiscard]] std::size_t headers::size() const noexcept { return values.size(); }
-
-bool operator==(const headers& lhs, const headers& rhs) noexcept
-{
-    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
-}
 
 }

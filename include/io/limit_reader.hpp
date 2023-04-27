@@ -18,7 +18,7 @@ public:
         , limit{limit}
     {}
 
-    result read(byte* data, size_t length) override
+    result read(std::byte* data, size_t length) override
     {
         if (progress >= limit) return {};
 

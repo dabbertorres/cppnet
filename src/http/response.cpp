@@ -9,7 +9,7 @@ status parse_status(std::string_view str) noexcept
 {
     using enum status;
 
-    uint32_t    v;
+    uint32_t    v; // NOLINT(cppcoreguidelines-init-variables)
     const char* begin = reinterpret_cast<const char*>(str.data());
     auto [_, err]     = std::from_chars(begin, begin + str.size(), v);
 
@@ -17,19 +17,20 @@ status parse_status(std::string_view str) noexcept
     return static_cast<status>(v);
 }
 
-response_writer::response_writer(server_response& base, response_encoder encode)
-    : resp(base)
+response_writer::response_writer(io::writer* writer, server_response* base, response_encoder encode)
+    : writer(writer)
+    , resp(base)
     , encode(encode)
 {}
 
-headers& response_writer::headers() noexcept { return resp.headers; }
+headers& response_writer::headers() noexcept { return resp->headers; }
 
 io::writer& response_writer::send(status status_code, std::size_t content_length)
 {
-    resp.status_code = status_code;
-    resp.headers.set_content_length(content_length);
-    encode(resp);
-    return *resp.body;
+    resp->status_code = status_code;
+    resp->headers.set_content_length(content_length);
+    encode(writer, *resp);
+    return *resp->body;
 }
 
 }

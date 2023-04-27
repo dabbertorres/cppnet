@@ -50,7 +50,7 @@ struct hash<T (&)[N]> // NOLINT(*-avoid-c-arrays)
         // this is similar to how boost::hash_combine does it
         constexpr std::size_t seed = hash_seed();
 
-        std::hash<T> value_hasher;
+        const std::hash<T> value_hasher;
 
         std::size_t result = 0;
 

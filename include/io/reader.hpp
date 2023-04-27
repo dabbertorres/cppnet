@@ -18,8 +18,8 @@ public:
 
     virtual ~reader() = default;
 
-    virtual result read(byte* data, size_t length) = 0;
-    result         read(char* data, size_t length) { return read(reinterpret_cast<byte*>(data), length); }
+    virtual result read(std::byte* data, size_t length) = 0;
+    result         read(char* data, size_t length) { return read(reinterpret_cast<std::byte*>(data), length); }
 
 protected:
     reader() = default;

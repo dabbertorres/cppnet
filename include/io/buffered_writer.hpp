@@ -13,14 +13,14 @@ namespace net::io
 class buffered_writer : public writer
 {
 public:
-    buffered_writer(writer& underlying, size_t bufsize = 1024)
-        : impl{&underlying}
+    buffered_writer(writer* underlying, size_t bufsize = 1'024)
+        : impl(underlying)
         , buf(bufsize)
     {
         buf.resize(0);
     }
 
-    result write(const byte* data, size_t length) override
+    result write(const std::byte* data, size_t length) override
     {
         if (length == 0) return {.count = 0};
 
@@ -122,8 +122,8 @@ private:
         return res;
     }
 
-    writer*           impl;
-    std::vector<byte> buf;
+    writer*                impl;
+    std::vector<std::byte> buf;
 };
 
 }

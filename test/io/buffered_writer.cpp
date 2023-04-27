@@ -9,7 +9,7 @@
 TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
 {
     net::io::string_writer<char> builder;
-    net::io::buffered_writer     writer{builder, 4};
+    net::io::buffered_writer     writer{&builder, 4};
 
     auto res = writer.write("foo", 3);
     REQUIRE_FALSE(res.err);
@@ -36,7 +36,7 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
 TEST_CASE("0-length write", "[io][buffered_writer]")
 {
     net::io::string_writer<char> builder;
-    net::io::buffered_writer     writer{builder, 4};
+    net::io::buffered_writer     writer{&builder, 4};
 
     auto res = writer.write("foo", 0);
     REQUIRE_FALSE(res.err);

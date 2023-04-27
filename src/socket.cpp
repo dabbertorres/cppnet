@@ -17,6 +17,41 @@
 
 #include "exception.hpp"
 
+namespace
+{
+
+std::string addr_name(sockaddr_storage* addr)
+{
+    std::string ret;
+    void*       addr_type = nullptr;
+    switch (addr->ss_family)
+    {
+    case AF_INET:
+        ret.resize(INET_ADDRSTRLEN);
+        addr_type = &reinterpret_cast<sockaddr_in*>(addr)->sin_addr;
+        break;
+
+    case AF_INET6:
+        ret.resize(INET6_ADDRSTRLEN);
+        addr_type = &reinterpret_cast<sockaddr_in6*>(addr)->sin6_addr;
+        break;
+
+    default:
+        [[unlikely]]
+#ifdef __cpp_lib_unreachable
+        std::unreachable()
+#endif
+            ;
+    }
+
+    const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
+    if (ptr == nullptr) throw net::system_error_from_errno(errno);
+
+    return ret;
+}
+
+}
+
 namespace net
 {
 
@@ -46,46 +81,16 @@ bool socket::valid() const noexcept
 {
     if (fd == invalid_fd) return false;
 
-    int       error_code;
+    int       error_code; // NOLINT(cppcoreguidelines-init-variables)
     socklen_t error_code_size = sizeof(error_code);
 
     int sts = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error_code, &error_code_size);
     return sts != -1 && error_code == 0;
 }
 
-std::string addr_name(sockaddr_storage* addr)
-{
-    std::string ret;
-    void*       addr_type = nullptr;
-    switch (addr->ss_family)
-    {
-    case AF_INET:
-        ret.resize(INET_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in*>(addr)->sin_addr;
-        break;
-
-    case AF_INET6:
-        ret.resize(INET6_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in6*>(addr)->sin6_addr;
-        break;
-
-    default:
-        [[unlikely]]
-#ifdef __cpp_lib_unreachable
-        std::unreachable()
-#endif
-            ;
-    }
-
-    const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
-    if (ptr == nullptr) throw system_error_from_errno(errno);
-
-    return ret;
-}
-
 std::string socket::local_addr() const
 {
-    sockaddr_storage addr;
+    sockaddr_storage addr{};
     socklen_t        size = sizeof(addr);
 
     int sts = getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &size);
@@ -95,7 +100,7 @@ std::string socket::local_addr() const
 
 std::string socket::remote_addr() const
 {
-    sockaddr_storage addr;
+    sockaddr_storage addr{};
     socklen_t        size = sizeof(addr);
 
     int sts = getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &size);
@@ -103,7 +108,7 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(io::byte* data, size_t length) noexcept
+io::result socket::read(std::byte* data, size_t length) noexcept
 {
     size_t received = 0;
     size_t attempts = 0;
@@ -136,7 +141,7 @@ io::result socket::read(io::byte* data, size_t length) noexcept
     return {.count = received};
 }
 
-io::result socket::write(const io::byte* data, size_t length) noexcept
+io::result socket::write(const std::byte* data, size_t length) noexcept
 {
     size_t sent = 0;
     while (sent < length)

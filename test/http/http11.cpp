@@ -17,7 +17,7 @@ using namespace std::string_view_literals;
 TEST_CASE("just a request line", "[http][1.1]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
-    net::io::buffered_reader     buf_reader(content);
+    net::io::buffered_reader     buf_reader(&content);
 
     auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
@@ -43,7 +43,7 @@ TEST_CASE("with headers", "[http][1.1]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "\r\n");
-    net::io::buffered_reader     buf_reader(content);
+    net::io::buffered_reader     buf_reader(&content);
 
     auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
@@ -77,7 +77,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
                                          "Content-Length: 18\r\n"
                                          "\r\n"
                                          "this is a request\n");
-    net::io::buffered_reader     buf_reader(content);
+    net::io::buffered_reader     buf_reader(&content);
 
     auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());
@@ -126,7 +126,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
                                          "with\n"
                                          "multiple\n"
                                          "lines\n");
-    net::io::buffered_reader     buf_reader(content);
+    net::io::buffered_reader     buf_reader(&content);
 
     auto result = net::http::http11::request_decode(buf_reader);
     REQUIRE(result.has_value());

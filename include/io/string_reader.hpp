@@ -29,7 +29,7 @@ public:
         return {.count = amount};
     }
 
-    result read(byte* data, size_t length) override { return read(reinterpret_cast<CharT*>(data), length); }
+    result read(std::byte* data, size_t length) override { return read(reinterpret_cast<CharT*>(data), length); }
 
 private:
     string view;

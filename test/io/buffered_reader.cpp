@@ -14,7 +14,7 @@ using namespace std::string_view_literals;
 TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
 {
     net::io::string_reader   string("foobarbaz"sv);
-    net::io::buffered_reader reader(string, 4);
+    net::io::buffered_reader reader(&string, 4);
 
     std::string buf(6, 0);
 
@@ -40,7 +40,7 @@ TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
 TEST_CASE("0-length read", "[io][buffered_reader]")
 {
     net::io::string_reader   string("foobarbaz"sv);
-    net::io::buffered_reader reader(string, 4);
+    net::io::buffered_reader reader(&string, 4);
 
     std::string buf(6, 0);
 

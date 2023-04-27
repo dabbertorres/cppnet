@@ -170,7 +170,7 @@ tcp_socket listener::accept() const
     /* if (num_ready == -1) throw system_error_from_errno(errno); */
     /* if (num_ready == 0) return tcp_socket{invalid_fd}; */
 
-    sockaddr_storage inc;
+    sockaddr_storage inc{};
     socklen_t        inc_size = sizeof(inc);
 
     int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);

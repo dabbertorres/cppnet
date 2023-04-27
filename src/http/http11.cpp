@@ -2,11 +2,13 @@
 
 #include <charconv>
 #include <cstddef>
+#include <ranges>
 #include <system_error>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
+#include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/limit_reader.hpp"
 #include "util/result.hpp"
@@ -34,10 +36,10 @@ using net::util::trim_string;
 
 result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 {
-    uint32_t value;
+    uint32_t value; // NOLINT(cppcoreguidelines-init-variables)
     auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
 
-    if (static_cast<int>(err) != 0) return {err};
+    if (err != std::errc()) return {err};
     return {value};
 }
 
@@ -64,10 +66,12 @@ result<std::string, std::error_condition> readline(buffered_reader& reader) noex
     while (true)
     {
         auto [next, have_next] = reader.peek();
-        if (!have_next) return reader.error();
+        if (!have_next) return std::make_error_condition(std::errc::not_connected); // TODO: not the right error...
 
         add_size();
-        reader.read(line.data() + (line.size() - 1), 1);
+        auto [count, err] = reader.read(line.data() + (line.size() - 1), 1);
+        if (err) return err;
+        if (count == 0) return std::make_error_condition(std::errc::io_error); // TODO: need a better error...
 
         if (have_carriage_return)
         {
@@ -123,7 +127,7 @@ std::error_condition parse_status_line(buffered_reader& reader, client_response&
     auto view = static_cast<std::string_view>(line);
 
     auto version_end = view.find(' ');
-    if (version_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
+    if (version_end == std::string_view::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto res = parse_http_version(view.substr(0, version_end));
     if (res.has_error()) return res.to_error();
@@ -131,7 +135,7 @@ std::error_condition parse_status_line(buffered_reader& reader, client_response&
 
     auto status_start = version_end + 1;
     auto status_end   = view.find(' ', status_start);
-    if (status_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
+    if (status_end == std::string_view::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     resp.status_code = parse_status(view.substr(status_start, status_end));
     if (resp.status_code == status::NONE) return std::make_error_condition(std::errc::illegal_byte_sequence);
@@ -149,17 +153,18 @@ std::error_condition parse_request_line(buffered_reader& reader, server_request&
     if (result.has_error()) return result.to_error();
 
     auto line = result.to_value();
+    if (line.empty()) return std::make_error_condition(std::errc::io_error); // TODO: return a not ready error
     auto view = static_cast<std::string_view>(line);
 
     auto method_end = view.find(' ');
-    if (method_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
+    if (method_end == std::string_view::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     req.method = parse_method(view.substr(0, method_end));
     if (req.method == request_method::NONE) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto uri_start = method_end + 1;
     auto uri_end   = view.find(' ', uri_start);
-    if (uri_end == std::string::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
+    if (uri_end == std::string_view::npos) return std::make_error_condition(std::errc::illegal_byte_sequence);
 
     auto uri = view.substr(uri_start, uri_end - uri_start);
 
@@ -192,7 +197,7 @@ std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read
         if (next_line.length() == 0)
         {
             // blank line - we're done
-            break;
+            return {};
         }
 
         amount_read += next_line.size();
@@ -211,6 +216,38 @@ std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read
         headers.set(key, val);
     }
 
+    return std::make_error_condition(std::errc::value_too_large);
+}
+
+std::error_condition write_headers(net::io::writer& writer, const headers& headers) noexcept
+{
+    for (const auto& header : headers)
+    {
+        auto res = writer.write(header.first);
+        if (res.err) return res.err;
+
+        res = writer.write(": ");
+        if (res.err) return res.err;
+
+        if (!header.second.empty())
+        {
+            res = writer.write(header.second.front());
+            if (res.err) return res.err;
+
+            for (const auto& value : std::ranges::drop_view(header.second, 1))
+            {
+                res = writer.write(", ");
+                if (res.err) return res.err;
+
+                res = writer.write(value);
+                if (res.err) return res.err;
+            }
+        }
+
+        res = writer.write("\r\n");
+        if (res.err) return res.err;
+    }
+
     return {};
 }
 
@@ -221,16 +258,41 @@ namespace net::http::http11
 
 using util::result;
 
-std::error_condition request_encode(io::writer& writer, const client_request& req) noexcept
+util::result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept
 {
     // TODO
-    return {};
+    return {writer};
 }
 
-std::error_condition response_encode(const server_response& resp) noexcept
+util::result<io::writer*, std::error_condition> response_encode(io::writer*            writer,
+                                                                const server_response& resp) noexcept
 {
-    // TODO
-    return {};
+    auto res = writer->write("HTTP/");
+    if (res.err) return res.err;
+
+    std::array<char, 4> version_buf{
+        static_cast<char>(resp.version.major + '0'),
+        '.',
+        static_cast<char>(resp.version.minor + '0'),
+        ' ',
+    };
+
+    res = writer->write(version_buf.data(), version_buf.size());
+    if (res.err) return {res.err};
+
+    res = writer->write(status_text(resp.status_code));
+    if (res.err) return {res.err};
+
+    res = writer->write("\r\n");
+    if (res.err) return res.err;
+
+    res.err = write_headers(*writer, resp.headers);
+    if (res.err) return res.err;
+
+    res = writer->write("\r\n");
+    if (res.err) return res.err;
+
+    return {writer};
 }
 
 result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
@@ -238,12 +300,17 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
 {
     server_request req;
 
-    if (auto err = parse_request_line(reader, req); err) return {err};
-    if (auto err = parse_headers(reader, max_header_bytes, req.headers); err) return {err};
+    auto err = parse_request_line(reader, req);
+    if (err) return {err};
+
+    err = parse_headers(reader, max_header_bytes, req.headers);
+    if (err) return {err};
+
+    if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
 
     std::size_t content_length = req.headers.get_content_length().value_or(0);
     req.body                   = io::limit_reader(&reader, content_length);
-    return {std::move(req)};
+    return {req};
 }
 
 result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
@@ -256,7 +323,7 @@ result<client_response, std::error_condition> response_decode(io::buffered_reade
 
     const size_t content_length = resp.headers.get_content_length().value_or(0);
     resp.body                   = io::limit_reader(&reader, content_length);
-    return {std::move(resp)};
+    return {resp};
 }
 
 }

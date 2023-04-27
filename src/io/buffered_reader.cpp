@@ -3,14 +3,14 @@
 namespace net::io
 {
 
-buffered_reader::buffered_reader(reader& impl, size_t bufsize)
-    : impl{&impl}
+buffered_reader::buffered_reader(reader* impl, size_t bufsize)
+    : impl(impl)
     , buf(bufsize)
 {
     buf.resize(0);
 }
 
-result buffered_reader::read(byte* data, size_t length)
+result buffered_reader::read(std::byte* data, size_t length)
 {
     if (length == 0) return {.count = 0};
 
@@ -82,12 +82,12 @@ result buffered_reader::read(byte* data, size_t length)
     return {.count = total};
 }
 
-[[nodiscard]] std::tuple<byte, bool> buffered_reader::peek()
+[[nodiscard]] std::tuple<std::byte, bool> buffered_reader::peek()
 {
     if (!buf.empty()) return {buf.front(), true};
     fill();
 
-    if (buf.empty()) return {static_cast<byte>(0), false};
+    if (buf.empty()) return {static_cast<std::byte>(0), false};
     return {buf.front(), true};
 }
 

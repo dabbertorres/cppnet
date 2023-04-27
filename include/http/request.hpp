@@ -4,6 +4,7 @@
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
+#include "io/buffered_reader.hpp"
 #include "io/limit_reader.hpp"
 #include "util/string_util.hpp"
 
@@ -87,5 +88,9 @@ struct server_request
 
     io::limit_reader body;
 };
+
+using request_decoder_result = util::result<server_request, std::error_condition>;
+
+using request_decoder = request_decoder_result (*)(io::buffered_reader&, std::size_t);
 
 }
