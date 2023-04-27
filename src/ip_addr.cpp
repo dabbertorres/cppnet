@@ -8,17 +8,6 @@
 
 #include "util/string_util.hpp"
 
-namespace
-{
-
-#if __cpp_lib_string_contains >= 202'011L
-constexpr bool string_view_contains(std::string_view s, char c) noexcept { return s.contains(c); }
-#else
-constexpr bool string_view_contains(std::string_view s, char c) noexcept { return s.find(c) != std::string_view::npos; }
-#endif
-
-}
-
 namespace net
 {
 
@@ -107,10 +96,10 @@ std::string ipv6_addr::to_string() const
 
 std::optional<ip_addr> ip_addr::parse(std::string_view str) noexcept
 {
-    if (string_view_contains(str, ':'))
+    if (str.contains(':'))
         if (auto result = ipv6_addr::parse(str); result) return *result;
 
-    if (string_view_contains(str, '.'))
+    if (str.contains('.'))
         if (auto result = ipv4_addr::parse(str); result) return *result;
 
     return std::nullopt;

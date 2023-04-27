@@ -16,11 +16,11 @@ namespace net::http
 {
 
 template<typename T>
-concept matcher =
+concept Matcher =
     std::invocable<T, const server_request&> && std::same_as<std::invoke_result_t<T, const server_request&>, bool>;
 
 template<typename T>
-concept handler = std::invocable<T, const server_request&, response_writer&>;
+concept Handler = std::invocable<T, const server_request&, response_writer&>;
 
 using matcher_func = std::function<bool(const server_request&)>;
 using handler_func = std::function<void(const server_request&, response_writer&)>;
@@ -33,18 +33,18 @@ public:
     route() = default;
 
     route& prefix(const std::string& prefix);
-    route& absolute(const std::string& path);
+    route& path(const std::string& path);
     route& on_method(request_method method);
     route& on_content_type(const std::string& content_type);
 
-    template<matcher matcher_type>
+    template<Matcher matcher_type>
     route& on(matcher_type&& m)
     {
         conditions.push_back(std::forward<matcher_type>(m));
         return *this;
     }
 
-    template<handler handler_type>
+    template<Handler handler_type>
     route& use(handler_type&& h)
     {
         handler = std::forward<handler_type>(h);

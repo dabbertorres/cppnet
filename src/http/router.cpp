@@ -1,5 +1,10 @@
 #include "http/router.hpp"
 
+#include <algorithm>
+#include <ranges>
+
+#include "util/iterator.hpp"
+
 namespace net::http
 {
 
@@ -9,7 +14,7 @@ route& route::prefix(const std::string& prefix)
     return *this;
 }
 
-route& route::absolute(const std::string& path)
+route& route::path(const std::string& path)
 {
     conditions.emplace_back([=](const server_request& req) { return req.uri.path == path; });
     return *this;
@@ -34,27 +39,19 @@ route& route::on_content_type(const std::string& want_content_type)
 
 [[nodiscard]] bool route::matches(const server_request& req) const
 {
-    for (const auto& cond : conditions)
-    {
-        if (!cond(req)) return false;
-    }
-    return true;
+    return std::ranges::all_of(conditions, [&req](const auto& cond) { return std::invoke(cond, req); });
 }
 
 void   router::add(const route& r) { routes.push_back(r); }
 route& router::add() { return routes.emplace_back(); }
 route& router::prefix(const std::string& prefix) { return add().prefix(prefix); }
-route& router::path(const std::string& path) { return add().absolute(path); }
+route& router::path(const std::string& path) { return add().path(path); }
 
 [[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
 router::route_request(const server_request& req) const
 {
-    for (const auto& r : routes)
-    {
-        if (r.matches(req)) return r.handler;
-    }
-
-    return std::nullopt;
+    auto route = std::ranges::find_if(routes, [&](const auto& route) { return route.matches(req); });
+    return util::optional_from_iterator(routes, route).transform([](const auto& route) { return route.handler; });
 }
 
 }

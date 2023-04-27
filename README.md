@@ -1,6 +1,6 @@
 # net for C++
 
-Networking library for C++. Uses C++ 20 features.
+Networking library for C++. Uses C++ 23 features.
 
 ## Building
 
