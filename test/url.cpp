@@ -1,13 +1,44 @@
 #include "url.hpp"
 
+#include <string>
+
 #include <catch.hpp>
 
 #include <catch2/catch_message.hpp>
+
+#include "util/result.hpp"
+
+namespace Catch
+{
+
+template<>
+struct StringMaker<net::url_parse_failure>
+{
+    static std::string convert(const net::url_parse_failure& value)
+    {
+        return std::string(net::url_parse_state_to_string(value.failed_at)) + ": " + std::to_string(value.index);
+    }
+};
+
+template<typename T, typename E>
+struct StringMaker<net::util::result<T, E>>
+{
+    static std::string convert(const net::util::result<T, E>& value)
+    {
+        std::string ret;
+        value.if_value([&](const T& val) { ret = StringMaker<T>::convert(val); })
+            .if_error([&](const E& err) { ret = StringMaker<E>::convert(err); });
+        return ret;
+    }
+};
+
+}
 
 TEST_CASE("url::parse '/'", "[url][parse]")
 {
     auto result = net::url::parse("/");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -25,6 +56,7 @@ TEST_CASE("url::parse 'foo/'", "[url][parse]")
 {
     auto result = net::url::parse("foo/");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -42,6 +74,7 @@ TEST_CASE("url::parse 'foo:9123/'", "[url][parse]")
 {
     auto result = net::url::parse("foo:9123/");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -59,6 +92,7 @@ TEST_CASE("url::parse 'http:///'", "[url][parse]")
 {
     auto result = net::url::parse("http:///");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -76,6 +110,7 @@ TEST_CASE("url::parse 'http://foo/'", "[url][parse]")
 {
     auto result = net::url::parse("http://foo/");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -93,6 +128,7 @@ TEST_CASE("url::parse 'http://foo:9123/'", "[url][parse]")
 {
     auto result = net::url::parse("http://foo:9123/");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -110,6 +146,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar#fragment'", "
 {
     auto result = net::url::parse("http://user:password@host:9123/path?foo=bar#fragment");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -130,6 +167,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar'", "[url][par
 {
     auto result = net::url::parse("http://user:password@host:9123/path?foo=bar");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -150,6 +188,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path#fragment'", "[url][pa
 {
     auto result = net::url::parse("http://user:password@host:9123/path#fragment");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -167,6 +206,7 @@ TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][parse]")
 {
     auto result = net::url::parse("/path?foo=bar&baz=xyzzy&qux=plugh");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -178,7 +218,7 @@ TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][parse]")
     CHECK(u.path == "/path");
     CHECK(u.query
           == net::url::query_values{
-              {"foo", {"bar"}  },
+              {"foo",   {"bar"}},
               {"baz", {"xyzzy"}},
               {"qux", {"plugh"}},
     });
@@ -189,6 +229,7 @@ TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][parse]")
 {
     auto result = net::url::parse("/path?foo=bar&foo=baz&xyzzy=plugh&foo=qux");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();
@@ -200,8 +241,8 @@ TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][parse]")
     CHECK(u.path == "/path");
     CHECK(u.query
           == net::url::query_values{
-              {"foo",   {"bar", "baz", "qux"}},
-              {"xyzzy", {"plugh"}            },
+              {  "foo", {"bar", "baz", "qux"}},
+              {"xyzzy",             {"plugh"}},
     });
     CHECK(u.fragment.empty());
 }
@@ -211,6 +252,7 @@ TEST_CASE("url::parse 'http://http://http://@http://http://?http://#http://'", "
 {
     auto result = net::url::parse("http://http://http://@http://http://?http://#http://");
 
+    CAPTURE(result);
     REQUIRE(result.has_value());
 
     auto u = result.to_value();

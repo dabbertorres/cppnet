@@ -19,11 +19,13 @@ url_parse_state& operator++(url_parse_state& p)
 struct url_parser
 {
     std::string_view input;
-    url*             out;
+    url              out;
 
     url_parse_state state = url_parse_state::scheme;
     size_t          start = 0;
     size_t          end   = 0;
+
+    url_parse_state parse() noexcept;
 
     void parse_scheme() noexcept;
     void parse_authority() noexcept;
@@ -68,9 +70,9 @@ void url_parser::parse_scheme() noexcept
     }
     else
     {
-        out->scheme = input.substr(start, end - start);
-        start       = end + 1;
-        end         = start;
+        out.scheme = input.substr(start, end - start);
+        start      = end + 1;
+        end        = start;
         ++state;
     }
 }
@@ -102,12 +104,12 @@ void url_parser::parse_userinfo() noexcept
         if (auto split = userinfo.find(':'); split != std::string_view::npos)
         {
             // has a password component
-            out->userinfo.username = userinfo.substr(0, split);
-            out->userinfo.password = userinfo.substr(split + 1, end - (split + 1));
+            out.userinfo.username = userinfo.substr(0, split);
+            out.userinfo.password = userinfo.substr(split + 1, end - (split + 1));
         }
         else
         {
-            out->userinfo.username = userinfo;
+            out.userinfo.username = userinfo;
         }
 
         state = url_parse_state::host;
@@ -126,9 +128,9 @@ void url_parser::parse_host() noexcept
     // anything up to either the port, path, query, fragment, or end is the host
     if (auto idx = input.find_first_of(":/?#", start); idx != std::string_view::npos)
     {
-        out->host = input.substr(start, idx - start);
-        start     = idx + 1;
-        end       = start;
+        out.host = input.substr(start, idx - start);
+        start    = idx + 1;
+        end      = start;
         switch (input[idx])
         {
         case ':': state = url_parse_state::port; break;
@@ -147,9 +149,9 @@ void url_parser::parse_host() noexcept
     }
     else
     {
-        out->host = input.substr(start);
-        state     = url_parse_state::done;
-        end       = input.size();
+        out.host = input.substr(start);
+        state    = url_parse_state::done;
+        end      = input.size();
     }
 }
 
@@ -158,9 +160,9 @@ void url_parser::parse_port() noexcept
     // anything up to either the path, query, fragment, or end is the port
     if (auto idx = input.find_first_of("/?#", start); idx != std::string_view::npos)
     {
-        out->port = input.substr(start, idx - start);
-        start     = idx + 1;
-        end       = start;
+        out.port = input.substr(start, idx - start);
+        start    = idx + 1;
+        end      = start;
         switch (input[idx])
         {
         case '/':
@@ -177,9 +179,9 @@ void url_parser::parse_port() noexcept
     }
     else
     {
-        out->port = input.substr(start);
-        state     = url_parse_state::done;
-        end       = input.size();
+        out.port = input.substr(start);
+        state    = url_parse_state::done;
+        end      = input.size();
     }
 }
 
@@ -188,9 +190,9 @@ void url_parser::parse_path() noexcept
     // anything up to either the query, fragment, or end is the path
     if (auto idx = input.find_first_of("?#", start); idx != std::string_view::npos)
     {
-        out->path = input.substr(start, idx - start);
-        start     = idx + 1;
-        end       = start;
+        out.path = input.substr(start, idx - start);
+        start    = idx + 1;
+        end      = start;
         switch (input[idx])
         {
         case '?': state = url_parse_state::query; break;
@@ -200,9 +202,9 @@ void url_parser::parse_path() noexcept
     }
     else
     {
-        out->path = input.substr(start);
-        state     = url_parse_state::done;
-        end       = input.size();
+        out.path = input.substr(start);
+        state    = url_parse_state::done;
+        end      = input.size();
     }
 }
 
@@ -227,9 +229,9 @@ void url_parser::parse_query() noexcept
 
     while (!raw_query.empty())
     {
-        end = raw_query.find('&');
+        auto next_var = raw_query.find('&');
 
-        auto kv     = raw_query.substr(0, end);
+        auto kv     = raw_query.substr(0, next_var);
         auto eq_idx = kv.find('=');
         auto key    = url::decode(kv.substr(0, eq_idx));
 
@@ -237,58 +239,53 @@ void url_parser::parse_query() noexcept
         {
             // NOTE: val may be empty
             auto val = kv.substr(eq_idx + 1);
-            out->query[key].emplace_back(url::decode(val));
+            out.query[key].emplace_back(url::decode(val));
         }
         else
         {
             // no value
-            out->query.try_emplace(key);
+            out.query.try_emplace(key);
         }
 
-        if (end == std::string_view::npos) break;
-        raw_query = raw_query.substr(end + 1);
+        if (next_var == std::string_view::npos) break;
+        raw_query = raw_query.substr(next_var + 1);
     }
 }
 
 void url_parser::parse_fragment() noexcept
 {
     // everything else!
-    out->fragment = input.substr(start);
-    state         = url_parse_state::done;
+    out.fragment = input.substr(start);
+    state        = url_parse_state::done;
 }
 
-url_parse_state url_parse(std::string_view s, url& u) noexcept
+url_parse_state url_parser::parse() noexcept
 {
-    url_parser parser{
-        .input = s,
-        .out   = &u,
-    };
-
-    while (parser.end < s.size())
+    while (end < input.size())
     {
-        switch (parser.state)
+        switch (state)
         {
-        case url_parse_state::scheme: parser.parse_scheme(); break;
-        case url_parse_state::authority: parser.parse_authority(); break;
-        case url_parse_state::userinfo: parser.parse_userinfo(); break;
-        case url_parse_state::host: parser.parse_host(); break;
-        case url_parse_state::port: parser.parse_port(); break;
-        case url_parse_state::path: parser.parse_path(); break;
-        case url_parse_state::query: parser.parse_query(); break;
-        case url_parse_state::fragment: parser.parse_fragment(); break;
-        case url_parse_state::done: parser.end = s.size(); break;
+        case url_parse_state::scheme: parse_scheme(); break;
+        case url_parse_state::authority: parse_authority(); break;
+        case url_parse_state::userinfo: parse_userinfo(); break;
+        case url_parse_state::host: parse_host(); break;
+        case url_parse_state::port: parse_port(); break;
+        case url_parse_state::path: parse_path(); break;
+        case url_parse_state::query: parse_query(); break;
+        case url_parse_state::fragment: parse_fragment(); break;
+        case url_parse_state::done: end = input.size(); break;
         }
     }
 
-    if (!u.scheme.empty()) u.scheme = url::decode(u.scheme);
-    if (!u.userinfo.username.empty()) u.userinfo.username = url::decode(u.userinfo.username);
-    if (!u.userinfo.password.empty()) u.userinfo.password = url::decode(u.userinfo.password);
-    if (!u.host.empty()) u.host = url::decode(u.host);
-    if (!u.port.empty()) u.port = url::decode(u.port);
-    if (!u.path.empty()) u.path = url::decode(u.path);
-    if (!u.fragment.empty()) u.fragment = url::decode(u.fragment);
+    if (!out.scheme.empty()) out.scheme = url::decode(out.scheme);
+    if (!out.userinfo.username.empty()) out.userinfo.username = url::decode(out.userinfo.username);
+    if (!out.userinfo.password.empty()) out.userinfo.password = url::decode(out.userinfo.password);
+    if (!out.host.empty()) out.host = url::decode(out.host);
+    if (!out.port.empty()) out.port = url::decode(out.port);
+    if (!out.path.empty()) out.path = url::decode(out.path);
+    if (!out.fragment.empty()) out.fragment = url::decode(out.fragment);
 
-    return parser.state;
+    return state;
 }
 
 }
@@ -307,7 +304,8 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
     {
         std::array<char, 2> buf{};
         std::to_chars(buf.begin(), buf.end(), str[idx], 16);
-        out << '%' << buf[0] << buf[1];
+        out << str.substr(0, idx) << '%' << buf[0] << buf[1];
+
         str = str.substr(idx + 1);
     }
 
@@ -349,10 +347,14 @@ url::parse_result url::parse(const std::string& s) noexcept { return parse(std::
 
 url::parse_result url::parse(std::string_view s) noexcept
 {
-    url  u;
-    auto end_state = url_parse(s, u);
-    if (end_state != url_parse_state::done) return {url_parse_failure{end_state}};
-    return {u};
+    url_parser parser{.input = s};
+
+    auto end_state = parser.parse();
+    if (end_state != url_parse_state::done)
+        return {
+            url_parse_failure{.failed_at = end_state, .index = parser.end}
+        };
+    return {parser.out};
 }
 
 std::string url::build() const noexcept

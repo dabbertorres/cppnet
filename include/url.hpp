@@ -25,7 +25,7 @@ enum class url_parse_state : uint8_t
     done,
 };
 
-constexpr std::string_view parse_state_string(url_parse_state s) noexcept
+constexpr std::string_view url_parse_state_to_string(url_parse_state s) noexcept
 {
     using enum url_parse_state;
 
@@ -46,6 +46,7 @@ constexpr std::string_view parse_state_string(url_parse_state s) noexcept
 struct url_parse_failure
 {
     url_parse_state failed_at;
+    std::size_t     index;
 };
 
 class url
