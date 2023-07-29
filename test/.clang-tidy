@@ -1,0 +1,9 @@
+# vim: ft=yaml
+
+# disable some checks triggered by Catch2 macros
+Checks: >-
+  -cert-err58-cpp,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -readability-function-cognitive-complexity,
+
+InheritParentConfig: true
