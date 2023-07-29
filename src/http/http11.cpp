@@ -11,6 +11,7 @@
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/limit_reader.hpp"
+#include "io/util.hpp"
 #include "util/result.hpp"
 #include "util/string_util.hpp"
 
@@ -41,52 +42,6 @@ result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
 
     if (err != std::errc()) return {err};
     return {value};
-}
-
-result<std::string, std::error_condition> readline(buffered_reader& reader) noexcept
-{
-    // TODO: max read
-
-    std::string line;
-    line.reserve(256); // TODO: make initial size and growth factor customizable
-
-    const auto add_size = [&]
-    {
-        if (line.size() == line.capacity())
-        {
-            auto new_size = static_cast<double>(line.size()) * 1.5;
-            line.reserve(static_cast<std::size_t>(new_size));
-        }
-
-        line.resize(line.size() + 1);
-    };
-
-    bool have_carriage_return = false;
-
-    while (true)
-    {
-        auto [next, have_next] = reader.peek();
-        if (!have_next) return std::make_error_condition(std::errc::not_connected); // TODO: not the right error...
-
-        add_size();
-        auto [count, err] = reader.read(line.data() + (line.size() - 1), 1);
-        if (err) return err;
-        if (count == 0) return std::make_error_condition(std::errc::io_error); // TODO: need a better error...
-
-        if (have_carriage_return)
-        {
-            if (static_cast<char>(next) == '\n') break;
-        }
-        else
-        {
-            if (static_cast<char>(next) == '\r') have_carriage_return = true;
-        }
-    }
-
-    // chop off the '\r\n'
-    line.resize(line.size() - 2);
-
-    return line;
 }
 
 result<protocol_version, std::error_condition> parse_http_version(std::string_view str)
@@ -120,7 +75,7 @@ std::error_condition parse_status_line(buffered_reader& reader, client_response&
 {
     // TODO: max bytes to read
 
-    auto result = readline(reader);
+    auto result = net::io::readline(reader);
     if (result.has_error()) return result.to_error();
 
     auto line = result.to_value();
