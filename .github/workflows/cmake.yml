@@ -11,13 +11,13 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, macos-12]
-        cc: [gcc-11, clang-14]
-        cxx: [g++-11, clang++-14]
+        cc: [gcc-12, clang-15]
+        cxx: [g++-12, clang++-15]
         exclude:
-        - cc: gcc-11
-          cxx: clang++-14
-        - cc: clang-14
-          cxx: g++-11
+        - cc: gcc-12
+          cxx: clang++-15
+        - cc: clang-15
+          cxx: g++-12
 
     runs-on: ${{ matrix.os }}
 
@@ -38,13 +38,13 @@ jobs:
         echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
 
     - name: Select MacOS Compilers (Clang)
-      if: runner.os == 'MacOS' && matrix.cc == 'clang-14'
+      if: runner.os == 'MacOS' && matrix.cc == 'clang-15'
       run: |
-        echo "CC=$(brew --prefix llvm@14)/bin/clang" >> $GITHUB_ENV
-        echo "CXX=$(brew --prefix llvm@14)/bin/clang++" >> $GITHUB_ENV
+        echo "CC=$(brew --prefix llvm@15)/bin/clang" >> $GITHUB_ENV
+        echo "CXX=$(brew --prefix llvm@15)/bin/clang++" >> $GITHUB_ENV
 
     - name: Select MacOS Compilers (GCC)
-      if: runner.os == 'MacOS' && matrix.cc == 'gcc-11'
+      if: runner.os == 'MacOS' && matrix.cc == 'gcc-12'
       run: |
         echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
         echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
