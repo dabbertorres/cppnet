@@ -192,11 +192,11 @@ constexpr auto operator<=>(const ipv6_addr& lhs, const ipv6_addr& rhs) noexcept
     for (auto i = 0U; i < lhs.data.size(); ++i)
     {
         auto cmp = lhs.data[i] <=> rhs.data[i];
-        if (std::is_lt(cmp)) return std::partial_ordering::less;
-        if (std::is_gt(cmp)) return std::partial_ordering::greater;
+        if (std::is_lt(cmp)) return std::strong_ordering::less;
+        if (std::is_gt(cmp)) return std::strong_ordering::greater;
     }
 
-    return std::partial_ordering::equivalent;
+    return std::strong_ordering::equivalent;
 }
 
 }

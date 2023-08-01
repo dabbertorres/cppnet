@@ -11,6 +11,13 @@
 namespace net
 {
 
+enum class protocol
+{
+    not_care,
+    ipv4,
+    ipv6,
+};
+
 class ip_addr
 {
 public:
@@ -45,13 +52,13 @@ public:
         return std::visit([](const auto& v) { return v.to_string(); }, addr);
     }
 
-    friend constexpr auto operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept;
+    friend constexpr std::partial_ordering operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept;
 
-    friend constexpr auto operator<=>(const ip_addr& lhs, const ipv6_addr& rhs) noexcept;
-    friend constexpr auto operator<=>(const ip_addr& lhs, const ipv4_addr& rhs) noexcept;
+    friend constexpr std::partial_ordering operator<=>(const ip_addr& lhs, const ipv6_addr& rhs) noexcept;
+    friend constexpr std::partial_ordering operator<=>(const ip_addr& lhs, const ipv4_addr& rhs) noexcept;
 
-    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
-    friend constexpr auto operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
+    friend constexpr std::partial_ordering operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
+    friend constexpr std::partial_ordering operator<=>(const ipv4_addr& lhs, const ip_addr& rhs) noexcept;
 
     friend constexpr bool operator==(const ip_addr& lhs, const ip_addr& rhs) noexcept = default;
 
@@ -59,7 +66,7 @@ private:
     std::variant<ipv4_addr, ipv6_addr> addr;
 };
 
-constexpr auto operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept
+constexpr std::partial_ordering operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept
 {
     if (lhs.is_ipv4() && rhs.is_ipv4()) return lhs.to_ipv4() <=> rhs.to_ipv4();
     if (lhs.is_ipv6() && rhs.is_ipv6()) return lhs.to_ipv6() <=> rhs.to_ipv6();

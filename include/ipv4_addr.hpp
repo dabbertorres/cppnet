@@ -12,13 +12,6 @@
 namespace net
 {
 
-enum class protocol
-{
-    not_care,
-    ipv4,
-    ipv6,
-};
-
 class ipv4_addr
 {
 public:
@@ -83,11 +76,11 @@ constexpr auto operator<=>(const ipv4_addr& lhs, const ipv4_addr& rhs) noexcept
     for (auto i = 0U; i < lhs.data.size(); ++i)
     {
         auto cmp = lhs.data[i] <=> rhs.data[i];
-        if (std::is_lt(cmp)) return std::partial_ordering::less;
-        if (std::is_gt(cmp)) return std::partial_ordering::greater;
+        if (std::is_lt(cmp)) return std::strong_ordering::less;
+        if (std::is_gt(cmp)) return std::strong_ordering::greater;
     }
 
-    return std::partial_ordering::equivalent;
+    return std::strong_ordering::equivalent;
 }
 
 }
