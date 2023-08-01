@@ -133,11 +133,18 @@ io::result socket::read(std::byte* data, std::size_t length) noexcept
         }
 
         // client closed connection
-        if (num == 0) return {.count = received};
+        if (num == 0)
+        {
+            return {
+                .count = received,
+                .err   = make_error_condition(io::status_condition::closed),
+            };
+        }
 
         received += static_cast<std::size_t>(num);
         break;
     }
+
     return {.count = received};
 }
 
@@ -146,9 +153,6 @@ io::result socket::write(const std::byte* data, std::size_t length) noexcept
     std::size_t sent = 0;
     while (sent < length)
     {
-        /* ::select(int, fd_set *, fd_set *, fd_set *, struct timeval *); */
-        /* ::pselect(int, fd_set *, fd_set *, fd_set *, const struct timespec *, const sigset_t *); */
-
         const std::int64_t num = ::send(fd, data + sent, length - sent, 0);
         if (num < 0)
         {
@@ -164,6 +168,7 @@ io::result socket::write(const std::byte* data, std::size_t length) noexcept
 
         sent += static_cast<std::size_t>(num);
     }
+
     return {.count = sent};
 }
 

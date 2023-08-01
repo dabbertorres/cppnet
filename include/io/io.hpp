@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <system_error>
+#include <type_traits>
 
 namespace net::io
 {
@@ -10,11 +12,22 @@ struct result
 {
     std::size_t          count{};
     std::error_condition err{};
-
-    // is_eof returns true if the result indicates an end-of-file condition.
-    // This is defined by a short read, but with no error condition.
-    // read_request should be the amount passed to a io::reader::read().
-    [[nodiscard]] bool is_eof(std::size_t read_request) const noexcept { return read_request < count && !err; }
 };
+
+enum class status_condition
+{
+    closed = 1,
+};
+
+std::error_condition make_error_condition(status_condition);
+
+}
+
+namespace std
+{
+
+template<>
+struct is_error_condition_enum<net::io::status_condition> : std::true_type
+{};
 
 }

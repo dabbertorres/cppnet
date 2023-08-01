@@ -1,5 +1,7 @@
 #include "io/util.hpp"
 
+#include "io/io.hpp"
+
 namespace net::io
 {
 
@@ -28,7 +30,7 @@ readline_result readline(buffered_reader& reader, std::string_view end_of_line) 
         add_size();
         auto [count, err] = reader.read(line.data() + (line.size() - 1), 1);
         if (err) return err;
-        if (count == 0) return {std::make_error_condition(std::errc::io_error)}; // TODO: communicate the actual error
+        if (count == 0) return {make_error_condition(status_condition::closed)}; // TODO: communicate the actual error
     }
 
     if (line.ends_with(end_of_line)) line.resize(line.size() - end_of_line.size());

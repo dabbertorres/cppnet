@@ -10,6 +10,7 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/io.hpp"
 #include "io/limit_reader.hpp"
 #include "io/util.hpp"
 #include "util/result.hpp"
@@ -75,10 +76,11 @@ std::error_condition parse_status_line(buffered_reader& reader, client_response&
 {
     // TODO: max bytes to read
 
-    auto result = net::io::readline(reader);
+    auto result = readline(reader);
     if (result.has_error()) return result.to_error();
 
     auto line = result.to_value();
+    if (line.empty()) return make_error_condition(net::io::status_condition::closed);
     auto view = static_cast<std::string_view>(line);
 
     auto version_end = view.find(' ');
@@ -108,7 +110,7 @@ std::error_condition parse_request_line(buffered_reader& reader, server_request&
     if (result.has_error()) return result.to_error();
 
     auto line = result.to_value();
-    if (line.empty()) return std::make_error_condition(std::errc::io_error); // TODO: return a not ready error
+    if (line.empty()) return make_error_condition(net::io::status_condition::closed);
     auto view = static_cast<std::string_view>(line);
 
     auto method_end = view.find(' ');
