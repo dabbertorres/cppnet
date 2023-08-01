@@ -175,24 +175,27 @@ public:
 
     ~promise_type()
     {
-        std::visit(state,
-                   [](auto&& arg)
-                   {
-                       using V = std::decay_t<decltype(arg)>;
-                       arg.~V();
-                   });
+        std::visit(
+            [](auto&& arg)
+            {
+                using V = std::decay_t<decltype(arg)>;
+                arg.~V();
+            },
+            state);
     }
 
     task<T> get_return_object() noexcept;
 
-    void unhandled_exception() noexcept { state.emplace(std::current_exception()); }
+    void unhandled_exception() noexcept { state = std::current_exception(); }
 
     template<typename V>
-        requires std::convertible_to<V&&, T>
+        requires std::constructible_from<T, V&&>
     void return_value(V&& value) noexcept(std::is_nothrow_constructible_v<T, V&&>)
     {
         state.emplace(std::forward<V>(value));
     }
+
+    void return_value(T&& value) noexcept { state = value; }
 
     T& result() &
     {
