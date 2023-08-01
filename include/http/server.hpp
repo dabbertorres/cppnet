@@ -58,8 +58,10 @@ public:
     void serve();
 
 private:
-    void serve_connection(tcp_socket& client_sock) noexcept;
-    bool enforce_protocol(const server_request& req, response_writer& resp) noexcept;
+    void             serve_connection(tcp_socket&& client_sock) noexcept;
+    std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
+    bool             is_protocol_supported(std::string_view protocol) const noexcept;
+    bool             enforce_protocol(const server_request& req, response_writer& resp) noexcept;
 
     net::listener                   listener;
     std::atomic_bool                is_serving;

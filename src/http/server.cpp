@@ -1,6 +1,7 @@
 #include "http/server.hpp"
 
 #include <functional>
+#include <string_view>
 
 #include "http/http11.hpp"
 #include "http/http2.hpp"
@@ -10,6 +11,8 @@
 
 namespace net::http
 {
+
+using namespace std::string_view_literals;
 
 server::server(const server_config& cfg)
     : listener(cfg.host,
@@ -50,12 +53,12 @@ void server::serve()
         try
         {
             logger->trace("waiting for connection");
-            auto client_sock = std::make_shared<tcp_socket>(listener.accept());
-            logger->trace("connection accepted: {} -> {}", client_sock->remote_addr(), client_sock->local_addr());
+            auto client_sock = listener.accept();
+            logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
             const std::lock_guard guard(connections_mu);
-            /* connections.push_back(client_sock); */
-            connections.emplace_back([this, client_sock] { serve_connection(*client_sock); });
+            connections.emplace_back([this, client_sock = std::move(client_sock)] mutable
+                                     { serve_connection(std::move(client_sock)); });
         }
         catch (const std::exception& ex)
         {
@@ -65,7 +68,7 @@ void server::serve()
     }
 }
 
-void server::serve_connection(tcp_socket& client_sock) noexcept
+void server::serve_connection(tcp_socket&& client_sock) noexcept
 {
     logger->trace("new connection handler started for {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
@@ -82,23 +85,21 @@ void server::serve_connection(tcp_socket& client_sock) noexcept
             logger->trace("decoding request");
 
             request_decoder decode = nullptr;
-            switch (1) // TODO: determine version of HTTP before full decoding
+            switch (0) // TODO: determine version of HTTP before full decoding
             {
             case 1: decode = http11::request_decode; break;
             case 2: decode = http2::request_decode; break;
 
-            default:
-                [[unlikely]]
-#ifdef __cpp_lib_unreachable
-                std::unreachable()
-#endif
-                    ;
+            default: decode = http11::request_decode; break;
             }
 
             auto req_result = decode(reader, max_header_bytes);
             if (req_result.has_error())
             {
-                logger->error("request decode error: {}", req_result.to_error().message());
+                auto err = req_result.to_error();
+                if (static_cast<io::status_condition>(err.value()) == io::status_condition::closed)
+                    logger->debug("connection closed");
+                else logger->error("request decode error: {} '{}'", err.value(), err.message());
                 break;
             }
 
@@ -135,6 +136,13 @@ void server::serve_connection(tcp_socket& client_sock) noexcept
                 logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
                 rw.send(status::HTTP_VERSION_NOT_SUPPORTED, 0);
             }
+            else if (auto upgrade_to = upgrade_to_protocol(req); !upgrade_to.empty())
+            {
+                logger->trace("upgrading to protocol: {}", upgrade_to);
+                resp.headers.set("Upgrade"sv, upgrade_to);
+                resp.headers.set("Connection"sv, "upgrade"sv);
+                rw.send(status::SWITCHING_PROTOCOLS, 0);
+            }
             else
             {
                 auto maybe_handler = router.route_request(req);
@@ -149,6 +157,7 @@ void server::serve_connection(tcp_socket& client_sock) noexcept
                     logger->trace("no handler found for {} {} - responding 404",
                                   method_string(req.method),
                                   req.uri.path);
+                    // TODO: add configuration for a 404 handler
                     rw.send(status::NOT_FOUND, 0);
                 }
             }
@@ -165,6 +174,31 @@ void server::serve_connection(tcp_socket& client_sock) noexcept
     }
 
     logger->trace("connection closing");
+}
+
+std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept
+{
+    auto upgrade = req.headers.get_all("Upgrade"sv);
+    if (!upgrade.has_value()) return ""sv;
+
+    std::string_view upgrade_to;
+    for (const auto& protocol : *upgrade)
+    {
+        if (is_protocol_supported(protocol))
+        {
+            upgrade_to = protocol;
+            break;
+        }
+    }
+
+    return upgrade_to;
+}
+
+bool server::is_protocol_supported(std::string_view protocol) const noexcept
+{
+    if (protocol == "HTTP/1.1") return true;
+
+    return false;
 }
 
 bool server::enforce_protocol(const server_request& req, response_writer& resp) noexcept
