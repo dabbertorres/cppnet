@@ -13,16 +13,16 @@ public:
         : limit_reader(nullptr, 0)
     {}
 
-    constexpr limit_reader(reader* reader, size_t limit)
+    constexpr limit_reader(reader* reader, std::size_t limit)
         : parent{reader}
         , limit{limit}
     {}
 
-    result read(std::byte* data, size_t length) override
+    result read(std::byte* data, std::size_t length) override
     {
         if (progress >= limit) return {};
 
-        const size_t read_amount = std::min(length, limit - progress);
+        const std::size_t read_amount = std::min(length, limit - progress);
 
         auto res = parent->read(data, read_amount);
         progress += res.count;
@@ -31,10 +31,12 @@ public:
 
     using reader::read;
 
+    [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
+
 private:
-    reader* parent   = nullptr;
-    size_t  limit    = 0;
-    size_t  progress = 0;
+    reader*     parent   = nullptr;
+    std::size_t limit    = 0;
+    std::size_t progress = 0;
 };
 
 }

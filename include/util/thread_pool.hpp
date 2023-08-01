@@ -20,7 +20,7 @@ namespace net::util
 class thread_pool
 {
 public:
-    thread_pool(size_t concurrency = std::thread::hardware_concurrency());
+    thread_pool(std::size_t concurrency = std::thread::hardware_concurrency());
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;
@@ -31,13 +31,13 @@ public:
     ~thread_pool();
 
     // num_workers returns the number of work threads managed by the thread_pool.
-    [[nodiscard]] size_t num_workers() const;
+    [[nodiscard]] std::size_t num_workers() const;
 
     // num_running_jobs returns the number of jobs currently running.
-    [[nodiscard]] size_t num_running_jobs() const;
+    [[nodiscard]] std::size_t num_running_jobs() const;
 
     // num_pending_jobs returns the number of jobs not currently running.
-    [[nodiscard]] size_t num_pending_jobs() const;
+    [[nodiscard]] std::size_t num_pending_jobs() const;
 
     // cancel clears the job queue, and requests worker threads to exit as soon as possible.
     void cancel();
@@ -92,7 +92,7 @@ private:
     mutable std::mutex                jobs_mu;
     std::condition_variable           check_for_job;
     std::atomic<bool>                 running;
-    std::atomic<size_t>               working;
+    std::atomic<std::size_t>          working;
 };
 
 }

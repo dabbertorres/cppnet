@@ -69,8 +69,8 @@ private:
     std::mutex                      connections_mu;
     util::thread_pool               threads;
 
-    size_t   max_header_bytes;
-    uint16_t max_pending_connections;
+    std::size_t   max_header_bytes;
+    std::uint16_t max_pending_connections;
 };
 
 }

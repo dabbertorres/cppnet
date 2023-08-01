@@ -38,8 +38,13 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
-    io::result read(std::byte* data, size_t length) noexcept override;
-    io::result write(const std::byte* data, size_t length) noexcept override;
+    io::result read(std::byte* data, std::size_t length) noexcept override;
+    io::result write(const std::byte* data, std::size_t length) noexcept override;
+
+    using io::reader::read;
+    using io::writer::write;
+
+    [[nodiscard]] int native_handle() const noexcept override { return fd; }
 
     void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) const noexcept;
 

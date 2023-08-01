@@ -18,7 +18,7 @@ public:
         : view{view}
     {}
 
-    result read(CharT* data, size_t length)
+    result read(CharT* data, std::size_t length)
     {
         if (idx == view.length()) return {.count = 0};
 
@@ -29,11 +29,13 @@ public:
         return {.count = amount};
     }
 
-    result read(std::byte* data, size_t length) override { return read(reinterpret_cast<CharT*>(data), length); }
+    result read(std::byte* data, std::size_t length) override { return read(reinterpret_cast<CharT*>(data), length); }
+
+    [[nodiscard]] int native_handle() const noexcept override { return 0; }
 
 private:
-    string view;
-    size_t idx = 0;
+    string      view;
+    std::size_t idx = 0;
 };
 
 }

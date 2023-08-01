@@ -144,7 +144,7 @@ listener::~listener() noexcept
     }
 }
 
-void listener::listen(uint16_t max_backlog)
+void listener::listen(std::uint16_t max_backlog)
 {
     if (is_listening.exchange(true))
     {

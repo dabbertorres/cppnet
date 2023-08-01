@@ -59,26 +59,26 @@ private:
     {
         string literal;
 
-        [[nodiscard]] bool match(string_view str, size_t& offset) const noexcept;
+        [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
     struct state_string_alternation
     {
         std::vector<string> choices;
 
-        [[nodiscard]] bool match(string_view str, size_t& offset) const noexcept;
+        [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
     struct state_char_alternation
     {
         std::vector<char> choices;
 
-        [[nodiscard]] bool match(string_view str, size_t& offset) const noexcept;
+        [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
     struct state_wildcard
     {
-        [[nodiscard]] bool match(string_view str, size_t& offset) const noexcept;
+        [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
     using state_types = std::variant<state_literal, state_string_alternation, state_char_alternation, state_wildcard>;
@@ -88,13 +88,13 @@ private:
         state_types impl;
         repetition  rep;
 
-        [[nodiscard]] bool match(string_view str, size_t& offset) const noexcept;
+        [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
     static void parse(string_view, std::vector<state>&);
 
-    static constexpr bool should_repeat(repetition rep, size_t current_matches) noexcept;
-    static constexpr bool repetition_satisfied(repetition rep, size_t current_matches) noexcept;
+    static constexpr bool should_repeat(repetition rep, std::size_t current_matches) noexcept;
+    static constexpr bool repetition_satisfied(repetition rep, std::size_t current_matches) noexcept;
 
     std::vector<state> states;
 };

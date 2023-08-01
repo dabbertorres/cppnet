@@ -3,14 +3,14 @@
 namespace net::io
 {
 
-buffered_reader::buffered_reader(reader* impl, size_t bufsize)
+buffered_reader::buffered_reader(reader* impl, std::size_t bufsize)
     : impl(impl)
     , buf(bufsize)
 {
     buf.resize(0);
 }
 
-result buffered_reader::read(std::byte* data, size_t length)
+result buffered_reader::read(std::byte* data, std::size_t length)
 {
     if (length == 0) return {.count = 0};
 
@@ -34,7 +34,7 @@ result buffered_reader::read(std::byte* data, size_t length)
 
     // Note that we always (try to) read from the inner reader in buf.capacity() increments.
 
-    size_t total = 0;
+    std::size_t total = 0;
 
     if (!buf.empty())
     {

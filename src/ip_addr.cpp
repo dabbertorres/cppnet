@@ -13,7 +13,7 @@ namespace net
 
 std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
 {
-    std::array<uint8_t, 4> values{};
+    std::array<std::uint8_t, 4> values{};
 
     auto* it = values.end() - 1;
     for (auto part : util::split_string(str, '.'))
@@ -52,7 +52,7 @@ std::optional<ipv6_addr> ipv6_addr::parse(std::string_view str) noexcept
     // NOTE: currently limited to parsing only fully-specified addresses,
     // rather than shortened representations.
 
-    std::array<uint16_t, 8> values{};
+    std::array<std::uint16_t, 8> values{};
 
     auto* it = values.end() - 1;
     for (auto part : util::split_string(str, ':'))

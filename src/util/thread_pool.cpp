@@ -3,14 +3,14 @@
 namespace net::util
 {
 
-thread_pool::thread_pool(size_t concurrency)
+thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
 {
     if (concurrency == 0) concurrency = 4;
 
     threads.reserve(concurrency);
 
-    for (size_t i = 0; i < concurrency; ++i)
+    for (std::size_t i = 0; i < concurrency; ++i)
     {
         threads.emplace_back(&thread_pool::worker, this);
     }
@@ -27,11 +27,11 @@ thread_pool::~thread_pool()
     }
 }
 
-size_t thread_pool::num_workers() const { return threads.size(); }
+std::size_t thread_pool::num_workers() const { return threads.size(); }
 
-size_t thread_pool::num_running_jobs() const { return working; }
+std::size_t thread_pool::num_running_jobs() const { return working; }
 
-size_t thread_pool::num_pending_jobs() const
+std::size_t thread_pool::num_pending_jobs() const
 {
     std::unique_lock lock(jobs_mu);
     return jobs.size();

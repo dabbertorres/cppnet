@@ -16,13 +16,13 @@ class string_writer : public writer
 public:
     using string = std::basic_string<CharT, Traits, Allocator>;
 
-    result write(const CharT* data, size_t length)
+    result write(const CharT* data, std::size_t length)
     {
         parts.emplace_back(data, length);
         return {.count = length};
     }
 
-    result write(const std::byte* data, size_t length) override
+    result write(const std::byte* data, std::size_t length) override
     {
         parts.emplace_back(reinterpret_cast<const CharT*>(data), length);
         return {.count = length};
@@ -52,9 +52,9 @@ public:
         return output;
     }
 
-    [[nodiscard]] size_t length() const
+    [[nodiscard]] std::size_t length() const
     {
-        size_t total = 0;
+        std::size_t total = 0;
         for (const auto& p : parts)
         {
             total += p.length();
@@ -63,6 +63,8 @@ public:
     }
 
     void reset() { parts.clear(); }
+
+    [[nodiscard]] int native_handle() const noexcept override { return 0; }
 
 private:
     std::deque<string> parts;

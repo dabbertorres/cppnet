@@ -41,7 +41,7 @@ consteval std::size_t hash_seed()
 namespace std
 {
 
-template<typename T, size_t N>
+template<typename T, std::size_t N>
 struct hash<T (&)[N]> // NOLINT(*-avoid-c-arrays)
 {
     // NOLINTNEXTLINE(*-avoid-c-arrays)

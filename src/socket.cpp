@@ -108,14 +108,14 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(std::byte* data, size_t length) noexcept
+io::result socket::read(std::byte* data, std::size_t length) noexcept
 {
-    size_t received = 0;
-    size_t attempts = 0;
+    std::size_t received = 0;
+    std::size_t attempts = 0;
 
     while (true)
     {
-        const int64_t num = ::recv(fd, data + received, length - received, 0);
+        const std::int64_t num = ::recv(fd, data + received, length - received, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -135,21 +135,21 @@ io::result socket::read(std::byte* data, size_t length) noexcept
         // client closed connection
         if (num == 0) return {.count = received};
 
-        received += static_cast<size_t>(num);
+        received += static_cast<std::size_t>(num);
         break;
     }
     return {.count = received};
 }
 
-io::result socket::write(const std::byte* data, size_t length) noexcept
+io::result socket::write(const std::byte* data, std::size_t length) noexcept
 {
-    size_t sent = 0;
+    std::size_t sent = 0;
     while (sent < length)
     {
         /* ::select(int, fd_set *, fd_set *, fd_set *, struct timeval *); */
         /* ::pselect(int, fd_set *, fd_set *, fd_set *, const struct timespec *, const sigset_t *); */
 
-        const int64_t num = ::send(fd, data + sent, length - sent, 0);
+        const std::int64_t num = ::send(fd, data + sent, length - sent, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -162,7 +162,7 @@ io::result socket::write(const std::byte* data, size_t length) noexcept
         // client closed connection
         if (num == 0) return {.count = sent};
 
-        sent += static_cast<size_t>(num);
+        sent += static_cast<std::size_t>(num);
     }
     return {.count = sent};
 }

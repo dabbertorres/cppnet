@@ -18,8 +18,10 @@ public:
 
     virtual ~reader() = default;
 
-    virtual result read(std::byte* data, size_t length) = 0;
-    result         read(char* data, size_t length) { return read(reinterpret_cast<std::byte*>(data), length); }
+    virtual result read(std::byte* data, std::size_t length) = 0;
+    result         read(char* data, std::size_t length) { return read(reinterpret_cast<std::byte*>(data), length); }
+
+    [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
 protected:
     reader() = default;

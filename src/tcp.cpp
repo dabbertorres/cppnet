@@ -93,6 +93,10 @@ int tcp_socket::open(
     return fd;
 }
 
+tcp_socket::tcp_socket() noexcept
+    : socket(invalid_fd)
+{}
+
 tcp_socket::tcp_socket(int fd) noexcept
     : socket(fd)
 {}

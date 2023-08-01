@@ -35,9 +35,9 @@ using net::io::buffered_reader;
 using net::util::result;
 using net::util::trim_string;
 
-result<uint32_t, std::errc> from_chars(std::string_view str) noexcept
+result<std::uint32_t, std::errc> from_chars(std::string_view str) noexcept
 {
-    uint32_t value; // NOLINT(cppcoreguidelines-init-variables)
+    std::uint32_t value; // NOLINT(cppcoreguidelines-init-variables)
     auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
 
     if (err != std::errc()) return {err};
@@ -251,7 +251,7 @@ util::result<io::writer*, std::error_condition> response_encode(io::writer*     
 }
 
 result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
-                                                            size_t               max_header_bytes) noexcept
+                                                            std::size_t          max_header_bytes) noexcept
 {
     server_request req;
 
@@ -276,8 +276,8 @@ result<client_response, std::error_condition> response_decode(io::buffered_reade
     if (auto err = parse_status_line(reader, resp); err) return {err};
     if (auto err = parse_headers(reader, max_header_bytes, resp.headers); err) return {err};
 
-    const size_t content_length = resp.headers.get_content_length().value_or(0);
-    resp.body                   = io::limit_reader(&reader, content_length);
+    const std::size_t content_length = resp.headers.get_content_length().value_or(0);
+    resp.body                        = io::limit_reader(&reader, content_length);
     return {resp};
 }
 

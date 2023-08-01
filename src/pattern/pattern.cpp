@@ -7,6 +7,39 @@
 
 using namespace std::string_view_literals;
 
+namespace
+{
+
+bool is_operator(char c) noexcept
+{
+    switch (c)
+    {
+    case '|': [[fallthrough]];
+    case '[': [[fallthrough]];
+    case ']': [[fallthrough]];
+
+    case '.': [[fallthrough]];
+
+    case '*': [[fallthrough]];
+    case '+': [[fallthrough]];
+    case '?': [[fallthrough]];
+
+    case '(': [[fallthrough]];
+    case ')': return true;
+
+    default: return false;
+    }
+}
+
+bool is_operator(net::pattern::expr::string_view str) noexcept
+{
+    if (str.length() != 1) return false;
+
+    return is_operator(str[0]);
+}
+
+}
+
 namespace net::pattern
 {
 
@@ -31,34 +64,6 @@ enum class op
     paren_open,
     paren_close,
 };
-
-static bool is_operator(char c) noexcept
-{
-    switch (c)
-    {
-    case '|': [[fallthrough]];
-    case '[': [[fallthrough]];
-    case ']': [[fallthrough]];
-
-    case '.': [[fallthrough]];
-
-    case '*': [[fallthrough]];
-    case '+': [[fallthrough]];
-    case '?': [[fallthrough]];
-
-    case '(': [[fallthrough]];
-    case ')': return true;
-
-    default: return false;
-    }
-}
-
-static bool is_operator(expr::string_view str) noexcept
-{
-    if (str.length() != 1) return false;
-
-    return is_operator(str[0]);
-}
 
 constexpr expr::string_view op_to_char(op op)
 {
@@ -141,9 +146,9 @@ void expr::parse(string_view str, std::vector<state>& states)
         operators.push(o);
     };
 
-    size_t first_char = 0;
+    std::size_t first_char = 0;
 
-    for (size_t i = 0; i < str.length(); ++i)
+    for (std::size_t i = 0; i < str.length(); ++i)
     {
         const auto c = str[i];
 
@@ -223,8 +228,8 @@ void expr::parse(string_view str, std::vector<state>& states)
 
 bool expr::match(string_view input) const noexcept
 {
-    auto   state_it = states.begin();
-    size_t offset   = 0;
+    auto        state_it = states.begin();
+    std::size_t offset   = 0;
 
     while (offset < input.length() && state_it != states.end())
     {
@@ -237,7 +242,7 @@ bool expr::match(string_view input) const noexcept
     return state_it == states.end();
 }
 
-constexpr bool expr::should_repeat(repetition rep, size_t current_matches) noexcept
+constexpr bool expr::should_repeat(repetition rep, std::size_t current_matches) noexcept
 {
     switch (rep)
     {
@@ -248,7 +253,7 @@ constexpr bool expr::should_repeat(repetition rep, size_t current_matches) noexc
     }
 }
 
-constexpr bool expr::repetition_satisfied(repetition rep, size_t current_matches) noexcept
+constexpr bool expr::repetition_satisfied(repetition rep, std::size_t current_matches) noexcept
 {
     switch (rep)
     {
@@ -259,7 +264,7 @@ constexpr bool expr::repetition_satisfied(repetition rep, size_t current_matches
     }
 }
 
-bool expr::state_literal::match(string_view str, size_t& offset) const noexcept
+bool expr::state_literal::match(string_view str, std::size_t& offset) const noexcept
 {
     if (str.substr(offset).starts_with(literal))
     {
@@ -270,7 +275,7 @@ bool expr::state_literal::match(string_view str, size_t& offset) const noexcept
     return false;
 }
 
-bool expr::state_string_alternation::match(string_view str, size_t& offset) const noexcept
+bool expr::state_string_alternation::match(string_view str, std::size_t& offset) const noexcept
 {
     for (const auto& choice : choices)
     {
@@ -284,7 +289,7 @@ bool expr::state_string_alternation::match(string_view str, size_t& offset) cons
     return false;
 }
 
-bool expr::state_char_alternation::match(string_view str, size_t& offset) const noexcept
+bool expr::state_char_alternation::match(string_view str, std::size_t& offset) const noexcept
 {
     for (auto choice : choices)
     {
@@ -298,7 +303,7 @@ bool expr::state_char_alternation::match(string_view str, size_t& offset) const 
     return false;
 }
 
-bool expr::state_wildcard::match(string_view str, size_t& offset) const noexcept
+bool expr::state_wildcard::match(string_view str, std::size_t& offset) const noexcept
 {
     if (str[offset] == '.')
     {
@@ -309,11 +314,12 @@ bool expr::state_wildcard::match(string_view str, size_t& offset) const noexcept
     return false;
 }
 
-bool expr::state::match(string_view str, size_t& offset) const noexcept
+bool expr::state::match(string_view str, std::size_t& offset) const noexcept
 {
-    size_t match_count = 0;
-    bool   did_match   = false;
+    std::size_t match_count = 0;
+    bool        did_match   = false;
 
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-do-while)
     do {
         did_match = std::visit([&](const auto& m) { return m.match(str, offset); }, impl);
         if (did_match) ++match_count;

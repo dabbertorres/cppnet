@@ -14,6 +14,7 @@ using namespace std::chrono_literals;
 class tcp_socket : public socket
 {
 public:
+    tcp_socket() noexcept;
     tcp_socket(int fd) noexcept;
 
     tcp_socket(std::string_view          host,

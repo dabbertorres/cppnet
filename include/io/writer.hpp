@@ -18,9 +18,14 @@ public:
 
     virtual ~writer() = default;
 
-    virtual result write(const std::byte* data, size_t length) = 0;
-    result write(const char* data, size_t length) { return write(reinterpret_cast<const std::byte*>(data), length); }
+    virtual result write(const std::byte* data, std::size_t length) = 0;
+    result         write(const char* data, std::size_t length)
+    {
+        return write(reinterpret_cast<const std::byte*>(data), length);
+    }
     result write(std::string_view data) { return write(data.data(), data.size()); }
+
+    [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
 protected:
     writer() = default;

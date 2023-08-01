@@ -19,9 +19,9 @@ namespace net::io
 class buffered_reader : public reader
 {
 public:
-    buffered_reader(reader* impl, size_t bufsize = 1'024);
+    buffered_reader(reader* impl, std::size_t bufsize = 1'024);
 
-    result read(std::byte* data, size_t length) override;
+    result read(std::byte* data, std::size_t length) override;
 
     using reader::read;
 
@@ -33,8 +33,8 @@ public:
     //       See ensure if you want to make sure data is available.
     [[nodiscard]] std::tuple<std::byte, bool> peek();
 
-    [[nodiscard]] size_t capacity() const noexcept { return buf.capacity(); }
-    [[nodiscard]] size_t size() const noexcept { return buf.size(); }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
+    [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }
 
     // reset clears the buffer, and if other is not null, switches to it.
     // If other is null, the current reader is kept.
@@ -47,6 +47,8 @@ public:
     // error returns the current error, if any.
     // Potentially useful if e.g. peek() fails.
     [[nodiscard]] std::error_condition error() const;
+
+    [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
 
 private:
     void fill();

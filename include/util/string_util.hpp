@@ -61,8 +61,8 @@ constexpr String trim_string(String str) noexcept
     constexpr auto whitespace =
         " \b\f\n\r\t\v\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202f\u205f\u3000"sv;
 
-    size_t first_not_space = str.find_first_not_of(whitespace);
-    size_t last_not_space  = str.find_last_not_of(whitespace);
+    std::size_t first_not_space = str.find_first_not_of(whitespace);
+    std::size_t last_not_space  = str.find_last_not_of(whitespace);
 
     if (first_not_space == String::npos) first_not_space = 0;
     if (last_not_space == String::npos) last_not_space = str.length();
@@ -85,7 +85,7 @@ String join(Args join_with, std::initializer_list<Args> strings) noexcept
     case 1: return String{*strings.begin()};
     }
 
-    size_t total = 0;
+    std::size_t total = 0;
     for (const auto& s : strings) total += s.size();
 
     String out;

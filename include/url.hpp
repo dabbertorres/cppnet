@@ -12,7 +12,7 @@
 namespace net
 {
 
-enum class url_parse_state : uint8_t
+enum class url_parse_state : std::uint8_t
 {
     scheme,
     authority,

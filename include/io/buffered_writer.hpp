@@ -13,18 +13,18 @@ namespace net::io
 class buffered_writer : public writer
 {
 public:
-    buffered_writer(writer* underlying, size_t bufsize = 1'024)
+    buffered_writer(writer* underlying, std::size_t bufsize = 1'024)
         : impl(underlying)
         , buf(bufsize)
     {
         buf.resize(0);
     }
 
-    result write(const std::byte* data, size_t length) override
+    result write(const std::byte* data, std::size_t length) override
     {
         if (length == 0) return {.count = 0};
 
-        size_t total = 0;
+        std::size_t total = 0;
 
         // fill up the buffer as much as possible first...
         if (buf.size() < buf.capacity())
@@ -76,14 +76,16 @@ public:
 
     using writer::write;
 
+    [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
+
     result flush()
     {
         if (buf.empty()) return {};
         return flush_available();
     }
 
-    [[nodiscard]] size_t capacity() const noexcept { return buf.capacity(); }
-    [[nodiscard]] size_t size() const noexcept { return buf.size(); }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
+    [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }
 
     // reset clears the buffer, and if other is not null, switches to it.
     // If other is null, the current writer is kept.

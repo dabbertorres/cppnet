@@ -9,7 +9,7 @@ namespace net
 
 std::string hostname() noexcept
 {
-    auto len = static_cast<size_t>(sysconf(_SC_HOST_NAME_MAX) + 1);
+    auto len = static_cast<std::size_t>(sysconf(_SC_HOST_NAME_MAX) + 1);
     if (len < 0) len = _POSIX_HOST_NAME_MAX;
 
     std::string name(len, '\0');

@@ -12,7 +12,7 @@ using net::url_parse_state;
 
 url_parse_state& operator++(url_parse_state& p)
 {
-    p = static_cast<url_parse_state>(static_cast<uint8_t>(p) + 1);
+    p = static_cast<url_parse_state>(static_cast<std::uint8_t>(p) + 1);
     return p;
 }
 
@@ -22,8 +22,8 @@ struct url_parser
     url              out;
 
     url_parse_state state = url_parse_state::scheme;
-    size_t          start = 0;
-    size_t          end   = 0;
+    std::size_t     start = 0;
+    std::size_t     end   = 0;
 
     url_parse_state parse() noexcept;
 
@@ -299,7 +299,7 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
 {
     std::ostringstream out;
 
-    size_t idx = 0;
+    std::size_t idx = 0;
     while ((idx = str.find_first_of(reserved, idx)) != std::string::npos)
     {
         std::array<char, 2> buf{};
@@ -318,7 +318,7 @@ std::string url::decode(std::string_view str) noexcept
 {
     std::ostringstream out;
 
-    size_t idx = 0;
+    std::size_t idx = 0;
     while ((idx = str.find('%')) != std::string::npos)
     {
         auto hex_val = str.substr(idx + 1, 2);
