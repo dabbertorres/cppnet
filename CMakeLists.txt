@@ -51,11 +51,14 @@ else()
     set(
       COMPILER_SPECIFIC_FLAGS
       "-fdiagnostics-color=always"
+      "-Wno-c++20-extensions"
+      "-Wno-c++20-attribute-extensions"
     )
   elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
     set(
       COMPILER_SPECIFIC_FLAGS
       "-fcolor-diagnostics"
+      "-stdlib=libc++"
     )
 
     if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
