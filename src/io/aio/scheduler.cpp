@@ -5,7 +5,7 @@
 #include <csignal>
 #include <mutex>
 
-#include <sys/epoll.h>
+/* #include <sys/epoll.h> */
 
 namespace net::io::aio
 {
@@ -20,10 +20,10 @@ scheduler::~scheduler() noexcept { shutdown(); }
 
 void scheduler::process_events(std::chrono::milliseconds timeout)
 {
-    loop.process_events([this]() { process_scheduled_tasks(); },
-                        [this]() { process_timeouts(); },
-                        [this]() { process_event(); },
-                        timeout);
+    /* loop.process_events([this]() { process_scheduled_tasks(); }, */
+    /*                     [this]() { process_timeouts(); }, */
+    /*                     [this]() { process_event(); }, */
+    /*                     timeout); */
 }
 
 void scheduler::shutdown() noexcept
@@ -32,7 +32,7 @@ void scheduler::shutdown() noexcept
     {
         workers.shutdown();
 
-        loop.shutdown();
+        /* loop.shutdown(); */
 
         if (io.joinable()) io.join();
     }
@@ -45,7 +45,7 @@ void scheduler::process_scheduled_tasks()
         std::lock_guard lock{scheduled_tasks_mutex};
         tasks.swap(scheduled_tasks);
 
-        loop.clear_schedule();
+        /* loop.clear_schedule(); */
 
         schedule_triggered.exchange(false, std::memory_order::release);
     }

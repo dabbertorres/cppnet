@@ -92,7 +92,7 @@ private:
 template<typename T>
 auto task<T>::operator co_await() const& noexcept
 {
-    struct awaitable : awaitable_base
+    struct awaitable : public awaitable_base
     {
         using awaitable_base::awaitable_base;
 
@@ -100,11 +100,11 @@ auto task<T>::operator co_await() const& noexcept
         {
             if constexpr (std::is_same_v<void, T>)
             {
-                handle.promise().result();
+                static_cast<awaitable_base*>(this)->handle.promise().result();
                 return;
             }
 
-            return handle.promise().result();
+            return static_cast<awaitable_base*>(this)->handle.promise().result();
         }
     };
 
@@ -114,7 +114,7 @@ auto task<T>::operator co_await() const& noexcept
 template<typename T>
 auto task<T>::operator co_await() const&& noexcept
 {
-    struct awaitable : awaitable_base
+    struct awaitable : public awaitable_base
     {
         using awaitable_base::awaitable_base;
 
@@ -122,11 +122,11 @@ auto task<T>::operator co_await() const&& noexcept
         {
             if constexpr (std::is_same_v<void, T>)
             {
-                handle.promise().result();
+                static_cast<awaitable_base*>(this)->handle.promise().result();
                 return;
             }
 
-            return std::move(handle.promise()).result();
+            return std::move(static_cast<awaitable_base*>(this)->handle.promise()).result();
         }
     };
 
@@ -136,7 +136,7 @@ auto task<T>::operator co_await() const&& noexcept
 template<typename T>
 [[nodiscard]] bool task<T>::when_ready() const noexcept
 {
-    struct awaitable : awaitable_base
+    struct awaitable : public awaitable_base
     {
         using awaitable_base::awaitable_base;
 
@@ -149,7 +149,7 @@ template<typename T>
 template<typename T>
 struct task<T>::awaitable_base
 {
-    constexpr awaitable_base(std::coroutine_handle<> handle) noexcept
+    constexpr awaitable_base(std::coroutine_handle<promise<T>> handle) noexcept
         : handle{handle}
     {}
 

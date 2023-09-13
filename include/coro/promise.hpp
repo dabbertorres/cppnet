@@ -25,7 +25,7 @@ class promise_base
         std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> coro) noexcept
         {
             auto& promise = coro.promise();
-            if (promise.handle != nullptr) return promise.handle();
+            if (promise.handle != nullptr) return promise.handle;
             return std::noop_coroutine();
         }
 
@@ -53,7 +53,7 @@ public:
     using task_t                       = task<T>;
     static constexpr bool is_reference = false;
 
-    task_t get_return_object() noexcept { return task<>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
+    task_t get_return_object() noexcept { return task{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     void return_value(T new_value) noexcept { value = std::move(new_value); }
 

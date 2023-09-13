@@ -46,7 +46,7 @@ private:
     coro::thread_pool workers;
     std::thread       io;
 
-    event_loop        loop;
+    /* event_loop        loop; */
     std::atomic<bool> shutdown_please;
 
     std::atomic<bool>                    schedule_triggered;
