@@ -27,9 +27,8 @@ namespace net::http
 
 struct server_config
 {
-    std::string                     host = "localhost";
-    std::string                     port = "8080";
-    router                          router;
+    std::string                     host                    = "localhost";
+    std::string                     port                    = "8080";
     std::size_t                     max_header_bytes        = 8'192;
     std::chrono::seconds            header_read_timeout     = 5s;
     std::uint16_t                   max_pending_connections = 512;
@@ -44,7 +43,7 @@ struct server_config
 class server
 {
 public:
-    server(const server_config& cfg = server_config{});
+    server(router&& handler, const server_config& cfg = server_config{});
 
     server(const server&)            = delete;
     server& operator=(const server&) = delete;
@@ -65,7 +64,7 @@ private:
 
     net::listener                   listener;
     std::atomic_bool                is_serving;
-    router                          router;
+    router                          handler;
     std::shared_ptr<spdlog::logger> logger;
     std::vector<std::thread>        connections;
     std::mutex                      connections_mu;

@@ -14,7 +14,6 @@ add_executable(tests ${test_sources})
 target_include_directories(
   tests
   PRIVATE
-  "${CMAKE_SOURCE_DIR}/include/"
   Catch2::Catch2
 )
 
@@ -24,11 +23,6 @@ target_link_libraries(
   Catch2::Catch2
   Catch2::Catch2WithMain
   net
-)
-
-target_compile_features(
-  tests
-  PRIVATE cxx_std_23
 )
 
 if(MSVC)

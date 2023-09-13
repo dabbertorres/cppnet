@@ -70,10 +70,10 @@ constexpr std::string_view method_string(request_method m) noexcept
 // client_request represents an outgoing HTTP request from a client to a server.
 struct client_request
 {
-    request_method   method = request_method::NONE;
-    protocol_version version{};
-    url              uri;
-    headers          headers;
+    request_method     method = request_method::NONE;
+    protocol_version   version{};
+    url                uri{};
+    net::http::headers headers{};
 
     io::reader* body = nullptr;
 };
@@ -81,10 +81,10 @@ struct client_request
 // server_request represents an incoming HTTP request from a client to a server.
 struct server_request
 {
-    request_method   method = request_method::NONE;
-    protocol_version version{};
-    url              uri;
-    headers          headers;
+    request_method     method = request_method::NONE;
+    protocol_version   version{};
+    url                uri{};
+    net::http::headers headers{};
 
     io::limit_reader body;
 };

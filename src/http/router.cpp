@@ -1,6 +1,7 @@
 #include "http/router.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <ranges>
 
 namespace net::http
@@ -51,6 +52,18 @@ router::route_request(const server_request& req) const
     auto route = std::ranges::find_if(routes, [&](const auto& route) { return route.matches(req); });
     if (route != routes.end()) return route->handler;
     return std::nullopt;
+}
+
+void router::operator()(const server_request& req, response_writer& resp) const
+{
+    auto handler = route_request(req);
+    if (!handler.has_value())
+    {
+        resp.send(status::NOT_FOUND, 0);
+        return;
+    }
+
+    std::invoke(handler->get(), req, resp);
 }
 
 }

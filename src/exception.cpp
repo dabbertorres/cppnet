@@ -7,10 +7,10 @@
 namespace net
 {
 
-[[nodiscard]] std::system_error system_error_from_errno(int err) noexcept
+[[nodiscard]] std::system_error system_error_from_errno(int err, const char* what) noexcept
 {
     auto code = std::make_error_code(static_cast<std::errc>(err));
-    return std::system_error{code};
+    return std::system_error{code, what};
 }
 
 bool throw_for_gai_error(int err)

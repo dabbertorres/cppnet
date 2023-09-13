@@ -54,7 +54,7 @@ public:
     void                     listen(std::uint16_t max_backlog);
     [[nodiscard]] tcp_socket accept() const;
 
-    int native_handle() const noexcept { return main_fd; }
+    [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
 private:
     std::atomic_bool is_listening;

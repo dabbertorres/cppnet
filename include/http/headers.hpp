@@ -53,13 +53,13 @@ public:
 
     struct values_range
     {
-        values_range(value_iterator begin, value_iterator end)
+        constexpr values_range(value_iterator begin, value_iterator end) noexcept
             : begin_it(begin)
             , end_it(end)
         {}
 
-        [[nodiscard]] value_iterator begin() const;
-        [[nodiscard]] value_iterator end() const;
+        [[nodiscard]] value_iterator begin() const noexcept { return begin_it; }
+        [[nodiscard]] value_iterator end() const noexcept { return end_it; }
 
     private:
         value_iterator begin_it;

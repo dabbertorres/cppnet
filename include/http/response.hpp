@@ -193,19 +193,19 @@ constexpr bool status_is_server_error(status s) noexcept { return status::INTERN
 // client_response represents an incoming HTTP response from a server to a client.
 struct client_response
 {
-    protocol_version version{};
-    status           status_code = status::NONE;
-    headers          headers;
-    io::limit_reader body;
+    protocol_version   version{};
+    status             status_code = status::NONE;
+    net::http::headers headers{};
+    io::limit_reader   body;
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.
 struct server_response
 {
-    protocol_version version{};
-    status           status_code = status::NONE;
-    headers          headers;
-    io::writer*      body = nullptr;
+    protocol_version   version{};
+    status             status_code = status::NONE;
+    net::http::headers headers{};
+    io::writer*        body = nullptr;
 };
 
 using response_encoder = util::result<io::writer*, std::error_condition> (*)(io::writer* writer,
@@ -217,8 +217,8 @@ struct response_writer
 public:
     response_writer(io::writer* writer, server_response* base, response_encoder encoder);
 
-    headers&    headers() noexcept;
-    io::writer& send(status status_code, std::size_t content_length);
+    net::http::headers& headers() noexcept;
+    io::writer&         send(status status_code, std::size_t content_length);
 
 private:
     io::writer*      writer;

@@ -73,11 +73,11 @@ public:
     [[nodiscard]] operation yield();
     void                    shutdown() noexcept;
 
-    std::size_t concurrency() const noexcept;
-    std::size_t size() const noexcept;
-    bool        empty() const noexcept;
-    std::size_t queue_size() const noexcept;
-    bool        queue_empty() const noexcept;
+    [[nodiscard]] std::size_t concurrency() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] bool        empty() const noexcept;
+    [[nodiscard]] std::size_t queue_size() const noexcept;
+    [[nodiscard]] bool        queue_empty() const noexcept;
 
 private:
     void worker();

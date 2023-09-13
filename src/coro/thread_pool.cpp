@@ -7,7 +7,7 @@ namespace net::coro
 
 std::size_t hardware_concurrency() noexcept
 {
-    static const auto count = std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() : 2;
+    static const auto count = std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() : 1;
     return count;
 }
 

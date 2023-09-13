@@ -2,6 +2,7 @@
 
 #include <compare>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <variant>
 
@@ -23,16 +24,14 @@ class ip_addr
 public:
     static std::optional<ip_addr> parse(std::string_view str) noexcept;
 
-    constexpr ip_addr() noexcept
-        : addr(ipv4_addr())
-    {}
+    constexpr ip_addr() noexcept = default;
 
     constexpr ip_addr(ipv4_addr addr) noexcept
-        : addr(addr)
+        : addr{addr}
     {}
 
     constexpr ip_addr(ipv6_addr addr) noexcept
-        : addr(addr)
+        : addr{addr}
     {}
 
     [[nodiscard]] constexpr bool is_ipv4() const noexcept { return std::holds_alternative<ipv4_addr>(addr); }
@@ -49,6 +48,10 @@ public:
 
     [[nodiscard]] std::string to_string() const
     {
+        /* if (is_ipv4()) return to_ipv4().to_string(); */
+        /* if (is_ipv6()) return to_ipv6().to_string(); */
+
+        /* return ""; */
         return std::visit([](const auto& v) { return v.to_string(); }, addr);
     }
 

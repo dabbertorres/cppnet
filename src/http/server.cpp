@@ -14,16 +14,16 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-server::server(const server_config& cfg)
-    : listener(cfg.host,
+server::server(router&& handler, const server_config& cfg)
+    : listener{cfg.host,
                cfg.port,
                network::tcp,
                protocol::not_care,
-               std::chrono::duration_cast<std::chrono::microseconds>(cfg.header_read_timeout))
+               std::chrono::duration_cast<std::chrono::microseconds>(cfg.header_read_timeout)}
     , is_serving{false}
-    , router(cfg.router)
+    , handler{handler}
     , logger{cfg.logger}
-    , threads(cfg.num_threads)
+    , threads{cfg.num_threads}
     , max_header_bytes{cfg.max_header_bytes}
     , max_pending_connections{cfg.max_pending_connections}
 {}
@@ -57,7 +57,7 @@ void server::serve()
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
             const std::lock_guard guard(connections_mu);
-            connections.emplace_back([this, client_sock = std::move(client_sock)] mutable
+            connections.emplace_back([this, client_sock = std::move(client_sock)]() mutable
                                      { serve_connection(std::move(client_sock)); });
         }
         catch (const std::exception& ex)
@@ -145,12 +145,12 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
             }
             else
             {
-                auto maybe_handler = router.route_request(req);
+                auto maybe_handler = handler.route_request(req);
                 if (maybe_handler.has_value())
                 {
-                    auto handler = maybe_handler.value();
+                    auto this_handler = maybe_handler.value();
                     logger->trace("calling handler");
-                    std::invoke(handler.get(), req, rw);
+                    std::invoke(this_handler.get(), req, rw);
                 }
                 else
                 {

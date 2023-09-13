@@ -25,19 +25,17 @@ add_library(net ${sources})
 
 target_include_directories(
   net
-  PUBLIC
-  "${CMAKE_SOURCE_DIR}/include/"
-)
-
-target_link_libraries(
-  net
-  PUBLIC
-  spdlog::spdlog
+  PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/"
 )
 
 target_compile_features(
   net
-  PRIVATE cxx_std_23
+  PUBLIC cxx_std_20
+)
+
+target_link_libraries(
+  net
+  PUBLIC spdlog::spdlog
 )
 
 if(MSVC)
@@ -52,13 +50,12 @@ else()
       COMPILER_SPECIFIC_FLAGS
       "-fdiagnostics-color=always"
       "-Wno-c++20-extensions"
-      "-Wno-c++20-attribute-extensions"
     )
   elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
     set(
       COMPILER_SPECIFIC_FLAGS
       "-fcolor-diagnostics"
-      "-stdlib=libc++"
+      # "-stdlib=libc++"
     )
 
     if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")

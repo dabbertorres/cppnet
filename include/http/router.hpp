@@ -37,17 +37,17 @@ public:
     route& on_method(request_method method);
     route& on_content_type(const std::string& content_type);
 
-    template<Matcher matcher_type>
-    route& on(matcher_type&& m)
+    template<Matcher M>
+    route& on(M&& m)
     {
-        conditions.push_back(std::forward<matcher_type>(m));
+        conditions.push_back(std::forward<M>(m));
         return *this;
     }
 
-    template<Handler handler_type>
-    route& use(handler_type&& h)
+    template<Handler H>
+    route& use(H&& h)
     {
-        handler = std::forward<handler_type>(h);
+        handler = std::forward<H>(h);
         return *this;
     }
 
@@ -70,6 +70,8 @@ public:
 
     [[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
     route_request(const server_request& req) const;
+
+    void operator()(const server_request&, response_writer&) const;
 
 private:
     std::vector<route> routes;

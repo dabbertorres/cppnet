@@ -4,6 +4,8 @@
 #include <charconv>
 #include <cstdlib>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <system_error>
 
 #include "util/string_util.hpp"
@@ -26,7 +28,7 @@ std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
     return ipv4_addr(values);
 }
 
-std::string ipv4_addr::to_string() const
+[[nodiscard]] std::string ipv4_addr::to_string() const
 {
     // large enough for largest (text) IPv4 address
     std::array<char, 15> buffer{};
