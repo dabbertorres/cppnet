@@ -15,10 +15,10 @@
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
+#include "coro/thread_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
-#include "util/thread_pool.hpp"
 
 #include "listen.hpp"
 
@@ -68,7 +68,7 @@ private:
     std::shared_ptr<spdlog::logger> logger;
     std::vector<std::thread>        connections;
     std::mutex                      connections_mu;
-    util::thread_pool               threads;
+    coro::thread_pool               threads;
 
     std::size_t   max_header_bytes;
     std::uint16_t max_pending_connections;
