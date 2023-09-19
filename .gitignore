@@ -104,3 +104,4 @@ build/
 vcpkg_installed/
 vcpkg-manifest-install.log
 CMakeUserPresets.json
+session.vim

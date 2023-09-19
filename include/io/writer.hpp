@@ -1,6 +1,8 @@
 #pragma once
 
+#include <concepts>
 #include <cstddef>
+#include <string_view>
 
 #include "io.hpp"
 
@@ -19,16 +21,100 @@ public:
     virtual ~writer() = default;
 
     virtual result write(const std::byte* data, std::size_t length) = 0;
-    result         write(const char* data, std::size_t length)
+    inline result  write(const char* data, std::size_t length)
     {
         return write(reinterpret_cast<const std::byte*>(data), length);
     }
-    result write(std::string_view data) { return write(data.data(), data.size()); }
+    inline result write(std::string_view data) { return write(data.data(), data.size()); }
+
+    inline result write(std::byte data) { return write(&data, 1); }
+    inline result write(char data) { return write(&data, 1); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
 protected:
     writer() = default;
 };
+
+inline result write_all(writer& /*out*/) { return {}; }
+
+template<typename... Writes>
+inline result write_all(writer& out, const std::byte* data, std::size_t length, Writes&&... writes)
+{
+    auto res = out.write(data, length);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, writes...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename... Writes>
+inline result write_all(writer& out, const char* data, std::size_t length, Writes&&... writes)
+{
+    auto res = out.write(data, length);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, writes...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename... Writes>
+inline result write_all(writer& out, std::string_view data, Writes&&... writes)
+{
+    auto res = out.write(data);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, std::forward<Writes>(writes)...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename... Writes>
+inline result write_all(writer& out, std::byte data, Writes&&... writes)
+{
+    auto res = out.write(data);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, std::forward<Writes>(writes)...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename... Writes>
+inline result write_all(writer& out, char data, Writes&&... writes)
+{
+    auto res = out.write(data);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, std::forward<Writes>(writes)...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename Call, typename... Writes>
+    requires(std::is_invocable_r_v<result, Call, writer&>)
+inline result write_all(writer& out, Call&& call, Writes&&... writes)
+{
+    auto res = call(out);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, std::forward<Writes>(writes)...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
 
 }
