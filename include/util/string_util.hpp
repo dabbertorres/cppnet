@@ -5,8 +5,11 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "coro/generator.hpp"
+#include "io/io.hpp"
+#include "io/writer.hpp"
 
 namespace net::util
 {
@@ -144,6 +147,83 @@ constexpr String replace(View view, View replace, View with_this)
         }
     }
 
+    return ss.str();
+}
+
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string<CharT, Traits>,
+         typename View   = std::basic_string_view<CharT, Traits>>
+constexpr void replace_all_to(std::ostream& os, View view, std::initializer_list<std::pair<View, View>> replacements)
+{
+    while (!view.empty())
+    {
+        bool replaced = false;
+        for (const auto& [replace, with_this] : replacements)
+        {
+            if (view.starts_with(replace))
+            {
+                os << with_this;
+                view     = view.substr(replace.length());
+                replaced = true;
+                break;
+            }
+        }
+
+        if (!replaced)
+        {
+            os << view.front();
+            view = view.substr(1);
+        }
+    }
+}
+
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string<CharT, Traits>,
+         typename View   = std::basic_string_view<CharT, Traits>>
+io::result replace_all_to(io::writer& out, View view, std::initializer_list<std::pair<View, View>> replacements)
+{
+    std::size_t total = 0;
+
+    while (!view.empty())
+    {
+        bool replaced = false;
+        for (const auto& [replace, with_this] : replacements)
+        {
+            if (view.starts_with(replace))
+            {
+                auto res = out.write(with_this);
+                total += res.count;
+                if (res.err) return {.count = total, .err = res.err};
+
+                view     = view.substr(replace.length());
+                replaced = true;
+                break;
+            }
+        }
+
+        if (!replaced)
+        {
+            auto res = out.write(view.front());
+            total += res.count;
+            if (res.err) return {.count = total, .err = res.err};
+
+            view = view.substr(1);
+        }
+    }
+
+    return {.count = total};
+}
+
+template<typename CharT  = char,
+         typename Traits = std::char_traits<CharT>,
+         typename String = std::basic_string<CharT, Traits>,
+         typename View   = std::basic_string_view<CharT, Traits>>
+constexpr String replace_all(View view, std::initializer_list<std::pair<View, View>> replacements)
+{
+    std::basic_stringstream<CharT, Traits> ss;
+    replace_all_to(ss, view, replacements);
     return ss.str();
 }
 
