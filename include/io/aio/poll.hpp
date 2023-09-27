@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coroutine>
 #include <cstdint>
 
 namespace net::io::aio
@@ -25,6 +26,14 @@ enum class poll_status
     timeout,
     error,
     closed,
+};
+
+// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+struct wait_for
+{
+    std::coroutine_handle<> handle;
+    int                     fd;
+    poll_op                 op;
 };
 
 }

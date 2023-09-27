@@ -1,12 +1,10 @@
-#include "io/aio/detail/epoll_loop.hpp"
-
 #include <exception>
 #include <stdexcept>
 #include <string>
 
 #include "config.hpp"
 
-#if NET_HAS_EPOLL
+#ifdef NET_HAS_EPOLL
 
 #    include <cstdint>
 
@@ -17,6 +15,8 @@
 #    include <sys/timerfd.h>
 
 #    include "exception.hpp"
+
+#    include "io/aio/detail/epoll_loop.hpp"
 
 namespace
 {
@@ -86,13 +86,13 @@ void epoll_loop::poll(int fd, poll_op op, std::chrono::milliseconds timeout)
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1) throw system_error_from_errno(errno);
 }
 
-void epoll_loop::clear_schedule() const noexcept
+void epoll_loop::clear_schedule() noexcept
 {
     eventfd_t value = 0;
     eventfd_read(schedule_fd, &value);
 }
 
-void epoll_loop::shutdown() const noexcept
+void epoll_loop::shutdown() noexcept
 {
     std::uint64_t value = 1;
     ::write(shutdown_fd, &value, sizeof(value));
