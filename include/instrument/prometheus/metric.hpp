@@ -6,8 +6,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "io/writer.hpp"
+#include "util/hash.hpp"
 #include "util/string_util.hpp"
 
 namespace net::instrument::prometheus
@@ -53,7 +56,15 @@ concept metric_impl = std::derived_from<T, base_metric<T>>
     };
 // clang-format on
 
-using metric_labels = std::map<std::string, std::string>;
+struct metric_label
+{
+    std::string key;
+    std::string val;
+
+    friend auto operator<=>(const metric_label& lhs, const metric_label& rhs) noexcept = default;
+};
+
+using metric_labels = std::vector<metric_label>;
 
 template<typename T>
 struct base_metric
@@ -247,5 +258,20 @@ T derive_child(const T& parent, metric_labels&& new_labels)
 
     return child;
 }
+
+}
+
+namespace std
+{
+
+template<>
+struct hash<net::instrument::prometheus::metric_label>
+{
+    std::size_t operator()(const net::instrument::prometheus::metric_label& value) const noexcept
+    {
+        std::size_t key_hash = net::util::detail::hash_combine(0, value.key);
+        return net::util::detail::hash_combine(key_hash, value.val);
+    }
+};
 
 }
