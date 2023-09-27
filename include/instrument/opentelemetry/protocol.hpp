@@ -24,10 +24,7 @@ struct key_value_list
     std::vector<key_value> values;
 };
 
-bool operator==(const key_value_list& lhs, const key_value_list& rhs) noexcept;
-
 void to_json(nlohmann::json& j, const key_value_list& value);
-void from_json(const nlohmann::json& j, key_value_list& value);
 
 // clang-format off
 using any_value_t = std::variant<
@@ -46,20 +43,14 @@ struct array_value
     std::vector<any_value> values;
 };
 
-bool operator==(const array_value& lhs, const array_value& rhs) noexcept;
-
 void to_json(nlohmann::json& j, const array_value& value);
-void from_json(const nlohmann::json& j, array_value& value);
 
 struct any_value
 {
     any_value_t value;
 };
 
-bool operator==(const any_value& lhs, const any_value& rhs) noexcept;
-
 void to_json(nlohmann::json& j, const any_value& value);
-void from_json(const nlohmann::json& j, any_value& value);
 
 struct key_value
 {
@@ -67,10 +58,7 @@ struct key_value
     any_value   value;
 };
 
-bool operator==(const key_value& lhs, const key_value& rhs) noexcept;
-
 void to_json(nlohmann::json& j, const key_value& value);
-void from_json(const nlohmann::json& j, key_value& value);
 
 struct resource
 {
@@ -79,7 +67,6 @@ struct resource
 };
 
 void to_json(nlohmann::json& j, const resource& value);
-void from_json(const nlohmann::json& j, resource& value);
 
 using trace_id = std::array<std::byte, 16>;
 using span_id  = std::array<std::byte, 8>;
@@ -134,7 +121,6 @@ struct event
 };
 
 void to_json(nlohmann::json& j, const event& value);
-void from_json(const nlohmann::json& j, event& value);
 
 struct link
 {
@@ -147,7 +133,6 @@ struct link
 };
 
 void to_json(nlohmann::json& j, const link& value);
-void from_json(const nlohmann::json& j, link& value);
 
 enum class status_code
 {
@@ -163,7 +148,6 @@ struct status
 };
 
 void to_json(nlohmann::json& j, const status& value);
-void from_json(const nlohmann::json& j, status& value);
 
 struct span
 {
@@ -186,7 +170,6 @@ struct span
 };
 
 void to_json(nlohmann::json& j, const span& value);
-void from_json(const nlohmann::json& j, span& value);
 
 struct instrumentation_scope
 {
@@ -197,7 +180,6 @@ struct instrumentation_scope
 };
 
 void to_json(nlohmann::json& j, const instrumentation_scope& value);
-void from_json(const nlohmann::json& j, instrumentation_scope& value);
 
 struct scope_spans
 {
@@ -207,7 +189,6 @@ struct scope_spans
 };
 
 void to_json(nlohmann::json& j, const scope_spans& value);
-void from_json(const nlohmann::json& j, scope_spans& value);
 
 struct resource_spans
 {
@@ -217,7 +198,6 @@ struct resource_spans
 };
 
 void to_json(nlohmann::json& j, const resource_spans& value);
-void from_json(const nlohmann::json& j, resource_spans& value);
 
 struct export_trace_service_request
 {
@@ -225,7 +205,6 @@ struct export_trace_service_request
 };
 
 void to_json(nlohmann::json& j, const export_trace_service_request& value);
-void from_json(const nlohmann::json& j, export_trace_service_request& value);
 
 struct export_trace_partial_success
 {
@@ -234,7 +213,6 @@ struct export_trace_partial_success
 };
 
 void to_json(nlohmann::json& j, const export_trace_partial_success& value);
-void from_json(const nlohmann::json& j, export_trace_partial_success& value);
 
 struct export_trace_service_response
 {
@@ -242,6 +220,5 @@ struct export_trace_service_response
 };
 
 void to_json(nlohmann::json& j, const export_trace_service_response& value);
-void from_json(const nlohmann::json& j, export_trace_service_response& value);
 
 }
