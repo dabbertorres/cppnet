@@ -24,19 +24,3 @@ target_link_libraries(
 #  net-example-http-server
 #  PRIVATE cxx_std_23
 #)
-
-if(MSVC)
-  target_compile_options(
-    net-example-http-server
-    PRIVATE
-    /W4
-  )
-else()
-  target_compile_options(
-    net-example-http-server
-    PRIVATE
-    -Wall
-    -Wextra
-    -pedantic
-  )
-endif()

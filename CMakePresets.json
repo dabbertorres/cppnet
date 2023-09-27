@@ -36,7 +36,9 @@
       "hidden": true,
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++"
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS_INIT": "-Wall -Wextra -Wpedantic -fcolor-diagnostics",
+        "CMAKE_CXX_FLAGS_DEBUG_INIT": "-fsanitize=address,undefined"
       }
     },
     {
@@ -44,7 +46,9 @@
       "hidden": true,
       "cacheVariables": {
         "CMAKE_C_COMPILER": "gcc",
-        "CMAKE_CXX_COMPILER": "g++"
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_CXX_FLAGS_INIT": "-Wall -Wextra -Wpedantic -fdiagnostics-color=always -Wno-c++20-extensions",
+        "CMAKE_CXX_FLAGS_DEBUG_INIT": "-fsanitize=address,undefined"
       }
     },
     {

@@ -120,7 +120,7 @@ InsertNewlineAtEOF: true
 InsertTrailingCommas: Wrapped
 IntegerLiteralSeparator:
   Binary: 4
-  Decimal: 3
+  # Decimal: 3
   Hex: 4
 KeepEmptyLinesAtTheStartOfBlocks: false
 LambdaBodyIndentation: Signature

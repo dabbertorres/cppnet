@@ -14,6 +14,7 @@ add_executable(tests ${test_sources})
 target_include_directories(
   tests
   PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
   Catch2::Catch2
 )
 
@@ -24,35 +25,6 @@ target_link_libraries(
   Catch2::Catch2WithMain
   net
 )
-
-if(MSVC)
-  target_compile_options(
-    tests
-    PRIVATE
-    /W4
-  )
-
-  # target_link_options(
-  #   net
-  #   PRIVATE
-  # )
-else()
-  target_compile_options(
-    tests
-    PRIVATE
-    -Wall
-    -Wextra
-    -pedantic
-    # PUBLIC
-    # -fsanitize=address
-  )
-
-  #   target_link_options(
-  #     net
-  #     PRIVATE
-  #     -fsanitize=address
-  #   )
-endif()
 
 include(Catch)
 catch_discover_tests(tests)

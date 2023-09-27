@@ -19,6 +19,7 @@ project(
 )
 
 find_package(spdlog CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
 add_library(net ${sources})
@@ -36,57 +37,8 @@ target_compile_features(
 target_link_libraries(
   net
   PUBLIC spdlog::spdlog
+  PRIVATE nlohmann_json::nlohmann_json
 )
-
-if(MSVC)
-  target_compile_options(
-    net
-    PRIVATE
-    /W4
-  )
-else()
-  if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-    set(
-      COMPILER_SPECIFIC_FLAGS
-      "-fdiagnostics-color=always"
-      "-Wno-c++20-extensions"
-    )
-  elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
-    set(
-      COMPILER_SPECIFIC_FLAGS
-      "-fcolor-diagnostics"
-      # "-stdlib=libc++"
-    )
-
-    if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-      set(
-        LINKER_OS_FLAGS
-        "-L/usr/local/opt/llvm/lib/c++ -Wl,-rpath,/usr/local/opt/llvm/lib/c++"
-      )
-    endif()
-  endif()
-
-  set(SANITIZERS address,undefined)
-
-  target_compile_options(
-    net
-    PRIVATE
-    -Wall
-    -Wextra
-    -pedantic
-    ${COMPILER_SPECIFIC_FLAGS}
-    PUBLIC
-    $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
-  )
-
-  target_link_options(
-    net
-    PRIVATE
-    ${LINKER_OS_FLAGS}
-    PUBLIC
-    $<$<CONFIG:Debug>:-fsanitize=${SANITIZERS}>
-  )
-endif()
 
 if(BUILD_TESTING)
   include(CTest)

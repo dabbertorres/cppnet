@@ -22,19 +22,3 @@ target_link_libraries(
 #  net-example-ip-resolv
 #  PRIVATE cxx_std_23
 #)
-
-if(MSVC)
-  target_compile_options(
-    net-example-ip-resolv
-    PRIVATE
-    /W4
-  )
-else()
-  target_compile_options(
-    net-example-ip-resolv
-    PRIVATE
-    -Wall
-    -Wextra
-    -pedantic
-  )
-endif()
