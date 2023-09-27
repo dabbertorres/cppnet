@@ -56,7 +56,7 @@ void server::serve()
             auto client_sock = listener.accept();
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
-            const std::lock_guard guard(connections_mu);
+            std::lock_guard guard{connections_mu};
             connections.emplace_back([this, client_sock = std::move(client_sock)]() mutable
                                      { serve_connection(std::move(client_sock)); });
         }

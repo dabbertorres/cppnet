@@ -4,9 +4,12 @@
 #include <concepts>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "util/string_map.hpp"
 
 namespace net::http
 {
@@ -28,7 +31,9 @@ class headers
 private:
     struct keyhash
     {
-        using is_transparent = void;
+        using is_transparent   = void;
+        using string_type      = std::string;
+        using string_view_type = std::string_view;
 
         std::size_t operator()(const std::string& key) const noexcept;
         std::size_t operator()(std::string_view key) const noexcept;
@@ -36,7 +41,9 @@ private:
 
     struct keyequal
     {
-        using is_transparent = void;
+        using is_transparent   = void;
+        using string_type      = std::string;
+        using string_view_type = std::string_view;
 
         bool operator()(const std::string& lhs, const std::string& rhs) const noexcept;
         bool operator()(std::string_view lhs, const std::string& rhs) const noexcept;
@@ -45,7 +52,7 @@ private:
 
     using value_type = std::vector<std::string>;
     using key_type   = std::string;
-    using map_type   = std::unordered_map<key_type, value_type, keyhash, keyequal>;
+    using map_type   = util::string_map<value_type, std::string, std::string_view, keyhash, keyequal>;
 
 public:
     using value_iterator = value_type::const_iterator;

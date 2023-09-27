@@ -34,8 +34,8 @@ public:
 
     route& prefix(const std::string& prefix);
     route& path(const std::string& path);
-    route& on_method(request_method method);
-    route& on_content_type(const std::string& content_type);
+    route& method(request_method method);
+    route& content_type(const std::string& content_type);
 
     template<Matcher M>
     route& on(M&& m)
@@ -67,6 +67,7 @@ public:
     route& add();
     route& prefix(const std::string& prefix);
     route& path(const std::string& path);
+    route& method(request_method method);
 
     [[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
     route_request(const server_request& req) const;
