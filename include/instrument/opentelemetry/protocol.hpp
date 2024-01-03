@@ -71,7 +71,7 @@ void to_json(nlohmann::json& j, const resource& value);
 using trace_id = std::array<std::byte, 16>;
 using span_id  = std::array<std::byte, 8>;
 
-enum class span_flags : std::uint32_t
+enum class span_flags : std::uint8_t
 {
     zero    = 0,
     sampled = 1,
@@ -151,6 +151,7 @@ void to_json(nlohmann::json& j, const status& value);
 
 struct span
 {
+    std::byte              version;
     trace_id               trace_id;
     std::optional<span_id> parent_span_id;
     span_id                span_id;
@@ -212,13 +213,13 @@ struct export_trace_partial_success
     std::string  error_message;
 };
 
-void to_json(nlohmann::json& j, const export_trace_partial_success& value);
+void from_json(const nlohmann::json& j, export_trace_partial_success& value);
 
 struct export_trace_service_response
 {
-    export_trace_partial_success partial_success;
+    std::optional<export_trace_partial_success> partial_success;
 };
 
-void to_json(nlohmann::json& j, const export_trace_service_response& value);
+void from_json(const nlohmann::json& j, export_trace_service_response& value);
 
 }

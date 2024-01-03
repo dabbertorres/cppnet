@@ -1,8 +1,6 @@
 #include "socket.hpp"
 
-#include <cassert>
 #include <cerrno>
-#include <iostream>
 #include <utility>
 
 #include <fcntl.h>
@@ -146,6 +144,16 @@ io::result socket::read(std::byte* data, std::size_t length) noexcept
     }
 
     return {.count = received};
+}
+
+coro::task<net::io::result> socket::read(io::aio::scheduler& scheduler, std::byte* data, std::size_t length) noexcept
+{
+    scheduler.schedule(io::aio::wait_for{
+        .fd = native_handle(),
+        .op = io::aio::poll_op::read,
+    });
+
+    co_return read(data, length);
 }
 
 io::result socket::write(const std::byte* data, std::size_t length) noexcept

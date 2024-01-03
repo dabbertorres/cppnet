@@ -74,7 +74,7 @@ epoll_loop::epoll_loop()
 epoll_loop::~epoll_loop()
 {
     if (epoll_fd != -1) ::close(epoll_fd);
-    if (shutdown_fd != -1) ::close(shutdown_fd);
+    if (schedule_fd != -1) ::close(schedule_fd);
     if (timer_fd != -1) ::close(timer_fd);
     if (shutdown_fd != -1) ::close(shutdown_fd);
 }

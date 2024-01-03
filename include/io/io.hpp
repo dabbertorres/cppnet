@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <string>
 #include <system_error>
 #include <type_traits>
 
@@ -16,10 +15,14 @@ struct result
 
 enum class status_condition
 {
-    closed = 1,
+    closed    = 1,
+    timed_out = 2,
+    // TODO
 };
 
 std::error_condition make_error_condition(status_condition);
+
+const std::error_category& status_condition_category() noexcept;
 
 }
 

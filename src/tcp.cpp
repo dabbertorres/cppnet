@@ -1,8 +1,5 @@
 #include "tcp.hpp"
 
-#include <algorithm>
-#include <cerrno>
-
 #include <netdb.h>
 #include <unistd.h>
 

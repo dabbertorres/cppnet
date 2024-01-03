@@ -1,11 +1,11 @@
 #pragma once
 
+#include <memory>
 #include <string_view>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
-#include "io/limit_reader.hpp"
 #include "util/string_util.hpp"
 
 #include "url.hpp"
@@ -59,11 +59,8 @@ constexpr std::string_view method_string(request_method m) noexcept
     case PATCH: return "PATCH";
     case POST: return "POST";
     case PUT: return "PUT";
-    case TRACE:
-        return "TRACE";
-
-    [[unlikely]] default:
-        return "NONE";
+    case TRACE: return "TRACE";
+    default: return "NONE";
     }
 }
 
@@ -75,7 +72,7 @@ struct client_request
     url                uri{};
     net::http::headers headers{};
 
-    io::reader* body = nullptr;
+    std::unique_ptr<io::reader> body = nullptr;
 };
 
 // server_request represents an incoming HTTP request from a client to a server.
@@ -86,11 +83,13 @@ struct server_request
     url                uri{};
     net::http::headers headers{};
 
-    io::limit_reader body;
+    std::unique_ptr<io::reader> body = nullptr;
 };
 
 using request_decoder_result = util::result<server_request, std::error_condition>;
+using request_encoder_result = util::result<io::writer*, std::error_condition>;
 
-using request_decoder = request_decoder_result (*)(io::buffered_reader&, std::size_t);
+using request_decoder = request_decoder_result (*)(io::buffered_reader&, std::size_t) noexcept;
+using request_encoder = request_encoder_result (*)(io::writer*, const client_request&) noexcept;
 
 }

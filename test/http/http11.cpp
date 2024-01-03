@@ -5,6 +5,8 @@
 
 #include <catch.hpp>
 
+#include <catch2/catch_test_macros.hpp>
+
 #include "http/http.hpp"
 #include "io/string_reader.hpp"
 #include "util/string_util.hpp"
@@ -14,7 +16,7 @@
 
 using namespace std::string_view_literals;
 
-TEST_CASE("just a request line", "[http][1.1]")
+TEST_CASE("just a request line", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
     net::io::buffered_reader     buf_reader(&content);
@@ -37,7 +39,7 @@ TEST_CASE("just a request line", "[http][1.1]")
     }
 }
 
-TEST_CASE("with headers", "[http][1.1]")
+TEST_CASE("with headers", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n"
                                          "Accept: application/json\r\n"
@@ -68,7 +70,7 @@ TEST_CASE("with headers", "[http][1.1]")
     }
 }
 
-TEST_CASE("with headers and body", "[http][1.1]")
+TEST_CASE("with headers and body", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("POST /some/resource HTTP/1.1\r\n"
                                          "Accept: application/json\r\n"
@@ -97,7 +99,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body.read(body.data(), body.size());
+    auto read_result = request.body->read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 18);
 
@@ -114,7 +116,7 @@ TEST_CASE("with headers and body", "[http][1.1]")
     }
 }
 
-TEST_CASE("with headers and multi-line body", "[http][1.1]")
+TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("POST /some/resource HTTP/1.1\r\n"
                                          "Accept: application/json\r\n"
@@ -146,7 +148,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body.read(body.data(), body.size());
+    auto read_result = request.body->read(body.data(), body.size());
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 38);
 
@@ -165,4 +167,9 @@ TEST_CASE("with headers and multi-line body", "[http][1.1]")
                  "multiple\n"
                  "lines");
     }
+}
+
+TEST_CASE("", "[http][1.1][request_decode]")
+{
+    // TODO: chunked
 }

@@ -6,13 +6,8 @@
 #include <coroutine>
 #include <cstddef>
 #include <deque>
-#include <exception>
 #include <functional>
-#include <future>
-#include <iterator>
-#include <memory>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -22,7 +17,7 @@
 namespace net::coro
 {
 
-std::size_t hardware_concurrency() noexcept;
+std::size_t hardware_concurrency(std::size_t minus_amount = 0) noexcept;
 
 template<typename T, typename V>
 concept RangeOf = std::ranges::range<T> && std::is_same_v<V, std::ranges::range_value_t<T>>;
@@ -56,12 +51,9 @@ public:
 
     ~thread_pool();
 
-    // schedule adds func to the work queue, and returns a std::future<R> which can be used
-    // to retrieve the result of the job.
-    // If func returns void, a std::future<void> is returned.
     template<typename Func, typename... Args>
         requires std::invocable<Func, Args...>
-    auto schedule(Func&& func, Args... args) noexcept -> task<std::invoke_result_t<Func>>;
+    auto schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>;
 
     [[nodiscard]] operation schedule();
 
@@ -94,21 +86,10 @@ private:
 template<typename Func, typename... Args>
     requires std::invocable<Func, Args...>
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-auto thread_pool::schedule(Func&& func, Args... args) noexcept -> task<std::invoke_result_t<Func>>
+auto thread_pool::schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>
 {
-    using result_type = std::invoke_result_t<Func>;
-
     co_await schedule();
-
-    if constexpr (std::is_same_v<void, result_type>)
-    {
-        func(std::forward<Args>(args)...);
-        co_return;
-    }
-    else
-    {
-        co_return func(std::forward<Args>(args)...);
-    }
+    co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
 }
 
 template<RangeOf<std::coroutine_handle<>> R>

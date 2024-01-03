@@ -4,6 +4,7 @@
 #include <exception>
 #include <optional>
 #include <type_traits>
+#include <variant>
 
 #include "coro/task.hpp"
 
@@ -15,6 +16,15 @@ class promise;
 
 class promise_base
 {
+public:
+    auto initial_suspend() noexcept { return std::suspend_always{}; }
+    auto final_suspend() noexcept { return final_awaitable{}; }
+
+    void unhandled_exception() noexcept { exception = std::current_exception(); }
+
+    void set_continuation(std::coroutine_handle<> continuation) noexcept { handle = continuation; }
+
+private:
     friend struct final_awaitable;
 
     struct final_awaitable
@@ -32,14 +42,6 @@ class promise_base
         void await_resume() noexcept {}
     };
 
-public:
-    auto initial_suspend() noexcept { return std::suspend_always{}; }
-    auto final_suspend() noexcept { return final_awaitable{}; }
-
-    void unhandled_exception() noexcept { exception = std::current_exception(); }
-
-    void set_continuation(std::coroutine_handle<> continuation) noexcept { handle = continuation; }
-
 protected:
     std::coroutine_handle<> handle;
     std::exception_ptr      exception;
@@ -53,7 +55,7 @@ public:
     using task_t                       = task<T>;
     static constexpr bool is_reference = false;
 
-    task_t get_return_object() noexcept { return task{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
+    task_t get_return_object() noexcept { return task_t{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     void return_value(T new_value) noexcept { value = std::move(new_value); }
 
@@ -72,6 +74,7 @@ public:
     }
 
 private:
+    // TODO: consider replacing with a std::variant<std::monostate, T, std::exception_ptr>
     T value;
 };
 
@@ -87,7 +90,7 @@ public:
     using task_t                       = task<T>;
     static constexpr bool is_reference = true;
 
-    task_t get_return_object() noexcept { return task<>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
+    task_t get_return_object() noexcept { return task_t{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     void return_value(T new_value) noexcept
     {
@@ -103,6 +106,7 @@ public:
     }
 
 private:
+    // TODO: consider replacing with a std::variant<std::monostate, T, std::exception_ptr>
     value_t value;
 };
 
@@ -112,7 +116,7 @@ class promise<void> : public promise_base
 public:
     using task_t = task<void>;
 
-    task_t get_return_object() noexcept { return task<>{std::coroutine_handle<promise<void>>::from_promise(*this)}; }
+    task_t get_return_object() noexcept { return task_t{std::coroutine_handle<promise<void>>::from_promise(*this)}; }
 
     void return_void() noexcept {}
 

@@ -12,7 +12,6 @@
 #include <type_traits>
 #include <vector>
 
-#include "coro/promise.hpp"
 #include "coro/task.hpp"
 
 namespace net::coro

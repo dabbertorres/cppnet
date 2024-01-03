@@ -5,10 +5,10 @@
 namespace net::coro
 {
 
-std::size_t hardware_concurrency() noexcept
+std::size_t hardware_concurrency(std::size_t minus_amount) noexcept
 {
-    static const auto count = std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() : 1;
-    return count;
+    static const auto count = std::thread::hardware_concurrency();
+    return count > 1 && count > minus_amount ? count - minus_amount : 1;
 }
 
 thread_pool::operation::operation(thread_pool* pool) noexcept

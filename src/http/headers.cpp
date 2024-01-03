@@ -14,6 +14,7 @@
 namespace net::http
 {
 
+using namespace std::string_literals;
 using namespace std::string_view_literals;
 
 std::size_t headers::keyhash::operator()(const std::string& key) const noexcept
@@ -221,31 +222,32 @@ headers& headers::set_content_type(const content_type& content_type)
     return out;
 }
 
-[[nodiscard]] bool headers::is_compressed() const
+[[nodiscard]] std::optional<headers::values_range> headers::get_content_encoding() const
 {
-    auto maybe = get("Content-Encoding"sv);
-    if (!maybe.has_value()) return false;
-
-    auto val = maybe.value();
-    return util::equal_ignore_case(val, "compress"sv) || util::equal_ignore_case(val, "x-compress"sv);
+    return get_all("Content-Encoding"sv);
 }
 
-[[nodiscard]] bool headers::is_deflated() const
+[[nodiscard]] std::optional<headers::values_range> headers::get_transfer_encoding() const
 {
-    auto maybe = get("Content-Encoding"sv);
-    if (!maybe.has_value()) return false;
-
-    auto val = maybe.value();
-    return util::equal_ignore_case(val, "deflate"sv) || util::equal_ignore_case(val, "zlib"sv);
+    return get_all("Transfer-Encoding"sv);
 }
 
-[[nodiscard]] bool headers::is_gziped() const
+[[nodiscard]] bool headers::is_chunked() const
 {
-    auto maybe = get("Content-Encoding"sv);
-    if (!maybe.has_value()) return false;
+    return get_transfer_encoding()
+        .transform(
+            [](auto range)
+            {
+                for (auto val : range)
+                {
+                    val = util::trim_string(val);
 
-    auto val = maybe.value();
-    return util::equal_ignore_case(val, "gzip"sv) || util::equal_ignore_case(val, "x-gzip"sv);
+                    if (util::equal_ignore_case(val, "chunked"s)) return true;
+                }
+
+                return false;
+            })
+        .value_or(false);
 }
 
 [[nodiscard]] headers::keys_iterator headers::begin() const { return values.begin(); }

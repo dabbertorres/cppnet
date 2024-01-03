@@ -66,4 +66,6 @@ std::error_condition make_error_condition(status_condition code)
     return {static_cast<int>(code), the_status_condition_category};
 }
 
+const std::error_category& status_condition_category() noexcept { return the_status_condition_category; }
+
 }

@@ -18,7 +18,7 @@ public:
 
     constexpr result() = delete;
 
-    constexpr result(const Value& value) noexcept(std::is_nothrow_move_constructible_v<Value>)
+    constexpr result(const Value& value) noexcept(std::is_nothrow_copy_constructible_v<Value>)
         : value{value}
     {}
 
@@ -26,7 +26,7 @@ public:
         : value{std::forward<Value>(value)}
     {}
 
-    constexpr result(const Error& error) noexcept(std::is_nothrow_move_constructible_v<Error>)
+    constexpr result(const Error& error) noexcept(std::is_nothrow_copy_constructible_v<Error>)
         : value{error}
     {}
 

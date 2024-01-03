@@ -1,16 +1,17 @@
 #pragma once
 
-#include <array>
-#include <chrono>
-#include <concepts>
-
 #include "config.hpp"
 
 #ifdef NET_HAS_EPOLL
 
+#    include <array>
+#    include <chrono>
+#    include <concepts>
+
 #    include <sys/epoll.h>
 #    include <sys/eventfd.h>
 
+#    include "io/aio/detail/event_handler.hpp"
 #    include "io/aio/poll.hpp"
 
 namespace net::io::aio::detail
@@ -33,7 +34,7 @@ public:
 
     void poll(int fd, poll_op op, std::chrono::milliseconds timeout = 0ms);
 
-    template<typename OnScheduled, typename OnTimeout, typename OnEvent>
+    template<EventHandler OnScheduled, EventHandler OnTimeout, EventHandler OnEvent>
     void process_events(OnScheduled&&             on_scheduled,
                         OnTimeout&&               on_timeout,
                         OnEvent&&                 on_event,
@@ -89,6 +90,8 @@ private:
 
     std::array<epoll_event, 16> events;
 };
+
+using event_loop = epoll_loop;
 
 }
 

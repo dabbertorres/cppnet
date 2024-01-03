@@ -1,10 +1,13 @@
 #include "http/http11.hpp"
 
+#include <array>
 #include <charconv>
 #include <cstddef>
+#include <memory>
 #include <ranges>
 #include <system_error>
 
+#include "http/chunked_reader.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -22,7 +25,6 @@ namespace
 using namespace std::string_view_literals;
 
 using net::url;
-using net::http::client_request;
 using net::http::client_response;
 using net::http::headers;
 using net::http::parse_method;
@@ -30,10 +32,10 @@ using net::http::parse_status;
 using net::http::protocol_version;
 using net::http::request_method;
 using net::http::server_request;
-using net::http::server_response;
 using net::http::status;
 using net::io::buffered_reader;
 using net::util::result;
+using net::util::split_string;
 using net::util::trim_string;
 
 result<std::uint32_t, std::errc> from_chars(std::string_view str) noexcept
@@ -168,9 +170,11 @@ std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read
         auto val = trim_string(view.substr(split_idx + 1));
 
         // TODO: validate key
-        // TODO: check for list values
 
-        headers.set(key, val);
+        for (auto v : split_string(val, ','))
+        {
+            headers.add(key, v);
+        }
     }
 
     return std::make_error_condition(std::errc::value_too_large);
@@ -215,17 +219,46 @@ namespace net::http::http11
 
 using util::result;
 
-util::result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept
+result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept
 {
-    // TODO
+    auto res = writer->write(method_string(req.method));
+    if (res.err) return {res.err};
+
+    res = writer->write(' ');
+    if (res.err) return {res.err};
+
+    // TODO: don't build the uri before writing it
+    res = writer->write(req.uri.build());
+    if (res.err) return {res.err};
+
+    res = writer->write(" HTTP/");
+    if (res.err) return {res.err};
+
+    std::array<char, 4> version_buf{
+        static_cast<char>(req.version.major + '0'),
+        '.',
+        static_cast<char>(req.version.minor + '0'),
+        ' ',
+    };
+
+    res = writer->write(version_buf.data(), version_buf.size());
+    if (res.err) return {res.err};
+
+    res = writer->write("\r\n");
+    if (res.err) return {res.err};
+
+    res.err = write_headers(*writer, req.headers);
+    if (res.err) return {res.err};
+
+    // TODO: copy req.body to writer
+
     return {writer};
 }
 
-util::result<io::writer*, std::error_condition> response_encode(io::writer*            writer,
-                                                                const server_response& resp) noexcept
+result<io::writer*, std::error_condition> response_encode(io::writer* writer, const server_response& resp) noexcept
 {
     auto res = writer->write("HTTP/");
-    if (res.err) return res.err;
+    if (res.err) return {res.err};
 
     std::array<char, 4> version_buf{
         static_cast<char>(resp.version.major + '0'),
@@ -237,17 +270,20 @@ util::result<io::writer*, std::error_condition> response_encode(io::writer*     
     res = writer->write(version_buf.data(), version_buf.size());
     if (res.err) return {res.err};
 
+    res = writer->write(' ');
+    if (res.err) return {res.err};
+
     res = writer->write(status_text(resp.status_code));
     if (res.err) return {res.err};
 
     res = writer->write("\r\n");
-    if (res.err) return res.err;
+    if (res.err) return {res.err};
 
     res.err = write_headers(*writer, resp.headers);
-    if (res.err) return res.err;
+    if (res.err) return {res.err};
 
     res = writer->write("\r\n");
-    if (res.err) return res.err;
+    if (res.err) return {res.err};
 
     return {writer};
 }
@@ -265,9 +301,19 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
 
     if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
 
-    std::size_t content_length = req.headers.get_content_length().value_or(0);
-    req.body                   = io::limit_reader(&reader, content_length);
-    return {req};
+    if (req.headers.is_chunked())
+    {
+        req.body = std::make_unique<chunked_reader>(&reader);
+    }
+    else
+    {
+        std::size_t content_length = req.headers.get_content_length().value_or(0);
+        req.body                   = std::make_unique<io::limit_reader>(&reader, content_length);
+    }
+
+    // TODO: trailers
+
+    return {std::move(req)};
 }
 
 result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
@@ -278,9 +324,19 @@ result<client_response, std::error_condition> response_decode(io::buffered_reade
     if (auto err = parse_status_line(reader, resp); err) return {err};
     if (auto err = parse_headers(reader, max_header_bytes, resp.headers); err) return {err};
 
-    const std::size_t content_length = resp.headers.get_content_length().value_or(0);
-    resp.body                        = io::limit_reader(&reader, content_length);
-    return {resp};
+    if (resp.headers.is_chunked())
+    {
+        resp.body = std::make_unique<chunked_reader>(&reader);
+    }
+    else
+    {
+        const std::size_t content_length = resp.headers.get_content_length().value_or(0);
+        resp.body                        = std::make_unique<io::limit_reader>(&reader, content_length);
+    }
+
+    // TODO: trailers
+
+    return {std::move(resp)};
 }
 
 }

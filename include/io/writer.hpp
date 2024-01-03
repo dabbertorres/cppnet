@@ -1,10 +1,13 @@
 #pragma once
 
-#include <concepts>
 #include <cstddef>
 #include <string_view>
 
+#include "coro/task.hpp"
+
 #include "io.hpp"
+
+#include "io/aio/scheduler.hpp"
 
 namespace net::io
 {
@@ -21,7 +24,8 @@ public:
     virtual ~writer() = default;
 
     virtual result write(const std::byte* data, std::size_t length) = 0;
-    inline result  write(const char* data, std::size_t length)
+
+    inline result write(const char* data, std::size_t length)
     {
         return write(reinterpret_cast<const std::byte*>(data), length);
     }
@@ -29,6 +33,13 @@ public:
 
     inline result write(std::byte data) { return write(&data, 1); }
     inline result write(char data) { return write(&data, 1); }
+
+    virtual coro::task<io::result> write(io::aio::scheduler& scheduler, const std::byte* data, std::size_t length) = 0;
+
+    inline coro::task<io::result> write(io::aio::scheduler& scheduler, const char* data, std::size_t length)
+    {
+        return write(scheduler, reinterpret_cast<const std::byte*>(data), length);
+    }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
@@ -45,7 +56,7 @@ inline result write_all(writer& out, const std::byte* data, std::size_t length, 
     if (res.err) return res;
 
     std::size_t total = res.count;
-    res               = write_all(out, writes...);
+    res               = write_all(out, std::forward<Writes>(writes)...);
     total += res.count;
 
     return {.count = total, .err = res.err};
@@ -58,7 +69,7 @@ inline result write_all(writer& out, const char* data, std::size_t length, Write
     if (res.err) return res;
 
     std::size_t total = res.count;
-    res               = write_all(out, writes...);
+    res               = write_all(out, std::forward<Writes>(writes)...);
     total += res.count;
 
     return {.count = total, .err = res.err};
@@ -107,7 +118,7 @@ template<typename Call, typename... Writes>
     requires(std::is_invocable_r_v<result, Call, writer&>)
 inline result write_all(writer& out, Call&& call, Writes&&... writes)
 {
-    auto res = call(out);
+    auto res = std::invoke(std::forward<Call>(call), out);
     if (res.err) return res;
 
     std::size_t total = res.count;

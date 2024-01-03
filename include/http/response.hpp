@@ -2,12 +2,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <type_traits>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
-#include "io/limit_reader.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/reader.hpp"
 #include "io/writer.hpp"
 #include "util/result.hpp"
 
@@ -193,10 +195,10 @@ constexpr bool status_is_server_error(status s) noexcept { return status::INTERN
 // client_response represents an incoming HTTP response from a server to a client.
 struct client_response
 {
-    protocol_version   version{};
-    status             status_code = status::NONE;
-    net::http::headers headers{};
-    io::limit_reader   body;
+    protocol_version            version{};
+    status                      status_code = status::NONE;
+    net::http::headers          headers{};
+    std::unique_ptr<io::reader> body = nullptr;
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.
@@ -208,8 +210,11 @@ struct server_response
     io::writer*        body = nullptr;
 };
 
-using response_encoder = util::result<io::writer*, std::error_condition> (*)(io::writer* writer,
-                                                                             const server_response&);
+using response_encoder_result = util::result<io::writer*, std::error_condition>;
+using response_decoder_result = util::result<client_response, std::error_condition>;
+
+using response_encoder = response_encoder_result (*)(io::writer*, const server_response&) noexcept;
+using response_decoder = response_decoder_result (*)(io::buffered_reader&, std::size_t) noexcept;
 
 // response_writer presents an interface for building a server_response to request handlers.
 struct response_writer

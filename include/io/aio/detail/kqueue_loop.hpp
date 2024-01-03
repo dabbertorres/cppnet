@@ -4,18 +4,21 @@
 
 #ifdef NET_HAS_KQUEUE
 
+#    include <atomic>
 #    include <chrono>
 #    include <coroutine>
+#    include <ctime>
 #    include <functional>
 #    include <mutex>
-#    include <optional>
-#    include <queue>
-#    include <utility>
-#    include <vector>
+#    include <system_error>
 
+#    include <spdlog/spdlog.h>
 #    include <sys/event.h>
 #    include <sys/types.h>
 
+#    include "io/io.hpp"
+
+#    include "io/aio/detail/event_handler.hpp"
 #    include "io/aio/poll.hpp"
 
 namespace net::io::aio::detail
@@ -36,57 +39,79 @@ public:
 
     ~kqueue_loop();
 
-    void queue(wait_for&& trigger, std::chrono::milliseconds timeout = 0ms);
+    void queue(const wait_for& trigger);
 
-    void dispatch();
+    template<EventHandler OnEvent>
+    void dispatch(OnEvent&& on_event)
+    {
+        std::array<struct kevent, 16> events{};
 
-    /* template<typename OnScheduled, typename OnTimeout, typename OnEvent> */
-    /* void process_events(OnScheduled&&             on_scheduled, */
-    /*                     OnTimeout&&               on_timeout, */
-    /*                     OnEvent&&                 on_event, */
-    /*                     std::chrono::milliseconds timeout = 0ms) */
-    /* { */
-    /* } */
+        auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
+        if (num_events == -1)
+        {
+            // TODO: throw/return an error?
+            spdlog::error("error queueing reading new events: {}", errno);
+            return;
+        }
 
-    /* void clear_schedule() noexcept; */
+        for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
+        {
+            auto& ev = events[i];
+            switch (ev.filter)
+            {
+            case EVFILT_TIMER:
+            {
+                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+                result res = {
+                    .count = 0,
+                    .err   = make_error_condition(status_condition::timed_out),
+                };
+
+                std::invoke(std::forward<OnEvent>(on_event), handle, res);
+                break;
+            }
+
+            case EVFILT_READ: [[fallthrough]];
+            case EVFILT_WRITE:
+            {
+                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+                result res = {
+                    .count = static_cast<std::size_t>(ev.data),
+                    .err   = {},
+                };
+
+                if ((ev.flags & EV_EOF) != 0)
+                {
+                    // Did it shutdown due to an error? Or did the socket just close?
+                    res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
+                                             : make_error_condition(status_condition::closed);
+                }
+
+                std::invoke(std::forward<OnEvent>(on_event), handle, res);
+                break;
+            }
+
+            default:
+                // no-op
+            }
+        }
+    }
 
     void shutdown() noexcept;
 
 private:
-    using clock      = std::chrono::high_resolution_clock;
-    using time_point = clock::time_point;
+    using clock = std::chrono::high_resolution_clock;
 
-    struct timeout
-    {
-        std::coroutine_handle<>        handle;
-        std::chrono::time_point<clock> expires_at;
-
-        friend constexpr bool operator==(const timeout& lhs, const timeout& rhs) noexcept
-        {
-            return lhs.handle == rhs.handle;
-        }
-    };
-
-    struct timeout_greater
-    {
-        bool operator()(const timeout& lhs, const timeout& rhs) noexcept { return lhs.expires_at > rhs.expires_at; }
-    };
-
-    // Use a single timer kevent that gets updated to the next timeout, rather than a timer kevent
-    // for every single timeout.
-    // This avoids any potential issues due to a system's max amount of timers.
-    using timeout_queue = std::priority_queue<timeout, std::vector<timeout>, timeout_greater>;
-
-    void                         queue_next_timeout() noexcept;
-    std::optional<struct kevent> build_timeout_event(std::coroutine_handle<>   handle,
-                                                     std::chrono::milliseconds timeout) noexcept;
-
-    int           descriptor;
-    uintptr_t     timeout_descriptor;
-    timeout_queue timeouts;
-    std::mutex    mutex;
+    int                      descriptor;
+    std::atomic<std::size_t> timeout_id;
+    std::mutex               mutex;
 };
+
+using event_loop = kqueue_loop;
 
 }
 
 #endif
+

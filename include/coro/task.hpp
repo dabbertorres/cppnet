@@ -2,8 +2,6 @@
 
 #include <coroutine>
 #include <memory>
-#include <optional>
-#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -96,7 +94,7 @@ auto task<T>::operator co_await() const& noexcept
     {
         using awaitable_base::awaitable_base;
 
-        decltype(auto) await_resume()
+        auto await_resume()
         {
             if constexpr (std::is_same_v<void, T>)
             {
@@ -118,7 +116,7 @@ auto task<T>::operator co_await() const&& noexcept
     {
         using awaitable_base::awaitable_base;
 
-        decltype(auto) await_resume()
+        auto await_resume()
         {
             if constexpr (std::is_same_v<void, T>)
             {

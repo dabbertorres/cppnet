@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <variant>
 
 #include <nlohmann/json.hpp>
@@ -110,37 +111,62 @@ void to_json(nlohmann::json& j, const status& value)
 
 void to_json(nlohmann::json& j, const span& value)
 {
-    // TODO
+    j["traceId"]                = encoding::hex::encode(value.trace_id);
+    j["spanId"]                 = encoding::hex::encode(value.span_id);
+    j["name"]                   = value.name;
+    j["kind"]                   = value.kind;
+    j["startTimeUnixNano"]      = value.start_time_unix_nano.time_since_epoch().count();
+    j["endTimeUnixNano"]        = value.end_time_unix_nano.time_since_epoch().count();
+    j["attributes"]             = value.attributes;
+    j["droppedAttributesCount"] = value.dropped_attributes_count;
+    j["events"]                 = value.events;
+    j["droppedEventsCount"]     = value.dropped_events_count;
+    j["links"]                  = value.links;
+    j["droppedLinksCount"]      = value.dropped_links_count;
+    j["status"]                 = value.status;
+
+    if (!value.trace_state.empty()) j["traceState"] = value.trace_state;
+    if (value.parent_span_id.has_value()) j["parentSpanId"] = encoding::hex::encode(value.parent_span_id.value());
+    if (value.flags != span_flags::zero) j["flags"] = value.flags;
 }
 
 void to_json(nlohmann::json& j, const instrumentation_scope& value)
 {
-    // TODO
+    j["name"]                   = value.name;
+    j["version"]                = value.version;
+    j["attributes"]             = value.attributes;
+    j["droppedAttributesCount"] = value.dropped_attributes_count;
 }
 
 void to_json(nlohmann::json& j, const scope_spans& value)
 {
-    // TODO
+    j["scope"]     = value.scope;
+    j["spans"]     = value.spans;
+    j["schemaUrl"] = value.schema_url;
 }
 
 void to_json(nlohmann::json& j, const resource_spans& value)
 {
-    // TODO
+    j["resource"]   = value.resource;
+    j["scopeSpans"] = value.scope_spans;
+    j["schemaUrl"]  = value.schema_url;
 }
 
 void to_json(nlohmann::json& j, const export_trace_service_request& value)
 {
-    // TODO
+    j["resource_spans"] = value.resource_spans;
 }
 
-void to_json(nlohmann::json& j, const export_trace_partial_success& value)
+void from_json(const nlohmann::json& j, export_trace_partial_success& value)
 {
-    // TODO
+    value.rejected_spans = j.value("rejectedSpans", 0);
+    value.error_message  = j.value("errorMessage", "");
 }
 
-void to_json(nlohmann::json& j, const export_trace_service_response& value)
+void from_json(const nlohmann::json& j, export_trace_service_response& value)
 {
-    // TODO
+    if (j.contains("partialSuccess")) value.partial_success = j["partialSuccess"];
+    else value.partial_success = std::nullopt;
 }
 
 }

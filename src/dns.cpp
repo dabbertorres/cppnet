@@ -13,10 +13,15 @@
 
 #include "exception.hpp"
 
+// Toggle to switch implementation of dns_lookup
+#define USE_GETADDRINFO
+
+#ifdef USE_GETADDRINFO
+
 namespace
 {
 
-// neatly derive 32-bit and 64-bit variants of the golden ratio for hash seeds
+// neatly derive variants of the golden ratio for hash seeds regardless of architecture size
 
 consteval long double pow(long double base, std::size_t exponent)
 {
@@ -32,8 +37,8 @@ constexpr auto inv_phi = 1.L / std::numbers::phi_v<long double>;
 
 consteval std::size_t hash_seed()
 {
-    if constexpr (sizeof(std::size_t) >= 8) return static_cast<std::uint64_t>(inv_phi * pow(2UL, 63));
-    else return static_cast<std::uint32_t>(inv_phi * pow(2UL, 31));
+    auto seed = inv_phi * pow(2UL, sizeof(std::size_t) * 4 - 1);
+    return static_cast<std::size_t>(seed);
 }
 
 }
@@ -48,6 +53,7 @@ struct hash<T (&)[N]> // NOLINT(*-avoid-c-arrays)
     std::size_t operator()(const T (&data)[N]) const noexcept
     {
         // this is similar to how boost::hash_combine does it
+
         constexpr std::size_t seed = hash_seed();
 
         const std::hash<T> value_hasher;
@@ -116,9 +122,9 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
 
         default:
             [[unlikely]]
-#ifdef __cpp_lib_unreachable
+#    ifdef __cpp_lib_unreachable
             std::unreachable()
-#endif
+#    endif
                 ;
         }
     }
@@ -127,3 +133,19 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
 }
 
 }
+
+#else
+
+#    include "dns/resolver.hpp"
+
+namespace net
+{
+
+coro::generator<ip_addr> dns_lookup(std::string_view hostname)
+{
+    // TODO
+}
+
+}
+
+#endif

@@ -78,10 +78,12 @@ public:
 
     headers& set(const std::string& key, std::string val);
     headers& set(const std::string& key, std::initializer_list<std::string> vals);
+    headers& set(const std::string& key, std::vector<std::string>&& vals);
     headers& add(const std::string& key, std::string val);
 
     headers& set(std::string_view key, std::string val);
     headers& set(std::string_view key, std::initializer_list<std::string> vals);
+    headers& set(std::string_view key, std::vector<std::string>&& vals);
     headers& add(std::string_view key, std::string val);
 
     headers& set(const std::string& key, std::string_view val);
@@ -107,9 +109,11 @@ public:
 
     [[nodiscard]] std::optional<std::size_t>  get_content_length() const;
     [[nodiscard]] std::optional<content_type> get_content_type() const;
-    [[nodiscard]] bool                        is_compressed() const;
-    [[nodiscard]] bool                        is_deflated() const;
-    [[nodiscard]] bool                        is_gziped() const;
+
+    [[nodiscard]] std::optional<values_range> get_content_encoding() const;
+    [[nodiscard]] std::optional<values_range> get_transfer_encoding() const;
+
+    [[nodiscard]] bool is_chunked() const;
 
     [[nodiscard]] keys_iterator begin() const;
     [[nodiscard]] keys_iterator end() const;

@@ -1,11 +1,10 @@
 #include "io/aio/scheduler.hpp"
 
-#include <algorithm>
-#include <array>
-#include <csignal>
-#include <mutex>
+#include <coroutine>
 
-/* #include <sys/epoll.h> */
+#include "io/io.hpp"
+
+#include "io/aio/poll.hpp"
 
 namespace net::io::aio
 {
@@ -18,13 +17,7 @@ scheduler::scheduler(std::size_t concurrency)
 
 scheduler::~scheduler() noexcept { shutdown(); }
 
-void scheduler::process_events(std::chrono::milliseconds timeout)
-{
-    /* loop.process_events([this]() { process_scheduled_tasks(); }, */
-    /*                     [this]() { process_timeouts(); }, */
-    /*                     [this]() { process_event(); }, */
-    /*                     timeout); */
-}
+void scheduler::schedule(wait_for job) noexcept { loop.queue(job); }
 
 void scheduler::shutdown() noexcept
 {
@@ -32,42 +25,22 @@ void scheduler::shutdown() noexcept
     {
         workers.shutdown();
 
-        /* loop.shutdown(); */
+        loop.shutdown();
 
         if (io.joinable()) io.join();
     }
-}
-
-void scheduler::process_scheduled_tasks()
-{
-    std::vector<std::coroutine_handle<>> tasks;
-    {
-        std::lock_guard lock{scheduled_tasks_mutex};
-        tasks.swap(scheduled_tasks);
-
-        /* loop.clear_schedule(); */
-
-        schedule_triggered.exchange(false, std::memory_order::release);
-    }
-
-    std::for_each(tasks.begin(), tasks.end(), [](auto& task) { task.resume(); });
-}
-
-void scheduler::process_timeouts()
-{
-    // TODO
-}
-
-void scheduler::process_event(/*TODO*/)
-{
-    // TODO
 }
 
 void scheduler::io_loop()
 {
     while (!shutdown_please.load(std::memory_order::acquire) || size() > 0)
     {
-        process_events(1'000ms);
+        loop.dispatch(
+            [this](std::coroutine_handle<promise> handle, result res)
+            {
+                handle.promise().return_value(res);
+                workers.resume(handle);
+            });
     }
 }
 

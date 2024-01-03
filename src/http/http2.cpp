@@ -58,7 +58,7 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
                                                             std::size_t          max_header_bytes) noexcept
 {}
 
-result<server_response, std::error_condition> response_decode(io::buffered_reader& reader,
+result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
                                                               std::size_t          max_header_bytes) noexcept
 {}
 
