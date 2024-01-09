@@ -1,11 +1,7 @@
 #pragma once
 
-#include <concepts>
 #include <coroutine>
-#include <exception>
-#include <future>
 #include <iterator>
-#include <type_traits>
 
 namespace net::coro
 {

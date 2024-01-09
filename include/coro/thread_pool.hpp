@@ -51,6 +51,9 @@ public:
 
     ~thread_pool();
 
+    // schedule adds func to the work queue, and returns a std::future<R> which can be used
+    // to retrieve the result of the job.
+    // If func returns void, a std::future<void> is returned.
     template<typename Func, typename... Args>
         requires std::invocable<Func, Args...>
     auto schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>;

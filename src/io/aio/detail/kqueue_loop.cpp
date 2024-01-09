@@ -13,6 +13,7 @@
 #    include <coroutine>
 #    include <cstdint>
 #    include <mutex>
+#    include <system_error>
 
 #    include <unistd.h>
 
@@ -22,6 +23,7 @@
 
 #    include "exception.hpp"
 
+#    include "io/aio/event.hpp"
 #    include "io/aio/poll.hpp"
 
 namespace net::io::aio::detail
@@ -64,7 +66,7 @@ void kqueue_loop::queue(const wait_for& trigger)
         if (expires_at < clock::now()) expires_at = clock::now();
 
         new_events[1] = {
-            .ident  = timeout_id.fetch_add(1, std::memory_order_acq_rel),
+            .ident  = timeout_id.fetch_add(1, std::memory_order_relaxed),
             .filter = EVFILT_TIMER,
             .flags  = EV_ADD | EV_ONESHOT,
             .fflags = NOTE_ABSOLUTE | NOTE_CRITICAL,
@@ -80,6 +82,70 @@ void kqueue_loop::queue(const wait_for& trigger)
         // TODO: throw/return an error?
         spdlog::error("error queueing {} new events: {}", num_new_events, errno);
         return;
+    }
+}
+
+coro::generator<event> kqueue_loop::dispatch() const
+{
+    std::array<struct kevent, 16> events{};
+
+    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
+    if (num_events == -1)
+    {
+        // TODO: throw/return an error?
+        spdlog::error("error queueing reading new events: {}", errno);
+    }
+    else
+    {
+        for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
+        {
+            auto& ev = events[i];
+            switch (ev.filter)
+            {
+            case EVFILT_TIMER:
+            {
+                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+                // don't try to invoke coroutines that have already finished.
+                if (handle.done()) break;
+
+                result res = {
+                    .count = 0,
+                    .err   = make_error_condition(status_condition::timed_out),
+                };
+
+                co_yield event{handle, res};
+                break;
+            }
+
+            case EVFILT_READ: [[fallthrough]];
+            case EVFILT_WRITE:
+            {
+                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+                // don't try to invoke coroutines that have already finished.
+                if (handle.done()) break;
+
+                result res = {
+                    .count = static_cast<std::size_t>(ev.data),
+                    .err   = {},
+                };
+
+                if ((ev.flags & EV_EOF) != 0)
+                {
+                    // Did it shutdown due to an error? Or did the socket just close?
+                    res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
+                                             : make_error_condition(status_condition::closed);
+                }
+
+                co_yield event{handle, res};
+                break;
+            }
+
+            default:
+                // no-op
+            }
+        }
     }
 }
 

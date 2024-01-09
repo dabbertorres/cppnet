@@ -35,12 +35,11 @@ void scheduler::io_loop()
 {
     while (!shutdown_please.load(std::memory_order::acquire) || size() > 0)
     {
-        loop.dispatch(
-            [this](std::coroutine_handle<promise> handle, result res)
-            {
-                handle.promise().return_value(res);
-                workers.resume(handle);
-            });
+        for (auto [handle, result] : loop.dispatch())
+        {
+            handle.promise().return_value(result);
+            workers.resume(handle);
+        }
     }
 }
 

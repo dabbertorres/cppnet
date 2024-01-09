@@ -90,7 +90,8 @@ void thread_pool::worker()
         std::unique_lock<std::mutex> lock(wait_mutex);
         wait.wait(lock, [&] { return !running || !jobs.empty(); });
 
-        if (!running || jobs.empty()) break;
+        // TODO: complete all pending jobs before stopping?
+        if (!running /*&& jobs.empty()*/) break;
 
         auto handle = jobs.front();
         jobs.pop_front();

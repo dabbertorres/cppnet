@@ -2,8 +2,11 @@
 
 #include <type_traits>
 
+#include "coro/generator.hpp"
+
 #include "config.hpp"
 
+#include "io/aio/event.hpp"
 #include "io/aio/poll.hpp"
 
 #ifdef NET_HAS_EPOLL
@@ -30,7 +33,7 @@ concept EventLoop = std::is_default_constructible_v<T>
     && requires(T* t, wait_for job)
     {
         { t->queue(job) } -> std::same_as<void>;
-        { t->dispatch([](auto, auto) {}) } -> std::same_as<void>;
+        { t->dispatch() } -> std::same_as<coro::generator<event>>;
         { t->shutdown() } -> std::same_as<void>;
     };
 // clang-format on
