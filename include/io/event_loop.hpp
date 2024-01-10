@@ -3,23 +3,22 @@
 #include <type_traits>
 
 #include "coro/generator.hpp"
+#include "io/event.hpp"
+#include "io/poll.hpp"
 
 #include "config.hpp"
 
-#include "io/aio/event.hpp"
-#include "io/aio/poll.hpp"
-
 #ifdef NET_HAS_EPOLL
-#    include "detail/epoll_loop.hpp"
+#    include "epoll_loop.hpp"
 #elifdef NET_HAS_KQUEUE
-#    include "detail/kqueue_loop.hpp"
+#    include "kqueue_loop.hpp"
 #elifdef NET_HAS_COMPLETION_PORTS
-#    include "detail/completion_ports_loop.hpp"
+#    include "completion_ports_loop.hpp"
 #else
 #    error "No supported event loop implementation."
 #endif
 
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 // clang-format off
@@ -42,7 +41,7 @@ static_assert(EventLoop<event_loop>);
 
 }
 
-namespace net::io::aio
+namespace net::io
 {
 
 using event_loop = detail::event_loop;

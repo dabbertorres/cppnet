@@ -1,12 +1,11 @@
-#include "io/aio/scheduler.hpp"
+#include "io/scheduler.hpp"
 
 #include <coroutine>
 
 #include "io/io.hpp"
+#include "io/poll.hpp"
 
-#include "io/aio/poll.hpp"
-
-namespace net::io::aio
+namespace net::io
 {
 
 scheduler::scheduler(std::size_t concurrency)

@@ -3,10 +3,9 @@
 #include <coroutine>
 
 #include "io/io.hpp"
+#include "io/poll.hpp"
 
-#include "io/aio/poll.hpp"
-
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 struct event

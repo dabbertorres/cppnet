@@ -6,7 +6,7 @@
 namespace net::io
 {
 
-coro::task<result> read(const aio::scheduler& scheduler, std::byte* data, std::size_t length)
+coro::task<result> read(const scheduler& scheduler, std::byte* data, std::size_t length)
 {
     // TODO
 }

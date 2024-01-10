@@ -1,13 +1,13 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string_view>
 
 #include "coro/task.hpp"
+#include "io/scheduler.hpp"
 
 #include "io.hpp"
-
-#include "io/aio/scheduler.hpp"
 
 namespace net::io
 {
@@ -23,23 +23,33 @@ public:
 
     virtual ~writer() = default;
 
-    virtual result write(const std::byte* data, std::size_t length) = 0;
+    virtual result write(std::span<const std::byte> data) = 0;
 
-    inline result write(const char* data, std::size_t length)
+    inline result write(std::span<const char> data) { return write(std::as_bytes(data)); }
+    inline result write(std::string_view data) { return write(std::span{data.data(), data.length()}); }
+
+    inline result write(std::byte data) { return write(std::span{&data, 1}); }
+    inline result write(char data) { return write(std::span{&data, 1}); }
+
+    template<typename T, std::size_t N = std::dynamic_extent>
+    inline result write(std::span<T, N> data)
     {
-        return write(reinterpret_cast<const std::byte*>(data), length);
+        return write(std::as_bytes(data));
     }
-    inline result write(std::string_view data) { return write(data.data(), data.size()); }
 
-    inline result write(std::byte data) { return write(&data, 1); }
-    inline result write(char data) { return write(&data, 1); }
-
-    virtual coro::task<io::result> write(io::aio::scheduler& scheduler, const std::byte* data, std::size_t length) = 0;
-
-    inline coro::task<io::result> write(io::aio::scheduler& scheduler, const char* data, std::size_t length)
+    template<typename T>
+    inline result write(const T& data)
     {
-        return write(scheduler, reinterpret_cast<const std::byte*>(data), length);
+        return write(std::as_bytes(std::span{&data, 1}));
     }
+
+    /* virtual coro::task<io::result> write(io::aio::scheduler& scheduler, const std::byte* data, std::size_t length) =
+     * 0; */
+
+    /* inline coro::task<io::result> write(io::aio::scheduler& scheduler, const char* data, std::size_t length) */
+    /* { */
+    /*     return write(scheduler, reinterpret_cast<const std::byte*>(data), length); */
+    /* } */
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
@@ -50,9 +60,9 @@ protected:
 inline result write_all(writer& /*out*/) { return {}; }
 
 template<typename... Writes>
-inline result write_all(writer& out, const std::byte* data, std::size_t length, Writes&&... writes)
+inline result write_all(writer& out, std::span<const std::byte> data, Writes&&... writes)
 {
-    auto res = out.write(data, length);
+    auto res = out.write(data);
     if (res.err) return res;
 
     std::size_t total = res.count;
@@ -63,9 +73,9 @@ inline result write_all(writer& out, const std::byte* data, std::size_t length, 
 }
 
 template<typename... Writes>
-inline result write_all(writer& out, const char* data, std::size_t length, Writes&&... writes)
+inline result write_all(writer& out, std::span<const char> data, Writes&&... writes)
 {
-    auto res = out.write(data, length);
+    auto res = out.write(data);
     if (res.err) return res;
 
     std::size_t total = res.count;

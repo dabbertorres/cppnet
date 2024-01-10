@@ -1,13 +1,8 @@
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
-#include <iterator>
-#include <limits>
-#include <optional>
 #include <system_error>
 #include <tuple>
-#include <type_traits>
 #include <vector>
 
 #include "io.hpp"
@@ -21,16 +16,13 @@ class buffered_reader : public reader
 public:
     buffered_reader(reader* impl, std::size_t bufsize = 1'024);
 
-    result read(std::byte* data, std::size_t length) override;
+    result read(std::span<std::byte> data) override;
 
     using reader::read;
 
     // peek sets next to the next byte and returns true, if available.
     //
     // If no next byte is available, next is not modified, and false is returned.
-    //
-    // NOTE: peek does not implicitly read more data, instead false if none is immediately available.
-    //       See ensure if you want to make sure data is available.
     [[nodiscard]] std::tuple<std::byte, bool> peek();
 
     [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }

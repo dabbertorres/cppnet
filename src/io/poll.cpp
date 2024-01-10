@@ -1,8 +1,8 @@
-#include "io/aio/poll.hpp"
+#include "io/poll.hpp"
 
 #include <type_traits>
 
-namespace net::io::aio
+namespace net::io
 {
 
 poll_op operator&(poll_op lhs, poll_op rhs) noexcept

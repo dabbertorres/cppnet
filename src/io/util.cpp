@@ -28,7 +28,7 @@ readline_result readline(buffered_reader& reader, std::string_view end_of_line) 
         if (!have_next) break; // nothing more to read
 
         add_size();
-        auto [count, err] = reader.read(line.data() + (line.size() - 1), 1);
+        auto [count, err] = reader.read(std::span{line.data() + (line.size() - 1), 1});
         if (err) return err;
         if (count == 0) return {make_error_condition(status_condition::closed)}; // TODO: communicate the actual error
     }

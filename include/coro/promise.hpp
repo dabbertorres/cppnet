@@ -2,7 +2,6 @@
 
 #include <coroutine>
 #include <exception>
-#include <optional>
 #include <type_traits>
 #include <variant>
 
@@ -19,8 +18,6 @@ class promise_base
 public:
     auto initial_suspend() noexcept { return std::suspend_always{}; }
     auto final_suspend() noexcept { return final_awaitable{}; }
-
-    void unhandled_exception() noexcept { exception = std::current_exception(); }
 
     void set_continuation(std::coroutine_handle<> continuation) noexcept { handle = continuation; }
 
@@ -44,7 +41,6 @@ private:
 
 protected:
     std::coroutine_handle<> handle;
-    std::exception_ptr      exception;
 };
 
 template<typename T>
@@ -59,23 +55,26 @@ public:
 
     void return_value(T new_value) noexcept { value = std::move(new_value); }
 
+    void unhandled_exception() noexcept { value = std::current_exception(); }
+
     [[nodiscard]] const T& result() const&
     {
-        if (exception != nullptr) std::rethrow_exception(exception);
+        if (std::holds_alternative<std::exception_ptr>(value))
+            std::rethrow_exception(std::get<std::exception_ptr>(value));
 
-        return value;
+        return std::get<T>(value);
     }
 
     [[nodiscard]] T&& result() &&
     {
-        if (exception != nullptr) std::rethrow_exception(exception);
+        if (std::holds_alternative<std::exception_ptr>(value))
+            std::rethrow_exception(std::get<std::exception_ptr>(value));
 
-        return std::move(value);
+        return std::move(std::get<T>(value));
     }
 
 private:
-    // TODO: consider replacing with a std::variant<std::monostate, T, std::exception_ptr>
-    T value;
+    std::variant<std::monostate, T, std::exception_ptr> value;
 };
 
 template<typename T>
@@ -84,7 +83,7 @@ class promise<T> final : public promise_base
 {
 private:
     using bare_value_t = std::remove_reference_t<T>;
-    using value_t      = std::optional<std::reference_wrapper<bare_value_t>>;
+    using value_t      = std::reference_wrapper<bare_value_t>;
 
 public:
     using task_t                       = task<T>;
@@ -92,26 +91,24 @@ public:
 
     task_t get_return_object() noexcept { return task_t{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
-    void return_value(T new_value) noexcept
-    {
-        value.reset();
-        value = new_value;
-    }
+    void return_value(T new_value) noexcept { value = new_value; }
+
+    void unhandled_exception() noexcept { value = std::current_exception(); }
 
     [[nodiscard]] T result() const&
     {
-        if (exception != nullptr) std::rethrow_exception(exception);
+        if (std::holds_alternative<std::exception_ptr>(value))
+            std::rethrow_exception(std::get<std::exception_ptr>(value));
 
-        return value.value();
+        return std::get<value_t>(value);
     }
 
 private:
-    // TODO: consider replacing with a std::variant<std::monostate, T, std::exception_ptr>
-    value_t value;
+    std::variant<std::monostate, value_t, std::exception_ptr> value;
 };
 
 template<>
-class promise<void> : public promise_base
+class promise<void> final : public promise_base
 {
 public:
     using task_t = task<void>;
@@ -120,10 +117,15 @@ public:
 
     void return_void() noexcept {}
 
+    void unhandled_exception() noexcept { exception = std::current_exception(); }
+
     void result()
     {
         if (exception != nullptr) std::rethrow_exception(exception);
     }
+
+private:
+    std::exception_ptr exception;
 };
 
 }

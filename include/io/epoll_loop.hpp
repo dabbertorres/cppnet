@@ -11,10 +11,10 @@
 #    include <sys/epoll.h>
 #    include <sys/eventfd.h>
 
-#    include "io/aio/detail/event_handler.hpp"
-#    include "io/aio/poll.hpp"
+#    include "io/event_handler.hpp"
+#    include "io/poll.hpp"
 
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 using namespace std::chrono_literals;

@@ -7,7 +7,7 @@
 #include "coro/promise.hpp"
 #include "io/io.hpp"
 
-namespace net::io::aio
+namespace net::io
 {
 
 enum class poll_op : std::uint8_t

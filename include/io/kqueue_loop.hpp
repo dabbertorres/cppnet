@@ -14,11 +14,10 @@
 #    include <sys/types.h>
 
 #    include "coro/generator.hpp"
+#    include "io/event.hpp"
+#    include "io/poll.hpp"
 
-#    include "io/aio/event.hpp"
-#    include "io/aio/poll.hpp"
-
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 using namespace std::chrono_literals;

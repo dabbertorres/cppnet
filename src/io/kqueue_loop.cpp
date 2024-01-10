@@ -1,4 +1,4 @@
-#include "io/aio/detail/kqueue_loop.hpp"
+#include "io/kqueue_loop.hpp"
 
 #include "config.hpp"
 
@@ -21,12 +21,12 @@
 #    include <sys/event.h>
 #    include <sys/types.h>
 
+#    include "io/event.hpp"
+#    include "io/poll.hpp"
+
 #    include "exception.hpp"
 
-#    include "io/aio/event.hpp"
-#    include "io/aio/poll.hpp"
-
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 kqueue_loop::kqueue_loop()

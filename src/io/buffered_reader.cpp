@@ -4,32 +4,32 @@ namespace net::io
 {
 
 buffered_reader::buffered_reader(reader* impl, std::size_t bufsize)
-    : impl(impl)
-    , buf(bufsize)
+    : impl{impl}
+    , buf{bufsize}
 {
     buf.resize(0);
 }
 
-result buffered_reader::read(std::byte* data, std::size_t length)
+result buffered_reader::read(std::span<std::byte> data)
 {
-    if (length == 0) return {.count = 0};
+    if (data.empty()) return {.count = 0};
 
     // easy way out
-    if (length <= buf.size())
+    if (data.size() <= buf.size())
     {
-        std::copy_n(buf.begin(), length, data);
+        std::copy_n(buf.begin(), data.size(), data.begin());
 
         auto end = buf.begin();
-        std::advance(end, length);
+        std::advance(end, data.size());
 
-        auto leftover = buf.size() - length;
+        auto leftover = buf.size() - data.size();
         auto new_end  = buf.begin();
         std::advance(new_end, leftover);
 
         std::copy_backward(end, buf.end(), new_end);
         buf.resize(leftover);
 
-        return {.count = length};
+        return {.count = data.size()};
     }
 
     // Note that we always (try to) read from the inner reader in buf.capacity() increments.
@@ -40,7 +40,7 @@ result buffered_reader::read(std::byte* data, std::size_t length)
     {
         // copy over what we can...
 
-        std::copy_n(buf.begin(), buf.size(), data);
+        std::copy_n(buf.begin(), buf.size(), data.begin());
         total += buf.size();
         buf.resize(0);
     }
@@ -48,16 +48,16 @@ result buffered_reader::read(std::byte* data, std::size_t length)
     // At this point, the buffer is empty. As long as length - total is larger
     // than the buffer capacity, we can skip a copy and read straight to data.
 
-    while (length - total > buf.capacity())
+    while (data.size() - total > buf.capacity())
     {
-        auto res = impl->read(data + total, buf.capacity());
+        auto res = impl->read(data.subspan(total, buf.capacity()));
         if (res.err) return {.count = total + res.count, .err = res.err};
 
         total += res.count;
     }
 
     // partial read of buffer capacity
-    auto leftover = length - total;
+    auto leftover = data.size() - total;
     if (leftover > 0)
     {
         fill();
@@ -65,7 +65,7 @@ result buffered_reader::read(std::byte* data, std::size_t length)
         // regardless of error, give the user what we can
 
         auto available = std::min(leftover, buf.size());
-        std::copy_n(buf.begin(), available, data + total);
+        std::copy_n(buf.begin(), available, data.subspan(total).begin());
 
         total += available;
 
@@ -109,7 +109,7 @@ void buffered_reader::fill()
     auto start     = buf.size();
     auto read_more = buf.capacity() - start;
     buf.resize(buf.capacity());
-    auto res = impl->read(buf.data() + start, read_more);
+    auto res = impl->read(std::span{buf.data() + start, read_more});
     buf.resize(start + res.count);
     err = res.err;
 }

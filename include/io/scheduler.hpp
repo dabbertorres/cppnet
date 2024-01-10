@@ -4,11 +4,10 @@
 #include <thread>
 
 #include "coro/thread_pool.hpp"
+#include "io/event_loop.hpp"
+#include "io/poll.hpp"
 
-#include "io/aio/event_loop.hpp"
-#include "io/aio/poll.hpp"
-
-namespace net::io::aio
+namespace net::io
 {
 
 using namespace std::chrono_literals;

@@ -14,9 +14,9 @@
 #    include <sys/eventfd.h>
 #    include <sys/timerfd.h>
 
-#    include "exception.hpp"
+#    include "io/epoll_loop.hpp"
 
-#    include "io/aio/detail/epoll_loop.hpp"
+#    include "exception.hpp"
 
 namespace
 {
@@ -41,7 +41,7 @@ EPOLL_EVENTS convert_poll_op(net::io::aio::poll_op op)
 
 }
 
-namespace net::io::aio::detail
+namespace net::io::detail
 {
 
 epoll_loop::epoll_loop()
