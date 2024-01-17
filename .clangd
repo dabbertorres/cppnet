@@ -30,6 +30,7 @@ Style:
   FullyQualifiedNamespaces: No
 Diagnostics:
   UnusedIncludes: Strict
+  MissingIncludes: Strict
   Suppress:
   - -Wpadded
 Completion:

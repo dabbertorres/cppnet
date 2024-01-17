@@ -1,5 +1,17 @@
 #include "io/buffered_reader.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <exception>
+#include <functional>
+#include <iterator>
+#include <span>
+#include <system_error>
+#include <tuple>
+
+#include "io/io.hpp"
+#include "io/reader.hpp"
+
 namespace net::io
 {
 
@@ -80,6 +92,23 @@ result buffered_reader::read(std::span<std::byte> data)
     }
 
     return {.count = total};
+}
+
+buffered_reader::read_until_result buffered_reader::read_until(std::span<const std::byte> delim) noexcept
+{
+    // do we already have an instance of delim in the buffer?
+    auto searcher    = std::boyer_moore_searcher{delim.begin(), delim.end()};
+    auto delim_begin = std::search(buf.begin(), buf.end(), searcher);
+    if (delim_begin != buf.end())
+    {
+        return {
+            .data      = {buf.begin(), delim_begin},
+            .is_prefix = false,
+            .err       = err,
+        };
+    }
+
+    std::terminate();
 }
 
 [[nodiscard]] std::tuple<std::byte, bool> buffered_reader::peek()

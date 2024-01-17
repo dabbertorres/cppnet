@@ -1,5 +1,11 @@
 #include "io/util.hpp"
 
+#include <cstddef>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 
 namespace net::io

@@ -17,7 +17,7 @@ public:
     void push(T&& value) noexcept
     {
         auto idx    = (begin + current_size) % capacity();
-        values[idx] = value;
+        values[idx] = std::move(value);
         if (current_size + 1 > capacity()) begin = (begin + 1) % capacity(); // drop oldest
         else ++current_size;
     }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <vector>
@@ -19,6 +21,24 @@ public:
     result read(std::span<std::byte> data) override;
 
     using reader::read;
+
+    struct read_until_result
+    {
+        std::span<std::byte> data;
+        bool                 is_prefix;
+        std::error_condition err;
+    };
+
+    // read_until returns a span of the data in the buffer up to (but not including)
+    // delim.
+    // If the buffer fills up before delim is found, then the partial data is returned,
+    // and is_prefix will be true.
+    // If an error occurs while reading to look for delim, err is set.
+    read_until_result read_until(std::span<const std::byte> delim) noexcept;
+    read_until_result read_until(std::string_view delim) noexcept
+    {
+        return read_until(std::as_bytes(std::span{delim.begin(), delim.end()}));
+    }
 
     // peek sets next to the next byte and returns true, if available.
     //
