@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "cppnet",
   "version-semver": "0.1.0",
   "builtin-baseline": "9d47b24eacbd1cd94f139457ef6cd35e5d92cc84",
@@ -15,6 +15,10 @@
     {
       "name": "nlohmann-json",
       "version>=": "3.11.2"
+    },
+    {
+      "name": "concurrencpp",
+      "version>=": "0.1.7"
     }
   ]
 }
