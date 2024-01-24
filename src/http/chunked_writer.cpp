@@ -4,7 +4,10 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <span>
 #include <string_view>
+
+#include "io/io.hpp"
 
 // calculates the maximum decimal value that would fit in size digits.
 // e.g. given 3, return 999.
@@ -28,27 +31,28 @@ namespace net::http::http11
 
 using namespace std::string_view_literals;
 
-io::result chunked_writer::write(const std::byte* data, std::size_t length)
+io::result chunked_writer::write(std::span<const std::byte> data)
 {
     std::array<char, 8>   chunk_size_buf{};
     constexpr std::size_t max_chunk_size = max_decimal_for_length_digits(chunk_size_buf.size());
 
     std::size_t amount_written = 0;
 
-    while (amount_written < length)
+    while (amount_written < data.size())
     {
-        std::size_t amount_to_write = std::min(max_chunk_size, length);
+        std::size_t amount_to_write = std::min(max_chunk_size, data.size());
 
         // write the chunk length
         auto [ptr, ec] = std::to_chars(chunk_size_buf.begin(), chunk_size_buf.end(), amount_to_write);
 
-        auto res = parent->write(chunk_size_buf.begin(), static_cast<std::size_t>(ptr - chunk_size_buf.begin()));
+        auto end = static_cast<std::size_t>(ptr - chunk_size_buf.begin());
+        auto res = parent->write(std::span{chunk_size_buf.data(), end});
         if (res.err) return {.count = amount_written, .err = res.err};
 
         res = parent->write("\r\n"sv);
         if (res.err) return {.count = amount_written, .err = res.err};
 
-        res = parent->write(data + amount_written, amount_to_write);
+        res = parent->write(data.subspan(amount_written, amount_to_write));
         amount_written += res.count;
         if (res.err) return {.count = amount_written, .err = res.err};
 

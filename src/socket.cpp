@@ -1,6 +1,12 @@
 #include "socket.hpp"
 
 #include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <system_error>
 #include <utility>
 
 #include <fcntl.h>
@@ -8,10 +14,13 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+
+#include "io/io.hpp"
 
 #include "exception.hpp"
 
@@ -106,14 +115,14 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(std::byte* data, std::size_t length) noexcept
+io::result socket::read(std::span<std::byte> data) noexcept
 {
     std::size_t received = 0;
     std::size_t attempts = 0;
 
     while (true)
     {
-        const std::int64_t num = ::recv(fd, data + received, length - received, 0);
+        const std::int64_t num = ::recv(fd, data.data() + received, data.size() - received, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -146,22 +155,23 @@ io::result socket::read(std::byte* data, std::size_t length) noexcept
     return {.count = received};
 }
 
-coro::task<net::io::result> socket::read(io::aio::scheduler& scheduler, std::byte* data, std::size_t length) noexcept
-{
-    scheduler.schedule(io::aio::wait_for{
-        .fd = native_handle(),
-        .op = io::aio::poll_op::read,
-    });
+/* coro::task<net::io::result> socket::read(io::aio::scheduler& scheduler, std::byte* data, std::size_t length) noexcept
+ */
+/* { */
+/*     scheduler.schedule(io::aio::wait_for{ */
+/*         .fd = native_handle(), */
+/*         .op = io::aio::poll_op::read, */
+/*     }); */
 
-    co_return read(data, length);
-}
+/*     co_return read(data, length); */
+/* } */
 
-io::result socket::write(const std::byte* data, std::size_t length) noexcept
+io::result socket::write(std::span<const std::byte> data) noexcept
 {
     std::size_t sent = 0;
-    while (sent < length)
+    while (sent < data.size())
     {
-        const std::int64_t num = ::send(fd, data + sent, length - sent, 0);
+        const std::int64_t num = ::send(fd, data.data() + sent, data.size() - sent, 0);
         if (num < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;

@@ -1,13 +1,16 @@
 #include "http/http11.hpp"
 
-#include <array>
-#include <sstream>
+#include <string>
+#include <string_view>
 
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "http/headers.hpp"
 #include "http/http.hpp"
+#include "http/request.hpp"
+#include "io/buffered_reader.hpp"
 #include "io/string_reader.hpp"
 #include "util/string_util.hpp"
 
@@ -99,7 +102,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body.data(), body.size());
+    auto read_result = request.body->read(body);
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 18);
 
@@ -148,7 +151,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body.data(), body.size());
+    auto read_result = request.body->read(body);
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 38);
 

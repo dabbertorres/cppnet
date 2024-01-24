@@ -1,5 +1,11 @@
 #include "io/kqueue_loop.hpp"
 
+#include <cerrno>
+#include <cstddef>
+
+#include "coro/generator.hpp"
+#include "io/io.hpp"
+
 #include "config.hpp"
 
 #ifdef NET_HAS_KQUEUE

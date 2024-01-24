@@ -24,18 +24,8 @@ public:
 
     virtual result read(std::span<std::byte> data) = 0;
     inline result  read(std::span<char> data) { return read(std::as_writable_bytes(data)); }
-
-    template<typename T, std::size_t N = std::dynamic_extent>
-    inline result read(std::span<T, N> data)
-    {
-        return read(std::as_writable_bytes(data));
-    }
-
-    template<typename T>
-    inline result read(T& data)
-    {
-        return read(std::as_writable_bytes(std::span{&data, 1}));
-    }
+    inline result  read(std::byte& data) { return read({&data, 1}); }
+    inline result  read(char& data) { return read({&data, 1}); }
 
     /* virtual coro::task<io::result> read(scheduler& scheduler, std::byte* data, std::size_t length) = 0; */
 

@@ -3,9 +3,13 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <ranges>
+#include <string>
+#include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "http/chunked_reader.hpp"
 #include "http/headers.hpp"
@@ -16,8 +20,11 @@
 #include "io/io.hpp"
 #include "io/limit_reader.hpp"
 #include "io/util.hpp"
+#include "io/writer.hpp"
 #include "util/result.hpp"
 #include "util/string_util.hpp"
+
+#include "url.hpp"
 
 namespace
 {
@@ -187,7 +194,7 @@ std::error_condition write_headers(net::io::writer& writer, const headers& heade
         auto res = writer.write(header.first);
         if (res.err) return res.err;
 
-        res = writer.write(": ");
+        res = writer.write(": "sv);
         if (res.err) return res.err;
 
         if (!header.second.empty())
@@ -197,7 +204,7 @@ std::error_condition write_headers(net::io::writer& writer, const headers& heade
 
             for (const auto& value : std::ranges::drop_view(header.second, 1))
             {
-                res = writer.write(", ");
+                res = writer.write(", "sv);
                 if (res.err) return res.err;
 
                 res = writer.write(value);
@@ -205,7 +212,7 @@ std::error_condition write_headers(net::io::writer& writer, const headers& heade
             }
         }
 
-        res = writer.write("\r\n");
+        res = writer.write("\r\n"sv);
         if (res.err) return res.err;
     }
 
@@ -231,7 +238,7 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
     res = writer->write(req.uri.build());
     if (res.err) return {res.err};
 
-    res = writer->write(" HTTP/");
+    res = writer->write(" HTTP/"sv);
     if (res.err) return {res.err};
 
     std::array<char, 4> version_buf{
@@ -241,10 +248,10 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
         ' ',
     };
 
-    res = writer->write(version_buf.data(), version_buf.size());
+    res = writer->write(version_buf);
     if (res.err) return {res.err};
 
-    res = writer->write("\r\n");
+    res = writer->write("\r\n"sv);
     if (res.err) return {res.err};
 
     res.err = write_headers(*writer, req.headers);
@@ -257,7 +264,7 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
 
 result<io::writer*, std::error_condition> response_encode(io::writer* writer, const server_response& resp) noexcept
 {
-    auto res = writer->write("HTTP/");
+    auto res = writer->write("HTTP/"sv);
     if (res.err) return {res.err};
 
     std::array<char, 4> version_buf{
@@ -267,7 +274,7 @@ result<io::writer*, std::error_condition> response_encode(io::writer* writer, co
         ' ',
     };
 
-    res = writer->write(version_buf.data(), version_buf.size());
+    res = writer->write(version_buf);
     if (res.err) return {res.err};
 
     res = writer->write(' ');
@@ -276,13 +283,13 @@ result<io::writer*, std::error_condition> response_encode(io::writer* writer, co
     res = writer->write(status_text(resp.status_code));
     if (res.err) return {res.err};
 
-    res = writer->write("\r\n");
+    res = writer->write("\r\n"sv);
     if (res.err) return {res.err};
 
     res.err = write_headers(*writer, resp.headers);
     if (res.err) return {res.err};
 
-    res = writer->write("\r\n");
+    res = writer->write("\r\n"sv);
     if (res.err) return {res.err};
 
     return {writer};

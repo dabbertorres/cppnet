@@ -2,19 +2,22 @@
 
 #include <atomic>
 #include <chrono>
-#include <map>
-#include <stdexcept>
+#include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "io/io.hpp"
 #include "io/writer.hpp"
 #include "util/hash.hpp"
 #include "util/string_util.hpp"
 
 namespace net::instrument::prometheus
 {
+
+using namespace std::string_view_literals;
 
 enum class metric_type
 {
@@ -168,7 +171,7 @@ protected:
     {
         if (!help.empty())
         {
-            return io::write_all(out, "# HELP ", name, ' ', help, '\n');
+            return io::write_all(out, "# HELP "sv, name, ' ', help, '\n');
         }
 
         return {};
@@ -176,7 +179,7 @@ protected:
 
     io::result encode_type(io::writer& out) const
     {
-        return io::write_all(out, "# TYPE ", name, ' ', metric_type_string(T::type()), '\n');
+        return io::write_all(out, "# TYPE "sv, name, ' ', metric_type_string(T::type()), '\n');
     }
 
     io::result encode_labels(io::writer& out) const
@@ -212,7 +215,7 @@ protected:
         return io::write_all(
             out,
             label_name,
-            "=\"",
+            R"(=")"sv,
             [=](io::writer& out)
             {
                 // clang-format off
@@ -223,7 +226,7 @@ protected:
                 });
                 // clang-format on
             },
-            "\",");
+            R"(",)"sv);
     }
 
     io::result encode_timestamp(io::writer& out) const
@@ -245,7 +248,7 @@ concept derive_hook = metric_impl<T>
 // clang-format on
 
 template<metric_impl T>
-T derive_child(const T& parent, metric_labels&& new_labels)
+T derive_child(const T& parent, const metric_labels& new_labels)
 {
     T child{parent.name, parent.help, parent.labels};
 

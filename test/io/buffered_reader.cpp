@@ -18,7 +18,7 @@ TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
 
     std::string buf(6, 0);
 
-    auto res = reader.read(buf.data(), buf.size());
+    auto res = reader.read(buf);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 6);
     REQUIRE(buf == "foobar"sv);
@@ -27,7 +27,7 @@ TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
     REQUIRE(have_next);
     REQUIRE(static_cast<char>(next) == 'b');
 
-    res = reader.read(buf.data(), buf.size());
+    res = reader.read(buf);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
     REQUIRE(buf.substr(0, res.count) == "baz"sv);
@@ -42,9 +42,9 @@ TEST_CASE("0-length read", "[io][buffered_reader]")
     net::io::string_reader   string("foobarbaz"sv);
     net::io::buffered_reader reader(&string, 4);
 
-    std::string buf(6, 0);
+    std::string buf;
 
-    auto res = reader.read(buf.data(), 0);
+    auto res = reader.read(buf);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
 }

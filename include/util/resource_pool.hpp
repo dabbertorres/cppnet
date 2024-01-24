@@ -7,7 +7,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <semaphore>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -63,13 +62,13 @@ public:
         , max_size{max_size}
         , num_waiting{0}
         , num_borrowed{0}
-        , make{make}
+        , make{std::move(make)}
     {
         pool.reserve(target_size);
     }
 
     resource_pool(std::size_t max_size, make_function&& make = std::make_unique<T>)
-        : resource_pool(max_size, max_size, make)
+        : resource_pool(max_size, max_size, std::move(make))
     {}
 
     resource_pool(const resource_pool&)            = delete;
@@ -139,13 +138,19 @@ public:
         auto resource = get();
         if constexpr (std::is_void_v<R>)
         {
-            std::invoke(func, resource);
+            std::invoke(std::forward<UseFunc>(func), resource);
         }
         else
         {
-            auto ret = std::invoke(func, resource);
+            auto ret = std::invoke(std::forward<UseFunc>(func), resource);
             return ret;
         }
+    }
+
+    std::size_t available_resources() const noexcept
+    {
+        std::lock_guard lock{mu};
+        return pool.size();
     }
 
 private:
@@ -156,7 +161,7 @@ private:
     std::atomic<std::size_t>  num_waiting;
     std::atomic<std::size_t>  num_borrowed;
     make_function             make;
-    std::mutex                mu;
+    mutable std::mutex        mu;
     std::condition_variable   resource_available;
 };
 

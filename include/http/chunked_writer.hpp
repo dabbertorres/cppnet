@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <span>
 
 #include "io/io.hpp"
 #include "io/writer.hpp"
@@ -13,7 +14,7 @@ public:
         : parent{writer}
     {}
 
-    io::result write(const std::byte* data, std::size_t length) override;
+    io::result write(std::span<const std::byte> data) override;
 
     using io::writer::write;
 

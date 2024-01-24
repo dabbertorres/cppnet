@@ -1,13 +1,14 @@
 #pragma once
 
 #include <atomic>
-#include <concepts>
+#include <concepts> // IWYU pragma: keep
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <ranges>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -32,13 +33,12 @@ public:
         explicit operation(thread_pool* pool) noexcept;
 
     public:
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> waiting) noexcept;
-        void await_resume() noexcept {}
+        constexpr bool await_ready() noexcept { return false; }
+        constexpr void await_resume() noexcept {}
+        void           await_suspend(std::coroutine_handle<> handle) noexcept;
 
     private:
-        thread_pool*            pool;
-        std::coroutine_handle<> handle;
+        thread_pool* pool;
     };
 
     thread_pool(std::size_t concurrency = hardware_concurrency());
@@ -51,17 +51,37 @@ public:
 
     ~thread_pool();
 
-    // schedule adds func to the work queue, and returns a std::future<R> which can be used
-    // to retrieve the result of the job.
-    // If func returns void, a std::future<void> is returned.
     template<typename Func, typename... Args>
         requires std::invocable<Func, Args...>
-    auto schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>
+    {
+        co_await schedule();
+        co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+    }
 
     [[nodiscard]] operation schedule();
 
     template<RangeOf<std::coroutine_handle<>> R>
-    void resume(const R& handles) noexcept;
+    void resume(const R& handles) noexcept
+    {
+        std::size_t new_jobs = 0;
+
+        {
+            std::lock_guard lock{wait_mutex};
+            for (const auto& handle : handles)
+            {
+                if (handle != nullptr) [[likely]]
+                {
+                    jobs.emplace_back(handle);
+                    ++new_jobs;
+                }
+            }
+        }
+
+        num_jobs.fetch_add(new_jobs, std::memory_order::release);
+        wait.notify_one();
+    }
 
     void resume(std::coroutine_handle<> handle) noexcept;
 
@@ -80,40 +100,10 @@ private:
 
     std::vector<std::thread>            threads;
     std::mutex                          wait_mutex;
-    std::condition_variable_any         wait;
+    std::condition_variable             wait;
     std::deque<std::coroutine_handle<>> jobs;
     std::atomic<bool>                   running;
     std::atomic<std::size_t>            num_jobs; // queued AND currently executing
 };
-
-template<typename Func, typename... Args>
-    requires std::invocable<Func, Args...>
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-auto thread_pool::schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>
-{
-    co_await schedule();
-    co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
-}
-
-template<RangeOf<std::coroutine_handle<>> R>
-void thread_pool::resume(const R& handles) noexcept
-{
-    std::size_t new_jobs = 0;
-
-    {
-        std::lock_guard lock{wait_mutex};
-        for (const auto& handle : handles)
-        {
-            if (handle != nullptr) [[likely]]
-            {
-                jobs.emplace_back(handle);
-                ++new_jobs;
-            }
-        }
-    }
-
-    num_jobs.fetch_add(new_jobs, std::memory_order::release);
-    wait.notify_one();
-}
 
 }

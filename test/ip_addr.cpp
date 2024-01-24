@@ -1,8 +1,15 @@
 #include "ip_addr.hpp"
 
+#include <exception> // IWYU pragma: keep
+#include <string>
+
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_tostring.hpp>
+
+#include "ipv4_addr.hpp"
+#include "ipv6_addr.hpp"
 
 using net::ip_addr;
 using net::ipv4_addr;

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <iterator>
+#include <span>
 #include <vector>
 
 #include "io.hpp"
@@ -20,9 +22,9 @@ public:
         buf.resize(0);
     }
 
-    result write(const std::byte* data, std::size_t length) override
+    result write(std::span<const std::byte> data) override
     {
-        if (length == 0) return {.count = 0};
+        if (data.empty()) return {.count = 0};
 
         std::size_t total = 0;
 
@@ -31,15 +33,15 @@ public:
         {
             auto start = buf.begin();
             std::advance(start, buf.size());
-            auto available = std::min(buf.capacity() - buf.size(), length);
+            auto available = std::min(buf.capacity() - buf.size(), data.size());
             buf.resize(buf.size() + available);
-            std::copy_n(data, available, start);
+            std::copy_n(data.begin(), available, start);
 
             total += available;
         }
 
         // we might be done!
-        if (total == length) return {.count = length};
+        if (total == data.size()) return {.count = data.size()};
 
         // Note that we always write to the inner reader in buf.capacity() increments.
 
@@ -52,9 +54,9 @@ public:
 
         // At this point, the buffer is now empty. As long as writes are larger than the capacity, bypass the buffer.
 
-        while (length - total > buf.capacity())
+        while (data.size() - total > buf.capacity())
         {
-            auto res = impl->write(data + total, buf.capacity());
+            auto res = impl->write(data.subspan(total, buf.capacity()));
             if (res.err) return {.count = total + res.count, .err = res.err};
 
             total += res.count;
@@ -63,11 +65,11 @@ public:
         // the rest of the data, if any, is less than the buffer capacity, so buffer it.
         // Note that the buffer is still empty at this point.
 
-        auto leftover = length - total;
+        auto leftover = data.size() - total;
         if (leftover > 0)
         {
             buf.resize(leftover);
-            std::copy_n(data + total, leftover, buf.begin());
+            std::copy_n(data.subspan(total).begin(), leftover, buf.begin());
             total += leftover;
         }
 
@@ -102,7 +104,7 @@ public:
 private:
     result flush_available()
     {
-        auto res = impl->write(buf.data(), buf.size());
+        auto res = impl->write(std::span{buf});
         if (res.count < buf.size())
         {
             // if short, adjust

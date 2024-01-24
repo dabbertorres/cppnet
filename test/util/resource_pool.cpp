@@ -1,9 +1,9 @@
 #include "util/resource_pool.hpp"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include <exception> // IWYU pragma: keep
 #include <thread>
+#include <utility>
 
 #include <catch.hpp>
 

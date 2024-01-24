@@ -1,6 +1,6 @@
 #include "util/string_util.hpp"
 
-#include <sstream>
+#include <exception> // IWYU pragma: keep
 #include <string_view>
 
 #include <catch.hpp>

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <span>
+
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
@@ -18,13 +22,13 @@ public:
         , limit{limit}
     {}
 
-    result read(std::byte* data, std::size_t length) override
+    result read(std::span<std::byte> data) override
     {
         if (progress >= limit) return {};
 
-        const std::size_t read_amount = std::min(length, limit - progress);
+        const std::size_t read_amount = std::min(data.size(), limit - progress);
 
-        auto res = parent->read(data, read_amount);
+        auto res = parent->read(data.subspan(0, read_amount));
         progress += res.count;
         return res;
     }

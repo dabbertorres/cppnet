@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <limits>
 #include <system_error>
-#include <type_traits>
 
 #include "http/request.hpp"
 #include "http/response.hpp"

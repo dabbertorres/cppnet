@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <thread>
 
 #include "coro/thread_pool.hpp"

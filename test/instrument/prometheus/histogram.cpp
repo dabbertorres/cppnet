@@ -1,6 +1,6 @@
 #include "instrument/prometheus/histogram.hpp"
 
-#include <chrono>
+#include <exception> // IWYU pragma: keep
 
 #include <catch.hpp>
 

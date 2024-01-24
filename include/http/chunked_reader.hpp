@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <span>
 
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -13,7 +14,7 @@ public:
         : parent{reader}
     {}
 
-    io::result read(std::byte* data, std::size_t length) override;
+    io::result read(std::span<std::byte> data) override;
 
     using io::reader::read;
 

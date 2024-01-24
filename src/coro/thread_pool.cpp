@@ -1,6 +1,11 @@
 #include "coro/thread_pool.hpp"
 
+#include <atomic>
+#include <coroutine>
+#include <cstddef>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace net::coro
 {
@@ -15,11 +20,7 @@ thread_pool::operation::operation(thread_pool* pool) noexcept
     : pool(pool)
 {}
 
-void thread_pool::operation::await_suspend(std::coroutine_handle<> waiting) noexcept
-{
-    handle = waiting;
-    pool->schedule(handle);
-}
+void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexcept { pool->schedule(handle); }
 
 thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
@@ -87,11 +88,10 @@ void thread_pool::worker()
 {
     while (true)
     {
-        std::unique_lock<std::mutex> lock(wait_mutex);
+        std::unique_lock lock{wait_mutex};
         wait.wait(lock, [&] { return !running || !jobs.empty(); });
 
-        // TODO: complete all pending jobs before stopping?
-        if (!running /*&& jobs.empty()*/) break;
+        if (!running && jobs.empty()) break;
 
         auto handle = jobs.front();
         jobs.pop_front();

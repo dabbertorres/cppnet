@@ -1,8 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
+#include <span>
+#include <string>
 #include <string_view>
 
+#include "io/io.hpp"
 #include "io/reader.hpp"
 
 namespace net::io
@@ -15,27 +19,34 @@ public:
     using string = std::basic_string_view<CharT, Traits>;
 
     string_reader(string view)
-        : view{view}
+        : view{std::as_bytes(std::span{view})}
     {}
 
-    result read(CharT* data, std::size_t length)
+    result read(std::span<CharT> data)
     {
-        if (idx == view.length()) return {.count = 0};
+        auto [count, err] = read(std::as_writable_bytes(data));
+        return {
+            .count = count / sizeof(CharT),
+            .err   = err,
+        };
+    }
 
-        auto amount = std::min(view.length() - idx, length);
+    result read(std::span<std::byte> data) override
+    {
+        if (idx == view.size()) return {.count = 0};
+
+        auto amount = std::min(view.size() - idx, data.size());
         auto start  = view.begin() + idx;
-        std::copy_n(start, amount, data);
+        std::copy_n(start, amount, data.begin());
         idx += amount;
         return {.count = amount};
     }
 
-    result read(std::byte* data, std::size_t length) override { return read(reinterpret_cast<CharT*>(data), length); }
-
     [[nodiscard]] int native_handle() const noexcept override { return 0; }
 
 private:
-    string      view;
-    std::size_t idx = 0;
+    std::span<const std::byte> view;
+    std::size_t                idx = 0;
 };
 
 }

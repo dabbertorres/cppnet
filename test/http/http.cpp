@@ -1,12 +1,11 @@
 #include "http/http.hpp"
 
+#include <exception> // IWYU pragma: keep
 #include <sstream>
-#include <string>
-#include <string_view>
 
 #include <catch.hpp>
 
-using namespace net::http;
+#include <catch2/catch_test_macros.hpp>
 
 TEST_CASE("response header is added correctly")
 {

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <exception> // IWYU pragma: keep
 #include <string_view>
 #include <vector>
 

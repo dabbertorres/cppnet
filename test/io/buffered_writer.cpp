@@ -1,5 +1,8 @@
 #include "io/buffered_writer.hpp"
 
+#include <exception> // IWYU pragma: keep
+#include <string_view>
+
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -8,10 +11,12 @@
 
 TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
 {
+    using namespace std::string_view_literals;
+
     net::io::string_writer<char> builder;
     net::io::buffered_writer     writer{&builder, 4};
 
-    auto res = writer.write("foo", 3);
+    auto res = writer.write("foo"sv);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
@@ -19,7 +24,7 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
     auto out = builder.build();
     REQUIRE(out.empty());
 
-    res = writer.write("bar", 3);
+    res = writer.write("bar"sv);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
@@ -35,10 +40,12 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
 
 TEST_CASE("0-length write", "[io][buffered_writer]")
 {
+    using namespace std::string_view_literals;
+
     net::io::string_writer<char> builder;
     net::io::buffered_writer     writer{&builder, 4};
 
-    auto res = writer.write("foo", 0);
+    auto res = writer.write(""sv);
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
 

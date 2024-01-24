@@ -1,6 +1,7 @@
 #include "encoding/base64.hpp"
 
 #include <cstddef>
+#include <exception> // IWYU pragma: keep
 #include <span>
 #include <vector>
 

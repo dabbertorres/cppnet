@@ -3,13 +3,18 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 #include <version>
 
+#include "io/io.hpp"
 #include "io/writer.hpp"
 
 #include "instrument/prometheus/metric.hpp"
@@ -19,7 +24,7 @@ namespace net::instrument::prometheus
 
 histogram::histogram(std::string&& name, std::string&& help, metric_labels&& labels, std::vector<double>&& buckets)
     : base_metric{std::move(name), std::move(help), std::move(labels)}
-    , buckets{buckets}
+    , buckets{std::move(buckets)}
     , bucket_values(buckets.size())
 {
     // ensure we have an "infinity" bucket
@@ -135,14 +140,14 @@ io::result histogram::encode_self(io::writer& out) const
                 auto res = io::write_all(
                     out,
                     name,
-                    "_bucket{",
+                    "_bucket{"sv,
                     [this, i](io::writer& out) {
                         return encode_one_label(out,
                                                 "le",
                                                 std::isfinite(buckets[i]) ? std::to_string(buckets[i]) : "+Inf");
                     },
                     [this](io::writer& out) { return encode_all_labels(out); },
-                    "} ",
+                    "} "sv,
                     [this, i](io::writer& out)
                     {
 #ifdef __cpp_lib_atomic_ref
@@ -161,7 +166,7 @@ io::result histogram::encode_self(io::writer& out) const
             return {.count = total};
         },
         name,
-        "_sum",
+        "_sum"sv,
         [this](io::writer& out) { return encode_labels(out); },
         ' ',
         [this](io::writer& out)
@@ -171,7 +176,7 @@ io::result histogram::encode_self(io::writer& out) const
         },
         '\n',
         name,
-        "_count",
+        "_count"sv,
         [this](io::writer& out) { return encode_labels(out); },
         ' ',
         [this](io::writer& out)

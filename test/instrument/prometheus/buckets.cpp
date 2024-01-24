@@ -1,7 +1,7 @@
 #include "instrument/prometheus/buckets.hpp"
 
 #include <cmath>
-#include <limits>
+#include <exception> // IWYU pragma: keep
 #include <vector>
 
 #include <catch.hpp>

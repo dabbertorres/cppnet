@@ -1,8 +1,9 @@
 #include "io/scheduler.hpp"
 
+#include <atomic>
 #include <coroutine>
+#include <cstddef>
 
-#include "io/io.hpp"
 #include "io/poll.hpp"
 
 namespace net::io

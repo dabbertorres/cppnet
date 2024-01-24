@@ -1,13 +1,26 @@
 #include "http/server.hpp"
 
+#include <chrono>
+#include <exception>
 #include <functional>
+#include <mutex>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #include "coro/thread_pool.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
 #include "http/request.hpp"
+#include "http/response.hpp"
+#include "http/router.hpp"
+#include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
+#include "io/io.hpp"
+
+#include "ip_addr.hpp"
+#include "listen.hpp"
+#include "tcp.hpp"
 
 namespace net::http
 {
@@ -21,7 +34,7 @@ server::server(router&& handler, const server_config& cfg)
                protocol::not_care,
                std::chrono::duration_cast<std::chrono::microseconds>(cfg.header_read_timeout)}
     , is_serving{false}
-    , handler{handler}
+    , handler{std::move(handler)}
     , logger{cfg.logger}
     , threads{cfg.num_threads}
     , max_header_bytes{cfg.max_header_bytes}
@@ -70,6 +83,8 @@ void server::serve()
 
 void server::serve_connection(tcp_socket&& client_sock) noexcept
 {
+    auto conn = std::move(client_sock);
+
     logger->trace("new connection handler started for {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
     io::buffered_reader reader(&client_sock);

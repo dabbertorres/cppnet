@@ -20,6 +20,7 @@ project(
 
 find_package(spdlog CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(concurrencpp CONFIG REQUIRED)
 
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
 add_library(net ${sources})
@@ -37,6 +38,7 @@ target_compile_features(
 target_link_libraries(
   net
   PUBLIC spdlog::spdlog
+  PUBLIC concurrencpp::concurrencpp
   PRIVATE nlohmann_json::nlohmann_json
 )
 

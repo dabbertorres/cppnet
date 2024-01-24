@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <deque>
-#include <ios>
 #include <memory>
+#include <span>
 #include <string>
 
+#include "io/io.hpp"
 #include "io/writer.hpp"
 
 namespace net::io
@@ -16,16 +18,16 @@ class string_writer : public writer
 public:
     using string = std::basic_string<CharT, Traits, Allocator>;
 
-    result write(const CharT* data, std::size_t length)
+    result write(std::span<const CharT> data)
     {
-        parts.emplace_back(data, length);
-        return {.count = length};
+        parts.emplace_back(data.data(), data.size());
+        return {.count = data.size()};
     }
 
-    result write(const std::byte* data, std::size_t length) override
+    result write(std::span<const std::byte> data) override
     {
-        parts.emplace_back(reinterpret_cast<const CharT*>(data), length);
-        return {.count = length};
+        parts.emplace_back(reinterpret_cast<const CharT*>(data.data()), data.size() / sizeof(CharT));
+        return {.count = data.size()};
     }
 
     void write(CharT c)

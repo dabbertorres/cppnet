@@ -1,9 +1,15 @@
 #include "http/http2.hpp"
 
+#include <cstddef>
 #include <cstdint>
-#include <string>
+#include <system_error>
 
+#include "http/request.hpp"
+#include "http/response.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/writer.hpp"
 #include "util/packed.hpp"
+#include "util/result.hpp"
 
 namespace net::http::http2
 {
@@ -54,12 +60,12 @@ util::result<io::writer*, std::error_condition> response_encode(io::writer*     
                                                                 const server_response& resp) noexcept
 {}
 
-result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
-                                                            std::size_t          max_header_bytes) noexcept
+util::result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
+                                                                  std::size_t          max_header_bytes) noexcept
 {}
 
-result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
-                                                              std::size_t          max_header_bytes) noexcept
+util::result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
+                                                                    std::size_t          max_header_bytes) noexcept
 {}
 
 }

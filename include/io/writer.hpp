@@ -2,10 +2,11 @@
 
 #include <cstddef>
 #include <span>
+#include <string>
 #include <string_view>
 
-#include "coro/task.hpp"
-#include "io/scheduler.hpp"
+/* #include "coro/task.hpp" */
+/* #include "io/scheduler.hpp" */
 
 #include "io.hpp"
 
@@ -27,29 +28,10 @@ public:
 
     inline result write(std::span<const char> data) { return write(std::as_bytes(data)); }
     inline result write(std::string_view data) { return write(std::span{data.data(), data.length()}); }
+    inline result write(const std::string& data) { return write(std::span{data.data(), data.length()}); }
 
     inline result write(std::byte data) { return write(std::span{&data, 1}); }
     inline result write(char data) { return write(std::span{&data, 1}); }
-
-    template<typename T, std::size_t N = std::dynamic_extent>
-    inline result write(std::span<T, N> data)
-    {
-        return write(std::as_bytes(data));
-    }
-
-    template<typename T>
-    inline result write(const T& data)
-    {
-        return write(std::as_bytes(std::span{&data, 1}));
-    }
-
-    /* virtual coro::task<io::result> write(io::aio::scheduler& scheduler, const std::byte* data, std::size_t length) =
-     * 0; */
-
-    /* inline coro::task<io::result> write(io::aio::scheduler& scheduler, const char* data, std::size_t length) */
-    /* { */
-    /*     return write(scheduler, reinterpret_cast<const std::byte*>(data), length); */
-    /* } */
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
@@ -87,6 +69,19 @@ inline result write_all(writer& out, std::span<const char> data, Writes&&... wri
 
 template<typename... Writes>
 inline result write_all(writer& out, std::string_view data, Writes&&... writes)
+{
+    auto res = out.write(data);
+    if (res.err) return res;
+
+    std::size_t total = res.count;
+    res               = write_all(out, std::forward<Writes>(writes)...);
+    total += res.count;
+
+    return {.count = total, .err = res.err};
+}
+
+template<typename... Writes>
+inline result write_all(writer& out, const std::string& data, Writes&&... writes)
 {
     auto res = out.write(data);
     if (res.err) return res;

@@ -2,12 +2,15 @@
 
 #include <chrono>
 #include <cstddef>
+#include <span>
 #include <string>
 
 #include <sys/socket.h>
 
+/* #include "coro/task.hpp" */
 #include "io/io.hpp"
 #include "io/reader.hpp"
+/* #include "io/scheduler.hpp" */
 #include "io/writer.hpp"
 
 namespace net
@@ -36,14 +39,14 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
-    io::result read(std::byte* data, std::size_t length) noexcept override;
+    io::result read(std::span<std::byte> data) noexcept override;
 
-    io::result write(const std::byte* data, std::size_t length) noexcept override;
+    io::result write(std::span<const std::byte> data) noexcept override;
 
-    coro::task<io::result> read(io::aio::scheduler& scheduler, std::byte* data, std::size_t length) noexcept override;
+    /* coro::task<io::result> read(io::scheduler& scheduler, std::byte* data, std::size_t length) noexcept override; */
 
-    coro::task<io::result>
-    write(io::aio::scheduler& scheduler, const std::byte* data, std::size_t length) noexcept override;
+    /* coro::task<io::result> write(io::scheduler& scheduler, const std::byte* data, std::size_t length) noexcept
+     * override; */
 
     using io::reader::read;
     using io::writer::write;
