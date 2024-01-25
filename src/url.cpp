@@ -1,7 +1,12 @@
 #include "url.hpp"
 
+#include <array>
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <system_error>
 
 namespace
@@ -145,6 +150,7 @@ void url_parser::parse_host() noexcept
         case '?': state = url_parse_state::query; break;
 
         case '#': state = url_parse_state::fragment; break;
+        default: break;
         }
     }
     else
@@ -175,6 +181,8 @@ void url_parser::parse_port() noexcept
         case '?': state = url_parse_state::query; break;
 
         case '#': state = url_parse_state::fragment; break;
+
+        default: break;
         }
     }
     else
@@ -198,6 +206,8 @@ void url_parser::parse_path() noexcept
         case '?': state = url_parse_state::query; break;
 
         case '#': state = url_parse_state::fragment; break;
+
+        default: break;
         }
     }
     else

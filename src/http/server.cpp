@@ -110,7 +110,7 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
             default: decode = http11::request_decode; break;
             }
 
-            auto req_result = decode(reader, max_header_bytes);
+            auto req_result = decode(&reader, max_header_bytes);
             if (req_result.has_error())
             {
                 auto err = req_result.to_error();

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstddef>
-#include <string>
+#include <limits>
 
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -15,11 +15,11 @@ request_encoder_result request_encode(io::writer* writer, const client_request& 
 
 response_encoder_result response_encode(io::writer* writer, const server_response& resp) noexcept;
 
-request_decoder_result request_decode(io::buffered_reader& reader,
+request_decoder_result request_decode(io::buffered_reader* reader,
                                       std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 response_decoder_result
-response_decode(io::buffered_reader& reader,
+response_decode(io::buffered_reader* reader,
                 std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 }

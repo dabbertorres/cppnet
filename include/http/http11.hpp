@@ -21,11 +21,11 @@ util::result<io::writer*, std::error_condition> response_encode(io::writer*     
                                                                 const server_response& resp) noexcept;
 
 result<server_request, std::error_condition>
-request_decode(io::buffered_reader& reader,
+request_decode(io::buffered_reader* reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 result<client_response, std::error_condition>
-response_decode(io::buffered_reader& reader,
+response_decode(io::buffered_reader* reader,
                 std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 }

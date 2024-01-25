@@ -43,7 +43,7 @@ public:
 private:
     using host_connections = util::resource_pool<tcp_socket>;
 
-    host_connections::borrowed_resource get_connection(const std::string& host) noexcept;
+    host_connections::borrowed_resource get_connection(const std::string& host, const std::string& port) noexcept;
 
     using connections_ptr = std::unique_ptr<host_connections>;
     using connection_pool = std::unordered_map<std::string, connections_ptr>;

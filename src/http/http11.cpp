@@ -81,7 +81,7 @@ result<protocol_version, std::error_condition> parse_http_version(std::string_vi
     return {version};
 }
 
-std::error_condition parse_status_line(buffered_reader& reader, client_response& resp) noexcept
+std::error_condition parse_status_line(buffered_reader* reader, client_response& resp) noexcept
 {
     // TODO: max bytes to read
 
@@ -111,7 +111,7 @@ std::error_condition parse_status_line(buffered_reader& reader, client_response&
     return {};
 }
 
-std::error_condition parse_request_line(buffered_reader& reader, server_request& req) noexcept
+std::error_condition parse_request_line(buffered_reader* reader, server_request& req) noexcept
 {
     // TODO: max bytes to read
 
@@ -150,7 +150,7 @@ std::error_condition parse_request_line(buffered_reader& reader, server_request&
     return {};
 }
 
-std::error_condition parse_headers(buffered_reader& reader, std::size_t max_read, headers& headers) noexcept
+std::error_condition parse_headers(buffered_reader* reader, std::size_t max_read, headers& headers) noexcept
 {
     std::size_t amount_read = 0;
 
@@ -241,10 +241,16 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
     res = writer->write(" HTTP/"sv);
     if (res.err) return {res.err};
 
+    auto major_version = req.version.major;
+    if (major_version == 0) major_version = 1;
+
+    auto minor_version = req.version.minor;
+    if (minor_version == 0) minor_version = 1;
+
     std::array<char, 4> version_buf{
-        static_cast<char>(req.version.major + '0'),
+        static_cast<char>(major_version + '0'),
         '.',
-        static_cast<char>(req.version.minor + '0'),
+        static_cast<char>(minor_version + '0'),
         ' ',
     };
 
@@ -255,6 +261,9 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
     if (res.err) return {res.err};
 
     res.err = write_headers(*writer, req.headers);
+    if (res.err) return {res.err};
+
+    res = writer->write("\r\n"sv);
     if (res.err) return {res.err};
 
     // TODO: copy req.body to writer
@@ -294,7 +303,7 @@ result<io::writer*, std::error_condition> response_encode(io::writer* writer, co
     return {writer};
 }
 
-result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
+result<server_request, std::error_condition> request_decode(io::buffered_reader* reader,
                                                             std::size_t          max_header_bytes) noexcept
 {
     server_request req;
@@ -309,12 +318,12 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
 
     if (req.headers.is_chunked())
     {
-        req.body = std::make_unique<chunked_reader>(&reader);
+        req.body = std::make_unique<chunked_reader>(reader);
     }
     else
     {
         std::size_t content_length = req.headers.get_content_length().value_or(0);
-        req.body                   = std::make_unique<io::limit_reader>(&reader, content_length);
+        req.body                   = std::make_unique<io::limit_reader>(reader, content_length);
     }
 
     // TODO: trailers
@@ -322,7 +331,7 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader&
     return {std::move(req)};
 }
 
-result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
+result<client_response, std::error_condition> response_decode(io::buffered_reader* reader,
                                                               std::size_t          max_header_bytes) noexcept
 {
     client_response resp;
@@ -332,12 +341,12 @@ result<client_response, std::error_condition> response_decode(io::buffered_reade
 
     if (resp.headers.is_chunked())
     {
-        resp.body = std::make_unique<chunked_reader>(&reader);
+        resp.body = std::make_unique<chunked_reader>(reader);
     }
     else
     {
         const std::size_t content_length = resp.headers.get_content_length().value_or(0);
-        resp.body                        = std::make_unique<io::limit_reader>(&reader, content_length);
+        resp.body                        = std::make_unique<io::limit_reader>(reader, content_length);
     }
 
     // TODO: trailers

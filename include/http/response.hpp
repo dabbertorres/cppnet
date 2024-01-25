@@ -214,7 +214,7 @@ using response_encoder_result = util::result<io::writer*, std::error_condition>;
 using response_decoder_result = util::result<client_response, std::error_condition>;
 
 using response_encoder = response_encoder_result (*)(io::writer*, const server_response&) noexcept;
-using response_decoder = response_decoder_result (*)(io::buffered_reader&, std::size_t) noexcept;
+using response_decoder = response_decoder_result (*)(io::buffered_reader*, std::size_t) noexcept;
 
 // response_writer presents an interface for building a server_response to request handlers.
 struct response_writer

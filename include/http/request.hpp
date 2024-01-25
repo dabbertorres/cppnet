@@ -1,11 +1,16 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string_view>
+#include <system_error>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/reader.hpp"
+#include "io/writer.hpp"
+#include "util/result.hpp"
 #include "util/string_util.hpp"
 
 #include "url.hpp"
@@ -89,7 +94,7 @@ struct server_request
 using request_decoder_result = util::result<server_request, std::error_condition>;
 using request_encoder_result = util::result<io::writer*, std::error_condition>;
 
-using request_decoder = request_decoder_result (*)(io::buffered_reader&, std::size_t) noexcept;
+using request_decoder = request_decoder_result (*)(io::buffered_reader*, std::size_t) noexcept;
 using request_encoder = request_encoder_result (*)(io::writer*, const client_request&) noexcept;
 
 }

@@ -75,28 +75,33 @@ std::expected<client_response, std::error_condition> client::send(const client_r
         return {};
     }
 
-    auto connection_host = request.uri.host;
-    if (!request.uri.port.empty())
-    {
-        connection_host += ":" + request.uri.port;
-    }
-
-    auto conn = get_connection(connection_host);
+    auto conn = get_connection(request.uri.host, request.uri.port);
     auto res  = encode(conn.get(), request);
     if (res.has_error()) return std::unexpected(res.to_error());
 
-    io::buffered_reader reader(conn.get());
-    auto                resp = decode(reader, std::numeric_limits<std::size_t>::max());
+    // TODO: NO MORE MEMORY LEAK
+    // Need to change response_decoder (and friends) to take a unique_ptr/shared_ptr
+    // as an argument instead of a raw pointer whenever the reader is returned to the
+    // caller.
+    auto* reader = new io::buffered_reader(conn.get());
+    auto  resp   = decode(reader, std::numeric_limits<std::size_t>::max());
     if (resp.has_error()) return std::unexpected(resp.to_error());
 
     return resp.to_value();
 }
 
-client::host_connections::borrowed_resource client::get_connection(const std::string& host) noexcept
+client::host_connections::borrowed_resource client::get_connection(const std::string& host,
+                                                                   const std::string& port) noexcept
 {
+    auto connection_host = host;
+    if (!port.empty())
+    {
+        connection_host += ":" + port;
+    }
+
     std::shared_lock read_lock{connections_mu};
 
-    auto it = connections.find(host);
+    auto it = connections.find(connection_host);
     if (it == connections.end())
     {
         read_lock.unlock();
@@ -105,13 +110,13 @@ client::host_connections::borrowed_resource client::get_connection(const std::st
             std::lock_guard write_lock{connections_mu};
 
             // check again if someone else added it before us...
-            it = connections.find(host);
+            it = connections.find(connection_host);
             if (it == connections.end())
             {
-                connections[host] =
-                    std::make_unique<host_connections>(max_connections_per_host,
-                                                       max_connections_per_host,
-                                                       [this] { return std::make_unique<tcp_socket>(scheduler); });
+                connections[connection_host] = std::make_unique<host_connections>(
+                    max_connections_per_host,
+                    max_connections_per_host,
+                    [&, this] { return std::make_unique<tcp_socket>(scheduler, host, port); });
             }
         }
 
@@ -119,7 +124,7 @@ client::host_connections::borrowed_resource client::get_connection(const std::st
         read_lock.lock();
     }
 
-    it = connections.find(host);
+    it = connections.find(connection_host);
     return it->second->get();
 }
 

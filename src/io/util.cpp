@@ -12,7 +12,7 @@
 namespace net::io
 {
 
-readline_result readline(buffered_reader& reader, std::string_view end_of_line) noexcept
+readline_result readline(buffered_reader* reader, std::string_view end_of_line) noexcept
 {
     // TODO: max read
 
@@ -31,11 +31,11 @@ readline_result readline(buffered_reader& reader, std::string_view end_of_line) 
 
     while (!line.ends_with(end_of_line))
     {
-        auto [next, have_next] = reader.peek();
+        auto [next, have_next] = reader->peek();
         if (!have_next) break; // nothing more to read
 
         add_size();
-        auto [count, err] = reader.read(std::span{line.data() + (line.size() - 1), 1});
+        auto [count, err] = reader->read(std::span{line.data() + (line.size() - 1), 1});
         if (err) return err;
         if (count == 0) return {make_error_condition(status_condition::closed)}; // TODO: communicate the actual error
     }

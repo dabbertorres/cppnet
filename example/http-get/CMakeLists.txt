@@ -6,11 +6,10 @@ include("../../cmake/vcpkg.cmake")
 # for use with clangd and other libclang tools
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(net-example-http-server main.cpp)
+add_executable(net-example-http-get main.cpp)
 
 target_link_libraries(
-  net-example-http-server
+  net-example-http-get
   PRIVATE
   net
-  spdlog::spdlog
 )

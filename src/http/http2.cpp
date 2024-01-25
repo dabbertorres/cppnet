@@ -60,11 +60,11 @@ util::result<io::writer*, std::error_condition> response_encode(io::writer*     
                                                                 const server_response& resp) noexcept
 {}
 
-util::result<server_request, std::error_condition> request_decode(io::buffered_reader& reader,
+util::result<server_request, std::error_condition> request_decode(io::buffered_reader* reader,
                                                                   std::size_t          max_header_bytes) noexcept
 {}
 
-util::result<client_response, std::error_condition> response_decode(io::buffered_reader& reader,
+util::result<client_response, std::error_condition> response_decode(io::buffered_reader* reader,
                                                                     std::size_t          max_header_bytes) noexcept
 {}
 

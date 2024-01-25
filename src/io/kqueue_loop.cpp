@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 
 #include "coro/generator.hpp"
 #include "io/io.hpp"
@@ -86,7 +87,7 @@ void kqueue_loop::queue(const wait_for& trigger)
     if (res == -1)
     {
         // TODO: throw/return an error?
-        spdlog::error("error queueing {} new events: {}", num_new_events, errno);
+        spdlog::error("error queueing {} new events: {} ({})", num_new_events, std::strerror(errno), errno);
         return;
     }
 }
@@ -98,8 +99,14 @@ coro::generator<event> kqueue_loop::dispatch() const
     auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
     if (num_events == -1)
     {
+        if (errno == EBADF)
+        {
+            // probably due to shutting down...
+            co_return;
+        }
+
         // TODO: throw/return an error?
-        spdlog::error("error queueing reading new events: {}", errno);
+        spdlog::error("error queueing reading new events: {} ({})", std::strerror(errno), errno);
     }
     else
     {

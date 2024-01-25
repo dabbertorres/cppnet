@@ -26,6 +26,8 @@ public:
             return {};
         }
 
+        void return_void() noexcept {}
+
         // disallow co_await in generator coroutines.
         void await_transform() = delete;
 

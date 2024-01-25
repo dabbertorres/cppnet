@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include <sys/_select.h>
 #include <sys/fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -22,10 +23,7 @@ namespace net
 int tcp_socket::open(
     std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wmissing-field-initializers"
-    addrinfo hints = {0};
-#pragma clang diagnostic pop
+    addrinfo hints = {};
 
     switch (proto)
     {
@@ -54,17 +52,9 @@ int tcp_socket::open(
             .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()),
         };
 
-        if (!set_option(fd, SO_RCVTIMEO, &tv))
+        if (tv.tv_sec != 0 && tv.tv_usec != 0)
         {
-            ::close(fd);
-            fd = invalid_fd;
-            continue;
-        }
-
-        if (keepalive)
-        {
-            int yes = 1;
-            if (!set_option(fd, SO_RCVTIMEO, &yes))
+            if (!set_option(fd, SO_RCVTIMEO, &tv))
             {
                 ::close(fd);
                 fd = invalid_fd;
@@ -72,14 +62,32 @@ int tcp_socket::open(
             }
         }
 
-        if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        if (keepalive)
         {
-            ::close(fd);
-            fd = invalid_fd;
-            continue;
+            int yes = 1;
+            if (!set_option(fd, SO_KEEPALIVE, &yes))
+            {
+                ::close(fd);
+                fd = invalid_fd;
+                continue;
+            }
         }
 
+        /* if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) */
+        /* { */
+        /*     ::close(fd); */
+        /*     fd = invalid_fd; */
+        /*     continue; */
+        /* } */
+
         sts = ::connect(fd, info->ai_addr, info->ai_addrlen);
+
+        /* struct fd_set writefs */
+        /* {}; */
+        /* FD_SET(fd, &writefs); */
+
+        /* sts = ::select(1, nullptr, &writefs, nullptr, nullptr); */
+
         if (sts != 0)
         {
             ::close(fd);

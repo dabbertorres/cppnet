@@ -15,7 +15,7 @@ using namespace std::string_view_literals;
 
 using readline_result = util::result<std::string, std::error_condition>;
 
-readline_result readline(buffered_reader& reader, std::string_view end_of_line = "\r\n"sv) noexcept;
+readline_result readline(buffered_reader* reader, std::string_view end_of_line = "\r\n"sv) noexcept;
 
 coro::task<readline_result> co_readline(buffered_reader* reader, std::string_view end_of_line = "\r\n"sv) noexcept;
 
