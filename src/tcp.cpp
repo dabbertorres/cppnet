@@ -1,5 +1,8 @@
 #include "tcp.hpp"
 
+#include <chrono>
+#include <string_view>
+
 #include <netdb.h>
 #include <unistd.h>
 
@@ -7,7 +10,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "io/scheduler.hpp"
+
 #include "exception.hpp"
+#include "ip_addr.hpp"
+#include "socket.hpp"
 
 namespace net
 {
@@ -90,17 +97,21 @@ int tcp_socket::open(
     return fd;
 }
 
-tcp_socket::tcp_socket() noexcept
-    : socket(invalid_fd)
+tcp_socket::tcp_socket(io::scheduler* scheduler) noexcept
+    : socket{scheduler, invalid_fd}
 {}
 
-tcp_socket::tcp_socket(int fd) noexcept
-    : socket(fd)
+tcp_socket::tcp_socket(io::scheduler* scheduler, int fd) noexcept
+    : socket{scheduler, fd}
 {}
 
-tcp_socket::tcp_socket(
-    std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)
-    : socket(open(host, port, proto, keepalive, timeout))
+tcp_socket::tcp_socket(io::scheduler*            scheduler,
+                       std::string_view          host,
+                       std::string_view          port,
+                       protocol                  proto,
+                       bool                      keepalive,
+                       std::chrono::microseconds timeout)
+    : socket{scheduler, open(host, port, proto, keepalive, timeout)}
 {}
 
 }

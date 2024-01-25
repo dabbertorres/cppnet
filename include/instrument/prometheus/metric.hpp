@@ -72,7 +72,7 @@ using metric_labels = std::vector<metric_label>;
 template<typename T>
 struct base_metric
 {
-    base_metric(std::string name, std::string help = "", metric_labels&& labels = {})
+    base_metric(std::string&& name, std::string&& help = "", metric_labels&& labels = {})
         : name{std::move(name)}
         , help{std::move(help)}
         , labels{std::move(labels)}

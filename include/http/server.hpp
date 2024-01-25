@@ -18,6 +18,7 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "io/scheduler.hpp"
 
 #include "listen.hpp"
 #include "tcp.hpp"
@@ -32,7 +33,7 @@ struct server_config
     std::string                     host                    = "localhost";
     std::string                     port                    = "8080";
     std::size_t                     max_header_bytes        = 8'192;
-    std::chrono::seconds            header_read_timeout     = 5s; // NOLINT(missing-includes)
+    std::chrono::seconds            header_read_timeout     = 5s;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
     bool                            http11                  = true;
@@ -45,7 +46,7 @@ struct server_config
 class server
 {
 public:
-    server(router&& handler, const server_config& cfg = server_config{});
+    server(io::scheduler* scheduler, router&& handler, const server_config& cfg = server_config{});
 
     server(const server&)            = delete;
     server& operator=(const server&) = delete;

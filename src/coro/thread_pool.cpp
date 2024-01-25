@@ -16,12 +16,6 @@ std::size_t hardware_concurrency(std::size_t minus_amount) noexcept
     return count > 1 && count > minus_amount ? count - minus_amount : 1;
 }
 
-thread_pool::operation::operation(thread_pool* pool) noexcept
-    : pool(pool)
-{}
-
-void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexcept { pool->schedule(handle); }
-
 thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
 {
@@ -39,11 +33,7 @@ thread_pool::~thread_pool() { shutdown(); }
 
 thread_pool::operation thread_pool::schedule()
 {
-    if (running.load(std::memory_order::relaxed))
-    {
-        num_jobs.fetch_sub(1, std::memory_order::release);
-        return operation{this};
-    }
+    if (running.load(std::memory_order::relaxed)) return operation{this};
 
     throw std::runtime_error("thread_pool is shutting down, unable to schedule new tasks");
 }

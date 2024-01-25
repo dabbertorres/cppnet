@@ -1,8 +1,6 @@
 #include "udp.hpp"
 
-#include <cerrno>
-#include <cstdint>
-#include <system_error>
+#include <string_view>
 
 #include <netdb.h>
 #include <unistd.h>
@@ -10,21 +8,25 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "io/scheduler.hpp"
+
 #include "exception.hpp"
+#include "ip_addr.hpp"
+#include "socket.hpp"
 
 namespace net
 {
 
-udp_socket::udp_socket(int fd) noexcept
-    : socket(fd)
+udp_socket::udp_socket(io::scheduler* scheduler, int fd) noexcept
+    : socket{scheduler, fd}
 {}
 
-udp_socket::udp_socket(std::string_view port, protocol proto)
-    : udp_socket("", port, proto)
+udp_socket::udp_socket(io::scheduler* scheduler, std::string_view port, protocol proto)
+    : udp_socket{scheduler, "", port, proto}
 {}
 
-udp_socket::udp_socket(std::string_view host, std::string_view port, protocol proto)
-    : socket(open(host, port, proto))
+udp_socket::udp_socket(io::scheduler* scheduler, std::string_view host, std::string_view port, protocol proto)
+    : socket{scheduler, open(host, port, proto)}
 {}
 
 int udp_socket::open(std::string_view host, std::string_view port, protocol proto)

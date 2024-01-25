@@ -7,6 +7,8 @@
 #include <tuple>
 #include <vector>
 
+#include "coro/task.hpp"
+
 #include "io.hpp"
 #include "reader.hpp"
 
@@ -19,6 +21,10 @@ public:
     buffered_reader(reader* impl, std::size_t bufsize = 1'024);
 
     result read(std::span<std::byte> data) override;
+
+    coro::task<result> co_read(std::span<std::byte> data);
+
+    inline coro::task<result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); }
 
     using reader::read;
 

@@ -4,7 +4,6 @@
 #include <span>
 
 #include "coro/task.hpp"
-#include "io/scheduler.hpp"
 
 #include "io.hpp"
 
@@ -27,12 +26,9 @@ public:
     inline result  read(std::byte& data) { return read({&data, 1}); }
     inline result  read(char& data) { return read({&data, 1}); }
 
-    /* virtual coro::task<io::result> read(scheduler& scheduler, std::byte* data, std::size_t length) = 0; */
+    /* virtual coro::task<io::result> co_read(std::span<std::byte> data) = 0; */
 
-    /* inline coro::task<io::result> read(scheduler& scheduler, char* data, std::size_t length) */
-    /* { */
-    /*     return read(scheduler, reinterpret_cast<std::byte*>(data), length); */
-    /* } */
+    /* inline coro::task<io::result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); } */
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 

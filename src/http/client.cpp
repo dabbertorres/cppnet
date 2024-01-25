@@ -1,25 +1,42 @@
 #include "http/client.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <expected>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <string>
 #include <system_error>
 #include <utility>
 
+#include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
+#include "http/request.hpp"
+#include "http/response.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/scheduler.hpp"
+
+#include "tcp.hpp"
 
 namespace net::http
 {
 
-client::client(std::size_t max_connections_per_host, std::chrono::microseconds timeout, bool keepalives)
-    : max_connections_per_host{max_connections_per_host}
+client::client(io::scheduler*            scheduler,
+               std::size_t               max_connections_per_host,
+               std::chrono::microseconds timeout,
+               bool                      keepalives)
+    : scheduler{scheduler}
+    , max_connections_per_host{max_connections_per_host}
     , keepalives{keepalives}
     , timeout{timeout}
 {}
 
 client::client(client&& other) noexcept
-    : max_connections_per_host{std::exchange(other.max_connections_per_host, 0)}
+    : scheduler{std::exchange(other.scheduler, nullptr)}
+    , max_connections_per_host{std::exchange(other.max_connections_per_host, 0)}
     , keepalives{std::exchange(other.keepalives, false)}
     , timeout{std::exchange(other.timeout, 0us)}
 {
@@ -92,7 +109,9 @@ client::host_connections::borrowed_resource client::get_connection(const std::st
             if (it == connections.end())
             {
                 connections[host] =
-                    std::make_unique<host_connections>(max_connections_per_host, max_connections_per_host);
+                    std::make_unique<host_connections>(max_connections_per_host,
+                                                       max_connections_per_host,
+                                                       [this] { return std::make_unique<tcp_socket>(scheduler); });
             }
         }
 

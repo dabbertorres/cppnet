@@ -20,7 +20,10 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
+#include "io/poll.hpp"
+#include "io/scheduler.hpp"
 
 #include "exception.hpp"
 
@@ -62,22 +65,22 @@ std::string addr_name(sockaddr_storage* addr)
 namespace net
 {
 
-socket::socket(int fd)
+socket::socket(io::scheduler* scheduler, int fd)
     : fd{fd}
+    , scheduler{scheduler}
 {}
 
 socket::socket(socket&& other) noexcept
-    : fd{other.fd}
-{
-    other.fd = invalid_fd;
-}
+    : fd{std::exchange(other.fd, invalid_fd)}
+    , scheduler{std::exchange(other.scheduler, nullptr)}
+{}
 
 socket& socket::operator=(socket&& other) noexcept
 {
     if (fd != invalid_fd) ::close(fd);
 
-    fd       = other.fd;
-    other.fd = invalid_fd;
+    fd        = std::exchange(other.fd, invalid_fd);
+    scheduler = std::exchange(other.scheduler, nullptr);
 
     return *this;
 }
@@ -101,7 +104,7 @@ std::string socket::local_addr() const
     socklen_t        size = sizeof(addr);
 
     int sts = getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &size);
-    if (sts != 0) throw system_error_from_errno(errno);
+    if (sts != 0) throw system_error_from_errno(errno, "failed to get local address");
     return addr_name(&addr);
 }
 
@@ -111,7 +114,7 @@ std::string socket::remote_addr() const
     socklen_t        size = sizeof(addr);
 
     int sts = getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &size);
-    if (sts != 0) throw system_error_from_errno(errno);
+    if (sts != 0) throw system_error_from_errno(errno, "failed to get remote address");
     return addr_name(&addr);
 }
 
@@ -155,16 +158,15 @@ io::result socket::read(std::span<std::byte> data) noexcept
     return {.count = received};
 }
 
-/* coro::task<net::io::result> socket::read(io::aio::scheduler& scheduler, std::byte* data, std::size_t length) noexcept
- */
-/* { */
-/*     scheduler.schedule(io::aio::wait_for{ */
-/*         .fd = native_handle(), */
-/*         .op = io::aio::poll_op::read, */
-/*     }); */
+coro::task<net::io::result> socket::co_read(std::span<std::byte> data) noexcept
+{
+    co_await scheduler->schedule(io::wait_for{
+        .fd = native_handle(),
+        .op = io::poll_op::read,
+    });
 
-/*     co_return read(data, length); */
-/* } */
+    co_return read(data);
+}
 
 io::result socket::write(std::span<const std::byte> data) noexcept
 {

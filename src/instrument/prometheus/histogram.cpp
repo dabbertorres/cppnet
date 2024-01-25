@@ -25,13 +25,13 @@ namespace net::instrument::prometheus
 histogram::histogram(std::string&& name, std::string&& help, metric_labels&& labels, std::vector<double>&& buckets)
     : base_metric{std::move(name), std::move(help), std::move(labels)}
     , buckets{std::move(buckets)}
-    , bucket_values(buckets.size())
+    , bucket_values(this->buckets.size())
 {
     // ensure we have an "infinity" bucket
-    if (buckets.back() != std::numeric_limits<double>::infinity())
+    if (this->buckets.back() != std::numeric_limits<double>::infinity())
     {
-        buckets.push_back(std::numeric_limits<double>::infinity());
-        bucket_values.emplace_back();
+        this->buckets.push_back(std::numeric_limits<double>::infinity());
+        this->bucket_values.emplace_back();
     }
 }
 

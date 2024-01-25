@@ -2,16 +2,10 @@
 
 #include <atomic>
 #include <chrono>
-#include <memory>
+#include <cstdint>
 #include <string>
-#include <string_view>
-/* #include <vector> */
 
-/* #ifndef _WIN32 */
-/* #    include <poll.h> */
-/* #else */
-/* #    error "TODO Windows I/O Completion Ports" */
-/* #endif */
+#include "io/scheduler.hpp"
 
 #include "ip_addr.hpp"
 #include "tcp.hpp"
@@ -30,14 +24,16 @@ enum class network
 class listener
 {
 public:
-    listener(const std::string&        port,
+    listener(io::scheduler*            scheduler,
+             const std::string&        port,
              network                   net,
              protocol                  proto   = protocol::not_care,
              std::chrono::microseconds timeout = 5s)
-        : listener("", port, net, proto, timeout)
+        : listener{scheduler, "", port, net, proto, timeout}
     {}
 
-    listener(const std::string&        host,
+    listener(io::scheduler*            scheduler,
+             const std::string&        host,
              const std::string&        port,
              network                   net,
              protocol                  proto   = protocol::not_care,
@@ -57,6 +53,7 @@ public:
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
 private:
+    io::scheduler*   scheduler;
     std::atomic_bool is_listening;
     int              main_fd;
     /* std::vector<pollfd> fds; */

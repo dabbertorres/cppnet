@@ -218,9 +218,9 @@ template<typename T>
 class promise final : public promise_base
 {
 public:
-    task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<void>>::from_promise(*this)}; }
+    task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
-    void return_value(T new_value) noexcept { value = new_value; }
+    /* void return_value(T new_value) noexcept { value = new_value; } */
     void return_value(T&& new_value) noexcept { value = std::move(new_value); }
 
     void unhandled_exception() noexcept { value = std::current_exception(); }

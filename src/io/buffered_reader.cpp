@@ -9,6 +9,7 @@
 #include <system_error>
 #include <tuple>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
@@ -93,6 +94,8 @@ result buffered_reader::read(std::span<std::byte> data)
 
     return {.count = total};
 }
+
+coro::task<result> buffered_reader::co_read(std::span<std::byte> data) { co_return read(data); }
 
 buffered_reader::read_until_result buffered_reader::read_until(std::span<const std::byte> delim) noexcept
 {

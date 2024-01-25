@@ -1,5 +1,10 @@
 #include "instrument/prometheus/buckets.hpp"
 
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <vector>
+
 namespace net::instrument::prometheus
 {
 

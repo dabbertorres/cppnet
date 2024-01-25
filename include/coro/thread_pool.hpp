@@ -30,12 +30,14 @@ public:
     {
         friend class thread_pool;
 
-        explicit operation(thread_pool* pool) noexcept;
+        explicit operation(thread_pool* pool) noexcept
+            : pool{pool}
+        {}
 
     public:
         constexpr bool await_ready() noexcept { return false; }
         constexpr void await_resume() noexcept {}
-        void           await_suspend(std::coroutine_handle<> handle) noexcept;
+        void           await_suspend(std::coroutine_handle<> handle) noexcept { pool->schedule(handle); }
 
     private:
         thread_pool* pool;

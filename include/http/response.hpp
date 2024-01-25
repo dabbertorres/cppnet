@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string_view>
-#include <type_traits>
+#include <system_error>
 
 #include "http/headers.hpp"
 #include "http/http.hpp"

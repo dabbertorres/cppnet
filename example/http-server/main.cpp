@@ -8,6 +8,7 @@
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "http/server.hpp"
+#include "io/scheduler.hpp"
 
 namespace http = net::http;
 
@@ -28,7 +29,9 @@ int main()
 
     config.logger->set_level(spdlog::level::trace);
 
-    http::server server{std::move(router), config};
+    net::io::scheduler scheduler;
+
+    http::server server{&scheduler, std::move(router), config};
 
     std::cout << "starting...\n";
     server.serve();

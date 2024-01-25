@@ -17,6 +17,7 @@
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/io.hpp"
+#include "io/scheduler.hpp"
 
 #include "ip_addr.hpp"
 #include "listen.hpp"
@@ -27,8 +28,9 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-server::server(router&& handler, const server_config& cfg)
-    : listener{cfg.host,
+server::server(io::scheduler* scheduler, router&& handler, const server_config& cfg)
+    : listener{scheduler,
+               cfg.host,
                cfg.port,
                network::tcp,
                protocol::not_care,
@@ -85,14 +87,14 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
 {
     auto conn = std::move(client_sock);
 
-    logger->trace("new connection handler started for {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
+    logger->trace("new connection handler started for {} -> {}", conn.remote_addr(), conn.local_addr());
 
-    io::buffered_reader reader(&client_sock);
-    io::buffered_writer writer(&client_sock);
+    io::buffered_reader reader(&conn);
+    io::buffered_writer writer(&conn);
 
     try
     {
-        while (is_serving && client_sock.valid())
+        while (is_serving && conn.valid())
         {
             /* threads.schedule( */
             /*     [&] */

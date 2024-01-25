@@ -1,6 +1,12 @@
 #include "http/response.hpp"
 
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+
+#include "http/headers.hpp"
+#include "io/writer.hpp"
 
 namespace net::http
 {

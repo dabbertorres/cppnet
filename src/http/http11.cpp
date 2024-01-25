@@ -267,11 +267,10 @@ result<io::writer*, std::error_condition> response_encode(io::writer* writer, co
     auto res = writer->write("HTTP/"sv);
     if (res.err) return {res.err};
 
-    std::array<char, 4> version_buf{
+    std::array<char, 3> version_buf{
         static_cast<char>(resp.version.major + '0'),
         '.',
         static_cast<char>(resp.version.minor + '0'),
-        ' ',
     };
 
     res = writer->write(version_buf);

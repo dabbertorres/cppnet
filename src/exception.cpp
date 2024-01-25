@@ -1,6 +1,8 @@
 #include "exception.hpp"
 
+#include <cerrno>
 #include <string>
+#include <system_error>
 
 #include <netdb.h>
 

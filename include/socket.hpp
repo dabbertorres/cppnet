@@ -7,10 +7,10 @@
 
 #include <sys/socket.h>
 
-/* #include "coro/task.hpp" */
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
-/* #include "io/scheduler.hpp" */
+#include "io/scheduler.hpp"
 #include "io/writer.hpp"
 
 namespace net
@@ -23,7 +23,7 @@ class socket
     , public io::writer
 {
 public:
-    socket(int fd);
+    socket(io::scheduler* scheduler, int fd);
 
     // non-copyable
     socket(const socket&)            = delete;
@@ -43,7 +43,7 @@ public:
 
     io::result write(std::span<const std::byte> data) noexcept override;
 
-    /* coro::task<io::result> read(io::scheduler& scheduler, std::byte* data, std::size_t length) noexcept override; */
+    coro::task<io::result> co_read(std::span<std::byte> data) noexcept;
 
     /* coro::task<io::result> write(io::scheduler& scheduler, const std::byte* data, std::size_t length) noexcept
      * override; */
@@ -66,7 +66,8 @@ protected:
     }
 
 private:
-    int fd;
+    int            fd;
+    io::scheduler* scheduler;
 };
 
 }

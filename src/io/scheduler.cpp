@@ -3,8 +3,9 @@
 #include <atomic>
 #include <coroutine>
 #include <cstddef>
+#include <utility>
 
-#include "io/poll.hpp"
+#include "io/event_loop.hpp"
 
 namespace net::io
 {
@@ -16,8 +17,6 @@ scheduler::scheduler(std::size_t concurrency)
 {}
 
 scheduler::~scheduler() noexcept { shutdown(); }
-
-void scheduler::schedule(wait_for job) noexcept { loop.queue(job); }
 
 void scheduler::shutdown() noexcept
 {
@@ -33,11 +32,11 @@ void scheduler::shutdown() noexcept
 
 void scheduler::io_loop()
 {
-    while (!shutdown_please.load(std::memory_order::acquire) || size() > 0)
+    while (!shutdown_please.load(std::memory_order::acquire) /* || size() > 0*/)
     {
         for (auto [handle, result] : loop.dispatch())
         {
-            handle.promise().return_value(result);
+            handle.promise().return_value(std::move(result)); // to move or not to move?
             workers.resume(handle);
         }
     }

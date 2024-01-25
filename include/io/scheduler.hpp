@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <coroutine>
 #include <cstddef>
 #include <thread>
 
@@ -26,11 +27,28 @@ public:
 
     ~scheduler() noexcept;
 
-    void schedule(wait_for job) noexcept;
+    auto schedule(wait_for job) noexcept
+    {
+        struct awaitable
+        {
+            event_loop* loop = nullptr;
+            wait_for    job;
+
+            constexpr bool await_ready() noexcept { return false; }
+            constexpr void await_resume() noexcept {}
+            void           await_suspend(std::coroutine_handle<io::promise> handle) noexcept
+            {
+                job.handle = handle;
+                loop->queue(job);
+            }
+        };
+
+        return awaitable{&loop, job};
+    }
 
     void shutdown() noexcept;
 
-    std::size_t size() noexcept;
+    /* std::size_t size() noexcept; */
 
 private:
     void io_loop();

@@ -1,17 +1,22 @@
 #include "listen.hpp"
 
 #include <cerrno>
-#include <system_error>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <utility>
 
 #include <fcntl.h>
 #include <netdb.h>
-/* #include <poll.h> */
 #include <unistd.h>
 
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "io/scheduler.hpp"
+
 #include "exception.hpp"
+#include "ip_addr.hpp"
 #include "tcp.hpp"
 
 namespace net
@@ -19,9 +24,14 @@ namespace net
 
 constexpr int invalid_fd = -1;
 
-listener::listener(
-    const std::string& host, const std::string& port, network net, protocol proto, std::chrono::microseconds timeout)
-    : main_fd{invalid_fd}
+listener::listener(io::scheduler*            scheduler,
+                   const std::string&        host,
+                   const std::string&        port,
+                   network                   net,
+                   protocol                  proto,
+                   std::chrono::microseconds timeout)
+    : scheduler{scheduler}
+    , main_fd{invalid_fd}
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -112,11 +122,10 @@ listener::listener(
 }
 
 listener::listener(listener&& other) noexcept
-    : is_listening(other.is_listening.exchange(false))
-    , main_fd(other.main_fd)
-{
-    other.main_fd = invalid_fd;
-}
+    : scheduler{std::exchange(other.scheduler, nullptr)}
+    , is_listening(other.is_listening.exchange(false))
+    , main_fd{std::exchange(other.main_fd, invalid_fd)}
+{}
 
 listener& listener::operator=(listener&& other) noexcept
 {
@@ -127,6 +136,7 @@ listener& listener::operator=(listener&& other) noexcept
         ::close(main_fd);
     }
 
+    scheduler     = other.scheduler;
     is_listening  = other.is_listening.exchange(false);
     main_fd       = other.main_fd;
     other.main_fd = invalid_fd;
@@ -162,7 +172,7 @@ void listener::listen(std::uint16_t max_backlog)
 
 tcp_socket listener::accept() const
 {
-    if (!is_listening) return tcp_socket{invalid_fd};
+    if (!is_listening) return tcp_socket{scheduler, invalid_fd};
 
     /* int num_ready = */
     /*     ::poll(fds.data(), static_cast<unsigned int>(fds.size()), -1); // TODO block? not-block?
@@ -176,7 +186,7 @@ tcp_socket listener::accept() const
     int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);
     if (inc_fd == -1) throw system_error_from_errno(errno);
 
-    return tcp_socket{inc_fd};
+    return tcp_socket{scheduler, inc_fd};
 }
 
 }
