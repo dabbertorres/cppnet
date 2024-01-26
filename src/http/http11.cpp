@@ -242,10 +242,12 @@ result<io::writer*, std::error_condition> request_encode(io::writer* writer, con
     if (res.err) return {res.err};
 
     auto major_version = req.version.major;
-    if (major_version == 0) major_version = 1;
-
     auto minor_version = req.version.minor;
-    if (minor_version == 0) minor_version = 1;
+    if (major_version == 0 && minor_version == 0)
+    {
+        major_version = 1;
+        minor_version = 0;
+    }
 
     std::array<char, 4> version_buf{
         static_cast<char>(major_version + '0'),
@@ -303,27 +305,27 @@ result<io::writer*, std::error_condition> response_encode(io::writer* writer, co
     return {writer};
 }
 
-result<server_request, std::error_condition> request_decode(io::buffered_reader* reader,
-                                                            std::size_t          max_header_bytes) noexcept
+result<server_request, std::error_condition> request_decode(std::unique_ptr<io::buffered_reader>&& reader,
+                                                            std::size_t max_header_bytes) noexcept
 {
     server_request req;
 
-    auto err = parse_request_line(reader, req);
+    auto err = parse_request_line(reader.get(), req);
     if (err) return {err};
 
-    err = parse_headers(reader, max_header_bytes, req.headers);
+    err = parse_headers(reader.get(), max_header_bytes, req.headers);
     if (err) return {err};
 
     if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
 
     if (req.headers.is_chunked())
     {
-        req.body = std::make_unique<chunked_reader>(reader);
+        req.body = std::make_unique<chunked_reader>(std::move(reader));
     }
     else
     {
         std::size_t content_length = req.headers.get_content_length().value_or(0);
-        req.body                   = std::make_unique<io::limit_reader>(reader, content_length);
+        req.body                   = std::make_unique<io::limit_reader>(std::move(reader), content_length);
     }
 
     // TODO: trailers
@@ -331,22 +333,22 @@ result<server_request, std::error_condition> request_decode(io::buffered_reader*
     return {std::move(req)};
 }
 
-result<client_response, std::error_condition> response_decode(io::buffered_reader* reader,
-                                                              std::size_t          max_header_bytes) noexcept
+result<client_response, std::error_condition> response_decode(std::unique_ptr<io::buffered_reader>&& reader,
+                                                              std::size_t max_header_bytes) noexcept
 {
     client_response resp;
 
-    if (auto err = parse_status_line(reader, resp); err) return {err};
-    if (auto err = parse_headers(reader, max_header_bytes, resp.headers); err) return {err};
+    if (auto err = parse_status_line(reader.get(), resp); err) return {err};
+    if (auto err = parse_headers(reader.get(), max_header_bytes, resp.headers); err) return {err};
 
     if (resp.headers.is_chunked())
     {
-        resp.body = std::make_unique<chunked_reader>(reader);
+        resp.body = std::make_unique<chunked_reader>(std::move(reader));
     }
     else
     {
         const std::size_t content_length = resp.headers.get_content_length().value_or(0);
-        resp.body                        = std::make_unique<io::limit_reader>(reader, content_length);
+        resp.body                        = std::make_unique<io::limit_reader>(std::move(reader), content_length);
     }
 
     // TODO: trailers

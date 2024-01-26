@@ -84,7 +84,7 @@ result buffered_reader::read(std::span<std::byte> data)
 
         auto end = buf.begin();
         std::advance(end, available);
-        std::copy_backward(end, buf.end(), end);
+        std::copy(end, buf.end(), buf.begin());
 
         buf.resize(buf.size() - available);
 

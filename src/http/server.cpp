@@ -3,6 +3,7 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -89,9 +90,6 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
 
     logger->trace("new connection handler started for {} -> {}", conn.remote_addr(), conn.local_addr());
 
-    io::buffered_reader reader(&conn);
-    io::buffered_writer writer(&conn);
-
     try
     {
         while (is_serving && conn.valid())
@@ -110,7 +108,10 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
             default: decode = http11::request_decode; break;
             }
 
-            auto req_result = decode(&reader, max_header_bytes);
+            auto reader = std::make_unique<io::buffered_reader>(&conn);
+            auto writer = std::make_unique<io::buffered_writer>(&conn);
+
+            auto req_result = decode(std::move(reader), max_header_bytes);
             if (req_result.has_error())
             {
                 auto err = req_result.to_error();
@@ -143,10 +144,10 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
 
             server_response resp{
                 .version = req.version,
-                .body    = &writer,
+                .body    = writer.get(),
             };
 
-            response_writer rw(&writer, &resp, encode);
+            response_writer rw(writer.get(), &resp, encode);
 
             if (unsupported)
             {
@@ -180,7 +181,7 @@ void server::serve_connection(tcp_socket&& client_sock) noexcept
             }
 
             logger->trace("flushing writer");
-            writer.flush();
+            writer->flush();
             logger->trace("response sent");
             /* }); */
         }

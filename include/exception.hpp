@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 namespace net
@@ -12,7 +13,7 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-[[nodiscard]] std::system_error system_error_from_errno(int err, const char* what = "") noexcept;
+[[nodiscard]] std::system_error system_error_from_errno(int err, const std::string& what = "") noexcept;
 
 // throw_for_gai_error throws an exception if err is unrecoverable (or logical) error.
 // If err is recoverable (e.g. retry), then it returns true.

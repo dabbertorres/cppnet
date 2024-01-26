@@ -30,7 +30,7 @@ using namespace std::chrono_literals;
 
 struct server_config
 {
-    std::string                     host                    = "localhost";
+    std::string                     host;
     std::string                     port                    = "8080";
     std::size_t                     max_header_bytes        = 8'192;
     std::chrono::seconds            header_read_timeout     = 5s;

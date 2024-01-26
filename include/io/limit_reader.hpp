@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <span>
+#include <utility>
 
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -17,8 +19,8 @@ public:
         : limit_reader(nullptr, 0)
     {}
 
-    constexpr limit_reader(reader* reader, std::size_t limit)
-        : parent{reader}
+    constexpr limit_reader(std::unique_ptr<reader>&& reader, std::size_t limit)
+        : parent{std::move(reader)}
         , limit{limit}
     {}
 
@@ -38,9 +40,9 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
-    reader*     parent   = nullptr;
-    std::size_t limit    = 0;
-    std::size_t progress = 0;
+    std::unique_ptr<reader> parent   = nullptr;
+    std::size_t             limit    = 0;
+    std::size_t             progress = 0;
 };
 
 }

@@ -1,17 +1,25 @@
 #include "dns.hpp"
 
-#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <numbers>
+#include <string_view>
 #include <utility>
 
 #include <netdb.h>
 
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "coro/generator.hpp"
+#include "util/defer.hpp"
+
 #include "exception.hpp"
+#include "ip_addr.hpp"
+#include "ipv4_addr.hpp"
+#include "ipv6_addr.hpp"
 
 // Toggle to switch implementation of dns_lookup
 #define USE_GETADDRINFO
@@ -88,6 +96,8 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
     auto      sts      = ::getaddrinfo(hostname.data(), nullptr, &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
+    util::defer freeservinfo{[&] noexcept { freeaddrinfo(servinfo); }};
+
     // Keep track of previous addresses to remove duplicates.
     // This assumes the addresses are given into us in a sorted
     // order, which appears to typically be the case.
@@ -128,8 +138,6 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
                 ;
         }
     }
-
-    ::freeaddrinfo(servinfo);
 }
 
 }

@@ -1,5 +1,6 @@
 #include "http/http11.hpp"
 
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -22,9 +23,8 @@ using namespace std::string_view_literals;
 TEST_CASE("just a request line", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
-    net::io::buffered_reader     buf_reader(&content);
 
-    auto result = net::http::http11::request_decode(&buf_reader);
+    auto result = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -48,9 +48,8 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "\r\n");
-    net::io::buffered_reader     buf_reader(&content);
 
-    auto result = net::http::http11::request_decode(&buf_reader);
+    auto result = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -84,7 +83,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
                                          "this is a request\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto result = net::http::http11::request_decode(&buf_reader);
+    auto result = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);
@@ -133,7 +132,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
                                          "lines\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto result = net::http::http11::request_decode(&buf_reader);
+    auto result = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
     REQUIRE(result.has_value());
 
     auto route = net::url::parse("/some/resource"sv);

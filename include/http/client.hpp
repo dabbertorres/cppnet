@@ -14,7 +14,6 @@
 #include "io/scheduler.hpp"
 #include "util/resource_pool.hpp"
 
-#include "ip_addr.hpp"
 #include "tcp.hpp"
 
 namespace net::http
@@ -38,12 +37,12 @@ public:
 
     ~client() = default;
 
-    std::expected<client_response, std::error_condition> send(const client_request& request) noexcept;
+    std::expected<client_response, std::error_condition> send(const client_request& request);
 
 private:
     using host_connections = util::resource_pool<tcp_socket>;
 
-    host_connections::borrowed_resource get_connection(const std::string& host, const std::string& port) noexcept;
+    host_connections::borrowed_resource get_connection(const std::string& host, const std::string& port);
 
     using connections_ptr = std::unique_ptr<host_connections>;
     using connection_pool = std::unordered_map<std::string, connections_ptr>;
@@ -52,7 +51,6 @@ private:
     io::scheduler*            scheduler;
     std::shared_mutex         connections_mu;
     std::size_t               max_connections_per_host;
-    net::protocol             protocol = net::protocol::not_care;
     bool                      keepalives;
     std::chrono::microseconds timeout;
 };

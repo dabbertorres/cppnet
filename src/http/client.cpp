@@ -54,12 +54,12 @@ client& client::operator=(client&& other) noexcept
     return *this;
 }
 
-std::expected<client_response, std::error_condition> client::send(const client_request& request) noexcept
+std::expected<client_response, std::error_condition> client::send(const client_request& request)
 {
     request_encoder  encode = nullptr;
     response_decoder decode = nullptr;
 
-    if (request.version == protocol_version{0, 0} || request.version == protocol_version{1, 1})
+    if (request.version.major <= 1)
     {
         encode = &http11::request_encode;
         decode = &http11::response_decode;
@@ -79,25 +79,16 @@ std::expected<client_response, std::error_condition> client::send(const client_r
     auto res  = encode(conn.get(), request);
     if (res.has_error()) return std::unexpected(res.to_error());
 
-    // TODO: NO MORE MEMORY LEAK
-    // Need to change response_decoder (and friends) to take a unique_ptr/shared_ptr
-    // as an argument instead of a raw pointer whenever the reader is returned to the
-    // caller.
-    auto* reader = new io::buffered_reader(conn.get());
-    auto  resp   = decode(reader, std::numeric_limits<std::size_t>::max());
+    auto reader = std::make_unique<io::buffered_reader>(conn.get());
+    auto resp   = decode(std::move(reader), std::numeric_limits<std::size_t>::max());
     if (resp.has_error()) return std::unexpected(resp.to_error());
 
     return resp.to_value();
 }
 
-client::host_connections::borrowed_resource client::get_connection(const std::string& host,
-                                                                   const std::string& port) noexcept
+client::host_connections::borrowed_resource client::get_connection(const std::string& host, const std::string& port)
 {
-    auto connection_host = host;
-    if (!port.empty())
-    {
-        connection_host += ":" + port;
-    }
+    auto connection_host = host + ":" + (!port.empty() ? port : "80");
 
     std::shared_lock read_lock{connections_mu};
 
@@ -116,7 +107,7 @@ client::host_connections::borrowed_resource client::get_connection(const std::st
                 connections[connection_host] = std::make_unique<host_connections>(
                     max_connections_per_host,
                     max_connections_per_host,
-                    [&, this] { return std::make_unique<tcp_socket>(scheduler, host, port); });
+                    [&, this] { return std::make_unique<tcp_socket>(scheduler, host, (!port.empty() ? port : "80")); });
             }
         }
 
