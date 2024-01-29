@@ -1,13 +1,6 @@
 #include "io/kqueue_loop.hpp"
 
-#include <cerrno>
-#include <cstddef>
-#include <cstring>
-
-#include "coro/generator.hpp"
-#include "io/io.hpp"
-
-#include "config.hpp"
+#include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
 
@@ -16,10 +9,14 @@
 
 #    include <array>
 #    include <atomic>
+#    include <cerrno>
 #    include <chrono>
 #    include <coroutine>
+#    include <cstddef>
 #    include <cstdint>
+#    include <cstring>
 #    include <mutex>
+#    include <string>
 #    include <system_error>
 
 #    include <unistd.h>
@@ -28,7 +25,9 @@
 #    include <sys/event.h>
 #    include <sys/types.h>
 
+#    include "coro/generator.hpp"
 #    include "io/event.hpp"
+#    include "io/io.hpp"
 #    include "io/poll.hpp"
 
 #    include "exception.hpp"
@@ -44,6 +43,8 @@ kqueue_loop::kqueue_loop()
 }
 
 kqueue_loop::~kqueue_loop() { shutdown(); }
+
+void kqueue_loop::queue(std::coroutine_handle<> handle, int fd) {}
 
 void kqueue_loop::queue(const wait_for& trigger)
 {
@@ -86,8 +87,14 @@ void kqueue_loop::queue(const wait_for& trigger)
     auto res = kevent(descriptor, new_events.data(), num_new_events, nullptr, 0, nullptr);
     if (res == -1)
     {
+        auto err = errno;
+
+        std::string errbuf(256, 0);
+        int         length = ::strerror_r(err, errbuf.data(), errbuf.length());
+        errbuf.resize(static_cast<std::size_t>(length));
+
         // TODO: throw/return an error?
-        spdlog::error("error queueing {} new events: {} ({})", num_new_events, std::strerror(errno), errno);
+        spdlog::error("error queueing {} new events: {} ({})", num_new_events, errbuf, err);
         return;
     }
 }
@@ -99,65 +106,70 @@ coro::generator<event> kqueue_loop::dispatch() const
     auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
     if (num_events == -1)
     {
-        if (errno == EBADF)
+        auto err = errno;
+
+        if (err == EBADF)
         {
             // probably due to shutting down...
             co_return;
         }
 
+        std::string errbuf(256, 0);
+        int         length = ::strerror_r(err, errbuf.data(), errbuf.length());
+        errbuf.resize(static_cast<std::size_t>(length));
+
         // TODO: throw/return an error?
-        spdlog::error("error queueing reading new events: {} ({})", std::strerror(errno), errno);
+        spdlog::error("error queueing reading new events: {} ({})", errbuf, err);
+        co_return;
     }
-    else
+
+    for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
     {
-        for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
+        auto& ev = events[i];
+        switch (ev.filter)
         {
-            auto& ev = events[i];
-            switch (ev.filter)
+        case EVFILT_TIMER:
+        {
+            auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+            // don't try to invoke coroutines that have already finished.
+            if (handle.done()) break;
+
+            result res = {
+                .count = 0,
+                .err   = make_error_condition(status_condition::timed_out),
+            };
+
+            co_yield event{handle, res};
+            break;
+        }
+
+        case EVFILT_READ: [[fallthrough]];
+        case EVFILT_WRITE:
+        {
+            auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+
+            // don't try to invoke coroutines that have already finished.
+            if (handle.done()) break;
+
+            result res = {
+                .count = static_cast<std::size_t>(ev.data),
+                .err   = {},
+            };
+
+            if ((ev.flags & EV_EOF) != 0)
             {
-            case EVFILT_TIMER:
-            {
-                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
-
-                // don't try to invoke coroutines that have already finished.
-                if (handle.done()) break;
-
-                result res = {
-                    .count = 0,
-                    .err   = make_error_condition(status_condition::timed_out),
-                };
-
-                co_yield event{handle, res};
-                break;
+                // Did it shutdown due to an error? Or did the socket just close?
+                res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
+                                         : make_error_condition(status_condition::closed);
             }
 
-            case EVFILT_READ: [[fallthrough]];
-            case EVFILT_WRITE:
-            {
-                auto handle = std::coroutine_handle<promise>::from_address(events[i].udata);
+            co_yield event{handle, res};
+            break;
+        }
 
-                // don't try to invoke coroutines that have already finished.
-                if (handle.done()) break;
-
-                result res = {
-                    .count = static_cast<std::size_t>(ev.data),
-                    .err   = {},
-                };
-
-                if ((ev.flags & EV_EOF) != 0)
-                {
-                    // Did it shutdown due to an error? Or did the socket just close?
-                    res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
-                                             : make_error_condition(status_condition::closed);
-                }
-
-                co_yield event{handle, res};
-                break;
-            }
-
-            default:
-                // no-op
-            }
+        default:
+            // no-op
         }
     }
 }

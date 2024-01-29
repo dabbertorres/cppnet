@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "coro/task.hpp"
+#include "io/poll.hpp"
 #include "io/scheduler.hpp"
 
 #include "exception.hpp"
@@ -170,9 +172,9 @@ void listener::listen(std::uint16_t max_backlog)
     /* }); */
 }
 
-tcp_socket listener::accept() const
+coro::task<tcp_socket> listener::accept() const
 {
-    if (!is_listening) return tcp_socket{scheduler, invalid_fd};
+    if (!is_listening) co_return tcp_socket{scheduler, invalid_fd};
 
     /* int num_ready = */
     /*     ::poll(fds.data(), static_cast<unsigned int>(fds.size()), -1); // TODO block? not-block?
@@ -183,10 +185,15 @@ tcp_socket listener::accept() const
     sockaddr_storage inc{};
     socklen_t        inc_size = sizeof(inc);
 
+    co_await scheduler->schedule(io::wait_for{
+        .fd = native_handle(),
+        .op = io::poll_op::read,
+    });
+
     int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);
     if (inc_fd == -1) throw system_error_from_errno(errno);
 
-    return tcp_socket{scheduler, inc_fd};
+    co_return tcp_socket{scheduler, inc_fd};
 }
 
 }

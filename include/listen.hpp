@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 
+#include "coro/task.hpp"
 #include "io/scheduler.hpp"
 
 #include "ip_addr.hpp"
@@ -47,8 +48,8 @@ public:
 
     ~listener() noexcept;
 
-    void                     listen(std::uint16_t max_backlog);
-    [[nodiscard]] tcp_socket accept() const;
+    void                                 listen(std::uint16_t max_backlog);
+    [[nodiscard]] coro::task<tcp_socket> accept() const;
 
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 

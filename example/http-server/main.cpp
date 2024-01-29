@@ -34,7 +34,7 @@ int main()
     http::server server{&scheduler, std::move(router), config};
 
     std::cout << "starting...\n";
-    server.serve();
+    auto serve_task = server.serve();
     std::cout << "exiting...\n";
 
     return 0;

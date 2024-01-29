@@ -36,7 +36,7 @@ void scheduler::io_loop()
     {
         for (auto [handle, result] : loop.dispatch())
         {
-            handle.promise().return_value(std::move(result)); // to move or not to move?
+            handle.promise().return_value(result); // to move or not to move?
             workers.resume(handle);
         }
     }

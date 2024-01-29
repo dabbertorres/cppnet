@@ -36,7 +36,7 @@ public:
 
             constexpr bool await_ready() noexcept { return false; }
             constexpr void await_resume() noexcept {}
-            void           await_suspend(std::coroutine_handle<io::promise> handle) noexcept
+            void           await_suspend(std::coroutine_handle<> handle) noexcept
             {
                 job.handle = handle;
                 loop->queue(job);
@@ -45,6 +45,22 @@ public:
 
         return awaitable{&loop, job};
     }
+
+    /* auto schedule_accept(int fd) noexcept */
+    /* { */
+    /*     struct awaitable */
+    /*     { */
+    /*         event_loop* loop = nullptr; */
+    /*         int         fd   = -1; */
+
+    /*         constexpr bool await_ready() noexcept { return false; } */
+    /*         constexpr void await_resume() noexcept {} */
+    /*         void           await_suspend(std::coroutine_handle<> handle) const noexcept { loop->queue(handle, fd); }
+     */
+    /*     }; */
+
+    /*     return awaitable{&loop, fd}; */
+    /* } */
 
     void shutdown() noexcept;
 

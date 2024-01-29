@@ -39,10 +39,10 @@ using namespace std::chrono_literals;
 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
 struct wait_for
 {
-    std::coroutine_handle<promise> handle;
-    int                            fd;
-    poll_op                        op;
-    std::chrono::milliseconds      timeout;
+    std::coroutine_handle<>   handle;
+    int                       fd;
+    poll_op                   op;
+    std::chrono::milliseconds timeout;
 };
 
 }

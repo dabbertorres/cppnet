@@ -54,12 +54,28 @@ public:
     ~thread_pool();
 
     template<typename Func, typename... Args>
-        requires std::invocable<Func, Args...>
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto schedule(Func&& func, Args&&... args) noexcept -> task<std::invoke_result_t<Func>>
+        requires(std::is_invocable_v<Func, Args...> && !std::same_as<void, std::invoke_result_t<Func, Args...>>)
+    auto schedule(Func func, Args&&... args) noexcept -> task<std::invoke_result_t<Func, Args...>>
     {
         co_await schedule();
         co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+    }
+
+    template<typename Func, typename... Args>
+        requires(std::is_invocable_r_v<void, Func, Args...>)
+    task<void> schedule(Func func, Args&&... args) noexcept
+    {
+        co_await schedule();
+        std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+        co_return;
+    }
+
+    template<typename Func, typename... Args>
+        requires(std::is_invocable_r_v<void, Func, Args...>)
+    task<void> schedule_detached(Func func, Args&&... args) noexcept
+    {
+        co_await schedule();
+        std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
     }
 
     [[nodiscard]] operation schedule();

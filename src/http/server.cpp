@@ -4,7 +4,6 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -53,7 +52,7 @@ void server::close()
     logger->flush();
 }
 
-void server::serve()
+server::serve_task server::serve()
 {
     if (is_serving.exchange(true))
     {
@@ -64,30 +63,26 @@ void server::serve()
 
     while (is_serving)
     {
-        // TODO: pull from ready sockets via coroutines
-
         try
         {
             logger->trace("waiting for connection");
-            auto client_sock = listener.accept();
+            auto accept_task = listener.accept();
+            accept_task.resume();
+            auto client_sock = co_await std::move(accept_task);
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
-            std::lock_guard guard{connections_mu};
-            connections.emplace_back([this, client_sock = std::move(client_sock)]() mutable
-                                     { serve_connection(std::move(client_sock)); });
+            threads.schedule_detached([this](auto client_sock) { serve_connection(std::move(client_sock)); },
+                                      std::move(client_sock));
         }
         catch (const std::exception& ex)
         {
-            // TODO
-            logger->critical("exception", ex.what());
+            logger->error("exception: {}", ex.what());
         }
     }
 }
 
-void server::serve_connection(tcp_socket&& client_sock) noexcept
+void server::serve_connection(tcp_socket conn) noexcept
 {
-    auto conn = std::move(client_sock);
-
     logger->trace("new connection handler started for {} -> {}", conn.remote_addr(), conn.local_addr());
 
     try

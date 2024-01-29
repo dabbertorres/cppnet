@@ -71,12 +71,13 @@ coro::task<readline_result> co_readline(buffered_reader* reader, std::string_vie
         auto [count, err] = co_await reader->co_read(std::span{line.data() + (line.size() - 1), 1});
         if (err) co_return err;
         if (count == 0)
-            co_return {make_error_condition(status_condition::closed)}; // TODO: communicate the actual error
+            co_return readline_result{
+                make_error_condition(status_condition::closed)}; // TODO: communicate the actual error
     }
 
     if (line.ends_with(end_of_line)) line.resize(line.size() - end_of_line.size());
 
-    co_return {line};
+    co_return readline_result{line};
 }
 
 }

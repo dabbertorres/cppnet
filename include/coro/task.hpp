@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <coroutine>
 #include <exception>
 #include <functional>
@@ -220,8 +221,15 @@ class promise final : public promise_base
 public:
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
-    /* void return_value(T new_value) noexcept { value = new_value; } */
-    void return_value(T&& new_value) noexcept { value = std::move(new_value); }
+    template<typename Y>
+        requires std::constructible_from<T, Y>
+    void return_value(Y&& new_value) noexcept
+    /* requires(!std::is_reference_v<Y>) */
+    {
+        value.template emplace<T>(std::forward<Y>(new_value));
+    }
+
+    /* void return_value(T&& new_value) noexcept { value = std::move(new_value); } */
 
     void unhandled_exception() noexcept { value = std::current_exception(); }
 

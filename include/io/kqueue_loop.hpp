@@ -1,11 +1,12 @@
 #pragma once
 
-#include "config.hpp"
+#include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
 
 #    include <atomic>
 #    include <chrono>
+#    include <coroutine>
 #    include <ctime>
 #    include <mutex>
 
@@ -35,6 +36,7 @@ public:
 
     ~kqueue_loop();
 
+    void queue(std::coroutine_handle<> handle, int fd);
     void queue(const wait_for& trigger);
 
     coro::generator<event> dispatch() const;

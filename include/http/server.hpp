@@ -2,18 +2,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <vector>
 
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
+#include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -56,11 +56,36 @@ public:
 
     ~server();
 
-    void close();
-    void serve();
+    struct serve_task
+    {
+    public:
+        struct promise_type
+        {
+            serve_task get_return_object() noexcept
+            {
+                return serve_task{std::coroutine_handle<promise_type>::from_promise(*this)};
+            }
+
+            [[nodiscard]] std::suspend_never initial_suspend() const noexcept { return {}; }
+            [[nodiscard]] std::suspend_never final_suspend() const noexcept { return {}; }
+
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept {}
+        };
+
+        explicit serve_task(std::coroutine_handle<promise_type> handle)
+            : handle{handle}
+        {}
+
+    private:
+        std::coroutine_handle<promise_type> handle;
+    };
+
+    void       close();
+    serve_task serve();
 
 private:
-    void             serve_connection(tcp_socket&& client_sock) noexcept;
+    void             serve_connection(tcp_socket conn) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
     bool             enforce_protocol(const server_request& req, response_writer& resp) noexcept;
@@ -69,8 +94,6 @@ private:
     std::atomic_bool                is_serving;
     router                          handler;
     std::shared_ptr<spdlog::logger> logger;
-    std::vector<std::thread>        connections;
-    std::mutex                      connections_mu;
     coro::thread_pool               threads;
 
     std::size_t   max_header_bytes;
