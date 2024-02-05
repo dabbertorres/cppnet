@@ -66,8 +66,8 @@ protected:
     }
 
 private:
-    int            fd;
     io::scheduler* scheduler;
+    int            fd;
 };
 
 }

@@ -4,7 +4,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
-#include <stdexcept>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -19,6 +19,7 @@
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
 
+#include "exception.hpp"
 #include "ip_addr.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
@@ -56,7 +57,7 @@ server::serve_task server::serve()
 {
     if (is_serving.exchange(true))
     {
-        throw std::runtime_error("already serving");
+        throw exception{"already serving"};
     }
 
     listener.listen(max_pending_connections);
@@ -66,9 +67,7 @@ server::serve_task server::serve()
         try
         {
             logger->trace("waiting for connection");
-            auto accept_task = listener.accept();
-            accept_task.resume();
-            auto client_sock = co_await std::move(accept_task);
+            auto client_sock = co_await listener.accept();
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
             threads.schedule_detached([this](auto client_sock) { serve_connection(std::move(client_sock)); },

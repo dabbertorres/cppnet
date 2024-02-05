@@ -125,36 +125,22 @@ listener::listener(io::scheduler*            scheduler,
 
 listener::listener(listener&& other) noexcept
     : scheduler{std::exchange(other.scheduler, nullptr)}
-    , is_listening(other.is_listening.exchange(false))
+    , is_listening{other.is_listening.exchange(false)}
     , main_fd{std::exchange(other.main_fd, invalid_fd)}
 {}
 
 listener& listener::operator=(listener&& other) noexcept
 {
-    if (is_listening && main_fd != invalid_fd)
-    {
-        is_listening = false;
-        is_listening.notify_all();
-        ::close(main_fd);
-    }
+    shutdown();
 
-    scheduler     = other.scheduler;
-    is_listening  = other.is_listening.exchange(false);
-    main_fd       = other.main_fd;
-    other.main_fd = invalid_fd;
+    scheduler    = std::exchange(other.scheduler, nullptr);
+    is_listening = other.is_listening.exchange(false);
+    main_fd      = std::exchange(other.main_fd, invalid_fd);
 
     return *this;
 }
 
-listener::~listener() noexcept
-{
-    if (is_listening && main_fd != invalid_fd)
-    {
-        is_listening = false;
-        is_listening.notify_all();
-        ::close(main_fd);
-    }
-}
+listener::~listener() noexcept { shutdown(); }
 
 void listener::listen(std::uint16_t max_backlog)
 {
@@ -165,7 +151,7 @@ void listener::listen(std::uint16_t max_backlog)
     }
 
     int res = ::listen(main_fd, max_backlog);
-    if (res == -1) throw system_error_from_errno(errno);
+    if (res == -1) throw system_error_from_errno(errno, "failed to listen");
     /* fds.push_back(pollfd{ */
     /*     .fd     = main_fd, */
     /*     .events = POLLIN, */
@@ -174,7 +160,7 @@ void listener::listen(std::uint16_t max_backlog)
 
 coro::task<tcp_socket> listener::accept() const
 {
-    if (!is_listening) co_return tcp_socket{scheduler, invalid_fd};
+    if (!is_listening) throw exception{"not listening"};
 
     /* int num_ready = */
     /*     ::poll(fds.data(), static_cast<unsigned int>(fds.size()), -1); // TODO block? not-block?
@@ -194,6 +180,15 @@ coro::task<tcp_socket> listener::accept() const
     if (inc_fd == -1) throw system_error_from_errno(errno);
 
     co_return tcp_socket{scheduler, inc_fd};
+}
+
+void listener::shutdown() noexcept
+{
+    if (is_listening.exchange(false) && main_fd != invalid_fd)
+    {
+        is_listening.notify_all();
+        ::close(main_fd);
+    }
 }
 
 }

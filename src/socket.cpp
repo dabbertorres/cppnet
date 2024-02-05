@@ -66,13 +66,13 @@ namespace net
 {
 
 socket::socket(io::scheduler* scheduler, int fd)
-    : fd{fd}
-    , scheduler{scheduler}
+    : scheduler{scheduler}
+    , fd{fd}
 {}
 
 socket::socket(socket&& other) noexcept
-    : fd{std::exchange(other.fd, invalid_fd)}
-    , scheduler{std::exchange(other.scheduler, nullptr)}
+    : scheduler{std::exchange(other.scheduler, nullptr)}
+    , fd{std::exchange(other.fd, invalid_fd)}
 {}
 
 socket& socket::operator=(socket&& other) noexcept
@@ -89,7 +89,7 @@ socket::~socket() { close(); }
 
 bool socket::valid() const noexcept
 {
-    if (fd == invalid_fd) return false;
+    if (fd == invalid_fd || scheduler == nullptr) return false;
 
     int       error_code; // NOLINT(cppcoreguidelines-init-variables)
     socklen_t error_code_size = sizeof(error_code);

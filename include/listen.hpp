@@ -54,10 +54,11 @@ public:
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
 private:
-    io::scheduler*   scheduler;
-    std::atomic_bool is_listening;
-    int              main_fd;
-    /* std::vector<pollfd> fds; */
+    void shutdown() noexcept;
+
+    io::scheduler*    scheduler;
+    std::atomic<bool> is_listening;
+    int               main_fd;
 };
 
 }

@@ -13,7 +13,6 @@
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
-#include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"

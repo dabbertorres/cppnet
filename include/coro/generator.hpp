@@ -1,7 +1,11 @@
 #pragma once
 
 #include <coroutine>
+#include <exception>
 #include <iterator>
+#include <memory>
+#include <utility>
+#include <variant>
 
 namespace net::coro
 {
@@ -12,7 +16,7 @@ class generator
 public:
     struct promise_type
     {
-        T value;
+        std::variant<std::monostate, T, std::exception_ptr> value;
 
         generator get_return_object() { return generator{handle_type::from_promise(*this)}; }
 
@@ -29,9 +33,9 @@ public:
         void return_void() noexcept {}
 
         // disallow co_await in generator coroutines.
-        void await_transform() = delete;
+        /* void await_transform() = delete; */
 
-        [[noreturn]] void unhandled_exception() { throw; }
+        [[noreturn]] void unhandled_exception() { value = std::current_exception(); }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;
@@ -62,18 +66,15 @@ public:
     generator& operator=(const generator&) = delete;
 
     generator(generator&& other) noexcept
-        : handle{other.handle}
-    {
-        other.handle = {};
-    }
+        : handle{std::exchange(other.handle, std::noop_coroutine())}
+    {}
 
     generator& operator=(generator&& other) noexcept
     {
-        if (this != &other)
+        if (this != std::addressof(other))
         {
             if (handle) handle.destroy();
-            handle       = other.handle;
-            other.handle = {};
+            handle = std::exchange(other.handle, std::noop_coroutine());
         }
 
         return *this;
@@ -102,7 +103,8 @@ public:
     {
         fill();
         full = false;
-        return std::move(handle.promise().value);
+        // NOTE: will throw if value isn't T
+        return std::move(std::get<T>(handle.promise().value));
     }
 
 private:
@@ -111,6 +113,8 @@ private:
         if (!full)
         {
             handle.resume();
+            if (std::holds_alternative<std::exception_ptr>(handle.promise().value))
+                std::rethrow_exception(std::get<std::exception_ptr>(handle.promise().value));
             full = true;
         }
     }
