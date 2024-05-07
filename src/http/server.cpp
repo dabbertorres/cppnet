@@ -188,6 +188,18 @@ void server::serve_connection(tcp_socket conn) noexcept
     logger->trace("connection closing");
 }
 
+void server::serve_http11(tcp_socket conn) noexcept
+{
+    while (is_serving && conn.valid())
+    {}
+}
+
+void server::serve_http2(tcp_socket conn) noexcept
+{
+    while (is_serving && conn.valid())
+    {}
+}
+
 std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept
 {
     auto upgrade = req.headers.get_all("Upgrade"sv);
