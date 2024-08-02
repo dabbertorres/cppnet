@@ -1,5 +1,6 @@
 #pragma once
 
+#include <concepts>
 #include <coroutine>
 #include <exception>
 #include <iterator>
@@ -35,7 +36,7 @@ public:
         // disallow co_await in generator coroutines.
         /* void await_transform() = delete; */
 
-        [[noreturn]] void unhandled_exception() { value = std::current_exception(); }
+        void unhandled_exception() { value = std::current_exception(); }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;
@@ -50,7 +51,7 @@ public:
 
         void operator++() { handle.resume(); }
 
-        T operator*() const { return handle.promise().value; }
+        T operator*() const { return std::get<T>(handle.promise().value); }
 
         bool operator==(std::default_sentinel_t /*unused*/) const { return !handle || handle.done(); }
 
