@@ -3,6 +3,9 @@
 #include <iostream>
 #include <span>
 #include <string_view>
+#include <system_error>
+
+#include <__expected/expected.h>
 
 #include "http/client.hpp"
 #include "http/request.hpp"
@@ -56,20 +59,20 @@ int main(int argc, char** argv)
         .method  = http::request_method::GET,
         .version = {.major = 1, .minor = 1},
         .uri     = url,
- // clang-format off
+        // clang-format off
         .headers = {
             {"User-Agent", {"cppnet/http/client"}},
             {"Accept", {"*/*"}},
         },
-  // clang-format on
+        // clang-format on
     };
 
     std::cout << "sending request...\n";
-    decltype(client.send(req)) get_result;
+    std::expected<net::http::client_response, std::error_condition> get_result;
 
     try
     {
-        get_result = client.send(req);
+        get_result = client.send(req).operator co_await().await_resume();
     }
     catch (const std::exception& ex)
     {

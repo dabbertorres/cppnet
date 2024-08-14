@@ -25,7 +25,15 @@ buffered_reader::buffered_reader(reader* impl, std::size_t bufsize)
 
 result buffered_reader::read(std::span<std::byte> data)
 {
-    if (data.empty()) return {.count = 0};
+    auto task = co_read(data);
+    /*while (task.valid() && !task.is_ready()) task.resume();*/
+
+    return task.operator co_await().await_resume();
+}
+
+coro::task<result> buffered_reader::co_read(std::span<std::byte> data)
+{
+    if (data.empty()) co_return result{.count = 0};
 
     // easy way out
     if (data.size() <= buf.size())
@@ -42,7 +50,7 @@ result buffered_reader::read(std::span<std::byte> data)
         std::copy_backward(end, buf.end(), new_end);
         buf.resize(leftover);
 
-        return {.count = data.size()};
+        co_return result{.count = data.size()};
     }
 
     // Note that we always (try to) read from the inner reader in buf.capacity() increments.
@@ -63,8 +71,8 @@ result buffered_reader::read(std::span<std::byte> data)
 
     while (data.size() - total > buf.capacity())
     {
-        auto res = impl->read(data.subspan(total, buf.capacity()));
-        if (res.err) return {.count = total + res.count, .err = res.err};
+        auto res = co_await impl->co_read(data.subspan(total, buf.capacity()));
+        if (res.err) co_return result{.count = total + res.count, .err = res.err};
 
         total += res.count;
     }
@@ -73,7 +81,7 @@ result buffered_reader::read(std::span<std::byte> data)
     auto leftover = data.size() - total;
     if (leftover > 0)
     {
-        fill();
+        co_await fill();
 
         // regardless of error, give the user what we can
 
@@ -89,13 +97,11 @@ result buffered_reader::read(std::span<std::byte> data)
         buf.resize(buf.size() - available);
 
         // only report an error if we couldn't fulfill the caller's request
-        if (available < leftover) return {.count = total, .err = err};
+        if (available < leftover) co_return result{.count = total, .err = err};
     }
 
-    return {.count = total};
+    co_return result{.count = total};
 }
-
-coro::task<result> buffered_reader::co_read(std::span<std::byte> data) { co_return read(data); }
 
 buffered_reader::read_until_result buffered_reader::read_until(std::span<const std::byte> delim) noexcept
 {
@@ -111,16 +117,28 @@ buffered_reader::read_until_result buffered_reader::read_until(std::span<const s
         };
     }
 
+    // TODO
     std::terminate();
 }
 
 [[nodiscard]] std::tuple<std::byte, bool> buffered_reader::peek()
 {
     if (!buf.empty()) return {buf.front(), true};
-    fill();
+    fill().resume();
 
     if (buf.empty()) return {static_cast<std::byte>(0), false};
     return {buf.front(), true};
+}
+
+[[nodiscard]] coro::task<std::tuple<std::byte, bool>> buffered_reader::co_peek()
+{
+    using result_t = std::tuple<std::byte, bool>;
+
+    if (!buf.empty()) co_return result_t{buf.front(), true};
+    co_await fill();
+
+    if (buf.empty()) co_return result_t{static_cast<std::byte>(0), false};
+    co_return result_t{buf.front(), true};
 }
 
 void buffered_reader::reset(reader* other)
@@ -134,14 +152,14 @@ void buffered_reader::reset() { buf.resize(0); }
 
 std::error_condition buffered_reader::error() const { return err; }
 
-void buffered_reader::fill()
+coro::task<void> buffered_reader::fill()
 {
-    if (buf.size() == buf.capacity()) return;
+    if (buf.size() == buf.capacity()) co_return;
 
     auto start     = buf.size();
     auto read_more = buf.capacity() - start;
     buf.resize(buf.capacity());
-    auto res = impl->read(std::span{buf.data() + start, read_more});
+    auto res = co_await impl->co_read(std::span{buf.data() + start, read_more});
     buf.resize(start + res.count);
     err = res.err;
 }

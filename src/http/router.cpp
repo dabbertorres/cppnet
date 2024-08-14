@@ -1,70 +1,102 @@
 #include "http/router.hpp"
 
-#include <algorithm>
 #include <functional>
-#include <ranges>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+#include "coro/task.hpp"
+#include "http/request.hpp"
+#include "http/response.hpp"
+#include "util/string_util.hpp"
 
 namespace net::http
 {
 
-route& route::prefix(const std::string& prefix)
+router& router::add(request_method method, std::string_view route, handler_func&& h)
 {
-    conditions.emplace_back([=](const server_request& req) { return req.uri.path.starts_with(prefix); });
+    auto& sub                   = get_subrouter(route);
+    sub.method_handlers[method] = h;
+
     return *this;
 }
 
-route& route::path(const std::string& path)
+coro::task<void> router::operator()(const server_request& req, response_writer& resp) const
 {
-    conditions.emplace_back([=](const server_request& req) { return req.uri.path == path; });
-    return *this;
-}
+    std::string_view route = req.uri.path;
 
-route& route::method(request_method method)
-{
-    conditions.emplace_back([=](const server_request& req) { return req.method == method; });
-    return *this;
-}
-
-route& route::content_type(const std::string& want_content_type)
-{
-    conditions.emplace_back(
-        [=](const server_request& req)
-        {
-            auto content = req.headers.get_content_type();
-            return content.has_value() && content->type == want_content_type;
-        });
-    return *this;
-}
-
-[[nodiscard]] bool route::matches(const server_request& req) const
-{
-    return std::ranges::all_of(conditions, [&req](const auto& cond) { return std::invoke(cond, req); });
-}
-
-void   router::add(const route& r) { routes.push_back(r); }
-route& router::add() { return routes.emplace_back(); }
-route& router::prefix(const std::string& prefix) { return add().prefix(prefix); }
-route& router::path(const std::string& path) { return add().path(path); }
-route& router::method(request_method method) { return add().method(method); }
-
-[[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
-router::route_request(const server_request& req) const
-{
-    auto route = std::ranges::find_if(routes, [&](const auto& route) { return route.matches(req); });
-    if (route != routes.end()) return route->handler;
-    return std::nullopt;
-}
-
-void router::operator()(const server_request& req, response_writer& resp) const
-{
-    auto handler = route_request(req);
-    if (!handler.has_value())
+    if (route.starts_with('/'))
     {
-        resp.send(status::NOT_FOUND, 0);
-        return;
+        route = route.substr(1);
     }
 
-    std::invoke(handler->get(), req, resp);
+    auto* parent = this;
+    for (const auto part : util::split_string(route, '/'))
+    {
+        auto iter = parent->children.find(part);
+        if (iter != parent->children.end())
+        {
+            parent = &iter->second;
+        }
+        else if (parent->wildcard != nullptr)
+        {
+            parent = parent->wildcard.get();
+        }
+        else
+        {
+            co_await resp.send(status::NOT_FOUND, 0);
+            co_return;
+        }
+    }
+
+    auto iter = parent->method_handlers.find(req.method);
+    if (iter == parent->method_handlers.end())
+    {
+        co_await resp.send(status::METHOD_NOT_ALLOWED, 0);
+        co_return;
+    }
+
+    co_await std::invoke(iter->second, req, resp);
+}
+
+router& router::get_subrouter(std::string_view route)
+{
+    if (route.starts_with('/'))
+    {
+        route = route.substr(1);
+    }
+
+    auto* current = this;
+    for (const auto part : util::split_string(route, '/'))
+    {
+        // wildcard
+        if (part.starts_with(':'))
+        {
+            if (part.length() == 1)
+            {
+                throw std::runtime_error{"wildcard name must not be empty"};
+            }
+
+            if (current->wildcard == nullptr)
+            {
+                current->wildcard      = std::make_unique<router>();
+                current->wildcard_name = part.substr(1);
+            }
+            else if (current->wildcard_name != part.substr(1))
+            {
+                throw std::runtime_error{"mismatched wildcard name"};
+            }
+
+            current = current->wildcard.get();
+        }
+        else
+        {
+            current = &current->children[part];
+        }
+    }
+
+    return *current;
 }
 
 }

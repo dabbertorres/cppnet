@@ -17,7 +17,8 @@ enum class status_condition
 {
     closed    = 1,
     timed_out = 2,
-    // TODO
+    error     = 3,
+    // TODO?
 };
 
 std::error_condition make_error_condition(status_condition);

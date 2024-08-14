@@ -1,5 +1,6 @@
 #include "io/io.hpp"
 
+#include <string>
 #include <system_error>
 
 namespace
@@ -13,16 +14,20 @@ struct status_condition_category : std::error_category
         switch (static_cast<net::io::status_condition>(ev))
         {
         case net::io::status_condition::closed: return "closed";
+        case net::io::status_condition::timed_out: return "timed out";
+        case net::io::status_condition::error: return "error";
         default: return "(unrecognized)";
         }
     }
 
     [[nodiscard]] bool equivalent(const std::error_code& code, int condition) const noexcept override
     {
+        auto code_value = static_cast<std::errc>(code.value());
+
         switch (static_cast<net::io::status_condition>(condition))
         {
         case net::io::status_condition::closed:
-            switch (static_cast<std::errc>(code.value()))
+            switch (code_value)
             {
             case std::errc::broken_pipe:
             case std::errc::connection_aborted:
@@ -48,6 +53,17 @@ struct status_condition_category : std::error_category
 
             default: return false;
             }
+
+        case net::io::status_condition::timed_out:
+            switch (code_value)
+            {
+            case std::errc::timed_out:
+            case std::errc::stream_timeout: return true;
+
+            default: return false;
+            }
+
+        case net::io::status_condition::error: return code_value != std::errc{};
 
         default: return false;
         }

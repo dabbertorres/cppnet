@@ -3,8 +3,8 @@
 #include <concepts>
 #include <coroutine>
 #include <exception>
-#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -23,11 +23,26 @@ namespace detail
 template<typename T = void>
 class [[nodiscard]] task
 {
-    struct awaitable_base;
-
 public:
     using promise_type = detail::promise<T>;
     using value_t      = T;
+
+    struct awaitable_base
+    {
+        constexpr awaitable_base(std::coroutine_handle<promise_type> handle) noexcept
+            : handle{handle}
+        {}
+
+        [[nodiscard]] bool await_ready() const noexcept { return !handle || handle.done(); }
+
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<> continuation) noexcept
+        {
+            handle.promise().set_continuation(continuation);
+            return handle;
+        }
+
+        std::coroutine_handle<promise_type> handle{nullptr};
+    };
 
     constexpr task() noexcept
         : handle{nullptr}
@@ -58,126 +73,60 @@ public:
 
     ~task()
     {
-        if (handle) handle.destroy();
+        if (handle != nullptr) handle.destroy();
     }
 
-    auto operator co_await() const& noexcept;
-    auto operator co_await() const&& noexcept;
+    operator task<>() const&& noexcept { return {std::move(handle)}; }
 
-    bool resume()
+    auto operator co_await() const& noexcept
+    {
+        struct awaitable : public awaitable_base
+        {
+            auto await_resume() { return this->handle.promise().result(); }
+        };
+
+        return awaitable{handle};
+    }
+
+    auto operator co_await() const&& noexcept
+    {
+        struct awaitable : public awaitable_base
+        {
+            auto await_resume() { return std::move(this->handle.promise()).result(); }
+        };
+
+        return awaitable{handle};
+    }
+
+    bool resume() const noexcept
     {
         if (!handle.done()) handle.resume();
         return !handle.done();
     }
 
-    /* bool destroy() */
-    /* { */
-    /*     if (handle != nullptr) */
-    /*     { */
-    /*         handle.destroy(); */
-    /*         handle = nullptr; */
-    /*         return true; */
-    /*     } */
+    bool valid() const noexcept { return static_cast<bool>(handle); }
 
-    /*     return false; */
-    /* } */
-
-    [[nodiscard]] bool is_ready() const noexcept { return !handle || handle.done(); }
-
-    [[nodiscard]] bool when_ready() const noexcept;
-
-    /* [[nodiscard]] promise_type&       get_promise() & { return handle.promise(); } */
-    /* [[nodiscard]] const promise_type& get_promise() const& { return handle.promise(); } */
-    /* [[nodiscard]] promise_type&&      get_promise() && { return std::move(handle.promise()); } */
-
-    /* std::coroutine_handle<promise_type> get_handle() { return handle; } */
-
-private:
-    std::coroutine_handle<promise_type> handle;
-};
-
-template<typename T>
-auto task<T>::operator co_await() const& noexcept
-{
-    struct awaitable : public awaitable_base
+    bool destroy()
     {
-        using awaitable_base::awaitable_base;
-
-        auto await_resume()
+        if (handle != nullptr)
         {
-            if (!this->handle)
-            {
-                // TODO: throw
-            }
-
-            if constexpr (std::is_same_v<void, T>)
-            {
-                this->handle.promise().result();
-                return;
-            }
-
-            return this->handle.promise().result();
+            handle.destroy();
+            handle = nullptr;
+            return true;
         }
-    };
 
-    return awaitable{handle};
-}
-
-template<typename T>
-auto task<T>::operator co_await() const&& noexcept
-{
-    struct awaitable : public awaitable_base
-    {
-        using awaitable_base::awaitable_base;
-
-        auto await_resume()
-        {
-            if (!this->handle)
-            {
-                // TODO: throw
-            }
-
-            if constexpr (std::is_same_v<void, T>)
-            {
-                this->handle.promise().result();
-                return;
-            }
-
-            return std::move(this->handle.promise()).result();
-        }
-    };
-
-    return awaitable{handle};
-}
-
-template<typename T>
-[[nodiscard]] bool task<T>::when_ready() const noexcept
-{
-    struct awaitable : public awaitable_base
-    {
-        using awaitable_base::awaitable_base;
-
-        void await_resume() const noexcept {}
-    };
-
-    return awaitable{handle};
-}
-
-template<typename T>
-struct task<T>::awaitable_base
-{
-    constexpr awaitable_base(std::coroutine_handle<detail::promise<T>> handle) noexcept
-        : handle{handle}
-    {}
-
-    [[nodiscard]] bool await_ready() const noexcept { return !handle || handle.done(); }
-
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> continuation) noexcept
-    {
-        handle.promise().set_continuation(continuation);
-        return handle;
+        return false;
     }
 
+    [[nodiscard]] bool is_ready() const noexcept { return handle == nullptr || handle.done(); }
+
+    [[nodiscard]] std::coroutine_handle<promise_type> get_handle() noexcept { return handle; }
+
+    [[nodiscard]] promise_type&       get_promise() & { return handle.promise(); }
+    [[nodiscard]] const promise_type& get_promise() const& { return handle.promise(); }
+    [[nodiscard]] promise_type&&      get_promise() && { return std::move(handle.promise()); }
+
+private:
     std::coroutine_handle<promise_type> handle;
 };
 
@@ -206,86 +155,131 @@ private:
         template<typename Promise>
         std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> coro) noexcept
         {
-            return coro.promise().continuation;
+            auto& promise = coro.promise();
+            if (promise.continuation != nullptr) return promise.continuation;
+            else return std::noop_coroutine();
         }
 
-        void await_resume() noexcept {}
+        void await_resume() noexcept { /* noop */ }
     };
 
-    std::coroutine_handle<> continuation;
+    std::coroutine_handle<> continuation{nullptr};
 };
 
 template<typename T>
 class promise final : public promise_base
 {
 public:
+    static constexpr bool is_reference = std::is_reference_v<T>;
+    using stored_type = std::conditional_t<is_reference, std::remove_reference_t<T>, std::remove_const_t<T>>;
+
+    promise() noexcept                 = default;
+    promise(const promise&)            = delete;
+    promise(promise&&)                 = delete;
+    promise& operator=(const promise&) = delete;
+    promise& operator=(promise&&)      = delete;
+    ~promise()                         = default;
+
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     template<typename Y>
-        requires std::constructible_from<T, Y>
+        requires((is_reference && std::constructible_from<T, Y &&>)
+                 || (!is_reference && std::is_constructible_v<stored_type, Y &&>))
     void return_value(Y&& new_value) noexcept
-    /* requires(!std::is_reference_v<Y>) */
     {
-        value.template emplace<T>(std::forward<Y>(new_value));
+        if constexpr (is_reference)
+        {
+            T ref = static_cast<Y&&>(new_value);
+            value.template emplace<stored_type>(std::addressof(ref));
+        }
+        else
+        {
+            value.template emplace<stored_type>(std::forward<Y>(new_value));
+        }
     }
 
-    /* void return_value(T&& new_value) noexcept { value = std::move(new_value); } */
+    void return_value(stored_type new_value) noexcept
+        requires(!is_reference)
+    {
+        if constexpr (std::is_move_constructible_v<stored_type>)
+        {
+            value.template emplace<stored_type>(std::move(new_value));
+        }
+        else
+        {
+            value.template emplace<stored_type>(new_value);
+        }
+    }
 
     void unhandled_exception() noexcept { value = std::current_exception(); }
 
+    [[nodiscard]] T result() &
+    {
+        if (std::holds_alternative<stored_type>(value))
+        {
+            if constexpr (is_reference) return static_cast<T>(*std::get<stored_type>(value));
+            else return static_cast<const T&>(std::get<stored_type>(value));
+        }
+        else if (std::holds_alternative<std::exception_ptr>(value))
+        {
+            std::rethrow_exception(std::get<std::exception_ptr>(value));
+        }
+        else
+        {
+            throw std::runtime_error{"return value never set, coroutine may have never been executed"};
+        }
+    }
+
     [[nodiscard]] const T& result() const&
     {
-        if (std::holds_alternative<std::exception_ptr>(value))
+        if (std::holds_alternative<stored_type>(value))
+        {
+            if constexpr (is_reference) return static_cast<std::add_const_t<T>>(*std::get<stored_type>(value));
+            else return static_cast<const T&>(std::get<stored_type>(value));
+        }
+        else if (std::holds_alternative<std::exception_ptr>(value))
+        {
             std::rethrow_exception(std::get<std::exception_ptr>(value));
-
-        return std::get<T>(value);
+        }
+        else
+        {
+            throw std::runtime_error{"return value never set, coroutine may have never been executed"};
+        }
     }
 
     [[nodiscard]] T&& result() &&
     {
-        if (std::holds_alternative<std::exception_ptr>(value))
+        if (std::holds_alternative<stored_type>(value))
+        {
+            if constexpr (is_reference) return static_cast<T>(*std::get<stored_type>(value));
+            else if constexpr (std::is_move_constructible_v<T>) return static_cast<T&&>(std::get<stored_type>(value));
+            else return static_cast<const T&&>(std::get<stored_type>(value));
+        }
+        else if (std::holds_alternative<std::exception_ptr>(value))
+        {
             std::rethrow_exception(std::get<std::exception_ptr>(value));
-
-        return std::move(std::get<T>(value));
+        }
+        else
+        {
+            throw std::runtime_error{"return value never set, coroutine may have never been executed"};
+        }
     }
 
 private:
-    std::variant<std::monostate, T, std::exception_ptr> value;
-};
-
-template<typename T>
-class promise<T&> final : public promise_base
-{
-private:
-    using bare_value_t = std::remove_reference_t<T>;
-    using value_t      = std::reference_wrapper<bare_value_t>;
-
-public:
-    task<T&> get_return_object() noexcept
-    {
-        return task<T&>{std::coroutine_handle<promise<void>>::from_promise(*this)};
-    }
-
-    void return_value(T& new_value) noexcept { value = new_value; }
-
-    void unhandled_exception() noexcept { value = std::current_exception(); }
-
-    [[nodiscard]] T& result() const&
-    {
-        if (std::holds_alternative<std::exception_ptr>(value))
-            std::rethrow_exception(std::get<std::exception_ptr>(value));
-
-        return std::get<value_t>(value);
-    }
-
-private:
-    std::variant<std::monostate, value_t, std::exception_ptr> value;
+    std::variant<std::monostate, stored_type, std::exception_ptr> value;
 };
 
 template<>
 class promise<void> final : public promise_base
 {
 public:
+    promise() noexcept                 = default;
+    promise(const promise&)            = delete;
+    promise(promise&&)                 = delete;
+    promise& operator=(const promise&) = delete;
+    promise& operator=(promise&&)      = delete;
+    ~promise()                         = default;
+
     task<void> get_return_object() noexcept
     {
         return task<void>{std::coroutine_handle<promise<void>>::from_promise(*this)};

@@ -11,6 +11,7 @@
 #include <system_error>
 #include <utility>
 
+#include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
@@ -54,7 +55,7 @@ client& client::operator=(client&& other) noexcept
     return *this;
 }
 
-std::expected<client_response, std::error_condition> client::send(const client_request& request)
+coro::task<std::expected<client_response, std::error_condition>> client::send(const client_request& request)
 {
     request_encoder  encode = nullptr;
     response_decoder decode = nullptr;
@@ -72,18 +73,18 @@ std::expected<client_response, std::error_condition> client::send(const client_r
     else
     {
         // TODO: return unsupported protocol
-        return {};
+        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
     }
 
     auto conn = get_connection(request.uri.host, request.uri.port);
-    auto res  = encode(conn.get(), request);
-    if (res.has_error()) return std::unexpected(res.to_error());
+    auto res  = co_await encode(conn.get(), request);
+    if (res.has_error()) co_return std::unexpected(res.to_error());
 
     auto reader = std::make_unique<io::buffered_reader>(conn.get());
-    auto resp   = decode(std::move(reader), std::numeric_limits<std::size_t>::max());
-    if (resp.has_error()) return std::unexpected(resp.to_error());
+    auto resp   = co_await decode(std::move(reader), std::numeric_limits<std::size_t>::max());
+    if (resp.has_error()) co_return std::unexpected(resp.to_error());
 
-    return resp.to_value();
+    co_return resp.to_value();
 }
 
 client::host_connections::borrowed_resource client::get_connection(const std::string& host, const std::string& port)

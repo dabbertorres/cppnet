@@ -10,6 +10,9 @@
 namespace net::io
 {
 
+// TODO: Linux vs OSX vs Windows, etc
+using io_handle = int;
+
 enum class poll_op : std::uint8_t
 {
     read       = 1 << 0,

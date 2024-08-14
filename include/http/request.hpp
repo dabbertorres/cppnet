@@ -5,6 +5,7 @@
 #include <string_view>
 #include <system_error>
 
+#include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
@@ -94,7 +95,8 @@ struct server_request
 using request_decoder_result = util::result<server_request, std::error_condition>;
 using request_encoder_result = util::result<io::writer*, std::error_condition>;
 
-using request_decoder = request_decoder_result (*)(std::unique_ptr<io::buffered_reader>&&, std::size_t) noexcept;
-using request_encoder = request_encoder_result (*)(io::writer*, const client_request&) noexcept;
+using request_decoder = coro::task<request_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
+                                                               std::size_t) noexcept;
+using request_encoder = coro::task<request_encoder_result> (*)(io::writer*, const client_request&) noexcept;
 
 }

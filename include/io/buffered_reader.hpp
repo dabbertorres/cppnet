@@ -22,10 +22,9 @@ public:
 
     result read(std::span<std::byte> data) override;
 
-    coro::task<result> co_read(std::span<std::byte> data);
+    coro::task<result> co_read(std::span<std::byte> data) override;
 
-    inline coro::task<result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); }
-
+    using reader::co_read;
     using reader::read;
 
     struct read_until_result
@@ -50,6 +49,7 @@ public:
     //
     // If no next byte is available, next is not modified, and false is returned.
     [[nodiscard]] std::tuple<std::byte, bool> peek();
+    coro::task<std::tuple<std::byte, bool>>   co_peek();
 
     [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
     [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }
@@ -69,7 +69,7 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
 
 private:
-    void fill();
+    coro::task<void> fill();
 
     reader*                impl;
     std::vector<std::byte> buf;

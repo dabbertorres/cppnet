@@ -9,6 +9,7 @@
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
+#include "io/poll.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
@@ -41,17 +42,16 @@ public:
 
     io::result read(std::span<std::byte> data) noexcept override;
 
+    coro::task<io::result> co_read(std::span<std::byte> data) noexcept override;
+
     io::result write(std::span<const std::byte> data) noexcept override;
 
-    coro::task<io::result> co_read(std::span<std::byte> data) noexcept;
-
-    /* coro::task<io::result> write(io::scheduler& scheduler, const std::byte* data, std::size_t length) noexcept
-     * override; */
+    coro::task<io::result> co_write(std::span<const std::byte> data) noexcept override;
 
     using io::reader::read;
     using io::writer::write;
 
-    [[nodiscard]] int native_handle() const noexcept override { return fd; }
+    [[nodiscard]] io::io_handle native_handle() const noexcept override { return fd; }
 
     void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) const noexcept;
 

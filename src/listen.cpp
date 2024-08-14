@@ -171,10 +171,10 @@ coro::task<tcp_socket> listener::accept() const
     sockaddr_storage inc{};
     socklen_t        inc_size = sizeof(inc);
 
-    co_await scheduler->schedule(io::wait_for{
-        .fd = native_handle(),
-        .op = io::poll_op::read,
-    });
+    auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
+    if (res.err) throw res.err;
+
+    // TODO: res.count?
 
     int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);
     if (inc_fd == -1) throw system_error_from_errno(errno);

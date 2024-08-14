@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "io/writer.hpp"
 
@@ -31,12 +32,17 @@ response_writer::response_writer(io::writer* writer, server_response* base, resp
 
 headers& response_writer::headers() noexcept { return resp->headers; }
 
-io::writer& response_writer::send(status status_code, std::size_t content_length)
+coro::task<io::writer*> response_writer::send(status status_code, std::size_t content_length)
 {
     resp->status_code = status_code;
     resp->headers.set_content_length(content_length);
-    encode(writer, *resp);
-    return *resp->body;
+    auto res = co_await encode(writer, *resp);
+    if (res.has_error())
+    {
+        throw res.to_error();
+    }
+
+    co_return resp->body;
 }
 
 }

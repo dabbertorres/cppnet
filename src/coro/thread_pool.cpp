@@ -16,6 +16,12 @@ std::size_t hardware_concurrency(std::size_t minus_amount) noexcept
     return count > 1 && count > minus_amount ? count - minus_amount : 1;
 }
 
+void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexcept
+{
+    awaiting = handle;
+    pool->schedule(awaiting);
+}
+
 thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
 {
@@ -38,19 +44,19 @@ thread_pool::operation thread_pool::schedule()
     throw std::runtime_error("thread_pool is shutting down, unable to schedule new tasks");
 }
 
-void thread_pool::resume(std::coroutine_handle<> handle) noexcept
+bool thread_pool::resume(std::coroutine_handle<> handle) noexcept
 {
-    if (handle == nullptr) return;
+    if (handle == nullptr) return false;
+    if (!running.load(std::memory_order::acquire)) return false;
 
     num_jobs.fetch_add(1, std::memory_order::release);
     schedule(handle);
+    return true;
 }
-
-thread_pool::operation thread_pool::yield() { return schedule(); }
 
 void thread_pool::shutdown() noexcept
 {
-    if (!running.exchange(false, std::memory_order::acq_rel))
+    if (running.exchange(false, std::memory_order::acq_rel))
     {
         wait.notify_all();
 
@@ -76,16 +82,29 @@ bool thread_pool::queue_empty() const noexcept { return queue_size() == 0; }
 
 void thread_pool::worker()
 {
-    while (true)
+    while (running.load(std::memory_order::acquire))
     {
         std::unique_lock lock{wait_mutex};
-        wait.wait(lock, [&] { return !running || !jobs.empty(); });
+        wait.wait(lock, [&] { return !jobs.empty() || !running.load(std::memory_order::acquire); });
 
-        if (!running && jobs.empty()) break;
+        if (jobs.empty()) continue;
 
         auto handle = jobs.front();
         jobs.pop_front();
+        lock.unlock();
 
+        handle.resume();
+        num_jobs.fetch_sub(1, std::memory_order::release);
+    }
+
+    while (num_jobs.load(std::memory_order::acquire) > 0)
+    {
+        std::unique_lock lock{wait_mutex};
+
+        if (jobs.empty()) break;
+
+        auto handle = jobs.front();
+        jobs.pop_front();
         lock.unlock();
 
         handle.resume();
@@ -100,9 +119,8 @@ void thread_pool::schedule(std::coroutine_handle<> handle)
     {
         std::lock_guard lock{wait_mutex};
         jobs.emplace_back(handle);
+        wait.notify_one();
     }
-
-    wait.notify_one();
 }
 
 }

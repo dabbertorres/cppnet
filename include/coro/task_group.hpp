@@ -6,10 +6,8 @@
 #include <cstddef>
 #include <iterator>
 #include <list>
-#include <memory>
 #include <mutex>
-#include <stdexcept>
-#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "coro/task.hpp"

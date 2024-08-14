@@ -37,10 +37,11 @@ public:
     public:
         constexpr bool await_ready() noexcept { return false; }
         constexpr void await_resume() noexcept {}
-        void           await_suspend(std::coroutine_handle<> handle) noexcept { pool->schedule(handle); }
+        void           await_suspend(std::coroutine_handle<> handle) noexcept;
 
     private:
-        thread_pool* pool;
+        thread_pool*            pool;
+        std::coroutine_handle<> awaiting{nullptr};
     };
 
     thread_pool(std::size_t concurrency = hardware_concurrency());
@@ -54,34 +55,26 @@ public:
     ~thread_pool();
 
     template<typename Func, typename... Args>
-        requires(std::is_invocable_v<Func, Args...> && !std::same_as<void, std::invoke_result_t<Func, Args...>>)
+        requires(std::is_invocable_v<Func, Args...>)
     auto schedule(Func func, Args&&... args) noexcept -> task<std::invoke_result_t<Func, Args...>>
     {
         co_await schedule();
-        co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
-    }
 
-    template<typename Func, typename... Args>
-        requires(std::is_invocable_r_v<void, Func, Args...>)
-    task<void> schedule(Func func, Args&&... args) noexcept
-    {
-        co_await schedule();
-        std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
-        co_return;
-    }
-
-    template<typename Func, typename... Args>
-        requires(std::is_invocable_r_v<void, Func, Args...>)
-    task<void> schedule_detached(Func func, Args&&... args) noexcept
-    {
-        co_await schedule();
-        std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+        if constexpr (std::is_same_v<void, std::invoke_result_t<Func, Args...>>)
+        {
+            std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+            co_return;
+        }
+        else
+        {
+            co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+        }
     }
 
     [[nodiscard]] operation schedule();
 
     template<RangeOf<std::coroutine_handle<>> R>
-    void resume(const R& handles) noexcept
+    std::size_t resume(const R& handles) noexcept
     {
         std::size_t new_jobs = 0;
 
@@ -98,12 +91,22 @@ public:
         }
 
         num_jobs.fetch_add(new_jobs, std::memory_order::release);
-        wait.notify_one();
+
+        if (new_jobs >= threads.size())
+        {
+            wait.notify_all();
+        }
+        else
+        {
+            for (auto i = 0u; i < new_jobs; ++i) wait.notify_one();
+        }
+
+        return new_jobs;
     }
 
-    void resume(std::coroutine_handle<> handle) noexcept;
+    bool resume(std::coroutine_handle<> handle) noexcept;
 
-    [[nodiscard]] operation yield();
+    [[nodiscard]] operation yield() { return schedule(); }
     void                    shutdown() noexcept;
 
     [[nodiscard]] std::size_t concurrency() const noexcept;

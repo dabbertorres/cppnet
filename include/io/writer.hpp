@@ -5,8 +5,7 @@
 #include <string>
 #include <string_view>
 
-/* #include "coro/task.hpp" */
-/* #include "io/scheduler.hpp" */
+#include "coro/task.hpp"
 
 #include "io.hpp"
 
@@ -32,6 +31,27 @@ public:
 
     inline result write(std::byte data) { return write(std::span{&data, 1}); }
     inline result write(char data) { return write(std::span{&data, 1}); }
+
+    virtual coro::task<result> co_write(std::span<const std::byte> data)
+    {
+        // defaults to a synchronous read
+        co_return write(data);
+    }
+
+    inline coro::task<result> co_write(std::span<const char> data) { return co_write(std::as_bytes(data)); }
+
+    inline coro::task<result> co_write(std::string_view data)
+    {
+        return co_write(std::span{data.data(), data.length()});
+    }
+
+    inline coro::task<result> co_write(const std::string& data)
+    {
+        return co_write(std::span{data.data(), data.length()});
+    }
+
+    inline coro::task<result> co_write(std::byte data) { return co_write(std::span{&data, 1}); }
+    inline coro::task<result> co_write(char data) { return co_write(std::span{&data, 1}); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 

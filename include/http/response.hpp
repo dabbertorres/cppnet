@@ -6,6 +6,7 @@
 #include <string_view>
 #include <system_error>
 
+#include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "io/buffered_reader.hpp"
@@ -213,8 +214,9 @@ struct server_response
 using response_encoder_result = util::result<io::writer*, std::error_condition>;
 using response_decoder_result = util::result<client_response, std::error_condition>;
 
-using response_encoder = response_encoder_result (*)(io::writer*, const server_response&) noexcept;
-using response_decoder = response_decoder_result (*)(std::unique_ptr<io::buffered_reader>&&, std::size_t) noexcept;
+using response_encoder = coro::task<response_encoder_result> (*)(io::writer*, const server_response&) noexcept;
+using response_decoder = coro::task<response_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
+                                                                 std::size_t) noexcept;
 
 // response_writer presents an interface for building a server_response to request handlers.
 struct response_writer
@@ -222,8 +224,8 @@ struct response_writer
 public:
     response_writer(io::writer* writer, server_response* base, response_encoder encoder);
 
-    net::http::headers& headers() noexcept;
-    io::writer&         send(status status_code, std::size_t content_length);
+    net::http::headers&     headers() noexcept;
+    coro::task<io::writer*> send(status status_code, std::size_t content_length);
 
 private:
     io::writer*      writer;

@@ -1,5 +1,7 @@
 #include "io/kqueue_loop.hpp"
 
+#include "coro/task.hpp"
+
 #include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
@@ -15,7 +17,6 @@
 #    include <cstddef>
 #    include <cstdint>
 #    include <cstring>
-#    include <mutex>
 #    include <string>
 #    include <system_error>
 
@@ -35,6 +36,14 @@
 namespace net::io::detail
 {
 
+void kqueue_loop::operation::await_suspend(std::coroutine_handle<promise> await_on) noexcept
+{
+    awaiting = await_on;
+    loop->queue(awaiting, handle, op, timeout);
+}
+
+result kqueue_loop::operation::await_resume() noexcept { return awaiting.promise().result(); }
+
 kqueue_loop::kqueue_loop()
     : descriptor{kqueue()}
     , timeout_id{1}
@@ -44,9 +53,16 @@ kqueue_loop::kqueue_loop()
 
 kqueue_loop::~kqueue_loop() { shutdown(); }
 
-void kqueue_loop::queue(std::coroutine_handle<> handle, int fd) {}
+coro::task<result> kqueue_loop::queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout)
+{
+    auto r = co_await operation{this, handle, op, timeout};
+    co_return r;
+}
 
-void kqueue_loop::queue(const wait_for& trigger)
+void kqueue_loop::queue(std::coroutine_handle<promise> awaiting,
+                        io_handle                      handle,
+                        poll_op                        op,
+                        std::chrono::milliseconds      timeout)
 {
     // we may be adding/updating up to two events (for trigger, and for timeout)
     int num_new_events = 1;
@@ -54,23 +70,23 @@ void kqueue_loop::queue(const wait_for& trigger)
     // clang-format off
     std::array<struct kevent, 2> new_events = {{
         {
-            .ident  = static_cast<uintptr_t>(trigger.fd),
+            .ident  = static_cast<uintptr_t>(handle),
             .filter = static_cast<int16_t>(
-                (readable(trigger.op) ? EVFILT_READ : 0) 
-                | (writable(trigger.op) ? EVFILT_WRITE : 0)
+                (readable(op) ? EVFILT_READ : 0) 
+                | (writable(op) ? EVFILT_WRITE : 0)
             ),
             .flags  = EV_ADD | EV_DISPATCH | EV_ONESHOT | EV_CLEAR | EV_EOF,
             .fflags = 0,
             .data   = 0,
-            .udata  = trigger.handle.address(),
+            .udata  = awaiting.address(),
         },
         {},
     }};
     // clang-format on
 
-    if (trigger.timeout > decltype(trigger.timeout)::zero())
+    if (timeout > decltype(timeout)::zero())
     {
-        auto expires_at = trigger.timeout + clock::now();
+        auto expires_at = timeout + clock::now();
         if (expires_at < clock::now()) expires_at = clock::now();
 
         new_events[1] = {
@@ -79,12 +95,15 @@ void kqueue_loop::queue(const wait_for& trigger)
             .flags  = EV_ADD | EV_ONESHOT,
             .fflags = NOTE_ABSOLUTE | NOTE_CRITICAL,
             .data   = expires_at.time_since_epoch().count(),
-            .udata  = trigger.handle.address(),
+            .udata  = awaiting.address(),
         };
         ++num_new_events;
     }
 
-    auto res = kevent(descriptor, new_events.data(), num_new_events, nullptr, 0, nullptr);
+    auto fd = descriptor.load();
+    if (fd == -1) return;
+
+    auto res = kevent(fd, new_events.data(), num_new_events, nullptr, 0, nullptr);
     if (res == -1)
     {
         auto err = errno;
@@ -103,12 +122,15 @@ coro::generator<event> kqueue_loop::dispatch() const
 {
     std::array<struct kevent, 16> events{};
 
-    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
+    auto fd = descriptor.load();
+    if (fd == -1) co_return;
+
+    auto num_events = kevent(fd, nullptr, 0, events.data(), events.size(), nullptr);
     if (num_events == -1)
     {
         auto err = errno;
 
-        if (err == EBADF)
+        if (err == EBADF || err == EINTR)
         {
             // probably due to shutting down...
             co_return;
@@ -176,12 +198,11 @@ coro::generator<event> kqueue_loop::dispatch() const
 
 void kqueue_loop::shutdown() noexcept
 {
-    std::lock_guard lock{mutex};
-
-    // TODO: anything else?
-
-    if (descriptor != -1) ::close(descriptor);
-    descriptor = -1;
+    if (auto fd = descriptor.exchange(-1); fd != -1)
+    {
+        // TODO: anything else?
+        ::close(fd);
+    }
 }
 
 }

@@ -1,0 +1,15 @@
+{
+  "versions": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug Tests",
+      "program": "../build/test/Debug/tests",
+      "osx": {
+        "MIMode": "lldb",
+        "miDebuggerPath": "/usr/local/opt/llvm/bin/lldb"
+      }
+    }
+  ]
+}

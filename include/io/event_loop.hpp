@@ -1,9 +1,13 @@
 #pragma once
 
+#include <chrono>
+#include <concepts>
 #include <type_traits>
 
 #include "coro/generator.hpp"
+#include "coro/task.hpp"
 #include "io/event.hpp"
+#include "io/io.hpp"
 #include "io/poll.hpp"
 
 #include "config.hpp"
@@ -29,9 +33,9 @@ concept EventLoop = std::is_default_constructible_v<T>
     && !std::is_move_constructible_v<T>
     && !std::is_move_assignable_v<T>
     && std::is_destructible_v<T>
-    && requires(T* t, wait_for job)
+    && requires(T* t, io_handle handle, poll_op op, std::chrono::milliseconds timeout)
     {
-        { t->queue(job) } -> std::same_as<void>;
+        { t->queue(handle, op, timeout) } -> std::same_as<coro::task<result>>;
         { t->dispatch() } -> std::same_as<coro::generator<event>>;
         { t->shutdown() } -> std::same_as<void>;
     };

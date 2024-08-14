@@ -1,5 +1,6 @@
 #include "socket.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <spdlog/spdlog.h>
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
@@ -160,12 +162,13 @@ io::result socket::read(std::span<std::byte> data) noexcept
 
 coro::task<net::io::result> socket::co_read(std::span<std::byte> data) noexcept
 {
-    co_await scheduler->schedule(io::wait_for{
-        .fd = native_handle(),
-        .op = io::poll_op::read,
-    });
+    auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
+    if (res.err && res.count == 0) co_return res;
 
-    co_return read(data);
+    auto read_amount = std::min(res.count, data.size());
+
+    res = read(data.subspan(0, read_amount));
+    co_return res;
 }
 
 io::result socket::write(std::span<const std::byte> data) noexcept
@@ -184,12 +187,31 @@ io::result socket::write(std::span<const std::byte> data) noexcept
         }
 
         // client closed connection
-        if (num == 0) return {.count = sent};
+        if (num == 0) return {.count = sent, .err = make_error_condition(io::status_condition::closed)};
 
         sent += static_cast<std::size_t>(num);
     }
 
     return {.count = sent};
+}
+
+coro::task<io::result> socket::co_write(std::span<const std::byte> data) noexcept
+{
+    std::size_t total_written = 0;
+
+    while (total_written < data.size())
+    {
+        auto res = co_await scheduler->schedule(native_handle(), io::poll_op::write, 0ms);
+        if (res.err && res.count == 0) co_return res;
+
+        auto write_amount = std::min(res.count, data.size() - total_written);
+        res               = write(data.subspan(total_written, write_amount));
+        if (res.err) co_return res;
+
+        total_written += res.count;
+    }
+
+    co_return {.count = total_written};
 }
 
 void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const noexcept

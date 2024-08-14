@@ -1,9 +1,11 @@
-#include <iostream>
+#include <csignal>
 #include <string_view>
 #include <utility>
 
 #include <spdlog/common.h>
+#include <spdlog/spdlog.h>
 
+#include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -17,25 +19,29 @@ int main()
     using namespace std::chrono_literals;
     using namespace std::string_view_literals;
 
+    spdlog::set_level(spdlog::level::trace);
+
     http::server_config config{};
     http::router        router;
-    router.add().use(
-        [](const http::server_request& req, http::response_writer& resp)
-        {
-            resp.headers().set("X-Msg"sv, "Hello"sv).set("Content-Type"sv, "text/plain"sv);
-            resp.send(http::status::OK, 11).write("hello world"sv);
-            std::cout << "handled: " << http::method_string(req.method) << " " << req.uri.build() << '\n';
-        });
+    router.GET("/",
+               [](const http::server_request& req, http::response_writer& resp) -> net::coro::task<void>
+               {
+                   resp.headers().set("X-Msg"sv, "Hello"sv).set("Content-Type"sv, "text/plain"sv);
+                   constexpr auto msg = "hello world\r\n"sv;
 
-    config.logger->set_level(spdlog::level::trace);
+                   auto body = co_await resp.send(http::status::OK, msg.length());
+                   co_await body->co_write(msg);
+               });
 
     net::io::scheduler scheduler;
 
     http::server server{&scheduler, std::move(router), config};
 
-    std::cout << "starting...\n";
+    config.logger->info("starting...");
     auto serve_task = server.serve();
-    std::cout << "exiting...\n";
+
+    scheduler.run();
+    config.logger->info("exiting...");
 
     return 0;
 }

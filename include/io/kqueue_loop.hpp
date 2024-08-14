@@ -1,5 +1,11 @@
 #pragma once
 
+#include "coro/generator.hpp"
+#include "coro/task.hpp"
+#include "io/event.hpp"
+#include "io/io.hpp"
+#include "io/poll.hpp"
+
 #include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
@@ -8,15 +14,10 @@
 #    include <chrono>
 #    include <coroutine>
 #    include <ctime>
-#    include <mutex>
 
 #    include <spdlog/spdlog.h>
 #    include <sys/event.h>
 #    include <sys/types.h>
-
-#    include "coro/generator.hpp"
-#    include "io/event.hpp"
-#    include "io/poll.hpp"
 
 namespace net::io::detail
 {
@@ -36,8 +37,7 @@ public:
 
     ~kqueue_loop();
 
-    void queue(std::coroutine_handle<> handle, int fd);
-    void queue(const wait_for& trigger);
+    coro::task<result> queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
 
     coro::generator<event> dispatch() const;
 
@@ -46,9 +46,37 @@ public:
 private:
     using clock = std::chrono::high_resolution_clock;
 
-    int                      descriptor;
+    class operation
+    {
+        friend class kqueue_loop;
+
+        explicit operation(kqueue_loop* loop, io_handle handle, poll_op op, std::chrono::milliseconds timeout) noexcept
+            : loop{loop}
+            , handle{handle}
+            , op{op}
+            , timeout{timeout}
+        {}
+
+    public:
+        constexpr bool await_ready() noexcept { return false; }
+        result         await_resume() noexcept;
+        void           await_suspend(std::coroutine_handle<promise> handle) noexcept;
+
+    private:
+        kqueue_loop*                   loop;
+        io_handle                      handle;
+        poll_op                        op;
+        std::chrono::milliseconds      timeout;
+        std::coroutine_handle<promise> awaiting{nullptr};
+    };
+
+    friend class operation;
+
+    void
+    queue(std::coroutine_handle<promise> awaiting, io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+
+    std::atomic<int>         descriptor;
     std::atomic<std::size_t> timeout_id;
-    std::mutex               mutex;
 };
 
 using event_loop = kqueue_loop;

@@ -3,79 +3,89 @@
 #include <concepts>
 #include <functional>
 #include <memory>
-#include <optional>
+#include <string>
 #include <string_view>
-#include <type_traits>
+#include <unordered_map>
 #include <utility>
-#include <vector>
 
+#include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "util/string_map.hpp"
 
 namespace net::http
 {
 
-template<typename T>
-concept Matcher =
-    std::invocable<T, const server_request&> && std::same_as<std::invoke_result_t<T, const server_request&>, bool>;
+using handler_func = std::function<coro::task<void>(const server_request&, response_writer&)>;
 
-template<typename T>
-concept Handler = std::invocable<T, const server_request&, response_writer&>;
-
-using matcher_func = std::function<bool(const server_request&)>;
-using handler_func = std::function<void(const server_request&, response_writer&)>;
-
-class router;
-
-struct route
-{
-public:
-    route() = default;
-
-    route& prefix(const std::string& prefix);
-    route& path(const std::string& path);
-    route& method(request_method method);
-    route& content_type(const std::string& content_type);
-
-    template<Matcher M>
-    route& on(M&& m)
-    {
-        conditions.push_back(std::forward<M>(m));
-        return *this;
-    }
-
-    template<Handler H>
-    route& use(H&& h)
-    {
-        handler = std::forward<H>(h);
-        return *this;
-    }
-
-    [[nodiscard]] bool matches(const server_request& req) const;
-
-private:
-    friend class router;
-
-    std::vector<matcher_func> conditions;
-    handler_func              handler;
-};
+// TODO: it'd be neat if we could build a "perfect" router at compile time...
 
 class router final
 {
 public:
-    void   add(const route& r);
-    route& add();
-    route& prefix(const std::string& prefix);
-    route& path(const std::string& path);
-    route& method(request_method method);
+    router& GET(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::GET, route, std::forward<handler_func>(h));
+    }
 
-    [[nodiscard]] std::optional<std::reference_wrapper<const handler_func>>
-    route_request(const server_request& req) const;
+    router& POST(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::POST, route, std::forward<handler_func>(h));
+    }
 
-    void operator()(const server_request&, response_writer&) const;
+    router& DELETE(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::DELETE, route, std::forward<handler_func>(h));
+    }
+
+    router& PUT(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::PUT, route, std::forward<handler_func>(h));
+    }
+
+    router& PATCH(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::PATCH, route, std::forward<handler_func>(h));
+    }
+
+    router& HEAD(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::HEAD, route, std::forward<handler_func>(h));
+    }
+
+    router& CONNECT(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::CONNECT, route, std::forward<handler_func>(h));
+    }
+
+    router& TRACE(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::TRACE, route, std::forward<handler_func>(h));
+    }
+
+    router& OPTIONS(std::string_view route, handler_func&& h)
+    {
+        return add(request_method::OPTIONS, route, std::forward<handler_func>(h));
+    }
+
+    router& add(request_method method, std::string_view route, handler_func&& h);
+
+    template<std::invocable<router&> I>
+    router& subrouter(std::string_view route, I&& sub_builder)
+    {
+        auto& sub = get_subrouter(route);
+        std::invoke(std::forward<I>(sub_builder), sub);
+    }
+
+    coro::task<void> operator()(const server_request&, response_writer&) const;
 
 private:
-    std::vector<route> routes;
+    router& get_subrouter(std::string_view route);
+
+    std::unordered_map<request_method, handler_func> method_handlers;
+    util::string_map<router>                         children;
+    std::unique_ptr<router>                          wildcard;
+    std::string                                      wildcard_name;
 };
 
 }

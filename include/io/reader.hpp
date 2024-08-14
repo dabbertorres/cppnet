@@ -26,9 +26,15 @@ public:
     inline result  read(std::byte& data) { return read({&data, 1}); }
     inline result  read(char& data) { return read({&data, 1}); }
 
-    /* virtual coro::task<io::result> co_read(std::span<std::byte> data) = 0; */
+    virtual coro::task<result> co_read(std::span<std::byte> data)
+    {
+        // defaults to a synchronous read
+        co_return read(data);
+    }
 
-    /* inline coro::task<io::result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); } */
+    inline coro::task<result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); }
+    inline coro::task<result> co_read(std::byte& data) { return co_read({&data, 1}); }
+    inline coro::task<result> co_read(char& data) { return co_read({&data, 1}); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 

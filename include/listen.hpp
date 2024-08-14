@@ -53,9 +53,9 @@ public:
 
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
-private:
     void shutdown() noexcept;
 
+private:
     io::scheduler*    scheduler;
     std::atomic<bool> is_listening;
     int               main_fd;

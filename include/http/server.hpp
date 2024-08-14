@@ -13,7 +13,7 @@
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
-#include "coro/thread_pool.hpp"
+#include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -84,7 +84,7 @@ public:
     serve_task serve();
 
 private:
-    void             serve_connection(tcp_socket conn) noexcept;
+    coro::task<>     serve_connection(tcp_socket conn) noexcept;
     void             serve_http11(tcp_socket conn) noexcept;
     void             serve_http2(tcp_socket conn) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
@@ -95,7 +95,7 @@ private:
     std::atomic_bool                is_serving;
     router                          handler;
     std::shared_ptr<spdlog::logger> logger;
-    coro::thread_pool               threads;
+    io::scheduler*                  scheduler;
 
     std::size_t   max_header_bytes;
     std::uint16_t max_pending_connections;

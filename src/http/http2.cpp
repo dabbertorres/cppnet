@@ -8,6 +8,7 @@
 #include <system_error>
 #include <unordered_map>
 
+#include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
@@ -18,10 +19,12 @@
 namespace net::http::http2
 {
 
+using coro::task;
 using net::http::client_request;
 using net::http::client_response;
 using net::http::server_request;
 using net::http::server_response;
+using util::result;
 
 // https://httpwg.org/specs/rfc9113.html#ErrorCodes
 // Unknown or unsupported error codes MUST NOT trigger any special behavior.
@@ -231,18 +234,18 @@ struct connection
     std::uint32_t max_header_list_size;   // Default is unlimited.
 };
 
-util::result<io::writer*, std::error_condition> request_encode(io::writer* writer, const client_request& req) noexcept
+task<result<io::writer*, std::error_condition>> request_encode(io::writer* writer, const client_request& req) noexcept
 {}
 
-util::result<io::writer*, std::error_condition> response_encode(io::writer*            writer,
+task<result<io::writer*, std::error_condition>> response_encode(io::writer*            writer,
                                                                 const server_response& resp) noexcept
 {}
 
-util::result<server_request, std::error_condition> request_decode(std::unique_ptr<io::buffered_reader>&& reader,
+task<result<server_request, std::error_condition>> request_decode(std::unique_ptr<io::buffered_reader> reader,
                                                                   std::size_t max_header_bytes) noexcept
 {}
 
-util::result<client_response, std::error_condition> response_decode(std::unique_ptr<io::buffered_reader>&& reader,
+task<result<client_response, std::error_condition>> response_decode(std::unique_ptr<io::buffered_reader> reader,
                                                                     std::size_t max_header_bytes) noexcept
 {}
 

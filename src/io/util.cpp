@@ -64,7 +64,7 @@ coro::task<readline_result> co_readline(buffered_reader* reader, std::string_vie
 
     while (!line.ends_with(end_of_line))
     {
-        auto [next, have_next] = reader->peek();
+        auto [next, have_next] = co_await reader->co_peek();
         if (!have_next) break; // nothing more to read
 
         add_size();

@@ -9,6 +9,7 @@
 #include <system_error>
 #include <unordered_map>
 
+#include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
@@ -37,7 +38,7 @@ public:
 
     ~client() = default;
 
-    std::expected<client_response, std::error_condition> send(const client_request& request);
+    coro::task<std::expected<client_response, std::error_condition>> send(const client_request& request);
 
 private:
     using host_connections = util::resource_pool<tcp_socket>;

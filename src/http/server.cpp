@@ -2,13 +2,12 @@
 
 #include <chrono>
 #include <exception>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
 #include <utility>
 
-#include "coro/thread_pool.hpp"
+#include "coro/task.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
 #include "http/request.hpp"
@@ -39,7 +38,7 @@ server::server(io::scheduler* scheduler, router&& handler, const server_config& 
     , is_serving{false}
     , handler{std::move(handler)}
     , logger{cfg.logger}
-    , threads{cfg.num_threads}
+    , scheduler{scheduler}
     , max_header_bytes{cfg.max_header_bytes}
     , max_pending_connections{cfg.max_pending_connections}
 {}
@@ -50,6 +49,7 @@ void server::close()
 {
     is_serving = false;
     is_serving.notify_all();
+    listener.shutdown();
     logger->flush();
 }
 
@@ -70,8 +70,7 @@ server::serve_task server::serve()
             auto client_sock = co_await listener.accept();
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
 
-            threads.schedule_detached([this](auto client_sock) { serve_connection(std::move(client_sock)); },
-                                      std::move(client_sock));
+            scheduler->schedule(serve_connection(std::move(client_sock)));
         }
         catch (const std::exception& ex)
         {
@@ -80,17 +79,12 @@ server::serve_task server::serve()
     }
 }
 
-void server::serve_connection(tcp_socket conn) noexcept
+coro::task<> server::serve_connection(tcp_socket conn) noexcept
 {
-    logger->trace("new connection handler started for {} -> {}", conn.remote_addr(), conn.local_addr());
-
     try
     {
         while (is_serving && conn.valid())
         {
-            /* threads.schedule( */
-            /*     [&] */
-            /*     { */
             logger->trace("decoding request");
 
             request_decoder decode = nullptr;
@@ -105,13 +99,18 @@ void server::serve_connection(tcp_socket conn) noexcept
             auto reader = std::make_unique<io::buffered_reader>(&conn);
             auto writer = std::make_unique<io::buffered_writer>(&conn);
 
-            auto req_result = decode(std::move(reader), max_header_bytes);
+            auto req_result = co_await decode(std::move(reader), max_header_bytes);
             if (req_result.has_error())
             {
                 auto err = req_result.to_error();
                 if (static_cast<io::status_condition>(err.value()) == io::status_condition::closed)
+                {
                     logger->debug("connection closed");
-                else logger->error("request decode error: {} '{}'", err.value(), err.message());
+                }
+                else
+                {
+                    logger->debug("request decoding error: {} '{}'", err.value(), err.message());
+                }
                 break;
             }
 
@@ -141,43 +140,29 @@ void server::serve_connection(tcp_socket conn) noexcept
                 .body    = writer.get(),
             };
 
-            response_writer rw(writer.get(), &resp, encode);
+            response_writer rw{writer.get(), &resp, encode};
 
             if (unsupported)
             {
                 logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
-                rw.send(status::HTTP_VERSION_NOT_SUPPORTED, 0);
+                co_await rw.send(status::HTTP_VERSION_NOT_SUPPORTED, 0);
             }
             else if (auto upgrade_to = upgrade_to_protocol(req); !upgrade_to.empty())
             {
                 logger->trace("upgrading to protocol: {}", upgrade_to);
                 resp.headers.set("Upgrade"sv, upgrade_to);
                 resp.headers.set("Connection"sv, "upgrade"sv);
-                rw.send(status::SWITCHING_PROTOCOLS, 0);
+                co_await rw.send(status::SWITCHING_PROTOCOLS, 0);
             }
             else
             {
-                auto maybe_handler = handler.route_request(req);
-                if (maybe_handler.has_value())
-                {
-                    auto this_handler = maybe_handler.value();
-                    logger->trace("calling handler");
-                    std::invoke(this_handler.get(), req, rw);
-                }
-                else
-                {
-                    logger->trace("no handler found for {} {} - responding 404",
-                                  method_string(req.method),
-                                  req.uri.path);
-                    // TODO: add configuration for a 404 handler
-                    rw.send(status::NOT_FOUND, 0);
-                }
+                logger->trace("calling handler");
+                co_await handler(req, rw);
             }
 
             logger->trace("flushing writer");
-            writer->flush();
+            co_await writer->co_flush();
             logger->trace("response sent");
-            /* }); */
         }
     }
     catch (const std::exception& ex)
