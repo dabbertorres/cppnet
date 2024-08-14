@@ -3,8 +3,6 @@
 #include <chrono>
 #include <concepts>
 
-#include "metric.hpp"
-
 namespace net::instrument::prometheus
 {
 

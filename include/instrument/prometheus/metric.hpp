@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -186,11 +187,7 @@ protected:
     {
         if (!labels.empty())
         {
-            return io::write_all(
-                out,
-                '{',
-                [this](io::writer& out) { return encode_all_labels(out); },
-                '}');
+            return io::write_all(out, '{', [this](io::writer& out) { return encode_all_labels(out); }, '}');
         }
 
         return {};

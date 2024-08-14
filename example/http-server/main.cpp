@@ -1,4 +1,5 @@
 #include <csignal>
+#include <iostream>
 #include <string_view>
 #include <utility>
 
@@ -10,7 +11,10 @@
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "http/server.hpp"
+#include "io/buffer.hpp"
 #include "io/scheduler.hpp"
+
+#include "instrument/prometheus/histogram.hpp"
 
 namespace http = net::http;
 
@@ -21,11 +25,15 @@ int main()
 
     spdlog::set_level(spdlog::level::trace);
 
+    net::instrument::prometheus::histogram request_times{"request_latency"};
+
     http::server_config config{};
     http::router        router;
     router.GET("/",
-               [](const http::server_request& req, http::response_writer& resp) -> net::coro::task<void>
+               [&](const http::server_request& req, http::response_writer& resp) -> net::coro::task<void>
                {
+                   auto tracker = request_times.track();
+
                    resp.headers().set("X-Msg"sv, "Hello"sv).set("Content-Type"sv, "text/plain"sv);
                    constexpr auto msg = "hello world\r\n"sv;
 
@@ -42,6 +50,11 @@ int main()
 
     scheduler.run();
     config.logger->info("exiting...");
+
+    net::io::buffer buf;
+    request_times.encode(buf);
+
+    std::cout << buf.to_string() << '\n';
 
     return 0;
 }

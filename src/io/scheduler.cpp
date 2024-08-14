@@ -8,8 +8,6 @@
 #include <utility>
 #include <vector>
 
-#include <spdlog/spdlog.h>
-
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "io/event_loop.hpp"
@@ -48,7 +46,7 @@ coro::task<result> scheduler::schedule(io_handle handle, poll_op op, std::chrono
 
 void scheduler::run()
 {
-    while (running.load(std::memory_order::acquire) /* || size() > 0*/)
+    while (running.load(std::memory_order::acquire))
     {
         for (auto [handle, result] : loop.dispatch())
         {
