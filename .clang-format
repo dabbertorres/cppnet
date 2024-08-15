@@ -41,23 +41,23 @@ BitFieldColonSpacing: Both
 
 BreakBeforeBraces: Custom
 BraceWrapping:
-  AfterCaseLabel:        true
-  AfterClass:            true
+  AfterCaseLabel: true
+  AfterClass: true
   AfterControlStatement: Always
-  AfterEnum:             true
-  AfterExternBlock:      true
-  AfterFunction:         true
-  AfterNamespace:        true
-  AfterStruct:           true
-  AfterUnion:            true
-  BeforeCatch:           true
-  BeforeElse:            true
-  BeforeLambdaBody:      true
-  BeforeWhile:           true
-  IndentBraces:          false
-  SplitEmptyFunction:    false
-  SplitEmptyNamespace:   false
-  SplitEmptyRecord:      false
+  AfterEnum: true
+  AfterExternBlock: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: true
+  BeforeWhile: true
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyNamespace: false
+  SplitEmptyRecord: false
 
 BreakAfterAttributes: Leave
 BreakBeforeBinaryOperators: NonAssignment
@@ -69,7 +69,7 @@ BreakInheritanceList: BeforeComma
 BreakStringLiterals: false
 
 ColumnLimit: 120
-CommentPragmas:  '^ IWYU pragma:'
+CommentPragmas: "^ IWYU pragma:"
 CompactNamespaces: false
 
 # ConstructorInitializerAllOnOneLineOrOnePerLine: true # deprecated
@@ -90,21 +90,21 @@ IfMacros: []
 IncludeBlocks: Regroup
 
 IncludeCategories:
-- Regex: ^<([[:alnum:]]|_)+>$
-  Priority: 1
-- Regex: ^<experimental/([[:alnum:]]|_)+>$
-  Priority: 2
-- Regex: ^<([[:alnum:]]|_)+\.h(pp)?>$
-  Priority: 11
-- Regex: ^<([[:alnum:]]|_)+/([[:alnum:]]|_)+(\.h(pp)?)?>$
-  Priority: 12
-- Regex: ^"([[:alnum:]]|_)+/([[:alnum:]]|_)+(\.h(pp)?)?"$
-  Priority: 98
-- Regex: ^"([[:alnum:]]|_)+(\.h(pp)?)?"$
-  Priority: 99
+  - Regex: ^<([[:alnum:]]|_)+>$
+    Priority: 1
+  - Regex: ^<experimental/([[:alnum:]]|_)+>$
+    Priority: 2
+  - Regex: ^<([[:alnum:]]|_)+\.h(pp)?>$
+    Priority: 11
+  - Regex: ^<sys/([[:alnum:]]|_|/)+(\.h(pp)?)?>$
+    Priority: 11
+  - Regex: ^<([[:alnum:]]|_|/)+(\.h(pp)?)?>$
+    Priority: 12
+  - Regex: ^"([[:alnum:]]|_|/)+(\.h(pp)?)?"$
+    Priority: 99
 
-IncludeIsMainRegex: '(_test)?$'
-IncludeIsMainSourceRegex: ''
+IncludeIsMainRegex: "(_test)?$"
+IncludeIsMainSourceRegex: ""
 
 IndentAccessModifiers: false
 IndentCaseBlocks: false
@@ -128,8 +128,8 @@ LambdaBodyIndentation: Signature
 
 LineEnding: DeriveLF
 
-MacroBlockBegin: '^.+_(BEGIN|HEAD|START)$'
-MacroBlockEnd:   '^.+_(END|STOP)$'
+MacroBlockBegin: "^.+_(BEGIN|HEAD|START)$"
+MacroBlockEnd: "^.+_(END|STOP)$"
 
 MaxEmptyLinesToKeep: 1
 NamespaceIndentation: Inner
@@ -143,13 +143,13 @@ PointerAlignment: Left
 
 QualifierAlignment: Custom
 QualifierOrder:
-- static
-- inline
-- const
-- constexpr
-- volatile
-- restrict
-- type
+  - static
+  - inline
+  - const
+  - constexpr
+  - volatile
+  - restrict
+  - type
 
 # RawStringFormats:
 # - Language: Cpp
@@ -209,8 +209,8 @@ SpacesInSquareBrackets: false
 StatementAttributeLikeMacros: []
 
 StatementMacros:
-- TEST_CASE
-- SECTION
+  - TEST_CASE
+  - SECTION
 
 TabWidth: 4
 
@@ -220,7 +220,6 @@ UseCRLF: false
 UseTab: Never
 
 WhitespaceSensitiveMacros: []
-
 # Penalty settings
 # PenaltyBreakAssignment: 0
 # PenaltyBreakBeforeFirstCallParameter: 0

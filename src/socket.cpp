@@ -16,7 +16,6 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <spdlog/spdlog.h>
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/socket.h>

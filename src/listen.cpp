@@ -1,5 +1,6 @@
 #include "listen.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -8,16 +9,14 @@
 
 #include <fcntl.h>
 #include <netdb.h>
-#include <unistd.h>
-
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "coro/task.hpp"
+#include "exception.hpp"
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
-
-#include "exception.hpp"
 #include "ip_addr.hpp"
 #include "tcp.hpp"
 
@@ -89,23 +88,6 @@ listener::listener(io::scheduler*            scheduler,
         /*     continue; */
         /* } */
 
-        /* int flags = ::fcntl(main_fd, F_GETFL); */
-        /* if (flags != 0) */
-        /* { */
-        /*     ::close(main_fd); */
-        /*     main_fd = invalid_fd; */
-        /*     continue; */
-        /* } */
-
-        /* flags |= O_NONBLOCK; */
-        /* sts = ::fcntl(main_fd, F_SETFL, flags); */
-        /* if (sts != 0) */
-        /* { */
-        /*     ::close(main_fd); */
-        /*     main_fd = invalid_fd; */
-        /*     continue; */
-        /* } */
-
         sts = ::bind(main_fd, info->ai_addr, info->ai_addrlen);
         if (sts != 0)
         {
@@ -125,7 +107,7 @@ listener::listener(io::scheduler*            scheduler,
 
 listener::listener(listener&& other) noexcept
     : scheduler{std::exchange(other.scheduler, nullptr)}
-    , is_listening{other.is_listening.exchange(false)}
+    , is_listening{other.is_listening.exchange(false, std::memory_order::acq_rel)}
     , main_fd{std::exchange(other.main_fd, invalid_fd)}
 {}
 
@@ -134,7 +116,7 @@ listener& listener::operator=(listener&& other) noexcept
     shutdown();
 
     scheduler    = std::exchange(other.scheduler, nullptr);
-    is_listening = other.is_listening.exchange(false);
+    is_listening = other.is_listening.exchange(false, std::memory_order::acq_rel);
     main_fd      = std::exchange(other.main_fd, invalid_fd);
 
     return *this;
@@ -144,7 +126,7 @@ listener::~listener() noexcept { shutdown(); }
 
 void listener::listen(std::uint16_t max_backlog)
 {
-    if (is_listening.exchange(true))
+    if (is_listening.exchange(true, std::memory_order::acq_rel))
     {
         // TODO: throw "already listening"
         return;
@@ -160,33 +142,31 @@ void listener::listen(std::uint16_t max_backlog)
 
 coro::task<tcp_socket> listener::accept() const
 {
-    if (!is_listening) throw exception{"not listening"};
-
-    /* int num_ready = */
-    /*     ::poll(fds.data(), static_cast<unsigned int>(fds.size()), -1); // TODO block? not-block?
-     */
-    /* if (num_ready == -1) throw system_error_from_errno(errno); */
-    /* if (num_ready == 0) return tcp_socket{invalid_fd}; */
+    if (!is_listening.load(std::memory_order::acquire)) throw exception{"not listening"};
 
     sockaddr_storage inc{};
     socklen_t        inc_size = sizeof(inc);
 
     auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
     if (res.err) throw res.err;
-
-    // TODO: res.count?
+    if (res.count == 0) co_return tcp_socket{scheduler};
 
     int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);
-    if (inc_fd == -1) throw system_error_from_errno(errno);
+    if (inc_fd == -1)
+    {
+        // return invalid socket to indicate shutdown
+        if (!is_listening.load(std::memory_order::acquire)) co_return tcp_socket{scheduler};
+
+        throw system_error_from_errno(errno);
+    }
 
     co_return tcp_socket{scheduler, inc_fd};
 }
 
 void listener::shutdown() noexcept
 {
-    if (is_listening.exchange(false) && main_fd != invalid_fd)
+    if (is_listening.exchange(false, std::memory_order::acq_rel) && main_fd != invalid_fd)
     {
-        is_listening.notify_all();
         ::close(main_fd);
     }
 }

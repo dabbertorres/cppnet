@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -39,7 +38,6 @@ struct server_config
     bool                            http2                   = false;
     bool                            http3                   = false;
     std::size_t                     num_threads             = std::thread::hardware_concurrency();
-    // TODO: coroutines
 };
 
 class server
@@ -55,33 +53,8 @@ public:
 
     ~server();
 
-    struct serve_task
-    {
-    public:
-        struct promise_type
-        {
-            serve_task get_return_object() noexcept
-            {
-                return serve_task{std::coroutine_handle<promise_type>::from_promise(*this)};
-            }
-
-            [[nodiscard]] std::suspend_never initial_suspend() const noexcept { return {}; }
-            [[nodiscard]] std::suspend_never final_suspend() const noexcept { return {}; }
-
-            void return_void() noexcept {}
-            void unhandled_exception() noexcept {}
-        };
-
-        explicit serve_task(std::coroutine_handle<promise_type> handle)
-            : handle{handle}
-        {}
-
-    private:
-        std::coroutine_handle<promise_type> handle;
-    };
-
-    void       close();
-    serve_task serve();
+    void         close();
+    coro::task<> serve();
 
 private:
     coro::task<>     serve_connection(tcp_socket conn) noexcept;

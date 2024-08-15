@@ -1,17 +1,19 @@
 #include <array>
 #include <exception>
+#include <expected>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <system_error>
 
-#include <__expected/expected.h>
+#include <spdlog/spdlog.h>
 
+#include "coro/thread_pool.hpp"
 #include "http/client.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
-
 #include "url.hpp"
 
 namespace http = net::http;
@@ -52,7 +54,10 @@ int main(int argc, char** argv)
               << "port: " << url.port << '\n'
               << "path: " << url.path << '\n';
 
-    net::io::scheduler scheduler;
+    auto workers =
+        std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1), spdlog::default_logger());
+
+    net::io::scheduler scheduler{workers, spdlog::default_logger()};
     http::client       client{&scheduler};
 
     http::client_request req{

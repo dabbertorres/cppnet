@@ -9,7 +9,6 @@
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
-#include "io/poll.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"

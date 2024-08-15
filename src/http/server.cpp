@@ -1,9 +1,11 @@
 #include "http/server.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -47,28 +49,34 @@ server::~server() { close(); }
 
 void server::close()
 {
-    is_serving = false;
-    is_serving.notify_all();
-    listener.shutdown();
-    logger->flush();
+    if (is_serving.exchange(false, std::memory_order::acq_rel))
+    {
+        listener.shutdown();
+        logger->flush();
+    }
 }
 
-server::serve_task server::serve()
+coro::task<> server::serve()
 {
-    if (is_serving.exchange(true))
+    if (is_serving.exchange(true, std::memory_order::acq_rel))
     {
         throw exception{"already serving"};
     }
 
     listener.listen(max_pending_connections);
 
-    while (is_serving)
+    while (is_serving.load(std::memory_order::acquire))
     {
         try
         {
             logger->trace("waiting for connection");
             auto client_sock = co_await listener.accept();
             logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
+            if (!client_sock.valid())
+            {
+                if (!is_serving.load(std::memory_order::acquire)) co_return;
+                else throw std::runtime_error{"listener unexpected closed"};
+            }
 
             scheduler->schedule(serve_connection(std::move(client_sock)));
         }
@@ -83,7 +91,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
 {
     try
     {
-        while (is_serving && conn.valid())
+        while (is_serving.load(std::memory_order::acquire) && conn.valid())
         {
             logger->trace("decoding request");
 

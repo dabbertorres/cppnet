@@ -7,6 +7,9 @@
 namespace net::io
 {
 
+// TODO: Linux vs OSX vs Windows, etc
+using io_handle = int;
+
 struct result
 {
     std::size_t          count{};

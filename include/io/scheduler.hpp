@@ -5,8 +5,13 @@
 #include <coroutine>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
+
+#include <spdlog/logger.h>
+#include <spdlog/sinks/null_sink.h>
+#include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
@@ -20,24 +25,8 @@ namespace net::io
 class scheduler
 {
 public:
-    class operation
-    {
-        friend class scheduler;
-
-        explicit operation(scheduler* scheduler) noexcept
-            : scheduler{scheduler}
-        {}
-
-    public:
-        constexpr bool await_ready() noexcept { return false; }
-        void           await_suspend(std::coroutine_handle<> awaiting) noexcept { scheduler->workers.resume(awaiting); }
-        void           await_resume() noexcept { /* noop */ }
-
-    private:
-        scheduler* scheduler;
-    };
-
-    scheduler(std::size_t concurrency = std::thread::hardware_concurrency());
+    scheduler(std::shared_ptr<coro::thread_pool> workers,
+              std::shared_ptr<spdlog::logger>    logger = spdlog::create<spdlog::sinks::null_sink_mt>("scheduler"));
 
     scheduler(const scheduler&)            = delete;
     scheduler& operator=(const scheduler&) = delete;
@@ -47,38 +36,22 @@ public:
 
     ~scheduler() noexcept;
 
-    operation          schedule() noexcept { return operation{this}; }
-    void               schedule(coro::task<>&& task) noexcept;
+    bool               schedule(coro::task<>&& task) noexcept;
     coro::task<result> schedule(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
     bool               resume(std::coroutine_handle<> handle) noexcept;
-    void               run();
-
-    /* auto schedule_accept(int fd) noexcept */
-    /* { */
-    /*     struct awaitable */
-    /*     { */
-    /*         event_loop* loop = nullptr; */
-    /*         int         fd   = -1; */
-
-    /*         constexpr bool await_ready() noexcept { return false; } */
-    /*         constexpr void await_resume() noexcept {} */
-    /*         void           await_suspend(std::coroutine_handle<> handle) const noexcept { loop->queue(handle, fd); }
-     */
-    /*     }; */
-
-    /*     return awaitable{&loop, fd}; */
-    /* } */
 
     void shutdown() noexcept;
 
-    /* std::size_t size() noexcept; */
-
 private:
-    coro::thread_pool        workers;
-    std::deque<coro::task<>> tasks;
-    event_loop               loop;
-    std::atomic<bool>        running;
-    std::mutex               tasks_mu;
+    void run();
+
+    std::shared_ptr<coro::thread_pool> workers;
+    event_loop                         loop;
+    std::deque<coro::task<>>           tasks;
+    std::mutex                         tasks_mu;
+    std::atomic<bool>                  running;
+    std::shared_ptr<spdlog::logger>    logger;
+    std::thread                        run_worker;
 };
 
 }

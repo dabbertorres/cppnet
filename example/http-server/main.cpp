@@ -1,5 +1,8 @@
+#include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string_view>
 #include <utility>
 
@@ -7,14 +10,14 @@
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "http/server.hpp"
+#include "instrument/prometheus/histogram.hpp"
 #include "io/buffer.hpp"
 #include "io/scheduler.hpp"
-
-#include "instrument/prometheus/histogram.hpp"
 
 namespace http = net::http;
 
@@ -23,12 +26,17 @@ int main()
     using namespace std::chrono_literals;
     using namespace std::string_view_literals;
 
-    spdlog::set_level(spdlog::level::trace);
+    auto logger = spdlog::default_logger()->clone("default");
+    logger->set_level(spdlog::level::trace);
+    logger->set_pattern("[%T.%e] [%^%-5!l%$] [%-11!n] [t %-8!t] %v");
+    spdlog::set_default_logger(logger);
 
     net::instrument::prometheus::histogram request_times{"request_latency"};
 
-    http::server_config config{};
-    http::router        router;
+    http::server_config config{
+        .logger = logger,
+    };
+    http::router router;
     router.GET("/",
                [&](const http::server_request& req, http::response_writer& resp) -> net::coro::task<void>
                {
@@ -41,15 +49,32 @@ int main()
                    co_await body->co_write(msg);
                });
 
-    net::io::scheduler scheduler;
+    sigset_t sig_set;
+    sigemptyset(&sig_set);
+    sigaddset(&sig_set, SIGINT);
+    sigaddset(&sig_set, SIGTERM);
+
+    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1), logger);
+
+    net::io::scheduler scheduler{workers, logger};
 
     http::server server{&scheduler, std::move(router), config};
 
     config.logger->info("starting...");
-    auto serve_task = server.serve();
+    scheduler.schedule(server.serve());
 
-    scheduler.run();
+    int sig;
+    int ret = sigwait(&sig_set, &sig);
+    if (ret != 0)
+    {
+        spdlog::critical("error in sigwait(): {}; errno = {}", ret, errno);
+        std::abort();
+    }
+
     config.logger->info("exiting...");
+
+    server.close();
+    scheduler.shutdown();
 
     net::io::buffer buf;
     request_times.encode(buf);

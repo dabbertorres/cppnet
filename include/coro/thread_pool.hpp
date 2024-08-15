@@ -7,13 +7,19 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #include <thread>
 #include <type_traits>
 #include <vector>
 
+#include <spdlog/logger.h>
+#include <spdlog/spdlog.h>
+
 #include "coro/task.hpp"
+
+#include <spdlog/sinks/null_sink.h>
 
 namespace net::coro
 {
@@ -44,7 +50,8 @@ public:
         std::coroutine_handle<> awaiting{nullptr};
     };
 
-    thread_pool(std::size_t concurrency = hardware_concurrency());
+    thread_pool(std::size_t                     concurrency = hardware_concurrency(),
+                std::shared_ptr<spdlog::logger> logger = spdlog::create<spdlog::sinks::null_sink_mt>("thread_pool"));
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;
@@ -125,6 +132,7 @@ private:
     std::deque<std::coroutine_handle<>> jobs;
     std::atomic<bool>                   running;
     std::atomic<std::size_t>            num_jobs; // queued AND currently executing
+    std::shared_ptr<spdlog::logger>     logger;
 };
 
 }

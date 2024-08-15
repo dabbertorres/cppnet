@@ -1,6 +1,5 @@
 #pragma once
 
-#include <concepts>
 #include <coroutine>
 #include <exception>
 #include <memory>
@@ -8,6 +7,8 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+
+#include <spdlog/spdlog.h>
 
 namespace net::coro
 {
@@ -63,7 +64,7 @@ public:
     {
         if (std::addressof(other) != this)
         {
-            if (handle) handle.destroy();
+            if (handle != nullptr) handle.destroy();
 
             handle = std::exchange(other.handle, nullptr);
         }
@@ -183,7 +184,7 @@ public:
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     template<typename Y>
-        requires((is_reference && std::constructible_from<T, Y &&>)
+        requires((is_reference && std::is_constructible_v<T, Y &&>)
                  || (!is_reference && std::is_constructible_v<stored_type, Y &&>))
     void return_value(Y&& new_value) noexcept
     {

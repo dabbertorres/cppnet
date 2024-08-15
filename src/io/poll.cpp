@@ -23,7 +23,7 @@ poll_op operator|(poll_op lhs, poll_op rhs) noexcept
     return static_cast<poll_op>(v);
 }
 
-bool readable(poll_op op) noexcept { return (op & poll_op::read) == poll_op::read; }
-bool writable(poll_op op) noexcept { return (op & poll_op::write) == poll_op::write; }
+bool is_readable(poll_op op) noexcept { return (op & poll_op::read) == poll_op::read; }
+bool is_writable(poll_op op) noexcept { return (op & poll_op::write) == poll_op::write; }
 
 }

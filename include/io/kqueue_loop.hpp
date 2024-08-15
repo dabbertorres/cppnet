@@ -1,11 +1,5 @@
 #pragma once
 
-#include "coro/generator.hpp"
-#include "coro/task.hpp"
-#include "io/event.hpp"
-#include "io/io.hpp"
-#include "io/poll.hpp"
-
 #include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
@@ -13,11 +7,24 @@
 #    include <atomic>
 #    include <chrono>
 #    include <coroutine>
+#    include <cstdint>
 #    include <ctime>
+#    include <memory>
 
-#    include <spdlog/spdlog.h>
 #    include <sys/event.h>
 #    include <sys/types.h>
+
+#    include <spdlog/common.h>
+#    include <spdlog/logger.h>
+#    include <spdlog/spdlog.h>
+
+#    include "coro/generator.hpp"
+#    include "coro/task.hpp"
+#    include "io/event.hpp"
+#    include "io/io.hpp"
+#    include "io/poll.hpp"
+
+#    include <spdlog/sinks/null_sink.h>
 
 namespace net::io::detail
 {
@@ -27,7 +34,7 @@ using namespace std::chrono_literals;
 class kqueue_loop
 {
 public:
-    kqueue_loop();
+    kqueue_loop(std::shared_ptr<spdlog::logger> logger = spdlog::null_logger_mt("kqueue_loop"));
 
     kqueue_loop(const kqueue_loop&)            = delete;
     kqueue_loop& operator=(const kqueue_loop&) = delete;
@@ -75,8 +82,15 @@ private:
     void
     queue(std::coroutine_handle<promise> awaiting, io_handle handle, poll_op op, std::chrono::milliseconds timeout);
 
-    std::atomic<int>         descriptor;
-    std::atomic<std::size_t> timeout_id;
+    struct kevent
+    make_io_kevent(std::coroutine_handle<promise> awaiting, io_handle handle, std::int16_t filter) const noexcept;
+    struct kevent make_timeout_kevent(std::coroutine_handle<promise> awaiting,
+                                      std::chrono::milliseconds      timeout) noexcept;
+
+    std::atomic<bool>               running;
+    int                             descriptor;
+    std::atomic<std::size_t>        timeout_id;
+    std::shared_ptr<spdlog::logger> logger;
 };
 
 using event_loop = kqueue_loop;

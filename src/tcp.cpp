@@ -6,20 +6,19 @@
 #include <string_view>
 
 #include <netdb.h>
-#include <unistd.h>
-
-#include <netinet/in.h>
 #include <sys/_select.h>
 #include <sys/fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
-#include "io/scheduler.hpp"
-#include "util/defer.hpp"
+#include <netinet/in.h>
 
 #include "exception.hpp"
+#include "io/scheduler.hpp"
 #include "ip_addr.hpp"
 #include "socket.hpp"
+#include "util/defer.hpp"
 
 namespace net
 {
@@ -100,19 +99,6 @@ int tcp_socket::open(
                 throw system_error_from_errno(err, "failed to set keepalive");
             }
         }
-
-        /* if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) */
-        /* { */
-        /*     ::close(fd); */
-        /*     fd = invalid_fd; */
-        /*     continue; */
-        /* } */
-
-        /* struct fd_set writefs */
-        /* {}; */
-        /* FD_SET(fd, &writefs); */
-
-        /* sts = ::select(1, nullptr, &writefs, nullptr, nullptr); */
 
         sts = ::connect(fd, info->ai_addr, info->ai_addrlen);
         if (sts == 0) break;
