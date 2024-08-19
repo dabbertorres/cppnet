@@ -16,6 +16,7 @@
 
 #    include <spdlog/common.h>
 #    include <spdlog/logger.h>
+#    include <spdlog/sinks/null_sink.h>
 #    include <spdlog/spdlog.h>
 
 #    include "coro/generator.hpp"
@@ -23,8 +24,6 @@
 #    include "io/event.hpp"
 #    include "io/io.hpp"
 #    include "io/poll.hpp"
-
-#    include <spdlog/sinks/null_sink.h>
 
 namespace net::io::detail
 {
@@ -92,8 +91,6 @@ private:
     std::atomic<std::size_t>        timeout_id;
     std::shared_ptr<spdlog::logger> logger;
 };
-
-using event_loop = kqueue_loop;
 
 }
 

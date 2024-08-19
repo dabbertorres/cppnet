@@ -4,20 +4,43 @@
 #include <concepts>
 #include <type_traits>
 
+#include "config.hpp"
 #include "coro/generator.hpp"
 #include "coro/task.hpp"
 #include "io/event.hpp"
 #include "io/io.hpp"
 #include "io/poll.hpp"
 
-#include "config.hpp"
-
 #ifdef NET_HAS_EPOLL
 #    include "epoll_loop.hpp"
+
+namespace net::io::detail
+{
+
+using event_loop = epoll_loop;
+
+}
+
 #elifdef NET_HAS_KQUEUE
 #    include "kqueue_loop.hpp"
+
+namespace net::io::detail
+{
+
+using event_loop = kqueue_loop;
+
+}
+
 #elifdef NET_HAS_COMPLETION_PORTS
 #    include "completion_ports_loop.hpp"
+
+namespace net::io::detail
+{
+
+using event_loop = completion_ports_loop;
+
+}
+
 #else
 #    error "No supported event loop implementation."
 #endif
