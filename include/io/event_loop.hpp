@@ -45,7 +45,7 @@ using event_loop = completion_ports_loop;
 #    error "No supported event loop implementation."
 #endif
 
-namespace net::io::detail
+namespace net::io
 {
 
 // clang-format off
@@ -59,17 +59,14 @@ concept EventLoop = std::is_default_constructible_v<T>
     && requires(T* t, io_handle handle, poll_op op, std::chrono::milliseconds timeout)
     {
         { t->queue(handle, op, timeout) } -> std::same_as<coro::task<result>>;
-        { t->dispatch() } -> std::same_as<coro::generator<event>>;
+        { t->dispatch() } -> std::same_as<coro::generator<detail::event>>;
         { t->shutdown() } -> std::same_as<void>;
+        { t->register_handle(handle) } -> std::same_as<void>;
+        { t->deregister_handle(handle) } -> std::same_as<void>;
     };
 // clang-format on
 
-static_assert(EventLoop<event_loop>);
-
-}
-
-namespace net::io
-{
+static_assert(EventLoop<detail::event_loop>);
 
 using event_loop = detail::event_loop;
 

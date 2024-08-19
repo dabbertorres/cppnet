@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
-#include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -21,8 +20,8 @@
 namespace net::io
 {
 
-scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, std::shared_ptr<spdlog::logger> logger)
-    : workers{workers}
+scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shared_ptr<spdlog::logger>& logger)
+    : workers{std::move(workers)}
     , loop{logger}
     , running{true}
     , logger{logger->clone("scheduler")}
@@ -30,6 +29,9 @@ scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, std::shared_ptr
 {}
 
 scheduler::~scheduler() noexcept { shutdown(); }
+
+void scheduler::register_handle(io_handle handle) { loop.register_handle(handle); }
+void scheduler::deregister_handle(io_handle handle) { loop.deregister_handle(handle); }
 
 bool scheduler::schedule(coro::task<>&& task) noexcept
 {

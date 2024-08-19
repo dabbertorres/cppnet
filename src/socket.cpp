@@ -12,21 +12,20 @@
 
 #include <fcntl.h>
 #include <netdb.h>
-#include <unistd.h>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "coro/task.hpp"
+#include "exception.hpp"
 #include "io/io.hpp"
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
-
-#include "exception.hpp"
 
 namespace
 {
@@ -66,10 +65,12 @@ std::string addr_name(sockaddr_storage* addr)
 namespace net
 {
 
-socket::socket(io::scheduler* scheduler, int fd)
+socket::socket(io::scheduler* scheduler, io::io_handle fd)
     : scheduler{scheduler}
     , fd{fd}
-{}
+{
+    scheduler->register_handle(fd);
+}
 
 socket::socket(socket&& other) noexcept
     : scheduler{std::exchange(other.scheduler, nullptr)}
@@ -226,6 +227,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const n
         set_option(fd, SO_LINGER, &linger);
     }
 
+    scheduler->deregister_handle(fd);
     ::close(fd);
 }
 

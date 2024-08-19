@@ -23,7 +23,7 @@ class socket
     , public io::writer
 {
 public:
-    socket(io::scheduler* scheduler, int fd);
+    socket(io::scheduler* scheduler, io::io_handle fd);
 
     // non-copyable
     socket(const socket&)            = delete;

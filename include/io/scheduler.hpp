@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
-#include <cstddef>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -25,8 +24,8 @@ namespace net::io
 class scheduler
 {
 public:
-    scheduler(std::shared_ptr<coro::thread_pool> workers,
-              std::shared_ptr<spdlog::logger>    logger = spdlog::create<spdlog::sinks::null_sink_mt>("scheduler"));
+    scheduler(std::shared_ptr<coro::thread_pool>     workers,
+              const std::shared_ptr<spdlog::logger>& logger = spdlog::create<spdlog::sinks::null_sink_mt>("scheduler"));
 
     scheduler(const scheduler&)            = delete;
     scheduler& operator=(const scheduler&) = delete;
@@ -35,6 +34,9 @@ public:
     scheduler& operator=(scheduler&&) = delete;
 
     ~scheduler() noexcept;
+
+    void register_handle(io_handle handle);
+    void deregister_handle(io_handle handle);
 
     bool               schedule(coro::task<>&& task) noexcept;
     coro::task<result> schedule(io_handle handle, poll_op op, std::chrono::milliseconds timeout);

@@ -8,9 +8,8 @@
 #    include <chrono>
 #    include <coroutine>
 #    include <memory>
-
-#    include <sys/epoll.h>
-#    include <sys/eventfd.h>
+#    include <mutex>
+#    include <queue>
 
 #    include <spdlog/logger.h>
 #    include <spdlog/sinks/null_sink.h>
@@ -29,7 +28,7 @@ using namespace std::chrono_literals;
 class epoll_loop
 {
 public:
-    epoll_loop(std::shared_ptr<spdlog::logger> logger = spdlog::null_logger_mt("kqueue_loop"));
+    epoll_loop(const std::shared_ptr<spdlog::logger>& logger = spdlog::null_logger_mt("epoll_loop"));
 
     epoll_loop(const epoll_loop&)            = delete;
     epoll_loop& operator=(const epoll_loop&) = delete;
@@ -39,12 +38,18 @@ public:
 
     ~epoll_loop();
 
-    coro::task<result>     queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
-    coro::generator<event> dispatch() const;
+    // TODO: expose these on the scheduler
+    void register_handle(io_handle handle);
+    void deregister_handle(io_handle handle);
+
+    coro::task<result>                   queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    [[nodiscard]] coro::generator<event> dispatch();
 
     void shutdown() noexcept;
 
 private:
+    using clock = std::chrono::high_resolution_clock;
+
     class operation
     {
         friend class epoll_loop;
@@ -57,9 +62,9 @@ private:
         {}
 
     public:
-        constexpr bool await_ready() noexcept { return false; }
-        result         await_resume() noexcept;
-        void           await_suspend(std::coroutine_handle<promise> handle) noexcept;
+        [[nodiscard]] bool await_ready() const noexcept;
+        result             await_resume() noexcept;
+        void               await_suspend(std::coroutine_handle<promise> await_on);
 
     private:
         epoll_loop*                    loop;
@@ -71,25 +76,29 @@ private:
 
     friend class operation;
 
+    struct timeout_operation
+    {
+        std::coroutine_handle<promise> handle;
+        clock::time_point              timeout_at;
+
+        constexpr bool operator<(const timeout_operation& other) const noexcept
+        {
+            return timeout_at < other.timeout_at;
+        }
+    };
+
     void
     queue(std::coroutine_handle<promise> awaiting, io_handle handle, poll_op op, std::chrono::milliseconds timeout);
-
-    // unique identifiers for the different event handles
-    static constexpr int schedule_value = 1;
-    static constexpr int timer_value    = 1;
-    static constexpr int shutdown_value = 1;
-
-    static const constexpr void* const schedule_ptr = &schedule_value;
-    static const constexpr void* const timer_ptr    = &timer_value;
-    static const constexpr void* const shutdown_ptr = &shutdown_value;
+    void update_timer(std::chrono::milliseconds timeout);
 
     int epoll_fd;
-    int schedule_fd;
     int timer_fd;
     int shutdown_fd;
 
-    std::atomic<bool>               running;
-    std::shared_ptr<spdlog::logger> logger;
+    std::atomic<bool>                      running;
+    std::shared_ptr<spdlog::logger>        logger;
+    std::priority_queue<timeout_operation> timeout_list;
+    std::mutex                             timeout_list_mu;
 };
 
 }

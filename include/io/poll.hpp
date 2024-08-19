@@ -1,7 +1,5 @@
 #pragma once
 
-#include <chrono>
-#include <coroutine>
 #include <cstdint>
 
 #include "coro/task.hpp"
@@ -35,14 +33,5 @@ enum class poll_status
 using promise = coro::detail::promise<io::result>;
 
 using namespace std::chrono_literals;
-
-// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-struct wait_for
-{
-    std::coroutine_handle<>   handle;
-    int                       fd;
-    poll_op                   op;
-    std::chrono::milliseconds timeout;
-};
 
 }

@@ -43,6 +43,9 @@ public:
 
     ~kqueue_loop();
 
+    void register_handle(io_handle handle) { /* noop - for now? */ }
+    void deregister_handle(io_handle handle) { /* noop - for now? */ }
+
     coro::task<result> queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
 
     coro::generator<event> dispatch() const;
