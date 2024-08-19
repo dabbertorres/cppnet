@@ -1,0 +1,14 @@
+FROM archlinux:base-devel
+RUN pacman -Syu --noconfirm --noprogressbar \
+    && pacman -S --noconfirm --noprogressbar \
+        cmake \
+        curl \
+        neovim \
+        git \
+        git-delta \
+        ninja \
+        zip \
+        unzip \
+        tar \
+        man-db \
+        man-pages

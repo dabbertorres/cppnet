@@ -1,0 +1,20 @@
+services:
+  dev-linux:
+    build:
+      dockerfile: "Dockerfile.linux"
+    command:
+      - nvim
+      - --headless
+      - --listen
+      - 0.0.0.0:7892
+    working_dir: /workspace/net
+    ports:
+      - "7892:7892"
+    volumes:
+      - "/Users/aleciverson/dotfiles/config/nvim/:/root/.config/nvim/"
+      - "/Users/aleciverson/dotfiles/config/git/:/root/.config/git/"
+      - "../:/workspace/net"
+      - nvim-plugins:/root/.local/share/nvim/
+
+volumes:
+  nvim-plugins: {}

@@ -36,7 +36,7 @@ Checks: >-
   -readability-magic-numbers,
   -readability-uppercase-literal-suffix,
 WarningsAsErrors: false
-AnalyzeTemporaryDtors: true
+# AnalyzeTemporaryDtors: true
 CheckOptions:
 - key:   cert-dcl16-c.NewSuffixes
   value: 'L;LL;LU;LLU'
