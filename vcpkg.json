@@ -15,10 +15,6 @@
     {
       "name": "nlohmann-json",
       "version>=": "3.11.2"
-    },
-    {
-      "name": "concurrencpp",
-      "version>=": "0.1.7"
     }
   ]
 }
