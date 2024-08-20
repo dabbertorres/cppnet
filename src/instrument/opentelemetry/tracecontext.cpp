@@ -1,10 +1,15 @@
 #include "instrument/opentelemetry/tracecontext.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "encoding/hex.hpp"
+#include "http/headers.hpp"
+#include "instrument/opentelemetry/protocol.hpp"
 
 namespace net::instrument::opentelemetry::tracecontext
 {
@@ -66,7 +71,7 @@ std::optional<span> parse_version_00(std::string_view traceparent) noexcept
 
     span s = {
         .version        = static_cast<std::byte>(0),
-        .parent_span_id = std::make_optional<span_id>(),
+        .parent_span_id = std::make_optional<span_id_t>(),
         .flags          = static_cast<span_flags>(encoding::hex::decode(flags_raw[0], flags_raw[1])),
     };
 
@@ -82,9 +87,8 @@ void inject(const span& span, http::headers& headers) noexcept
 {
     switch (static_cast<std::uint8_t>(span.version))
     {
-    case 0: inject_version_00(span, headers);
-
-    default:
+    case 0: inject_version_00(span, headers); break;
+    default: break;
     }
 }
 

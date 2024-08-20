@@ -9,9 +9,8 @@
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
-#include <nlohmann/json.hpp>
-
 #include <catch2/generators/catch_generators.hpp>
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -32,7 +31,6 @@ std::vector<std::byte> operator""_bytes(const char* str, std::size_t length)
 }
 
 using any_value      = net::instrument::opentelemetry::any_value;
-using any_value_t    = net::instrument::opentelemetry::any_value_t;
 using array_value    = net::instrument::opentelemetry::array_value;
 using key_value_list = net::instrument::opentelemetry::key_value_list;
 using key_value      = net::instrument::opentelemetry::key_value;
