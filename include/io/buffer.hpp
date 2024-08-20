@@ -17,11 +17,11 @@ class buffer
     , public writer
 {
 public:
-    result write(std::span<const std::byte> data) override;
-    result read(std::span<std::byte> data) override;
-    int    native_handle() const noexcept override { return -1; }
+    result            write(std::span<const std::byte> data) override;
+    result            read(std::span<std::byte> data) override;
+    [[nodiscard]] int native_handle() const noexcept override { return -1; }
 
-    std::string to_string() const;
+    [[nodiscard]] std::string to_string() const;
 
 private:
     std::vector<std::byte> content;

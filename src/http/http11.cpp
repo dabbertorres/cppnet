@@ -25,10 +25,9 @@
 #include "io/limit_reader.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
+#include "url.hpp"
 #include "util/result.hpp"
 #include "util/string_util.hpp"
-
-#include "url.hpp"
 
 namespace
 {
@@ -90,7 +89,7 @@ task<std::error_condition> parse_status_line(buffered_reader* reader, client_res
 {
     // TODO: max bytes to read
 
-    auto result = readline(reader);
+    auto result = co_await co_readline(reader);
     if (result.has_error()) co_return result.to_error();
 
     auto line = result.to_value();

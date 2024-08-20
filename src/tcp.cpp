@@ -2,11 +2,9 @@
 
 #include <cerrno>
 #include <chrono>
-#include <string>
 #include <string_view>
 
 #include <netdb.h>
-#include <sys/_select.h>
 #include <sys/fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -22,8 +20,6 @@
 
 namespace net
 {
-
-using namespace std::string_literals;
 
 int tcp_socket::open(
     std::string_view host, std::string_view port, protocol proto, bool keepalive, std::chrono::microseconds timeout)

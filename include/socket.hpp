@@ -23,7 +23,7 @@ class socket
     , public io::writer
 {
 public:
-    socket(io::scheduler* scheduler, io::io_handle fd);
+    socket(io::scheduler* scheduler, io::handle fd);
 
     // non-copyable
     socket(const socket&)            = delete;
@@ -50,7 +50,7 @@ public:
     using io::reader::read;
     using io::writer::write;
 
-    [[nodiscard]] io::io_handle native_handle() const noexcept override { return fd; }
+    [[nodiscard]] io::handle native_handle() const noexcept override { return fd; }
 
     void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) const noexcept;
 

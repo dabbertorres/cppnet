@@ -30,8 +30,8 @@ scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shar
 
 scheduler::~scheduler() noexcept { shutdown(); }
 
-void scheduler::register_handle(io_handle handle) { loop.register_handle(handle); }
-void scheduler::deregister_handle(io_handle handle) { loop.deregister_handle(handle); }
+void scheduler::register_handle(handle handle) { loop.register_handle(handle); }
+void scheduler::deregister_handle(handle handle) { loop.deregister_handle(handle); }
 
 bool scheduler::schedule(coro::task<>&& task) noexcept
 {
@@ -55,7 +55,7 @@ bool scheduler::resume(std::coroutine_handle<> handle) noexcept
     return workers->resume(handle);
 }
 
-coro::task<result> scheduler::schedule(io_handle handle, poll_op op, std::chrono::milliseconds timeout)
+coro::task<result> scheduler::schedule(handle handle, poll_op op, std::chrono::milliseconds timeout)
 {
     return loop.queue(handle, op, timeout);
 }
@@ -73,8 +73,7 @@ void scheduler::shutdown() noexcept
         {
             if (t.valid())
             {
-                t.resume();
-                t.destroy();
+                if (!t.resume()) t.destroy();
             }
         }
 

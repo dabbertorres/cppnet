@@ -65,7 +65,7 @@ std::string addr_name(sockaddr_storage* addr)
 namespace net
 {
 
-socket::socket(io::scheduler* scheduler, io::io_handle fd)
+socket::socket(io::scheduler* scheduler, io::handle fd)
     : scheduler{scheduler}
     , fd{fd}
 {

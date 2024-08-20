@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -12,7 +11,7 @@
 namespace net
 {
 
-enum class url_parse_state : std::uint8_t
+enum class url_parse_state
 {
     scheme,
     authority,

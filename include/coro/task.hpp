@@ -13,19 +13,14 @@
 namespace net::coro
 {
 
-namespace detail
-{
-
-    template<typename T>
-    class promise;
-
-}
+template<typename T>
+class promise;
 
 template<typename T = void>
 class [[nodiscard]] task
 {
 public:
-    using promise_type = detail::promise<T>;
+    using promise_type = promise<T>;
     using value_t      = T;
 
     struct awaitable_base
@@ -99,13 +94,13 @@ public:
         return awaitable{handle};
     }
 
-    bool resume() const noexcept
+    [[nodiscard]] bool resume() const noexcept
     {
         if (!handle.done()) handle.resume();
         return !handle.done();
     }
 
-    bool valid() const noexcept { return static_cast<bool>(handle); }
+    [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(handle); }
 
     bool destroy()
     {
@@ -131,11 +126,6 @@ private:
     std::coroutine_handle<promise_type> handle;
 };
 
-}
-
-namespace net::coro::detail
-{
-
 class promise_base
 {
 public:
@@ -158,7 +148,7 @@ private:
         {
             auto& promise = coro.promise();
             if (promise.continuation != nullptr) return promise.continuation;
-            else return std::noop_coroutine();
+            return std::noop_coroutine();
         }
 
         void await_resume() noexcept { /* noop */ }

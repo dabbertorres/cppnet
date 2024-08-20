@@ -111,7 +111,7 @@ epoll_loop::~epoll_loop()
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::register_handle(io_handle handle)
+void epoll_loop::register_handle(handle handle)
 {
     epoll_event event{.events = 0, .data = {nullptr}};
 
@@ -125,7 +125,7 @@ void epoll_loop::register_handle(io_handle handle)
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::deregister_handle(io_handle handle)
+void epoll_loop::deregister_handle(handle handle)
 {
     epoll_event ev{.events = 0, .data = {nullptr}};
 
@@ -140,7 +140,7 @@ void epoll_loop::deregister_handle(io_handle handle)
     // TODO: remove from timeout_list and ready_fds if needed
 }
 
-coro::task<result> epoll_loop::queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout)
+coro::task<result> epoll_loop::queue(handle handle, poll_op op, std::chrono::milliseconds timeout)
 {
     auto r = co_await operation{this, handle, op, timeout};
     co_return r;
@@ -195,6 +195,7 @@ coro::generator<event> epoll_loop::dispatch()
             auto op = timeout_list.top();
             timeout_list.pop();
 
+            // drop already completed coroutines
             if (!op.handle || op.handle.done()) continue;
 
             io::result res = {
@@ -221,15 +222,19 @@ void epoll_loop::shutdown() noexcept
 
 bool epoll_loop::operation::await_ready() const noexcept
 {
-    auto count = roughly_get_socket_buffer_size(handle, op);
+    auto count = roughly_get_socket_buffer_size(fd, op);
     return count > 0;
 }
 
-result epoll_loop::operation::await_resume() noexcept
+result epoll_loop::operation::await_resume()
 {
     auto res = awaiting.promise().result();
+    if (res.err == status_condition::timed_out)
+    {
+        loop->disable_events(fd);
+    }
 
-    auto count = roughly_get_socket_buffer_size(handle, op);
+    auto count = roughly_get_socket_buffer_size(fd, op);
     if (count > 0) res.count = count;
 
     return res;
@@ -238,11 +243,11 @@ result epoll_loop::operation::await_resume() noexcept
 void epoll_loop::operation::await_suspend(std::coroutine_handle<promise> await_on)
 {
     awaiting = await_on;
-    loop->queue(awaiting, handle, op, timeout);
+    loop->queue(awaiting, fd, op, timeout);
 }
 
 void epoll_loop::queue(std::coroutine_handle<promise> awaiting,
-                       io_handle                      handle,
+                       handle                         handle,
                        poll_op                        op,
                        std::chrono::milliseconds      timeout)
 {
@@ -269,6 +274,15 @@ void epoll_loop::queue(std::coroutine_handle<promise> awaiting,
             .timeout_at = timeout_at,
         });
     }
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
+void epoll_loop::disable_events(handle handle)
+{
+    epoll_event ev{.events = 0, .data = {nullptr}};
+
+    auto status = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, handle, &ev);
+    if (status == -1) throw system_error_from_errno(errno);
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const, "not really const")

@@ -1,11 +1,12 @@
 #pragma once
 
+#include <coroutine>
 #include <cstddef>
 #include <span>
 
 #include "coro/task.hpp"
-
 #include "io.hpp"
+#include "io/event.hpp"
 
 namespace net::io
 {
@@ -28,8 +29,19 @@ public:
 
     virtual coro::task<result> co_read(std::span<std::byte> data)
     {
-        // defaults to a synchronous read
-        co_return read(data);
+        // awaitable for defaulting to a synchronous read
+        struct awaitable
+        {
+            [[nodiscard]] constexpr bool await_ready() const noexcept { return true; }
+            [[nodiscard]] result         await_resume() const { return r->read(data); }
+            constexpr void await_suspend(std::coroutine_handle<promise> await_on) const noexcept { /* noop */ }
+
+            reader*              r;
+            std::span<std::byte> data;
+        };
+
+        auto r = co_await awaitable{this, data};
+        co_return r;
     }
 
     inline coro::task<result> co_read(std::span<char> data) { return co_read(std::as_writable_bytes(data)); }

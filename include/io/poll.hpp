@@ -2,9 +2,6 @@
 
 #include <cstdint>
 
-#include "coro/task.hpp"
-#include "io/io.hpp"
-
 namespace net::io
 {
 
@@ -29,9 +26,5 @@ enum class poll_status
     error,
     closed,
 };
-
-using promise = coro::detail::promise<io::result>;
-
-using namespace std::chrono_literals;
 
 }

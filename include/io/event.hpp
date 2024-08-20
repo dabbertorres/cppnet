@@ -2,16 +2,18 @@
 
 #include <coroutine>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
-#include "io/poll.hpp"
 
-namespace net::io::detail
+namespace net::io
 {
+
+using promise = coro::promise<result>;
 
 struct event
 {
     std::coroutine_handle<promise> handle;
-    io::result                     result;
+    struct result                  result;
 };
 
 }

@@ -56,10 +56,10 @@ concept EventLoop = std::is_default_constructible_v<T>
     && !std::is_move_constructible_v<T>
     && !std::is_move_assignable_v<T>
     && std::is_destructible_v<T>
-    && requires(T* t, io_handle handle, poll_op op, std::chrono::milliseconds timeout)
+    && requires(T* t, handle handle, poll_op op, std::chrono::milliseconds timeout)
     {
         { t->queue(handle, op, timeout) } -> std::same_as<coro::task<result>>;
-        { t->dispatch() } -> std::same_as<coro::generator<detail::event>>;
+        { t->dispatch() } -> std::same_as<coro::generator<event>>;
         { t->shutdown() } -> std::same_as<void>;
         { t->register_handle(handle) } -> std::same_as<void>;
         { t->deregister_handle(handle) } -> std::same_as<void>;
@@ -67,7 +67,5 @@ concept EventLoop = std::is_default_constructible_v<T>
 // clang-format on
 
 static_assert(EventLoop<detail::event_loop>);
-
-using event_loop = detail::event_loop;
 
 }

@@ -8,12 +8,12 @@ namespace net::io
 {
 
 // TODO: Linux vs OSX vs Windows, etc
-using io_handle = int;
+using handle = int;
 
 struct result
 {
     std::size_t          count{};
-    std::error_condition err{};
+    std::error_condition err;
 };
 
 enum class status_condition

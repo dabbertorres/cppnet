@@ -35,11 +35,11 @@ public:
 
     ~scheduler() noexcept;
 
-    void register_handle(io_handle handle);
-    void deregister_handle(io_handle handle);
+    void register_handle(handle handle);
+    void deregister_handle(handle handle);
 
     bool               schedule(coro::task<>&& task) noexcept;
-    coro::task<result> schedule(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    coro::task<result> schedule(handle handle, poll_op op, std::chrono::milliseconds timeout);
     bool               resume(std::coroutine_handle<> handle) noexcept;
 
     void shutdown() noexcept;
@@ -48,7 +48,7 @@ private:
     void run();
 
     std::shared_ptr<coro::thread_pool> workers;
-    event_loop                         loop;
+    detail::event_loop                 loop;
     std::deque<coro::task<>>           tasks;
     std::mutex                         tasks_mu;
     std::atomic<bool>                  running;

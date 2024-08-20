@@ -38,11 +38,10 @@ public:
 
     ~epoll_loop();
 
-    // TODO: expose these on the scheduler
-    void register_handle(io_handle handle);
-    void deregister_handle(io_handle handle);
+    void register_handle(handle handle);
+    void deregister_handle(handle handle);
 
-    coro::task<result>                   queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    coro::task<result>                   queue(handle handle, poll_op op, std::chrono::milliseconds timeout);
     [[nodiscard]] coro::generator<event> dispatch();
 
     void shutdown() noexcept;
@@ -54,21 +53,21 @@ private:
     {
         friend class epoll_loop;
 
-        explicit operation(epoll_loop* loop, io_handle handle, poll_op op, std::chrono::milliseconds timeout) noexcept
+        explicit operation(epoll_loop* loop, handle handle, poll_op op, std::chrono::milliseconds timeout) noexcept
             : loop{loop}
-            , handle{handle}
+            , fd{handle}
             , op{op}
             , timeout{timeout}
         {}
 
     public:
         [[nodiscard]] bool await_ready() const noexcept;
-        result             await_resume() noexcept;
+        result             await_resume();
         void               await_suspend(std::coroutine_handle<promise> await_on);
 
     private:
         epoll_loop*                    loop;
-        io_handle                      handle;
+        handle                         fd;
         poll_op                        op;
         std::chrono::milliseconds      timeout;
         std::coroutine_handle<promise> awaiting{nullptr};
@@ -87,8 +86,8 @@ private:
         }
     };
 
-    void
-    queue(std::coroutine_handle<promise> awaiting, io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    void queue(std::coroutine_handle<promise> awaiting, handle handle, poll_op op, std::chrono::milliseconds timeout);
+    void disable_events(handle handle);
     void update_timer(std::chrono::milliseconds timeout);
 
     int epoll_fd;

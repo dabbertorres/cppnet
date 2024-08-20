@@ -108,7 +108,7 @@ struct NET_PACKED priority_frame
 
 struct NET_PACKED rst_stream_frame
 {
-    error_code error_code;
+    enum error_code error_code;
 };
 
 // From: https://httpwg.org/specs/rfc9113.html#SettingValues
@@ -150,9 +150,9 @@ struct NET_PACKED ping_frame
 
 struct NET_PACKED goaway_frame
 {
-    std::uint32_t _              : 1;
-    std::uint32_t last_stream_id : 31;
-    error_code    error_code;
+    std::uint32_t   _              : 1;
+    std::uint32_t   last_stream_id : 31;
+    enum error_code error_code;
     // additional debug data
 };
 
