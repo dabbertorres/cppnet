@@ -11,4 +11,7 @@ RUN pacman -Syu --noconfirm --noprogressbar \
         unzip \
         tar \
         man-db \
-        man-pages
+        man-pages \
+        fd \
+        ripgrep \
+        gdb
