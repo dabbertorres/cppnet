@@ -45,7 +45,7 @@ int main()
                    resp.headers().set("X-Msg"sv, "Hello"sv).set("Content-Type"sv, "text/plain"sv);
                    constexpr auto msg = "hello world\r\n"sv;
 
-                   auto body = co_await resp.send(http::status::OK, msg.length());
+                   auto* body = co_await resp.send(http::status::OK, msg.length());
                    co_await body->co_write(msg);
                });
 
