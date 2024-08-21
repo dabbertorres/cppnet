@@ -46,7 +46,7 @@ constexpr bool is_set(std::chrono::milliseconds v) noexcept { return v > decltyp
 namespace net::io::detail
 {
 
-kqueue_loop::kqueue_loop(std::shared_ptr<spdlog::logger> logger)
+kqueue_loop::kqueue_loop(const std::shared_ptr<spdlog::logger>& logger)
     : running{true}
     , descriptor{kqueue()}
     , timeout_id{1}
@@ -66,15 +66,15 @@ kqueue_loop::~kqueue_loop()
     }
 }
 
-coro::task<result> kqueue_loop::queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout)
+coro::task<result> kqueue_loop::queue(handle fd, poll_op op, std::chrono::milliseconds timeout)
 {
-    auto r = co_await operation{this, handle, op, timeout};
+    auto r = co_await operation{this, fd, op, timeout};
     co_return r;
 }
 
 coro::generator<event> kqueue_loop::dispatch() const
 {
-    std::array<struct kevent, 16> events;
+    std::array<struct kevent, 16> events{};
 
     if (descriptor == -1) co_return;
 
@@ -158,28 +158,32 @@ coro::generator<event> kqueue_loop::dispatch() const
     }
 }
 
-void kqueue_loop::shutdown() noexcept { running.store(false, std::memory_order::release); }
+void kqueue_loop::shutdown() noexcept
+{
+    // TODO: send shutdown signal to wake up kevent() in dispatch()
+    running.store(false, std::memory_order::release);
+}
 
 void kqueue_loop::operation::await_suspend(std::coroutine_handle<promise> await_on) noexcept
 {
     awaiting = await_on;
-    loop->queue(awaiting, handle, op, timeout);
+    loop->queue(awaiting, fd, op, timeout);
 }
 
 result kqueue_loop::operation::await_resume() noexcept { return awaiting.promise().result(); }
 
 void kqueue_loop::queue(std::coroutine_handle<promise> awaiting,
-                        io_handle                      handle,
+                        handle                         fd,
                         poll_op                        op,
                         std::chrono::milliseconds      timeout)
 {
     // we may be adding/updating up to three events (read, write, timeout)
-    std::array<struct kevent, 3> new_events;
+    std::array<struct kevent, 3> new_events{};
 
     auto num_new_events = 0u;
 
-    if (is_readable(op)) new_events[num_new_events++] = make_io_kevent(awaiting, handle, EVFILT_READ);
-    if (is_writable(op)) new_events[num_new_events++] = make_io_kevent(awaiting, handle, EVFILT_WRITE);
+    if (is_readable(op)) new_events[num_new_events++] = make_io_kevent(awaiting, fd, EVFILT_READ);
+    if (is_writable(op)) new_events[num_new_events++] = make_io_kevent(awaiting, fd, EVFILT_WRITE);
     if (is_set(timeout)) new_events[num_new_events++] = make_timeout_kevent(awaiting, timeout);
 
     if (descriptor == -1) return;
@@ -188,7 +192,7 @@ void kqueue_loop::queue(std::coroutine_handle<promise> awaiting,
                   awaiting.address(),
                   num_new_events,
                   std::to_underlying(op),
-                  handle);
+                  fd);
 
     auto res = kevent(descriptor, new_events.data(), static_cast<int>(num_new_events), nullptr, 0, nullptr);
     if (res == -1)
@@ -206,10 +210,10 @@ void kqueue_loop::queue(std::coroutine_handle<promise> awaiting,
 }
 
 struct kevent
-kqueue_loop::make_io_kevent(std::coroutine_handle<promise> awaiting, io_handle handle, int16_t filter) const noexcept
+kqueue_loop::make_io_kevent(std::coroutine_handle<promise> awaiting, handle fd, int16_t filter) const noexcept
 {
     return {
-        .ident  = static_cast<uintptr_t>(handle),
+        .ident  = static_cast<uintptr_t>(fd),
         .filter = filter,
         .flags  = EV_ADD | EV_DISPATCH | EV_ONESHOT | EV_CLEAR | EV_EOF,
         .fflags = 0,

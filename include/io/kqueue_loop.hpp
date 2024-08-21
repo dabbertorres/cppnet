@@ -33,7 +33,7 @@ using namespace std::chrono_literals;
 class kqueue_loop
 {
 public:
-    kqueue_loop(std::shared_ptr<spdlog::logger> logger = spdlog::null_logger_mt("kqueue_loop"));
+    kqueue_loop(const std::shared_ptr<spdlog::logger>& logger = spdlog::null_logger_mt("kqueue_loop"));
 
     kqueue_loop(const kqueue_loop&)            = delete;
     kqueue_loop& operator=(const kqueue_loop&) = delete;
@@ -43,10 +43,10 @@ public:
 
     ~kqueue_loop();
 
-    void register_handle(io_handle handle) { /* noop - for now? */ }
-    void deregister_handle(io_handle handle) { /* noop - for now? */ }
+    void register_handle(handle fd) { /* noop - for now? */ }
+    void deregister_handle(handle fd) { /* noop - for now? */ }
 
-    coro::task<result> queue(io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    coro::task<result> queue(handle fd, poll_op op, std::chrono::milliseconds timeout);
 
     coro::generator<event> dispatch() const;
 
@@ -59,9 +59,9 @@ private:
     {
         friend class kqueue_loop;
 
-        explicit operation(kqueue_loop* loop, io_handle handle, poll_op op, std::chrono::milliseconds timeout) noexcept
+        explicit operation(kqueue_loop* loop, handle fd, poll_op op, std::chrono::milliseconds timeout) noexcept
             : loop{loop}
-            , handle{handle}
+            , fd{fd}
             , op{op}
             , timeout{timeout}
         {}
@@ -69,11 +69,11 @@ private:
     public:
         constexpr bool await_ready() noexcept { return false; }
         result         await_resume() noexcept;
-        void           await_suspend(std::coroutine_handle<promise> handle) noexcept;
+        void           await_suspend(std::coroutine_handle<promise> await_on) noexcept;
 
     private:
         kqueue_loop*                   loop;
-        io_handle                      handle;
+        handle                         fd;
         poll_op                        op;
         std::chrono::milliseconds      timeout;
         std::coroutine_handle<promise> awaiting{nullptr};
@@ -81,11 +81,10 @@ private:
 
     friend class operation;
 
-    void
-    queue(std::coroutine_handle<promise> awaiting, io_handle handle, poll_op op, std::chrono::milliseconds timeout);
+    void queue(std::coroutine_handle<promise> awaiting, handle fd, poll_op op, std::chrono::milliseconds timeout);
 
     struct kevent
-    make_io_kevent(std::coroutine_handle<promise> awaiting, io_handle handle, std::int16_t filter) const noexcept;
+    make_io_kevent(std::coroutine_handle<promise> awaiting, handle fd, std::int16_t filter) const noexcept;
     struct kevent make_timeout_kevent(std::coroutine_handle<promise> awaiting,
                                       std::chrono::milliseconds      timeout) noexcept;
 
