@@ -20,6 +20,18 @@
       }
     },
     {
+      "name": "dev-make",
+      "displayName": "Dev Config w/ Make",
+      "description": "Build with tests and example using Make",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "BUILD_EXAMPLE": "ON",
+        "CMAKE_MAKE_PROGRAM": "make"
+      }
+    },
+    {
       "name": "lib",
       "displayName": "Build Library",
       "description": "Build just the library",
