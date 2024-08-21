@@ -99,10 +99,13 @@ listener::listener(io::scheduler*            scheduler,
         break;
     }
 
+    auto last_err = errno;
+
     ::freeaddrinfo(servinfo);
 
-    if (main_fd == invalid_fd) throw exception{"failed to bind a socket matching options"};
-    // TODO report the reasons why we couldn't bind a socket?
+    if (main_fd == invalid_fd) throw system_error_from_errno(last_err, "failed to bind a socket matching options");
+
+    scheduler->register_handle(main_fd);
 }
 
 listener::listener(listener&& other) noexcept
@@ -168,6 +171,8 @@ void listener::shutdown() noexcept
     if (is_listening.exchange(false, std::memory_order::acq_rel) && main_fd != invalid_fd)
     {
         ::close(main_fd);
+        scheduler->deregister_handle(main_fd);
+        main_fd = invalid_fd;
     }
 }
 
