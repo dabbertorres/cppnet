@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "cppnet",
   "version-semver": "0.1.0",
-  "builtin-baseline": "9d47b24eacbd1cd94f139457ef6cd35e5d92cc84",
+  "builtin-baseline": "bb002e69deb36c00e9ce21810f69eff349a833f7",
   "dependencies": [
     {
       "name": "catch2",
