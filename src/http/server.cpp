@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "exception.hpp"
 #include "http/http11.hpp"
 #include "http/http2.hpp"
 #include "http/request.hpp"
@@ -19,8 +20,6 @@
 #include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
-
-#include "exception.hpp"
 #include "ip_addr.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
@@ -169,7 +168,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             }
 
             logger->trace("flushing writer");
-            co_await writer->co_flush();
+            co_await writer->flush();
             logger->trace("response sent");
         }
     }

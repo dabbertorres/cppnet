@@ -19,15 +19,7 @@ buffered_writer::buffered_writer(writer* underlying, std::size_t bufsize)
     buf.resize(0);
 }
 
-result buffered_writer::write(std::span<const std::byte> data)
-{
-    auto task = co_write(data);
-    while (task.valid() && !task.is_ready()) task.resume();
-
-    return task.operator co_await().await_resume();
-}
-
-coro::task<result> buffered_writer::co_write(std::span<const std::byte> data)
+coro::task<result> buffered_writer::write(std::span<const std::byte> data)
 {
     if (data.empty()) co_return result{.count = 0};
 
@@ -53,7 +45,7 @@ coro::task<result> buffered_writer::co_write(std::span<const std::byte> data)
     // At this point, the buffer is full, and we have more to write, so flush it.
     if (buf.size() == buf.capacity())
     {
-        auto res = flush_available();
+        auto res = co_await flush_available();
         if (res.err) co_return res;
     }
 
@@ -61,7 +53,7 @@ coro::task<result> buffered_writer::co_write(std::span<const std::byte> data)
 
     while (data.size() - total > buf.capacity())
     {
-        auto res = co_await impl->co_write(data.subspan(total, buf.capacity()));
+        auto res = co_await impl->write(data.subspan(total, buf.capacity()));
         if (res.err) co_return result{.count = total + res.count, .err = res.err};
 
         total += res.count;
@@ -83,21 +75,13 @@ coro::task<result> buffered_writer::co_write(std::span<const std::byte> data)
 
 int buffered_writer::native_handle() const noexcept { return impl->native_handle(); }
 
-result buffered_writer::flush()
-{
-    auto task = co_flush();
-    while (task.valid() && !task.is_ready()) task.resume();
-
-    return task.operator co_await().await_resume();
-}
-
-coro::task<result> buffered_writer::co_flush()
+coro::task<result> buffered_writer::flush()
 {
     std::size_t total = 0;
 
     while (total < buf.size())
     {
-        auto res = co_await impl->co_write(std::span{buf}.subspan(total));
+        auto res = co_await impl->write(std::span{buf}.subspan(total));
         if (res.err) co_return result{.count = total + res.count, .err = res.err};
 
         total += res.count;
@@ -120,9 +104,9 @@ void buffered_writer::reset(writer* other)
 // reset clears the buffer.
 void buffered_writer::reset() { buf.resize(0); }
 
-result buffered_writer::flush_available()
+coro::task<result> buffered_writer::flush_available()
 {
-    auto res = impl->write(std::span{buf});
+    auto res = co_await impl->write(std::span{buf});
     if (res.count < buf.size())
     {
         // if short, adjust
@@ -141,7 +125,7 @@ result buffered_writer::flush_available()
         buf.resize(0);
     }
 
-    return res;
+    co_return res;
 }
 
 }

@@ -3,9 +3,9 @@
 #include <atomic>
 #include <chrono>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
-
 #include "metric.hpp"
 #include "tracker.hpp"
 
@@ -70,7 +70,7 @@ struct gauge : public base_metric<gauge>
 private:
     friend struct base_metric<gauge>;
 
-    io::result encode_value(io::writer& out) const;
+    coro::task<io::result> encode_value(io::writer& out) const;
 
     std::atomic<double> value = 0.0;
 };

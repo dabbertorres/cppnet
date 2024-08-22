@@ -1,13 +1,17 @@
 #pragma once
 
-#include <coroutine>
+#include <cctype>
+#include <concepts>
 #include <cstddef>
+#include <initializer_list>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "coro/generator.hpp"
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
 
@@ -182,7 +186,8 @@ template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string<CharT, Traits>,
          typename View   = std::basic_string_view<CharT, Traits>>
-io::result replace_all_to(io::writer& out, View view, std::initializer_list<std::pair<View, View>> replacements)
+coro::task<io::result>
+replace_all_to(io::writer& out, View view, std::initializer_list<std::pair<View, View>> replacements)
 {
     std::size_t total = 0;
 
@@ -193,9 +198,9 @@ io::result replace_all_to(io::writer& out, View view, std::initializer_list<std:
         {
             if (view.starts_with(replace))
             {
-                auto res = out.write(with_this);
+                auto res = co_await out.write(with_this);
                 total += res.count;
-                if (res.err) return {.count = total, .err = res.err};
+                if (res.err) co_return {.count = total, .err = res.err};
 
                 view     = view.substr(replace.length());
                 replaced = true;
@@ -205,15 +210,15 @@ io::result replace_all_to(io::writer& out, View view, std::initializer_list<std:
 
         if (!replaced)
         {
-            auto res = out.write(view.front());
+            auto res = co_await out.write(view.front());
             total += res.count;
-            if (res.err) return {.count = total, .err = res.err};
+            if (res.err) co_return {.count = total, .err = res.err};
 
             view = view.substr(1);
         }
     }
 
-    return {.count = total};
+    co_return {.count = total};
 }
 
 template<typename CharT  = char,

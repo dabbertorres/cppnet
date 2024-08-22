@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 
+#include "coro/task.hpp"
+#include "io/io.hpp"
 #include "io/writer.hpp"
-
 #include "metric.hpp"
 
 namespace net::instrument::prometheus
@@ -42,7 +44,7 @@ struct counter : public base_metric<counter>
 private:
     friend struct base_metric<counter>;
 
-    io::result encode_value(io::writer& out) const;
+    coro::task<io::result> encode_value(io::writer& out) const;
 
     std::atomic<double> value = 0.0;
 };

@@ -15,17 +15,17 @@ TEST_CASE("partial reading", "[io][string_reader]")
 
     std::string buf(3, 0);
 
-    auto res = reader.read(buf);
+    auto res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
     REQUIRE(buf == "foo"sv);
 
-    res = reader.read(buf);
+    res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
     REQUIRE(buf == "bar"sv);
 
-    res = reader.read(buf);
+    res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
     REQUIRE(buf == "bar"sv); // ensure it doesn't write anything at all
@@ -37,7 +37,7 @@ TEST_CASE("0-length read", "[io][string_reader]")
 
     std::string buf;
 
-    auto res = reader.read(buf);
+    auto res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
     REQUIRE(buf == ""sv);
@@ -49,12 +49,12 @@ TEST_CASE("full-length read", "[io][string_reader]")
 
     std::string buf(6, 0);
 
-    auto res = reader.read(buf);
+    auto res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 6);
     REQUIRE(buf == "foobar"sv);
 
-    res = reader.read(buf);
+    res = reader.read(buf).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
     REQUIRE(buf == "foobar"sv); // ensure it doesn't write anything at all

@@ -120,25 +120,24 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-io::result socket::read(std::span<std::byte> data) noexcept
+// TODO: timeout
+coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
     std::size_t received = 0;
-    std::size_t attempts = 0;
 
-    while (true)
+    while (received < data.size())
     {
-        const std::int64_t num = ::recv(fd, data.data() + received, data.size() - received, 0);
+        auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
+        if (res.err && res.count == 0) co_return res;
+
+        auto read_amount = std::min(res.count, data.size() - received);
+
+        const std::int64_t num = ::recv(fd, data.data() + received, read_amount, 0);
         if (num < 0)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                ++attempts;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
 
-                if (attempts < 5) continue;
-                return {.count = received};
-            }
-
-            return {
+            co_return {
                 .count = received,
                 .err   = std::error_condition{errno, std::system_category()}
             };
@@ -147,7 +146,7 @@ io::result socket::read(std::span<std::byte> data) noexcept
         // client closed connection
         if (num == 0)
         {
-            return {
+            co_return {
                 .count = received,
                 .err   = make_error_condition(io::status_condition::closed),
             };
@@ -157,45 +156,10 @@ io::result socket::read(std::span<std::byte> data) noexcept
         break;
     }
 
-    return {.count = received};
+    co_return {.count = received};
 }
 
-coro::task<net::io::result> socket::co_read(std::span<std::byte> data) noexcept
-{
-    auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
-    if (res.err && res.count == 0) co_return res;
-
-    auto read_amount = std::min(res.count, data.size());
-
-    res = read(data.subspan(0, read_amount));
-    co_return res;
-}
-
-io::result socket::write(std::span<const std::byte> data) noexcept
-{
-    std::size_t sent = 0;
-    while (sent < data.size())
-    {
-        const std::int64_t num = ::send(fd, data.data() + sent, data.size() - sent, 0);
-        if (num < 0)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            return {
-                .count = sent,
-                .err   = std::error_condition{errno, std::system_category()}
-            };
-        }
-
-        // client closed connection
-        if (num == 0) return {.count = sent, .err = make_error_condition(io::status_condition::closed)};
-
-        sent += static_cast<std::size_t>(num);
-    }
-
-    return {.count = sent};
-}
-
-coro::task<io::result> socket::co_write(std::span<const std::byte> data) noexcept
+coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 {
     std::size_t total_written = 0;
 
@@ -205,10 +169,28 @@ coro::task<io::result> socket::co_write(std::span<const std::byte> data) noexcep
         if (res.err && res.count == 0) co_return res;
 
         auto write_amount = std::min(res.count, data.size() - total_written);
-        res               = write(data.subspan(total_written, write_amount));
-        if (res.err) co_return res;
 
-        total_written += res.count;
+        const std::int64_t num = ::send(fd, data.data() + total_written, write_amount, 0);
+        if (num < 0)
+        {
+            auto err = errno;
+            if (err == EAGAIN || err == EWOULDBLOCK) continue;
+            co_return {
+                .count = total_written,
+                .err   = std::make_error_condition(static_cast<std::errc>(err)),
+            };
+        }
+
+        // client closed connection
+        if (num == 0)
+        {
+            co_return {
+                .count = total_written,
+                .err   = make_error_condition(io::status_condition::closed),
+            };
+        }
+
+        total_written += static_cast<std::size_t>(num);
     }
 
     co_return {.count = total_written};
@@ -220,7 +202,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const n
 
     if (graceful)
     {
-        linger linger = {
+        struct linger linger = {
             .l_onoff  = 1,
             .l_linger = static_cast<int>(graceful_timeout.count()),
         };

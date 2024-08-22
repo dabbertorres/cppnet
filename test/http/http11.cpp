@@ -14,10 +14,9 @@
 #include "http/request.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/string_reader.hpp"
-#include "util/string_util.hpp"
-
 #include "string_makers.hpp"
 #include "url.hpp"
+#include "util/string_util.hpp"
 
 using namespace std::string_view_literals;
 
@@ -108,7 +107,8 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body);
+    auto read_task   = request.body->read(body);
+    auto read_result = std::move(read_task).operator co_await().await_resume();
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 18);
 
@@ -159,7 +159,8 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
 
     std::string body(64, 0);
 
-    auto read_result = request.body->read(body);
+    auto read_task   = request.body->read(body);
+    auto read_result = std::move(read_task).operator co_await().await_resume();
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 38);
 

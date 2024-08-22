@@ -16,7 +16,7 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
     net::io::string_writer<char> builder;
     net::io::buffered_writer     writer{&builder, 4};
 
-    auto res = writer.write("foo"sv);
+    auto res = writer.write("foo"sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
@@ -24,7 +24,7 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
     auto out = builder.build();
     REQUIRE(out.empty());
 
-    res = writer.write("bar"sv);
+    res = writer.write("bar"sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
@@ -33,7 +33,7 @@ TEST_CASE("buffer fills up and flushes", "[io][buffered_writer]")
     REQUIRE(out == "foob");
 
     // flush it all
-    writer.flush();
+    writer.flush().operator co_await().await_resume();
     out = builder.build();
     REQUIRE(out == "foobar");
 }
@@ -45,11 +45,11 @@ TEST_CASE("0-length write", "[io][buffered_writer]")
     net::io::string_writer<char> builder;
     net::io::buffered_writer     writer{&builder, 4};
 
-    auto res = writer.write(""sv);
+    auto res = writer.write(""sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
 
-    writer.flush();
+    writer.flush().operator co_await().await_resume();
     auto out = builder.build();
     REQUIRE(out.empty());
 }

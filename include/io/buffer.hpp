@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
@@ -17,9 +18,9 @@ class buffer
     , public writer
 {
 public:
-    result            write(std::span<const std::byte> data) override;
-    result            read(std::span<std::byte> data) override;
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    coro::task<result> write(std::span<const std::byte> data) override;
+    coro::task<result> read(std::span<std::byte> data) override;
+    [[nodiscard]] int  native_handle() const noexcept override { return -1; }
 
     [[nodiscard]] std::string to_string() const;
 

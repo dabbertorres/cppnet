@@ -8,7 +8,6 @@
 #include <vector>
 
 #include "coro/task.hpp"
-
 #include "io.hpp"
 #include "reader.hpp"
 
@@ -20,11 +19,8 @@ class buffered_reader : public reader
 public:
     buffered_reader(reader* impl, std::size_t bufsize = 1'024);
 
-    result read(std::span<std::byte> data) override;
+    coro::task<result> read(std::span<std::byte> data) override;
 
-    coro::task<result> co_read(std::span<std::byte> data) override;
-
-    using reader::co_read;
     using reader::read;
 
     struct read_until_result
@@ -39,8 +35,8 @@ public:
     // If the buffer fills up before delim is found, then the partial data is returned,
     // and is_prefix will be true.
     // If an error occurs while reading to look for delim, err is set.
-    read_until_result read_until(std::span<const std::byte> delim) noexcept;
-    read_until_result read_until(std::string_view delim) noexcept
+    coro::task<read_until_result> read_until(std::span<const std::byte> delim) noexcept;
+    coro::task<read_until_result> read_until(std::string_view delim) noexcept
     {
         return read_until(std::as_bytes(std::span{delim.begin(), delim.end()}));
     }
@@ -48,8 +44,7 @@ public:
     // peek sets next to the next byte and returns true, if available.
     //
     // If no next byte is available, next is not modified, and false is returned.
-    [[nodiscard]] std::tuple<std::byte, bool> peek();
-    coro::task<std::tuple<std::byte, bool>>   co_peek();
+    [[nodiscard]] coro::task<std::tuple<std::byte, bool>> peek();
 
     [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
     [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }

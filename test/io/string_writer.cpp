@@ -13,15 +13,15 @@ TEST_CASE("build a string", "[io][string_writer]")
 {
     net::io::string_writer<char> writer;
 
-    auto res = writer.write("foo"sv);
+    auto res = writer.write("foo"sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
-    res = writer.write("bar"sv);
+    res = writer.write("bar"sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
-    res = writer.write("xyzzy"sv);
+    res = writer.write("xyzzy"sv).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 5);
 

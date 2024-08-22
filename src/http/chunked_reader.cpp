@@ -6,12 +6,13 @@
 #include <span>
 #include <system_error>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 
 namespace net::http::http11
 {
 
-io::result chunked_reader::read(std::span<std::byte> data)
+coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
 {
     // TODO: Return the ACTUAL number of bytes read (chunk lengths, "\r\n" sequences, etc),
     //       or just the bytes read INTO data?
@@ -24,14 +25,14 @@ io::result chunked_reader::read(std::span<std::byte> data)
         // new chunk
         if (current_chunk_size == 0)
         {
-            auto res = get_next_chunk_size();
-            if (res.err) return {.count = bytes_read, .err = res.err};
+            auto res = co_await get_next_chunk_size();
+            if (res.err) co_return {.count = bytes_read, .err = res.err};
 
             // final chunk is size 0
             if (current_chunk_size == 0)
             {
-                res = validate_end_of_chunk();
-                if (res.err) return {.count = bytes_read, .err = res.err};
+                res = co_await validate_end_of_chunk();
+                if (res.err) co_return {.count = bytes_read, .err = res.err};
 
                 break;
             }
@@ -39,31 +40,31 @@ io::result chunked_reader::read(std::span<std::byte> data)
 
         // plain read of current chunk
         auto amount_to_read = std::min(data.size() - bytes_read, current_chunk_size);
-        auto res            = parent->read(data.subspan(bytes_read, amount_to_read));
+        auto res            = co_await parent->read(data.subspan(bytes_read, amount_to_read));
         current_chunk_size -= res.count;
         bytes_read += res.count;
-        if (res.err) return {.count = bytes_read, .err = res.err};
+        if (res.err) co_return {.count = bytes_read, .err = res.err};
 
         // end of chunk
         if (current_chunk_size == 0)
         {
-            res = validate_end_of_chunk();
-            if (res.err) return {.count = bytes_read, .err = res.err};
+            res = co_await validate_end_of_chunk();
+            if (res.err) co_return {.count = bytes_read, .err = res.err};
         }
     }
 
-    return {.count = bytes_read};
+    co_return {.count = bytes_read};
 }
 
-io::result chunked_reader::get_next_chunk_size()
+coro::task<io::result> chunked_reader::get_next_chunk_size()
 {
     current_chunk_size = 0;
 
     while (true)
     {
         char next = 0;
-        auto res  = parent->read(next);
-        if (res.err) return res;
+        auto res  = co_await parent->read(next);
+        if (res.err) co_return res;
 
         if ('0' <= next && next <= '9')
         {
@@ -73,37 +74,37 @@ io::result chunked_reader::get_next_chunk_size()
         else if (next == '\r')
         {
             // end of size - next byte should be a '\n'
-            res = parent->read(next);
-            if (res.err) return res;
+            res = co_await parent->read(next);
+            if (res.err) co_return res;
 
             // done
             if (next == '\n') break;
 
             // nope, invalid
-            return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
+            co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
         }
         else
         {
-            return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
+            co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
         }
     }
 
-    return {};
+    co_return {};
 }
 
-io::result chunked_reader::validate_end_of_chunk()
+coro::task<io::result> chunked_reader::validate_end_of_chunk()
 {
     std::array<char, 2> end_of_chunk{};
 
-    auto res = parent->read(std::span{end_of_chunk});
-    if (res.err) return res;
+    auto res = co_await parent->read(std::span{end_of_chunk});
+    if (res.err) co_return res;
 
     if (end_of_chunk[0] != '\r' && end_of_chunk[1] != '\n')
     {
-        return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
+        co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
     }
 
-    return {.count = 2};
+    co_return {.count = 2};
 }
 
 }

@@ -1,11 +1,11 @@
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <utility>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
@@ -24,16 +24,7 @@ public:
         , limit{limit}
     {}
 
-    result read(std::span<std::byte> data) override
-    {
-        if (progress >= limit) return {};
-
-        const std::size_t read_amount = std::min(data.size(), limit - progress);
-
-        auto res = parent->read(data.subspan(0, read_amount));
-        progress += res.count;
-        return res;
-    }
+    coro::task<result> read(std::span<std::byte> data) override;
 
     using reader::read;
 

@@ -15,11 +15,10 @@
 #include <vector>
 
 #include <spdlog/logger.h>
+#include <spdlog/sinks/null_sink.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
-
-#include <spdlog/sinks/null_sink.h>
 
 namespace net::coro
 {
@@ -50,8 +49,9 @@ public:
         std::coroutine_handle<> awaiting{nullptr};
     };
 
-    thread_pool(std::size_t                     concurrency = hardware_concurrency(),
-                std::shared_ptr<spdlog::logger> logger = spdlog::create<spdlog::sinks::null_sink_mt>("thread_pool"));
+    thread_pool(
+        std::size_t                            concurrency = hardware_concurrency(),
+        const std::shared_ptr<spdlog::logger>& logger = spdlog::create<spdlog::sinks::null_sink_mt>("thread_pool"));
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;

@@ -14,10 +14,10 @@
 #include <vector>
 #include <version>
 
+#include "coro/task.hpp"
+#include "instrument/prometheus/metric.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
-
-#include "instrument/prometheus/metric.hpp"
 
 namespace net::instrument::prometheus
 {
@@ -118,7 +118,7 @@ void histogram::observe(double v) noexcept
     }
 }
 
-io::result histogram::encode_self(io::writer& out) const
+coro::task<io::result> histogram::encode_self(io::writer& out) const
 {
     // NOTE: not including timestamp in output - appears to not usually be included in histogram output
 
@@ -126,7 +126,7 @@ io::result histogram::encode_self(io::writer& out) const
         out,
         [this](io::writer& out) { return encode_help(out); },
         [this](io::writer& out) { return encode_type(out); },
-        [this](io::writer& out) -> io::result
+        [this](io::writer& out) -> coro::task<io::result>
         {
 #ifndef __cpp_lib_atomic_ref
             // don't allow updates while encoding
@@ -137,7 +137,7 @@ io::result histogram::encode_self(io::writer& out) const
 
             for (std::size_t i = 0; i < buckets.size(); ++i)
             {
-                auto res = io::write_all(
+                auto res = co_await io::write_all(
                     out,
                     name,
                     "_bucket{"sv,
@@ -160,10 +160,10 @@ io::result histogram::encode_self(io::writer& out) const
                     },
                     '\n');
                 total += res.count;
-                if (res.err) return {.count = total, .err = res.err};
+                if (res.err) co_return {.count = total, .err = res.err};
             }
 
-            return {.count = total};
+            co_return {.count = total};
         },
         name,
         "_sum"sv,

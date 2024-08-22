@@ -8,10 +8,10 @@
 #include <vector>
 #include <version>
 
+#include "buckets.hpp"
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
-
-#include "buckets.hpp"
 #include "metric.hpp"
 #include "tracker.hpp"
 
@@ -45,8 +45,8 @@ struct histogram : public base_metric<histogram>
 private:
     friend struct base_metric<histogram>;
 
-    io::result encode_self(io::writer& out) const;
-    void       on_derive(histogram& child);
+    coro::task<io::result> encode_self(io::writer& out) const;
+    void                   on_derive(histogram& child);
 
     std::vector<double>       buckets;
     std::vector<std::size_t>  bucket_values;

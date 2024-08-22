@@ -14,16 +14,15 @@
 #include <variant>
 #include <vector>
 
+#include "coro/task.hpp"
+#include "counter.hpp"
+#include "gauge.hpp"
+#include "histogram.hpp"
+#include "instrument/prometheus/metric.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
 #include "util/hash.hpp"
 #include "util/string_map.hpp"
-
-#include "counter.hpp"
-#include "gauge.hpp"
-#include "histogram.hpp"
-
-#include "instrument/prometheus/metric.hpp"
 
 namespace std
 {
@@ -85,7 +84,7 @@ public:
             .transform([](metric_ref val) -> std::reference_wrapper<T> { return std::ref(std::get<T>(val.get())); });
     }
 
-    static io::result record(io::writer& writer);
+    static coro::task<io::result> record(io::writer& writer);
 
 private:
     using metric_ref       = std::reference_wrapper<metric>;
@@ -102,7 +101,7 @@ private:
 
     metric_ref                register_metric(std::string_view name, const metric_labels& labels, metric&& m);
     std::optional<metric_ref> get_metric(std::string_view name, const metric_labels& labels);
-    io::result                record_all(io::writer& out) const;
+    coro::task<io::result>    record_all(io::writer& out) const;
 
     std::shared_mutex  mutex;
     std::deque<metric> metrics;

@@ -7,6 +7,7 @@
 #include <span>
 #include <string_view>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 
 // calculates the maximum decimal value that would fit in size digits.
@@ -31,7 +32,7 @@ namespace net::http::http11
 
 using namespace std::string_view_literals;
 
-io::result chunked_writer::write(std::span<const std::byte> data)
+coro::task<io::result> chunked_writer::write(std::span<const std::byte> data)
 {
     std::array<char, 8>   chunk_size_buf{};
     constexpr std::size_t max_chunk_size = max_decimal_for_length_digits(chunk_size_buf.size());
@@ -46,22 +47,22 @@ io::result chunked_writer::write(std::span<const std::byte> data)
         auto [ptr, ec] = std::to_chars(chunk_size_buf.begin(), chunk_size_buf.end(), amount_to_write);
 
         auto end = static_cast<std::size_t>(ptr - chunk_size_buf.begin());
-        auto res = parent->write(std::span{chunk_size_buf.data(), end});
-        if (res.err) return {.count = amount_written, .err = res.err};
+        auto res = co_await parent->write(std::span{chunk_size_buf.data(), end});
+        if (res.err) co_return {.count = amount_written, .err = res.err};
 
-        res = parent->write("\r\n"sv);
-        if (res.err) return {.count = amount_written, .err = res.err};
+        res = co_await parent->write("\r\n"sv);
+        if (res.err) co_return {.count = amount_written, .err = res.err};
 
-        res = parent->write(data.subspan(amount_written, amount_to_write));
+        res = co_await parent->write(data.subspan(amount_written, amount_to_write));
         amount_written += res.count;
-        if (res.err) return {.count = amount_written, .err = res.err};
+        if (res.err) co_return {.count = amount_written, .err = res.err};
 
         // end of chunk
-        res = parent->write("\r\n"sv);
-        if (res.err) return {.count = amount_written, .err = res.err};
+        res = co_await parent->write("\r\n"sv);
+        if (res.err) co_return {.count = amount_written, .err = res.err};
     }
 
-    return {.count = amount_written};
+    co_return {.count = amount_written};
 }
 
 }

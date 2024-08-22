@@ -22,20 +22,20 @@ net::coro::task<> serve_connection(net::tcp_socket socket)
 {
     spdlog::info("serving new connection from {} on {}", socket.local_addr(), socket.remote_addr());
 
-    std::array<std::byte, 1024> buf;
+    std::array<std::byte, 1024> buf{};
 
-    do {
+    while (socket.valid())
+    {
         spdlog::info("reading from socket {}", socket.remote_addr());
 
-        auto res = co_await socket.co_read(buf);
+        auto res = co_await socket.read(buf);
         if (res.err) co_return;
 
         spdlog::info("writing to socket {}", socket.remote_addr());
 
-        res = co_await socket.co_write(std::span{buf}.subspan(0, res.count));
+        res = co_await socket.write(std::span{buf}.subspan(0, res.count));
         if (res.err) co_return;
     }
-    while (socket.valid());
 }
 
 net::coro::task<> run_echo_server(net::io::scheduler& scheduler, net::listener& listener, std::atomic<bool>& run)

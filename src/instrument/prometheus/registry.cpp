@@ -1,12 +1,22 @@
 #include "instrument/prometheus/registry.hpp"
 
+#include <cstddef>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string_view>
-#include <type_traits>
+#include <utility>
 #include <variant>
 
+#include "coro/task.hpp"
+#include "instrument/prometheus/counter.hpp"
+#include "instrument/prometheus/gauge.hpp"
+#include "instrument/prometheus/histogram.hpp"
+#include "instrument/prometheus/metric.hpp"
+#include "io/io.hpp"
+#include "io/writer.hpp"
 #include "util/overloaded.hpp"
 
 namespace net::instrument::prometheus
@@ -17,7 +27,7 @@ std::unique_ptr<registry> registry::instance;
 std::once_flag            registry::initialized;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
-io::result registry::record(io::writer& writer)
+coro::task<io::result> registry::record(io::writer& writer)
 {
     auto* r = get();
 
@@ -55,13 +65,13 @@ std::optional<registry::metric_ref> registry::get_metric(std::string_view name, 
     return std::nullopt;
 }
 
-io::result registry::record_all(io::writer& out) const
+coro::task<io::result> registry::record_all(io::writer& out) const
 {
     std::size_t total = 0;
 
     for (const auto& m : metrics)
     {
-        auto res = std::visit(
+        auto res = co_await std::visit(
             util::overloaded{
                 [&](const counter& counter) { return counter.encode(out); },
                 [&](const gauge& gauge) { return gauge.encode(out); },
@@ -71,10 +81,10 @@ io::result registry::record_all(io::writer& out) const
 
         total += res.count;
 
-        if (res.err) return {.count = total, .err = res.err};
+        if (res.err) co_return {.count = total, .err = res.err};
     }
 
-    return {.count = total};
+    co_return {.count = total};
 }
 
 }

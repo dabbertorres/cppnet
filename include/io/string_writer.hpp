@@ -6,6 +6,7 @@
 #include <span>
 #include <string>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
 
@@ -18,16 +19,16 @@ class string_writer : public writer
 public:
     using string = std::basic_string<CharT, Traits, Allocator>;
 
-    result write(std::span<const CharT> data)
+    coro::task<result> write(std::span<const CharT> data)
     {
         parts.emplace_back(data.data(), data.size());
-        return {.count = data.size()};
+        co_return {.count = data.size()};
     }
 
-    result write(std::span<const std::byte> data) override
+    coro::task<result> write(std::span<const std::byte> data) override
     {
         parts.emplace_back(reinterpret_cast<const CharT*>(data.data()), data.size() / sizeof(CharT));
-        return {.count = data.size()};
+        co_return {.count = data.size()};
     }
 
     void write(CharT c)

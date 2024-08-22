@@ -84,12 +84,6 @@ void scheduler::shutdown() noexcept
 
 void scheduler::run()
 {
-    const auto size = [this] noexcept
-    {
-        std::lock_guard lock{tasks_mu};
-        return tasks.size();
-    };
-
     while (running.load(std::memory_order::acquire))
     {
         for (auto [handle, result] : loop.dispatch())

@@ -5,12 +5,13 @@
 #include <span>
 #include <string>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 
 namespace net::io
 {
 
-result buffer::write(std::span<const std::byte> data)
+coro::task<result> buffer::write(std::span<const std::byte> data)
 {
     if (content.size() - write_at < data.size())
     {
@@ -18,10 +19,10 @@ result buffer::write(std::span<const std::byte> data)
     }
 
     std::copy(data.begin(), data.end(), &content[write_at]);
-    return {.count = data.size()};
+    co_return {.count = data.size()};
 }
 
-result buffer::read(std::span<std::byte> data)
+coro::task<result> buffer::read(std::span<std::byte> data)
 {
     auto read_amount = std::min(data.size(), content.size() - read_at);
     std::copy_n(&content[read_at], read_amount, data.begin());
@@ -30,7 +31,7 @@ result buffer::read(std::span<std::byte> data)
     result r{.count = read_amount};
     if (read_at >= content.size()) r.err = io::status_condition::closed; // TODO: should be EOF
 
-    return r;
+    co_return r;
 }
 
 std::string buffer::to_string() const

@@ -39,13 +39,8 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
-    io::result read(std::span<std::byte> data) noexcept override;
-
-    coro::task<io::result> co_read(std::span<std::byte> data) noexcept override;
-
-    io::result write(std::span<const std::byte> data) noexcept override;
-
-    coro::task<io::result> co_write(std::span<const std::byte> data) noexcept override;
+    coro::task<io::result> read(std::span<std::byte> data) noexcept override;
+    coro::task<io::result> write(std::span<const std::byte> data) noexcept override;
 
     using io::reader::read;
     using io::writer::write;

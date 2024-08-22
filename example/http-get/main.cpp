@@ -1,14 +1,17 @@
 #include <array>
-#include <exception>
+#include <condition_variable>
 #include <expected>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <system_error>
 
+#include <spdlog/common.h>
 #include <spdlog/spdlog.h>
 
+#include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
 #include "http/request.hpp"
@@ -17,6 +20,9 @@
 #include "url.hpp"
 
 namespace http = net::http;
+
+net::coro::task<>
+run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success);
 
 int main(int argc, char** argv)
 {
@@ -28,6 +34,8 @@ int main(int argc, char** argv)
         std::cerr << "Must provide a single url to GET.\n";
         return 1;
     }
+
+    spdlog::set_level(spdlog::level::trace);
 
     auto parse_result = net::url::parse(argv[1]);
     if (parse_result.has_error())
@@ -54,8 +62,7 @@ int main(int argc, char** argv)
               << "port: " << url.port << '\n'
               << "path: " << url.path << '\n';
 
-    auto workers =
-        std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1), spdlog::default_logger());
+    auto workers = std::make_shared<net::coro::thread_pool>(1, spdlog::default_logger());
 
     net::io::scheduler scheduler{workers, spdlog::default_logger()};
     http::client       client{&scheduler};
@@ -73,22 +80,31 @@ int main(int argc, char** argv)
     };
 
     std::cout << "sending request...\n";
-    std::expected<net::http::client_response, std::error_condition> get_result;
 
-    try
-    {
-        get_result = client.send(req).operator co_await().await_resume();
-    }
-    catch (const std::exception& ex)
-    {
-        std::cerr << "Error sending request: " << ex.what() << "\n";
-        return 1;
-    }
+    std::mutex              is_done_mu;
+    std::condition_variable is_done_cv;
+    bool                    success = false;
 
+    scheduler.schedule(run_request(client, req, is_done_cv, success));
+
+    std::cout << "waiting for response...\n";
+    std::unique_lock lock{is_done_mu};
+    is_done_cv.wait(lock);
+
+    std::cout << "done\n";
+
+    return success ? 0 : 1;
+}
+
+net::coro::task<>
+run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success)
+{
+    auto get_result = co_await client.send(req);
     if (!get_result.has_value())
     {
         std::cerr << "Error sending request: " << get_result.error().message() << "\n";
-        return 1;
+        is_done.notify_one();
+        co_return;
     }
 
     auto& resp = get_result.value();
@@ -113,27 +129,20 @@ int main(int argc, char** argv)
 
         std::array<char, 512> buf{};
 
-        while (true)
+        auto res = co_await resp.body->read(buf);
+        if (res.err)
         {
-            auto res = resp.body->read(buf);
-            if (res.count != 0)
-            {
-                std::cout << std::string_view{std::span{buf}.subspan(0, res.count)};
-            }
-            else
-            {
-                break;
-            }
-
-            if (res.err)
-            {
-                std::cerr << "error reading body: " << res.err.message() << '\n';
-                return 1;
-            }
+            std::cerr << "error reading body: " << res.err.message() << '\n';
+            is_done.notify_one();
+            co_return;
         }
 
-        std::cout << '\n';
+        if (res.count != 0)
+        {
+            std::cout << std::string_view{std::span{buf}.subspan(0, res.count)} << '\n';
+        }
     }
 
-    return 0;
+    success = true;
+    is_done.notify_one();
 }

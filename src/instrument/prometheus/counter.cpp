@@ -1,8 +1,13 @@
 #include "instrument/prometheus/counter.hpp"
 
 #include <atomic>
+#include <memory>
 #include <string>
+#include <utility>
 
+#include "coro/task.hpp"
+#include "instrument/prometheus/metric.hpp"
+#include "io/io.hpp"
 #include "io/writer.hpp"
 
 namespace net::instrument::prometheus
@@ -40,7 +45,7 @@ double counter::operator+=(double v) noexcept { return increment(v); }
 double counter::operator++() noexcept { return increment(1); }
 double counter::operator++(int) noexcept { return increment(1) - 1; }
 
-io::result counter::encode_value(io::writer& out) const
+coro::task<io::result> counter::encode_value(io::writer& out) const
 {
     auto val = value.load(std::memory_order_acquire);
     return out.write(std::to_string(val));

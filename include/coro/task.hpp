@@ -72,7 +72,7 @@ public:
         if (handle != nullptr) handle.destroy();
     }
 
-    operator task<>() const&& noexcept { return {std::move(handle)}; }
+    operator task<>() const&& noexcept { return task{std::move(handle)}; }
 
     auto operator co_await() const& noexcept
     {

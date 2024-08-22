@@ -89,7 +89,7 @@ task<std::error_condition> parse_status_line(buffered_reader* reader, client_res
 {
     // TODO: max bytes to read
 
-    auto result = co_await co_readline(reader);
+    auto result = co_await readline(reader);
     if (result.has_error()) co_return result.to_error();
 
     auto line = result.to_value();
@@ -119,7 +119,7 @@ task<std::error_condition> parse_request_line(buffered_reader* reader, server_re
 {
     // TODO: max bytes to read
 
-    auto result = co_await co_readline(reader);
+    auto result = co_await readline(reader);
     if (result.has_error()) co_return result.to_error();
 
     auto line = result.to_value();
@@ -160,7 +160,7 @@ task<std::error_condition> parse_headers(buffered_reader* reader, std::size_t ma
 
     while (amount_read < max_read)
     {
-        auto maybe_line = co_await co_readline(reader);
+        auto maybe_line = co_await readline(reader);
         if (!maybe_line.has_value()) co_return maybe_line.to_error();
 
         auto next_line = maybe_line.to_value();
@@ -195,28 +195,28 @@ task<std::error_condition> write_headers(net::io::writer& writer, const headers&
 {
     for (const auto& header : headers)
     {
-        auto res = co_await writer.co_write(header.first);
+        auto res = co_await writer.write(header.first);
         if (res.err) co_return res.err;
 
-        res = co_await writer.co_write(": "sv);
+        res = co_await writer.write(": "sv);
         if (res.err) co_return res.err;
 
         if (!header.second.empty())
         {
-            res = co_await writer.co_write(header.second.front());
+            res = co_await writer.write(header.second.front());
             if (res.err) co_return res.err;
 
             for (const auto& value : std::ranges::drop_view(header.second, 1))
             {
-                res = co_await writer.co_write(", "sv);
+                res = co_await writer.write(", "sv);
                 if (res.err) co_return res.err;
 
-                res = co_await writer.co_write(value);
+                res = co_await writer.write(value);
                 if (res.err) co_return res.err;
             }
         }
 
-        res = co_await writer.co_write("\r\n"sv);
+        res = co_await writer.write("\r\n"sv);
         if (res.err) co_return res.err;
     }
 
@@ -235,17 +235,17 @@ task<result<io::writer*, std::error_condition>> request_encode(io::writer* write
 {
     using result_t = result<io::writer*, std::error_condition>;
 
-    auto res = co_await writer->co_write(method_string(req.method));
+    auto res = co_await writer->write(method_string(req.method));
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write(' ');
+    res = co_await writer->write(' ');
     if (res.err) co_return result_t{res.err};
 
     // TODO: don't build the uri before writing it
-    res = co_await writer->co_write(req.uri.build());
+    res = co_await writer->write(req.uri.build());
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write(" HTTP/"sv);
+    res = co_await writer->write(" HTTP/"sv);
     if (res.err) co_return result_t{res.err};
 
     auto major_version = req.version.major;
@@ -263,16 +263,16 @@ task<result<io::writer*, std::error_condition>> request_encode(io::writer* write
         ' ',
     };
 
-    res = co_await writer->co_write(version_buf);
+    res = co_await writer->write(version_buf);
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write("\r\n"sv);
+    res = co_await writer->write("\r\n"sv);
     if (res.err) co_return result_t{res.err};
 
     res.err = co_await write_headers(*writer, req.headers);
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write("\r\n"sv);
+    res = co_await writer->write("\r\n"sv);
     if (res.err) co_return result_t{res.err};
 
     // TODO: copy req.body to writer
@@ -285,7 +285,7 @@ task<result<io::writer*, std::error_condition>> response_encode(io::writer*     
 {
     using result_t = result<io::writer*, std::error_condition>;
 
-    auto res = co_await writer->co_write("HTTP/"sv);
+    auto res = co_await writer->write("HTTP/"sv);
     if (res.err) co_return result_t{res.err};
 
     std::array<char, 4> version_buf{
@@ -295,19 +295,19 @@ task<result<io::writer*, std::error_condition>> response_encode(io::writer*     
         ' ',
     };
 
-    res = co_await writer->co_write(version_buf);
+    res = co_await writer->write(version_buf);
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write(status_text(resp.status_code));
+    res = co_await writer->write(status_text(resp.status_code));
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write("\r\n"sv);
+    res = co_await writer->write("\r\n"sv);
     if (res.err) co_return result_t{res.err};
 
     res.err = co_await write_headers(*writer, resp.headers);
     if (res.err) co_return result_t{res.err};
 
-    res = co_await writer->co_write("\r\n"sv);
+    res = co_await writer->write("\r\n"sv);
     if (res.err) co_return result_t{res.err};
 
     co_return result_t{writer};

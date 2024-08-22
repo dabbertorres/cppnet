@@ -46,7 +46,7 @@ int main()
                    constexpr auto msg = "hello world\r\n"sv;
 
                    auto* body = co_await resp.send(http::status::OK, msg.length());
-                   co_await body->co_write(msg);
+                   co_await body->write(msg);
                });
 
     sigset_t sig_set;
@@ -77,7 +77,7 @@ int main()
     scheduler.shutdown();
 
     net::io::buffer buf;
-    request_times.encode(buf);
+    scheduler.schedule(request_times.encode(buf));
 
     std::cout << buf.to_string() << '\n';
 

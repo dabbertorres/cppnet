@@ -5,7 +5,6 @@
 #include <vector>
 
 #include "coro/task.hpp"
-
 #include "io.hpp"
 #include "writer.hpp"
 
@@ -17,16 +16,13 @@ class buffered_writer : public writer
 public:
     buffered_writer(writer* underlying, std::size_t bufsize = 1'024);
 
-    result write(std::span<const std::byte> data) override;
-
-    coro::task<result> co_write(std::span<const std::byte> data) override;
+    coro::task<result> write(std::span<const std::byte> data) override;
 
     using writer::write;
 
     [[nodiscard]] int native_handle() const noexcept override;
 
-    result             flush();
-    coro::task<result> co_flush();
+    coro::task<result> flush();
 
     [[nodiscard]] std::size_t capacity() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
@@ -42,7 +38,7 @@ public:
     void reset();
 
 private:
-    result flush_available();
+    coro::task<result> flush_available();
 
     writer*                impl;
     std::vector<std::byte> buf;

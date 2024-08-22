@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
 #include "util/hash.hpp"
@@ -145,7 +146,7 @@ struct base_metric
         last_update.store(seconds, std::memory_order_relaxed);
     }
 
-    io::result encode(io::writer& out) const
+    coro::task<io::result> encode(io::writer& out) const
     {
         if constexpr (self_encoder<T>)
         {
@@ -165,49 +166,54 @@ struct base_metric
                 [this](io::writer& out) { return encode_timestamp(out); },
                 '\n');
         }
+        else
+        {
+            std::unreachable();
+        }
     }
 
 protected:
-    io::result encode_help(io::writer& out) const
+    coro::task<io::result> encode_help(io::writer& out) const
     {
         if (!help.empty())
         {
-            return io::write_all(out, "# HELP "sv, name, ' ', help, '\n');
+            co_return co_await io::write_all(out, "# HELP "sv, name, ' ', help, '\n');
         }
 
-        return {};
+        co_return {.count = 0};
     }
 
-    io::result encode_type(io::writer& out) const
+    coro::task<io::result> encode_type(io::writer& out) const
     {
         return io::write_all(out, "# TYPE "sv, name, ' ', metric_type_string(T::type()), '\n');
     }
 
-    io::result encode_labels(io::writer& out) const
+    coro::task<io::result> encode_labels(io::writer& out) const
     {
         if (!labels.empty())
         {
-            return io::write_all(out, '{', [this](io::writer& out) { return encode_all_labels(out); }, '}');
+            co_return co_await io::write_all(out, '{', [this](io::writer& out) { return encode_all_labels(out); }, '}');
         }
 
-        return {};
+        co_return {.count = 0};
     }
 
-    io::result encode_all_labels(io::writer& out) const
+    coro::task<io::result> encode_all_labels(io::writer& out) const
     {
         std::size_t total = 0;
 
         for (const auto& [label_name, label_value] : labels)
         {
-            auto res = encode_one_label(out, label_name, label_value);
+            auto res = co_await encode_one_label(out, label_name, label_value);
             total += res.count;
-            if (res.err) return {.count = total, .err = res.err};
+            if (res.err) co_return {.count = total, .err = res.err};
         }
 
-        return {.count = total};
+        co_return {.count = total};
     }
 
-    io::result encode_one_label(io::writer& out, std::string_view label_name, std::string_view label_value) const
+    coro::task<io::result>
+    encode_one_label(io::writer& out, std::string_view label_name, std::string_view label_value) const
     {
         return io::write_all(
             out,
@@ -226,10 +232,10 @@ protected:
             R"(",)"sv);
     }
 
-    io::result encode_timestamp(io::writer& out) const
+    coro::task<io::result> encode_timestamp(io::writer& out) const
     {
         auto ts = last_update.load(std::memory_order_acquire);
-        return out.write(std::to_string(ts.count()));
+        co_return out.write(std::to_string(ts.count()));
     }
 
     std::atomic<std::chrono::seconds> last_update;

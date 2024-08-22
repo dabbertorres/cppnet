@@ -30,7 +30,7 @@ TEST_CASE("histogram encodes without help nor labels", "[instrument][prometheus]
     h.observe(100);
 
     string_writer<char> writer;
-    auto                res = h.encode(writer);
+    auto                res = h.encode(writer).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
 
     auto out = writer.build();
@@ -72,7 +72,7 @@ TEST_CASE("histogram encodes with help", "[instrument][prometheus][histogram][en
     h.observe(100);
 
     string_writer<char> writer;
-    auto                res = h.encode(writer);
+    auto                res = h.encode(writer).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
 
     auto out = writer.build();
@@ -119,7 +119,7 @@ TEST_CASE("histogram encodes with labels", "[instrument][prometheus][histogram][
     h.observe(100);
 
     string_writer<char> writer;
-    auto                res = h.encode(writer);
+    auto                res = h.encode(writer).operator co_await().await_resume();
     REQUIRE_FALSE(res.err);
 
     auto out = writer.build();

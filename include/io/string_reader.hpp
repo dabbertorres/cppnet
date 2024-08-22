@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
@@ -22,24 +23,24 @@ public:
         : view{std::as_bytes(std::span{view})}
     {}
 
-    result read(std::span<CharT> data)
+    coro::task<result> read(std::span<CharT> data)
     {
-        auto [count, err] = read(std::as_writable_bytes(data));
-        return {
+        auto [count, err] = co_await read(std::as_writable_bytes(data));
+        co_return {
             .count = count / sizeof(CharT),
             .err   = err,
         };
     }
 
-    result read(std::span<std::byte> data) override
+    coro::task<result> read(std::span<std::byte> data) override
     {
-        if (idx == view.size()) return {.count = 0};
+        if (idx == view.size()) co_return {.count = 0};
 
         auto amount = std::min(view.size() - idx, data.size());
         auto start  = view.begin() + idx;
         std::copy_n(start, amount, data.begin());
         idx += amount;
-        return {.count = amount};
+        co_return {.count = amount};
     }
 
     [[nodiscard]] int native_handle() const noexcept override { return 0; }

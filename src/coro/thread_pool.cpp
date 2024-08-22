@@ -27,7 +27,7 @@ void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexc
     pool->schedule(awaiting);
 }
 
-thread_pool::thread_pool(std::size_t concurrency, std::shared_ptr<spdlog::logger> logger)
+thread_pool::thread_pool(std::size_t concurrency, const std::shared_ptr<spdlog::logger>& logger)
     : running(true)
     , logger{logger->clone("thread_pool")}
 {

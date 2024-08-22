@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <span>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
 
@@ -14,7 +15,7 @@ public:
         : parent{writer}
     {}
 
-    io::result write(std::span<const std::byte> data) override;
+    coro::task<io::result> write(std::span<const std::byte> data) override;
 
     using io::writer::write;
 

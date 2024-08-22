@@ -1,3 +1,5 @@
+#include <string>
+
 #include <catch2/catch_tostring.hpp>
 
 #include "http/headers.hpp"
