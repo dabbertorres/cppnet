@@ -1,4 +1,4 @@
-#include "config.hpp" // IWYU pragma: keep
+#include "config.hpp"
 
 #ifdef NET_HAS_KQUEUE
 
@@ -19,7 +19,7 @@
 #    include <memory>
 #    include <string>
 #    include <system_error>
-#    include <utility>
+#    include <tuple>
 
 #    include <sys/event.h>
 #    include <sys/types.h>
@@ -41,6 +41,15 @@ namespace
 
 constexpr bool is_set(std::chrono::milliseconds v) noexcept { return v > decltype(v)::zero(); }
 
+std::string get_errno_msg(int err)
+{
+    std::string errbuf(256, 0);
+    int         length = ::strerror_r(err, errbuf.data(), errbuf.length());
+    errbuf.resize(static_cast<std::size_t>(length));
+
+    return errbuf;
+}
+
 }
 
 namespace net::io::detail
@@ -53,9 +62,23 @@ kqueue_loop::kqueue_loop(const std::shared_ptr<spdlog::logger>& logger)
     , logger{logger->clone("kqueue_loop")}
 {
     if (descriptor == -1) throw system_error_from_errno(errno, "failed to create kqueue");
+
+    // also listen for shutdown signal
+
+    struct kevent shutdown_event = {
+        .ident  = shutdown_ident,
+        .filter = EVFILT_USER,
+        .flags  = EV_ADD | EV_DISPATCH | EV_ONESHOT | EV_CLEAR,
+        .fflags = 0,
+        .data   = 0,
+        .udata  = nullptr,
+    };
+
+    auto res = kevent(descriptor, &shutdown_event, 1, nullptr, 0, nullptr);
+    if (res == -1) throw system_error_from_errno(errno, "failed to register for user shutdown event");
 }
 
-kqueue_loop::~kqueue_loop()
+kqueue_loop::~kqueue_loop() noexcept
 {
     shutdown();
 
@@ -72,18 +95,18 @@ coro::task<result> kqueue_loop::queue(handle fd, poll_op op, std::chrono::millis
     co_return r;
 }
 
-coro::generator<event> kqueue_loop::dispatch() const
+coro::generator<event> kqueue_loop::dispatch()
 {
     std::array<struct kevent, 16> events{};
 
-    if (descriptor == -1) co_return;
+    if (descriptor == -1 || !running.load(std::memory_order::acquire)) co_return;
 
     /*struct timespec timeout*/
     /*{*/
     /*    .tv_sec = 0, .tv_nsec = 1000000*/
     /*};*/
 
-    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr); //&timeout);
+    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
     if (num_events == -1)
     {
         auto err = errno;
@@ -94,74 +117,115 @@ coro::generator<event> kqueue_loop::dispatch() const
         /*    co_return;*/
         /*}*/
 
-        std::string errbuf(256, 0);
-        int         length = ::strerror_r(err, errbuf.data(), errbuf.length());
-        errbuf.resize(static_cast<std::size_t>(length));
+        auto msg = get_errno_msg(err);
 
         // TODO: throw/return an error?
-        logger->error("error reading new events: {} ({})", errbuf, err);
+        logger->error("error reading new events: {} ({})", msg, err);
         co_return;
     }
 
     // if we got no events and we're supposed to shutdown, we're done
     if (num_events == 0 && !running.load(std::memory_order::acquire)) co_return;
 
+    bool notify_shutdown = false;
+
     for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
     {
-        auto& ev     = events[i];
-        auto  handle = std::coroutine_handle<promise>::from_address(ev.udata);
-
-        logger->trace("[c {}]: got event for {}: {} of size {}", handle.address(), ev.ident, ev.filter, ev.data);
-
-        // don't try to invoke coroutines that have already finished.
-        if (handle.done())
+        auto& kev = events[i];
+        if (kev.filter == EVFILT_USER)
         {
-            logger->trace("[c {}]: coroutine for {} {} event already finished", handle.address(), ev.ident, ev.filter);
-            break;
-        }
-
-        result res = {
-            .count = static_cast<std::size_t>(ev.data),
-            .err   = {},
-        };
-
-        if ((ev.flags & EV_ERROR) != 0)
-        {
-            res.err = std::make_error_condition(static_cast<std::errc>(ev.data));
-        }
-        else
-        {
-            switch (ev.filter)
+            switch (kev.ident)
             {
-            case EVFILT_TIMER: res.err = make_error_condition(status_condition::timed_out); break;
-
-            case EVFILT_READ: [[fallthrough]];
-            case EVFILT_WRITE:
-                if ((ev.flags & EV_EOF) != 0)
-                {
-                    // Did it shutdown due to an error? Or did the socket just close?
-                    res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
-                                             : make_error_condition(status_condition::closed);
-                }
-
+            case shutdown_ident:
+                // shutdown signal - process any other events (if any) before returning.
+                notify_shutdown = true;
                 break;
 
-            default:
-                logger->warn("[c {}]: unexpected event type {} for {}", handle.address(), ev.filter, ev.ident);
-                break;
+            default: logger->warn("unexpected ident for EVFILT_USER: {}", kev.ident); break;
             }
+
+            continue;
         }
 
-        logger->trace("[c {}]: yielding event for {}; error = '{}'", handle.address(), ev.ident, res.err.message());
-
-        co_yield event{handle, res};
+        auto [ev, ok] = translate_kevent(kev);
+        if (ok)
+        {
+            co_yield ev;
+        }
     }
+
+    if (notify_shutdown)
+    {
+        running.store(false, std::memory_order::release);
+        running.notify_one();
+    }
+}
+
+std::tuple<event, bool> kqueue_loop::translate_kevent(const struct kevent& ev) const noexcept
+{
+    auto handle = std::coroutine_handle<promise>::from_address(ev.udata);
+
+    // don't try to invoke coroutines that have already finished.
+    if (handle.done()) return {{}, false};
+
+    result res;
+
+    if ((ev.flags & EV_ERROR) != 0)
+    {
+        res.err = std::make_error_condition(static_cast<std::errc>(ev.data));
+    }
+    else
+    {
+        res.count = static_cast<std::size_t>(ev.data);
+
+        switch (ev.filter)
+        {
+        case EVFILT_TIMER: res.err = make_error_condition(status_condition::timed_out); break;
+
+        case EVFILT_READ: [[fallthrough]];
+        case EVFILT_WRITE:
+            if ((ev.flags & EV_EOF) != 0)
+            {
+                // Did it shutdown due to an error? Or did the socket just close?
+                res.err = ev.fflags != 0 ? std::make_error_condition(static_cast<std::errc>(ev.fflags))
+                                         : make_error_condition(status_condition::closed);
+            }
+
+            break;
+
+        default: logger->warn("[c {}]: unexpected event type {} for {}", handle.address(), ev.filter, ev.ident); break;
+        }
+    }
+
+    return {
+        {handle, res},
+        true
+    };
 }
 
 void kqueue_loop::shutdown() noexcept
 {
-    // TODO: send shutdown signal to wake up kevent() in dispatch()
-    running.store(false, std::memory_order::release);
+    if (!running.load(std::memory_order::acquire)) return;
+
+    struct kevent trigger_shutdown = {
+        .ident  = shutdown_ident,
+        .filter = EVFILT_USER,
+        .flags  = 0,
+        .fflags = NOTE_TRIGGER,
+        .data   = 0,
+        .udata  = nullptr,
+    };
+
+    auto res = kevent(descriptor, &trigger_shutdown, 1, nullptr, 0, nullptr);
+    if (res == -1)
+    {
+        auto err = errno;
+        logger->error("error triggering shutdown event: {}: {}", err, get_errno_msg(err));
+        running.store(false, std::memory_order::release);
+        return;
+    }
+
+    running.wait(true, std::memory_order::acquire);
 }
 
 void kqueue_loop::operation::await_suspend(std::coroutine_handle<promise> await_on) noexcept
@@ -188,23 +252,14 @@ void kqueue_loop::queue(std::coroutine_handle<promise> awaiting,
 
     if (descriptor == -1) return;
 
-    logger->trace("[c {}]: queuing {} events for op {} on {}",
-                  awaiting.address(),
-                  num_new_events,
-                  std::to_underlying(op),
-                  fd);
-
     auto res = kevent(descriptor, new_events.data(), static_cast<int>(num_new_events), nullptr, 0, nullptr);
     if (res == -1)
     {
         auto err = errno;
-
-        std::string errbuf(256, 0);
-        int         length = ::strerror_r(err, errbuf.data(), errbuf.length());
-        errbuf.resize(static_cast<std::size_t>(length));
+        auto msg = get_errno_msg(err);
 
         // TODO: throw/return an error?
-        logger->error("[c {}]: error queueing {} new events: {} ({})", awaiting.address(), num_new_events, errbuf, err);
+        logger->error("[c {}]: error queueing {} new events: {} ({})", awaiting.address(), num_new_events, msg, err);
         return;
     }
 }

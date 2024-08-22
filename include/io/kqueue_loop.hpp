@@ -1,5 +1,7 @@
 #pragma once
 
+#include <tuple>
+
 #include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
@@ -41,19 +43,23 @@ public:
     kqueue_loop(kqueue_loop&&) noexcept            = delete;
     kqueue_loop& operator=(kqueue_loop&&) noexcept = delete;
 
-    ~kqueue_loop();
+    ~kqueue_loop() noexcept;
 
     void register_handle(handle fd) { /* noop - for now? */ }
     void deregister_handle(handle fd) { /* noop - for now? */ }
 
     coro::task<result> queue(handle fd, poll_op op, std::chrono::milliseconds timeout);
 
-    coro::generator<event> dispatch() const;
+    coro::generator<event> dispatch();
 
     void shutdown() noexcept;
 
 private:
     using clock = std::chrono::high_resolution_clock;
+
+    // It is left as an excercise to the reader to determine if this value has any special meaning.
+    // (Hint: it doesn't really)
+    static constexpr uintptr_t shutdown_ident = 0x6578'6974;
 
     class operation
     {
@@ -80,6 +86,8 @@ private:
     };
 
     friend class operation;
+
+    std::tuple<event, bool> translate_kevent(const struct kevent& ev) const noexcept;
 
     void queue(std::coroutine_handle<promise> awaiting, handle fd, poll_op op, std::chrono::milliseconds timeout);
 

@@ -3,14 +3,9 @@
 #include <atomic>
 #include <coroutine>
 #include <cstddef>
-#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
-
-#include <spdlog/logger.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/spdlog.h>
 
 namespace net::coro
 {
@@ -27,9 +22,8 @@ void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexc
     pool->schedule(awaiting);
 }
 
-thread_pool::thread_pool(std::size_t concurrency, const std::shared_ptr<spdlog::logger>& logger)
+thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
-    , logger{logger->clone("thread_pool")}
 {
     if (concurrency == 0) concurrency = 4;
 
@@ -63,13 +57,11 @@ void thread_pool::shutdown() noexcept
 {
     if (running.exchange(false, std::memory_order::acq_rel))
     {
-        logger->trace("shutting down - notifying workers...");
         wait.notify_all();
 
         int i = 0;
         for (auto& thread : threads)
         {
-            logger->trace("shutting down - waiting on worker {}...", i);
             if (thread.joinable()) thread.join();
             ++i;
         }
@@ -102,10 +94,8 @@ void thread_pool::worker()
         jobs.pop_front();
         lock.unlock();
 
-        logger->trace("[c {}]: executing", handle.address());
         handle.resume();
         num_jobs.fetch_sub(1, std::memory_order::release);
-        logger->trace("[c {}]: done executing; done = {}", handle.address(), handle.done());
     }
 
     while (num_jobs.load(std::memory_order::acquire) > 0)

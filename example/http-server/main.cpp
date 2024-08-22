@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include <spdlog/common.h>
@@ -54,7 +55,7 @@ int main()
     sigaddset(&sig_set, SIGINT);
     sigaddset(&sig_set, SIGTERM);
 
-    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1), logger);
+    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1));
 
     net::io::scheduler scheduler{workers, logger};
 
@@ -62,6 +63,8 @@ int main()
 
     config.logger->info("starting...");
     scheduler.schedule(server.serve());
+
+    auto run_thread = std::thread{[&] { scheduler.run(); }};
 
     int sig;
     int ret = sigwait(&sig_set, &sig);
@@ -74,12 +77,15 @@ int main()
     config.logger->info("exiting...");
 
     server.close();
-    scheduler.shutdown();
 
     net::io::buffer buf;
     scheduler.schedule(request_times.encode(buf));
 
     std::cout << buf.to_string() << '\n';
+
+    scheduler.shutdown();
+
+    if (run_thread.joinable()) run_thread.join();
 
     return 0;
 }

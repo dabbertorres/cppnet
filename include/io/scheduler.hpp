@@ -6,7 +6,6 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
 
 #include <spdlog/logger.h>
 #include <spdlog/sinks/null_sink.h>
@@ -42,18 +41,15 @@ public:
     coro::task<result> schedule(handle handle, poll_op op, std::chrono::milliseconds timeout);
     bool               resume(std::coroutine_handle<> handle) noexcept;
 
+    void run();
     void shutdown() noexcept;
 
 private:
-    void run();
-
     std::shared_ptr<coro::thread_pool> workers;
     detail::event_loop                 loop;
     std::deque<coro::task<>>           tasks;
     std::mutex                         tasks_mu;
     std::atomic<bool>                  running;
-    std::shared_ptr<spdlog::logger>    logger;
-    std::thread                        run_worker;
 };
 
 }

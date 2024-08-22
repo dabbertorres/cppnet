@@ -8,8 +8,6 @@
 #include <utility>
 #include <variant>
 
-#include <spdlog/spdlog.h>
-
 namespace net::coro
 {
 

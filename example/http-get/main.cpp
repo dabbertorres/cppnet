@@ -7,6 +7,7 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
@@ -35,8 +36,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    spdlog::set_level(spdlog::level::trace);
-
     auto parse_result = net::url::parse(argv[1]);
     if (parse_result.has_error())
     {
@@ -48,7 +47,6 @@ int main(int argc, char** argv)
 
     auto url = parse_result.to_value();
     if (url.scheme.empty()) url.scheme = "http";
-    /* if (url.path.empty()) url.path = "/"; */
     if (url.port.empty())
     {
         if (url.scheme == "http") url.port = "80";
@@ -62,7 +60,7 @@ int main(int argc, char** argv)
               << "port: " << url.port << '\n'
               << "path: " << url.path << '\n';
 
-    auto workers = std::make_shared<net::coro::thread_pool>(1, spdlog::default_logger());
+    auto workers = std::make_shared<net::coro::thread_pool>(1);
 
     net::io::scheduler scheduler{workers, spdlog::default_logger()};
     http::client       client{&scheduler};
@@ -85,13 +83,17 @@ int main(int argc, char** argv)
     std::condition_variable is_done_cv;
     bool                    success = false;
 
+    auto run_thread = std::thread{[&] { scheduler.run(); }};
+
     scheduler.schedule(run_request(client, req, is_done_cv, success));
 
     std::cout << "waiting for response...\n";
     std::unique_lock lock{is_done_mu};
     is_done_cv.wait(lock);
 
-    std::cout << "done\n";
+    scheduler.shutdown();
+
+    if (run_thread.joinable()) run_thread.join();
 
     return success ? 0 : 1;
 }

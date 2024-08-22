@@ -7,6 +7,7 @@
 #include <exception>
 #include <memory>
 #include <span>
+#include <thread>
 #include <utility>
 
 #include <spdlog/common.h>
@@ -72,7 +73,7 @@ int main()
     sigaddset(&sig_set, SIGINT);
     sigaddset(&sig_set, SIGTERM);
 
-    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1), logger);
+    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1));
 
     net::io::scheduler scheduler{workers, logger};
     net::listener      listener{&scheduler, "7777", net::network::tcp};
@@ -81,6 +82,8 @@ int main()
 
     spdlog::info("starting...");
     scheduler.schedule(run_echo_server(scheduler, listener, running));
+
+    auto run_thread = std::thread{[&] { scheduler.run(); }};
 
     int sig;
     int ret = sigwait(&sig_set, &sig);
@@ -95,6 +98,8 @@ int main()
     running = false;
     listener.shutdown();
     scheduler.shutdown();
+
+    if (run_thread.joinable()) run_thread.join();
 
     spdlog::info("done");
 

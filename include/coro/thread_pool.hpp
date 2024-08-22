@@ -1,22 +1,16 @@
 #pragma once
 
 #include <atomic>
-#include <concepts> // IWYU pragma: keep
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <ranges>
 #include <thread>
 #include <type_traits>
 #include <vector>
-
-#include <spdlog/logger.h>
-#include <spdlog/sinks/null_sink.h>
-#include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 
@@ -49,9 +43,7 @@ public:
         std::coroutine_handle<> awaiting{nullptr};
     };
 
-    thread_pool(
-        std::size_t                            concurrency = hardware_concurrency(),
-        const std::shared_ptr<spdlog::logger>& logger = spdlog::create<spdlog::sinks::null_sink_mt>("thread_pool"));
+    thread_pool(std::size_t concurrency = hardware_concurrency());
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;
@@ -132,7 +124,6 @@ private:
     std::deque<std::coroutine_handle<>> jobs;
     std::atomic<bool>                   running;
     std::atomic<std::size_t>            num_jobs; // queued AND currently executing
-    std::shared_ptr<spdlog::logger>     logger;
 };
 
 }
