@@ -17,6 +17,8 @@
 #    include <cstring>
 #    include <ctime>
 #    include <memory>
+#    include <mutex>
+#    include <shared_mutex>
 #    include <string>
 #    include <system_error>
 #    include <tuple>
@@ -56,10 +58,11 @@ namespace net::io::detail
 {
 
 kqueue_loop::kqueue_loop(const std::shared_ptr<spdlog::logger>& logger)
-    : running{true}
-    , descriptor{kqueue()}
+    : descriptor{kqueue()}
     , timeout_id{1}
     , logger{logger->clone("kqueue_loop")}
+    , is_shutdown{false}
+    , wait_for_shutdown{0}
 {
     if (descriptor == -1) throw system_error_from_errno(errno, "failed to create kqueue");
 
@@ -95,18 +98,22 @@ coro::task<result> kqueue_loop::queue(handle fd, poll_op op, std::chrono::millis
     co_return r;
 }
 
-coro::generator<event> kqueue_loop::dispatch()
+coro::generator<event> kqueue_loop::dispatch(std::chrono::milliseconds timeout)
 {
     std::array<struct kevent, 16> events{};
 
-    if (descriptor == -1 || !running.load(std::memory_order::acquire)) co_return;
+    if (descriptor == -1 || is_shutdown.test(std::memory_order::acquire)) co_return;
 
-    /*struct timespec timeout*/
-    /*{*/
-    /*    .tv_sec = 0, .tv_nsec = 1000000*/
-    /*};*/
+    std::shared_lock lock{is_dispatching};
 
-    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), nullptr);
+    struct timespec timeout_spec = {
+        .tv_sec  = 0,
+        .tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count(),
+    };
+
+    auto* timeout_ptr = timeout_spec.tv_nsec >= 0 ? &timeout_spec : nullptr;
+
+    auto num_events = kevent(descriptor, nullptr, 0, events.data(), events.size(), timeout_ptr);
     if (num_events == -1)
     {
         auto err = errno;
@@ -124,10 +131,9 @@ coro::generator<event> kqueue_loop::dispatch()
         co_return;
     }
 
-    // if we got no events and we're supposed to shutdown, we're done
-    if (num_events == 0 && !running.load(std::memory_order::acquire)) co_return;
+    if (num_events == 0) co_return;
 
-    bool notify_shutdown = false;
+    bool is_shutting_down = false;
 
     for (auto i = 0u; i < static_cast<std::size_t>(num_events); ++i)
     {
@@ -138,7 +144,12 @@ coro::generator<event> kqueue_loop::dispatch()
             {
             case shutdown_ident:
                 // shutdown signal - process any other events (if any) before returning.
-                notify_shutdown = true;
+                is_shutting_down = true;
+                is_shutdown.notify_one();
+                break;
+
+            case wakeup_ident:
+                // wakeup signal - used just to trigger kevent() to return.
                 break;
 
             default: logger->warn("unexpected ident for EVFILT_USER: {}", kev.ident); break;
@@ -154,10 +165,9 @@ coro::generator<event> kqueue_loop::dispatch()
         }
     }
 
-    if (notify_shutdown)
+    if (is_shutting_down)
     {
-        running.store(false, std::memory_order::release);
-        running.notify_one();
+        wait_for_shutdown.release();
     }
 }
 
@@ -203,10 +213,42 @@ std::tuple<event, bool> kqueue_loop::translate_kevent(const struct kevent& ev) c
     };
 }
 
-void kqueue_loop::shutdown() noexcept
+void kqueue_loop::wakeup() noexcept
 {
-    if (!running.load(std::memory_order::acquire)) return;
+    if (is_shutdown.test(std::memory_order::acquire)) return;
 
+    struct kevent trigger_wakeup = {
+        .ident  = wakeup_ident,
+        .filter = EVFILT_USER,
+        .flags  = 0,
+        .fflags = NOTE_TRIGGER,
+        .data   = 0,
+        .udata  = nullptr,
+    };
+
+    auto res = kevent(descriptor, &trigger_wakeup, 1, nullptr, 0, nullptr);
+    if (res == -1)
+    {
+        auto err = errno;
+        logger->error("error triggering wakeup event: {}: {}", err, get_errno_msg(err));
+    }
+}
+
+void kqueue_loop::shutdown(std::chrono::milliseconds timeout)
+{
+    if (is_shutdown.test_and_set(std::memory_order::acquire)) return;
+
+    // we only need to wait if we're currently dispatching...
+    std::unique_lock lock{is_dispatching, std::try_to_lock};
+    if (lock.owns_lock())
+    {
+        // we're not currently dispatching, so need to wait
+        return;
+    }
+
+    auto started_waiting = std::chrono::steady_clock::now();
+
+    // send event...
     struct kevent trigger_shutdown = {
         .ident  = shutdown_ident,
         .filter = EVFILT_USER,
@@ -219,13 +261,36 @@ void kqueue_loop::shutdown() noexcept
     auto res = kevent(descriptor, &trigger_shutdown, 1, nullptr, 0, nullptr);
     if (res == -1)
     {
+        // TODO: should probably throw instead
         auto err = errno;
         logger->error("error triggering shutdown event: {}: {}", err, get_errno_msg(err));
-        running.store(false, std::memory_order::release);
         return;
     }
 
-    running.wait(true, std::memory_order::acquire);
+    // wait for confirmation of receipt of shutdown event...
+    is_shutdown.wait(true, std::memory_order::acquire);
+
+    // now wait for shutdown to finish...
+    if (timeout.count() != 0)
+    {
+        auto waited_for = std::chrono::steady_clock::now() - started_waiting;
+        timeout -= std::chrono::duration_cast<decltype(timeout)>(waited_for);
+
+        if (timeout.count() < 0)
+        {
+            // TODO: throw
+        }
+
+        auto did_acquire = wait_for_shutdown.try_acquire_for(timeout);
+        if (!did_acquire)
+        {
+            // TODO: throw
+        }
+    }
+    else
+    {
+        wait_for_shutdown.acquire();
+    }
 }
 
 void kqueue_loop::operation::await_suspend(std::coroutine_handle<promise> await_on) noexcept

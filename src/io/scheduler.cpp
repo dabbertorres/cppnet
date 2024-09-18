@@ -22,7 +22,8 @@ namespace net::io
 scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shared_ptr<spdlog::logger>& logger)
     : workers{std::move(workers)}
     , loop{logger}
-    , running{true}
+    , is_shutdown{false}
+    , wait_for_shutdown{0}
 {}
 
 scheduler::~scheduler() noexcept { shutdown(); }
@@ -32,11 +33,11 @@ void scheduler::deregister_handle(handle handle) { loop.deregister_handle(handle
 
 bool scheduler::schedule(coro::task<>&& task) noexcept
 {
-    std::coroutine_handle<> handle;
+    auto handle = task.get_handle();
 
     {
         std::lock_guard lock{tasks_mu};
-        handle = tasks.emplace_back(std::move(task)).get_handle();
+        tasks.emplace_back(std::move(task));
     }
 
     return workers->resume(handle);
@@ -45,7 +46,7 @@ bool scheduler::schedule(coro::task<>&& task) noexcept
 bool scheduler::resume(std::coroutine_handle<> handle) noexcept
 {
     if (handle == nullptr) return false;
-    if (!running.load(std::memory_order::acquire)) return false;
+    if (is_shutdown.test(std::memory_order::acquire)) return false;
 
     return workers->resume(handle);
 }
@@ -57,11 +58,11 @@ coro::task<result> scheduler::schedule(handle handle, poll_op op, std::chrono::m
 
 void scheduler::run()
 {
-    while (running.load(std::memory_order::acquire))
+    while (!is_shutdown.test(std::memory_order::acquire))
     {
         for (auto [handle, result] : loop.dispatch())
         {
-            handle.promise().return_value(result); // to move or not to move?
+            handle.promise().return_value(result);
             workers->resume(handle);
         }
 
@@ -69,25 +70,74 @@ void scheduler::run()
         std::lock_guard lock{tasks_mu};
         std::erase_if(tasks, [](const coro::task<>& t) { return t.is_ready(); });
     }
+
+    wait_for_shutdown.release();
 }
 
-// TODO: timeout
-void scheduler::shutdown() noexcept
+void scheduler::run_until_done(coro::task<>&& task)
 {
-    if (running.exchange(false, std::memory_order::acq_rel))
-    {
-        loop.shutdown();
+    if (is_shutdown.test(std::memory_order::acquire)) return;
 
+    auto top_handle = task.get_handle();
+    workers->resume(top_handle);
+
+    while (top_handle && !top_handle.done())
+    {
+        for (auto [handle, result] : loop.dispatch())
         {
-            std::lock_guard lock{tasks_mu};
-            for (auto& t : tasks)
+            handle.promise().return_value(result);
+            workers->resume(handle);
+        }
+    }
+
+    wait_for_shutdown.release();
+}
+
+void scheduler::shutdown(std::chrono::milliseconds timeout)
+{
+    if (is_shutdown.test_and_set(std::memory_order::release)) return;
+
+    auto started_waiting = std::chrono::steady_clock::now();
+    loop.shutdown(timeout);
+
+    {
+        std::lock_guard lock{tasks_mu};
+        for (auto& t : tasks)
+        {
+            if (t.valid())
             {
-                if (t.valid())
+                if (!t.is_ready())
                 {
-                    if (!t.resume()) t.destroy();
+                    if (t.resume()) t.destroy();
+                }
+                else
+                {
+                    t.destroy();
                 }
             }
         }
+    }
+
+    // now wait for shutdown to finish...
+    if (timeout.count() != 0)
+    {
+        auto waited_for = std::chrono::steady_clock::now() - started_waiting;
+        timeout -= std::chrono::duration_cast<decltype(timeout)>(waited_for);
+
+        if (timeout.count() < 0)
+        {
+            // TODO: throw
+        }
+
+        auto did_acquire = wait_for_shutdown.try_acquire_for(timeout);
+        if (!did_acquire)
+        {
+            // TODO: throw
+        }
+    }
+    else
+    {
+        wait_for_shutdown.acquire();
     }
 }
 

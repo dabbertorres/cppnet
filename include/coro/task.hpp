@@ -1,6 +1,8 @@
 #pragma once
 
 #include <coroutine>
+#include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -67,7 +69,10 @@ public:
 
     ~task()
     {
-        if (handle != nullptr) handle.destroy();
+        if (handle != nullptr)
+        {
+            handle.destroy();
+        }
     }
 
     operator task<>() const&& noexcept { return task{std::move(handle)}; }
@@ -112,9 +117,9 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool is_ready() const noexcept { return handle == nullptr || handle.done(); }
+    [[nodiscard]] bool is_ready() const noexcept { return handle != nullptr && handle.done(); }
 
-    [[nodiscard]] std::coroutine_handle<promise_type> get_handle() noexcept { return handle; }
+    [[nodiscard]] std::coroutine_handle<promise_type> get_handle() const noexcept { return handle; }
 
     [[nodiscard]] promise_type&       get_promise() & { return handle.promise(); }
     [[nodiscard]] const promise_type& get_promise() const& { return handle.promise(); }
@@ -170,6 +175,13 @@ public:
     ~promise()                         = default;
 
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
+
+    /*void* operator new(std::size_t size) noexcept*/
+    /*{*/
+    /*    std::cout << "allocating promise of size " << size << '\n';*/
+    /*    if (void* mem = std::malloc(size)) return mem;*/
+    /*    return nullptr;*/
+    /*}*/
 
     template<typename Y>
         requires((is_reference && std::is_constructible_v<T, Y &&>)

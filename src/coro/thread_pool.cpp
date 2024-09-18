@@ -6,26 +6,34 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
+
+#include "coro/task.hpp"
 
 namespace net::coro
 {
 
 std::size_t hardware_concurrency(std::size_t minus_amount) noexcept
 {
-    static const auto count = std::thread::hardware_concurrency();
+    auto count = std::thread::hardware_concurrency();
+    if (count == 0)
+    {
+        // TODO: get amount in OS-specific manner
+    }
+
     return count > minus_amount ? count - minus_amount : 1;
 }
 
 void thread_pool::operation::await_suspend(std::coroutine_handle<> handle) noexcept
 {
     awaiting = handle;
-    pool->schedule(awaiting);
+    pool->resume(awaiting);
 }
 
 thread_pool::thread_pool(std::size_t concurrency)
     : running(true)
 {
-    if (concurrency == 0) concurrency = 4;
+    if (concurrency == 0) concurrency = 1;
 
     threads.reserve(concurrency);
 
@@ -39,25 +47,38 @@ thread_pool::~thread_pool() { shutdown(); }
 
 thread_pool::operation thread_pool::schedule()
 {
-    if (running.load(std::memory_order::relaxed)) return operation{this};
+    if (!running.load(std::memory_order::relaxed))
+        throw std::runtime_error("thread_pool is shutting down, unable to schedule new tasks");
 
-    throw std::runtime_error("thread_pool is shutting down, unable to schedule new tasks");
+    return operation{this};
 }
 
 bool thread_pool::resume(std::coroutine_handle<> handle) noexcept
 {
     if (handle == nullptr) return false;
-    if (!running.load(std::memory_order::acquire)) return false;
+    if (!running.load(std::memory_order::relaxed)) return false;
 
-    schedule(handle);
+    num_jobs.fetch_add(1, std::memory_order::release);
+
+    {
+        std::lock_guard lock{jobs_mutex};
+        jobs.emplace_back(handle);
+        jobs_available.notify_one();
+    }
     return true;
+}
+
+bool thread_pool::resume(coro::task<>&& task) noexcept
+{
+    auto handle = std::move(task).get_handle();
+    return resume(static_cast<std::coroutine_handle<>>(handle));
 }
 
 void thread_pool::shutdown() noexcept
 {
     if (running.exchange(false, std::memory_order::acq_rel))
     {
-        wait.notify_all();
+        jobs_available.notify_all();
 
         int i = 0;
         for (auto& thread : threads)
@@ -85,8 +106,8 @@ void thread_pool::worker()
 {
     while (running.load(std::memory_order::acquire))
     {
-        std::unique_lock lock{wait_mutex};
-        wait.wait(lock, [this] { return !jobs.empty() || !running.load(std::memory_order::acquire); });
+        std::unique_lock lock{jobs_mutex};
+        jobs_available.wait(lock, [this] { return !jobs.empty() || !running.load(std::memory_order::acquire); });
 
         if (jobs.empty()) continue;
 
@@ -100,7 +121,7 @@ void thread_pool::worker()
 
     while (num_jobs.load(std::memory_order::acquire) > 0)
     {
-        std::unique_lock lock{wait_mutex};
+        std::unique_lock lock{jobs_mutex};
 
         if (jobs.empty()) break;
 
@@ -110,19 +131,6 @@ void thread_pool::worker()
 
         handle.resume();
         num_jobs.fetch_sub(1, std::memory_order::release);
-    }
-}
-
-void thread_pool::schedule(std::coroutine_handle<> handle)
-{
-    if (handle == nullptr) return;
-
-    num_jobs.fetch_add(1, std::memory_order::release);
-
-    {
-        std::lock_guard lock{wait_mutex};
-        jobs.emplace_back(handle);
-        wait.notify_one();
     }
 }
 

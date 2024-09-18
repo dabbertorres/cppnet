@@ -6,6 +6,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <semaphore>
+#include <vector>
 
 #include <spdlog/logger.h>
 #include <spdlog/sinks/null_sink.h>
@@ -19,6 +21,8 @@
 
 namespace net::io
 {
+
+using namespace std::chrono_literals;
 
 class scheduler
 {
@@ -38,18 +42,22 @@ public:
     void deregister_handle(handle handle);
 
     bool               schedule(coro::task<>&& task) noexcept;
-    coro::task<result> schedule(handle handle, poll_op op, std::chrono::milliseconds timeout);
+    coro::task<result> schedule(handle handle, poll_op op, std::chrono::milliseconds timeout = 0ms);
     bool               resume(std::coroutine_handle<> handle) noexcept;
 
     void run();
-    void shutdown() noexcept;
+    void run_until_done(coro::task<>&& task);
+    void shutdown(std::chrono::milliseconds timeout = 0ms);
 
 private:
+    void run_once(std::vector<std::coroutine_handle<>>& done_list);
+
     std::shared_ptr<coro::thread_pool> workers;
     detail::event_loop                 loop;
     std::deque<coro::task<>>           tasks;
     std::mutex                         tasks_mu;
-    std::atomic<bool>                  running;
+    std::atomic_flag                   is_shutdown;
+    std::binary_semaphore              wait_for_shutdown;
 };
 
 }

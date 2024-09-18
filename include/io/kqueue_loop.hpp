@@ -1,7 +1,5 @@
 #pragma once
 
-#include <tuple>
-
 #include "config.hpp" // IWYU pragma: keep
 
 #ifdef NET_HAS_KQUEUE
@@ -12,6 +10,9 @@
 #    include <cstdint>
 #    include <ctime>
 #    include <memory>
+#    include <semaphore>
+#    include <shared_mutex>
+#    include <tuple>
 
 #    include <sys/event.h>
 #    include <sys/types.h>
@@ -50,9 +51,10 @@ public:
 
     coro::task<result> queue(handle fd, poll_op op, std::chrono::milliseconds timeout);
 
-    coro::generator<event> dispatch();
+    coro::generator<event> dispatch(std::chrono::milliseconds timeout = -1ms);
 
-    void shutdown() noexcept;
+    void wakeup() noexcept;
+    void shutdown(std::chrono::milliseconds timeout = 0ms);
 
 private:
     using clock = std::chrono::high_resolution_clock;
@@ -60,6 +62,7 @@ private:
     // It is left as an excercise to the reader to determine if this value has any special meaning.
     // (Hint: it doesn't really)
     static constexpr uintptr_t shutdown_ident = 0x6578'6974;
+    static constexpr uintptr_t wakeup_ident   = 0x7761'6b65;
 
     class operation
     {
@@ -96,10 +99,12 @@ private:
     struct kevent make_timeout_kevent(std::coroutine_handle<promise> awaiting,
                                       std::chrono::milliseconds      timeout) noexcept;
 
-    std::atomic<bool>               running;
     int                             descriptor;
     std::atomic<std::size_t>        timeout_id;
     std::shared_ptr<spdlog::logger> logger;
+    std::atomic_flag                is_shutdown;
+    std::binary_semaphore           wait_for_shutdown;
+    std::shared_mutex               is_dispatching;
 };
 
 }

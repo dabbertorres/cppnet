@@ -43,7 +43,7 @@ public:
         std::coroutine_handle<> awaiting{nullptr};
     };
 
-    thread_pool(std::size_t concurrency = hardware_concurrency());
+    thread_pool(std::size_t concurrency = hardware_concurrency(1));
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;
@@ -73,12 +73,12 @@ public:
     [[nodiscard]] operation schedule();
 
     template<RangeOf<std::coroutine_handle<>> R>
-    std::size_t resume(const R& handles) noexcept
+    std::size_t resume_all(const R& handles) noexcept
     {
         std::size_t new_jobs = 0;
 
         {
-            std::lock_guard lock{wait_mutex};
+            std::lock_guard lock{jobs_mutex};
             for (const auto& handle : handles)
             {
                 if (handle != nullptr) [[likely]]
@@ -93,17 +93,18 @@ public:
 
         if (new_jobs >= threads.size())
         {
-            wait.notify_all();
+            jobs_available.notify_all();
         }
         else
         {
-            for (auto i = 0u; i < new_jobs; ++i) wait.notify_one();
+            for (auto i = 0u; i < new_jobs; ++i) jobs_available.notify_one();
         }
 
         return new_jobs;
     }
 
     bool resume(std::coroutine_handle<> handle) noexcept;
+    bool resume(coro::task<>&& task) noexcept;
 
     [[nodiscard]] operation yield() { return schedule(); }
     void                    shutdown() noexcept;
@@ -116,11 +117,10 @@ public:
 
 private:
     void worker();
-    void schedule(std::coroutine_handle<>);
 
     std::vector<std::thread>            threads;
-    std::mutex                          wait_mutex;
-    std::condition_variable             wait;
+    std::mutex                          jobs_mutex;
+    std::condition_variable             jobs_available;
     std::deque<std::coroutine_handle<>> jobs;
     std::atomic<bool>                   running;
     std::atomic<std::size_t>            num_jobs; // queued AND currently executing
