@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <variant>
 
@@ -23,7 +24,7 @@ public:
     {}
 
     constexpr result(Value&& value) noexcept(std::is_nothrow_move_constructible_v<Value>)
-        : value{std::forward<Value>(value)}
+        : value{std::move(value)}
     {}
 
     constexpr result(const Error& error) noexcept(std::is_nothrow_copy_constructible_v<Error>)
@@ -31,35 +32,33 @@ public:
     {}
 
     constexpr result(Error&& error) noexcept(std::is_nothrow_move_constructible_v<Error>)
-        : value{std::forward<Error>(error)}
+        : value{std::move(error)}
     {}
 
-    constexpr result(const result& other) noexcept(
-        std::is_nothrow_copy_constructible_v<Value>&& std::is_nothrow_copy_constructible_v<Error>)
-        : value{other.value}
-    {}
+    constexpr result(const result& other) noexcept(std::is_nothrow_copy_constructible_v<Value>
+                                                   && std::is_nothrow_copy_constructible_v<Error>) = default;
 
-    constexpr result(result&& other) noexcept(
-        std::is_nothrow_move_constructible_v<Value>&& std::is_nothrow_move_constructible_v<Error>)
+    constexpr result(result&& other) noexcept(std::is_nothrow_move_constructible_v<Value>
+                                              && std::is_nothrow_move_constructible_v<Error>)
         : value{std::move(other.value)}
     {}
 
-    constexpr result& operator=(const result& other) noexcept(
-        std::is_nothrow_copy_assignable_v<Value>&& std::is_nothrow_copy_assignable_v<Error>)
+    constexpr result& operator=(const result& other) noexcept(std::is_nothrow_copy_assignable_v<Value>
+                                                              && std::is_nothrow_copy_assignable_v<Error>)
     {
-        if (this != &other) value = other.value;
+        if (this != std::addressof(other)) value = other.value;
         return *this;
     }
 
-    constexpr result& operator=(result&& other) noexcept(
-        std::is_nothrow_move_assignable_v<Value>&& std::is_nothrow_move_assignable_v<Error>)
+    constexpr result& operator=(result&& other) noexcept(std::is_nothrow_move_assignable_v<Value>
+                                                         && std::is_nothrow_move_assignable_v<Error>)
     {
         value = std::move(other.value);
         return *this;
     }
 
-    constexpr ~result() noexcept(std::is_nothrow_destructible_v<Value>&& std::is_nothrow_destructible_v<Error>) =
-        default;
+    constexpr ~result() noexcept(std::is_nothrow_destructible_v<Value>
+                                 && std::is_nothrow_destructible_v<Error>) = default;
 
     [[nodiscard]] constexpr bool has_value() const noexcept { return std::holds_alternative<Value>(value); }
     [[nodiscard]] constexpr bool has_error() const noexcept { return std::holds_alternative<Error>(value); }
@@ -78,7 +77,7 @@ public:
             {
                 using T = std::decay_t<decltype(arg)>;
 
-                if constexpr (std::is_same_v<T, Value>) std::invoke(f, arg);
+                if constexpr (std::is_same_v<T, Value>) std::invoke(std::forward<F>(f), arg);
             },
             value);
 
@@ -93,7 +92,7 @@ public:
             {
                 using T = std::decay_t<decltype(arg)>;
 
-                if constexpr (std::is_same_v<T, Error>) std::invoke(f, arg);
+                if constexpr (std::is_same_v<T, Error>) std::invoke(std::forward<F>(f), arg);
             },
             value);
         return *this;
@@ -103,11 +102,11 @@ public:
         requires std::is_same_v<std::invoke_result_t<F>, Value>
     constexpr Value or_else(F&& f) const noexcept(std::is_nothrow_invocable_v<F>)
     {
-        if (has_error()) return std::invoke(f);
+        if (has_error()) return std::invoke(std::forward<F>(f));
         return to_value();
     }
 
-    constexpr Value or_else(Value&& other) const noexcept
+    constexpr Value or_else(Value other) const noexcept
     {
         if (has_error()) return other;
         return value;
@@ -123,7 +122,7 @@ public:
 
                 if constexpr (std::is_same_v<T, Value>)
                 {
-                    auto r = std::invoke(f, arg);
+                    auto r = std::invoke(std::forward<F>(f), arg);
                     return result<decltype(r), Error>{r};
                 }
                 else

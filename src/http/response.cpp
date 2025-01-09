@@ -37,9 +37,9 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
     resp->status_code = status_code;
     resp->headers.set_content_length(content_length);
     auto res = co_await encode(writer, *resp);
-    if (res.has_error())
+    if (!res.has_value())
     {
-        throw res.to_error();
+        throw(res.error());
     }
 
     co_return resp->body;

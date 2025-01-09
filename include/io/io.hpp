@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <system_error>
 #include <type_traits>
 
@@ -16,7 +17,7 @@ struct result
     std::error_condition err;
 };
 
-enum class status_condition
+enum class status_condition : std::uint8_t
 {
     closed    = 1,
     timed_out = 2,

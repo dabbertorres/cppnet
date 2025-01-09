@@ -22,8 +22,13 @@
 
 namespace http = net::http;
 
+namespace
+{
+
 net::coro::task<>
 run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success);
+
+}
 
 int main(int argc, char** argv)
 {
@@ -62,7 +67,10 @@ int main(int argc, char** argv)
 
     auto workers = std::make_shared<net::coro::thread_pool>(1);
 
-    net::io::scheduler scheduler{workers, spdlog::default_logger()};
+    auto logger = spdlog::default_logger();
+    logger->set_level(spdlog::level::trace);
+
+    net::io::scheduler scheduler{workers, logger};
     http::client       client{&scheduler};
 
     http::client_request req{
@@ -77,17 +85,17 @@ int main(int argc, char** argv)
         // clang-format on
     };
 
-    std::cout << "sending request...\n";
-
     std::mutex              is_done_mu;
     std::condition_variable is_done_cv;
     bool                    success = false;
 
     auto run_thread = std::thread{[&] { scheduler.run(); }};
 
+    std::cout << "building request...\n";
     scheduler.schedule(run_request(client, req, is_done_cv, success));
 
-    std::cout << "waiting for response...\n";
+    /*scheduler.run_to_completion(run_request(client, req, is_done_cv, success));*/
+
     std::unique_lock lock{is_done_mu};
     is_done_cv.wait(lock);
 
@@ -98,16 +106,23 @@ int main(int argc, char** argv)
     return success ? 0 : 1;
 }
 
+namespace
+{
+
 net::coro::task<>
 run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success)
 {
+    std::cout << "sending request...\n";
     auto get_result = co_await client.send(req);
+    std::cout << "aaahhhhh\n";
     if (!get_result.has_value())
     {
         std::cerr << "Error sending request: " << get_result.error().message() << "\n";
         is_done.notify_one();
         co_return;
     }
+
+    std::cout << "received response!\n";
 
     auto& resp = get_result.value();
 
@@ -147,4 +162,6 @@ run_request(http::client& client, http::client_request& req, std::condition_vari
 
     success = true;
     is_done.notify_one();
+}
+
 }

@@ -13,9 +13,8 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
-#include "util/resource_pool.hpp"
-
 #include "tcp.hpp"
+#include "util/resource_pool.hpp"
 
 namespace net::http
 {

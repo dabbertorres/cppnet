@@ -107,9 +107,9 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             auto writer = std::make_unique<io::buffered_writer>(&conn);
 
             auto req_result = co_await decode(std::move(reader), max_header_bytes);
-            if (req_result.has_error())
+            if (!req_result.has_value())
             {
-                auto err = req_result.to_error();
+                auto err = req_result.error();
                 if (static_cast<io::status_condition>(err.value()) == io::status_condition::closed)
                 {
                     logger->debug("connection closed");
@@ -123,7 +123,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
 
             logger->trace("request decoded");
 
-            auto req = req_result.to_value();
+            auto& req = req_result.value();
             logger->trace("request {} {} as HTTP/{}.{}",
                           method_string(req.method),
                           req.uri.path,

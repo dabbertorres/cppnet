@@ -1,5 +1,6 @@
 #include "encoding/hex.hpp"
 
+#include <concepts>
 #include <cstddef>
 #include <exception> // IWYU pragma: keep
 #include <span>
@@ -9,7 +10,6 @@
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <catch2/generators/catch_generators.hpp>
 
 namespace

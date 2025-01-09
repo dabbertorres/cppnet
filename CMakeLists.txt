@@ -34,6 +34,12 @@ target_compile_features(
   PUBLIC cxx_std_23
 )
 
+target_compile_definitions(
+  net
+  PRIVATE
+  SPDLOG_COMPILED_LIB=1
+)
+
 target_link_libraries(
   net
   PUBLIC spdlog::spdlog

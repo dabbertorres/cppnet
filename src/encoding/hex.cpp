@@ -8,10 +8,15 @@
 #include <string>
 #include <vector>
 
-namespace net::encoding::hex
+namespace
 {
 
 bool is_hex_char(char c) { return ('0' <= c && c <= '9') || ('A' <= c && c <= 'F') || ('a' <= c && c <= 'f'); }
+
+}
+
+namespace net::encoding::hex
+{
 
 std::array<char, 2> encode(std::byte b) noexcept
 {
@@ -37,9 +42,9 @@ void encode_to(std::span<const std::byte> data, std::string& out, std::size_t of
 {
     for (std::size_t i = 0u; i < data.size(); ++i)
     {
-        auto chars              = encode(data[i]);
-        out[offset + i * 2 + 0] = chars[0];
-        out[offset + i * 2 + 1] = chars[1];
+        auto chars                = encode(data[i]);
+        out[offset + (i * 2) + 0] = chars[0];
+        out[offset + (i * 2) + 1] = chars[1];
     }
 }
 
@@ -71,8 +76,7 @@ std::optional<std::vector<std::byte>> decode(std::span<const char> data) noexcep
 
     std::vector<std::byte> out(decoded_size(data.size()));
 
-    auto valid = decode_to(data, out);
-    if (valid) return out;
+    if (auto valid = decode_to(data, out); valid) return out;
     return std::nullopt;
 }
 
@@ -82,8 +86,8 @@ bool decode_to(std::span<const char> data, std::span<std::byte> out) noexcept
 
     for (auto i = 0u; i < out.size(); ++i)
     {
-        auto hi = data[i * 2 + 0];
-        auto lo = data[i * 2 + 1];
+        auto hi = data[(i * 2) + 0];
+        auto lo = data[(i * 2) + 1];
 
         if (!is_hex_char(hi) || !is_hex_char(lo)) return false;
 

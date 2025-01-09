@@ -33,7 +33,7 @@ TEST_CASE("just a request line", "[http][1.1][request_decode]")
     REQUIRE(route.has_value());
     const auto expected_route = route.to_value();
 
-    auto request = result.to_value();
+    auto& request = result.value();
 
     SECTION("expected result")
     {
@@ -65,7 +65,7 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
         {"X-Hello",      {"hello world"}},
     };
 
-    auto request = result.to_value();
+    auto& request = result.value();
 
     SECTION("expected result")
     {
@@ -103,7 +103,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
         {"Content-Length",               {"18"}},
     };
 
-    auto request = result.to_value();
+    auto& request = result.value();
 
     std::string body(64, 0);
 
@@ -155,7 +155,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
         {"Content-Length",               {"38"}},
     };
 
-    auto request = result.to_value();
+    auto& request = result.value();
 
     std::string body(64, 0);
 

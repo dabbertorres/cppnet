@@ -7,7 +7,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -43,7 +42,7 @@ histogram::histogram(const histogram& other)
     , sum{other.sum.load(std::memory_order_acquire)}
 {
     std::lock_guard lock{other.mutex};
-    std::copy(other.bucket_values.begin(), other.bucket_values.end(), bucket_values.begin());
+    std::ranges::copy(other.bucket_values, bucket_values.begin());
 }
 
 histogram& histogram::operator=(const histogram& other)
@@ -126,7 +125,16 @@ coro::task<io::result> histogram::encode_self(io::writer& out) const
         out,
         [this](io::writer& out) { return encode_help(out); },
         [this](io::writer& out) { return encode_type(out); },
+        // NOLINTBEGIN(
+        //   cppcoreguidelines-avoid-capturing-lambda-coroutines,
+        //   cppcoreguidelines-avoid-reference-coroutine-parameters,
+        //   "this is fine",
+        // )
         [this](io::writer& out) -> coro::task<io::result>
+        // NOLINTEND(
+        //   cppcoreguidelines-avoid-capturing-lambda-coroutines,
+        //   cppcoreguidelines-avoid-reference-coroutine-parameters,
+        // )
         {
 #ifndef __cpp_lib_atomic_ref
             // don't allow updates while encoding
@@ -141,7 +149,8 @@ coro::task<io::result> histogram::encode_self(io::writer& out) const
                     out,
                     name,
                     "_bucket{"sv,
-                    [this, i](io::writer& out) {
+                    [this, i](io::writer& out)
+                    {
                         return encode_one_label(out,
                                                 "le",
                                                 std::isfinite(buckets[i]) ? std::to_string(buckets[i]) : "+Inf");
@@ -150,12 +159,7 @@ coro::task<io::result> histogram::encode_self(io::writer& out) const
                     "} "sv,
                     [this, i](io::writer& out)
                     {
-#ifdef __cpp_lib_atomic_ref
-                        std::atomic_ref ref{bucket_values[i]};
-                        auto            val = ref.load(std::memory_order_acquire);
-#else
                         auto val = bucket_values[i];
-#endif
                         return out.write(std::to_string(val));
                     },
                     '\n');
@@ -163,7 +167,7 @@ coro::task<io::result> histogram::encode_self(io::writer& out) const
                 if (res.err) co_return {.count = total, .err = res.err};
             }
 
-            co_return {.count = total};
+            co_return {.count = total, .err = {}};
         },
         name,
         "_sum"sv,
