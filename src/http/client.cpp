@@ -19,7 +19,6 @@
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/scheduler.hpp"
-
 #include "tcp.hpp"
 
 namespace net::http
@@ -65,7 +64,7 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
         encode = &http11::request_encode;
         decode = &http11::response_decode;
     }
-    else if (request.version == protocol_version{2, 0})
+    else if (request.version == protocol_version{.major = 2, .minor = 0})
     {
         encode = &http2::request_encode;
         decode = &http2::response_decode;
@@ -78,13 +77,13 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
 
     auto conn = get_connection(request.uri.host, request.uri.port);
     auto res  = co_await encode(conn.get(), request);
-    if (res.has_error()) co_return std::unexpected(res.to_error());
+    if (!res.has_value()) co_return std::unexpected(res.error());
 
     auto reader = std::make_unique<io::buffered_reader>(conn.get());
     auto resp   = co_await decode(std::move(reader), std::numeric_limits<std::size_t>::max());
-    if (resp.has_error()) co_return std::unexpected(resp.to_error());
+    if (!resp.has_value()) co_return std::unexpected(resp.error());
 
-    co_return resp.to_value();
+    co_return {std::move(resp.value())};
 }
 
 client::host_connections::borrowed_resource client::get_connection(const std::string& host, const std::string& port)

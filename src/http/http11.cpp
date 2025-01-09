@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <ranges>
 #include <span>
@@ -229,24 +230,21 @@ namespace net::http::http11
 {
 
 using coro::task;
-using util::result;
 
-task<result<io::writer*, std::error_condition>> request_encode(io::writer* writer, const client_request& req) noexcept
+task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept
 {
-    using result_t = result<io::writer*, std::error_condition>;
-
     auto res = co_await writer->write(method_string(req.method));
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write(' ');
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     // TODO: don't build the uri before writing it
     res = co_await writer->write(req.uri.build());
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write(" HTTP/"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     auto major_version = req.version.major;
     auto minor_version = req.version.minor;
@@ -264,29 +262,26 @@ task<result<io::writer*, std::error_condition>> request_encode(io::writer* write
     };
 
     res = co_await writer->write(version_buf);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res.err = co_await write_headers(*writer, req.headers);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     // TODO: copy req.body to writer
 
-    co_return result_t{writer};
+    co_return writer;
 }
 
-task<result<io::writer*, std::error_condition>> response_encode(io::writer*            writer,
-                                                                const server_response& resp) noexcept
+task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept
 {
-    using result_t = result<io::writer*, std::error_condition>;
-
     auto res = co_await writer->write("HTTP/"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     std::array<char, 4> version_buf{
         static_cast<char>(resp.version.major + '0'),
@@ -296,35 +291,33 @@ task<result<io::writer*, std::error_condition>> response_encode(io::writer*     
     };
 
     res = co_await writer->write(version_buf);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write(status_text(resp.status_code));
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res.err = co_await write_headers(*writer, resp.headers);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return result_t{res.err};
+    if (res.err) co_return std::unexpected(res.err);
 
-    co_return result_t{writer};
+    co_return writer;
 }
 
-task<result<server_request, std::error_condition>> request_decode(std::unique_ptr<io::buffered_reader> reader,
-                                                                  std::size_t max_header_bytes) noexcept
+task<request_decoder_result> request_decode(std::unique_ptr<io::buffered_reader> reader,
+                                            std::size_t                          max_header_bytes) noexcept
 {
-    using result_t = result<server_request, std::error_condition>;
-
     server_request req;
 
     auto err = co_await parse_request_line(reader.get(), req);
-    if (err) co_return result_t{err};
+    if (err) co_return std::unexpected(err);
 
     err = co_await parse_headers(reader.get(), max_header_bytes, req.headers);
-    if (err) co_return result_t{err};
+    if (err) co_return std::unexpected(err);
 
     if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
 
@@ -340,18 +333,17 @@ task<result<server_request, std::error_condition>> request_decode(std::unique_pt
 
     // TODO: trailers
 
-    co_return result_t{std::move(req)};
+    co_return req;
 }
 
-coro::task<result<client_response, std::error_condition>> response_decode(std::unique_ptr<io::buffered_reader> reader,
-                                                                          std::size_t max_header_bytes) noexcept
+coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
+                                                    std::size_t                          max_header_bytes) noexcept
 {
-    using result_t = result<client_response, std::error_condition>;
-
     client_response resp;
 
-    if (auto err = co_await parse_status_line(reader.get(), resp); err) co_return result_t{err};
-    if (auto err = co_await parse_headers(reader.get(), max_header_bytes, resp.headers); err) co_return result_t{err};
+    if (auto err = co_await parse_status_line(reader.get(), resp); err) co_return std::unexpected(err);
+    if (auto err = co_await parse_headers(reader.get(), max_header_bytes, resp.headers); err)
+        co_return std::unexpected(err);
 
     if (resp.headers.is_chunked())
     {
@@ -365,7 +357,7 @@ coro::task<result<client_response, std::error_condition>> response_decode(std::u
 
     // TODO: trailers
 
-    co_return result_t{std::move(resp)};
+    co_return resp;
 }
 
 }

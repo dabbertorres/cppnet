@@ -7,7 +7,6 @@
 #include <memory>
 #include <mutex>
 #include <utility>
-#include <vector>
 
 #include <spdlog/logger.h>
 
@@ -22,7 +21,7 @@ namespace net::io
 scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shared_ptr<spdlog::logger>& logger)
     : workers{std::move(workers)}
     , loop{logger}
-    , running{true}
+    , running{false}
 {}
 
 scheduler::~scheduler() noexcept { shutdown(); }
@@ -57,6 +56,12 @@ coro::task<result> scheduler::schedule(handle handle, poll_op op, std::chrono::m
 
 void scheduler::run()
 {
+    if (running.exchange(true, std::memory_order_acq_rel))
+    {
+        // log? throw?
+        return;
+    }
+
     while (running.load(std::memory_order::acquire))
     {
         for (auto [handle, result] : loop.dispatch())
@@ -66,8 +71,8 @@ void scheduler::run()
         }
 
         // TODO: any better way to do this?
-        std::lock_guard lock{tasks_mu};
-        std::erase_if(tasks, [](const coro::task<>& t) { return t.is_ready(); });
+        /*std::lock_guard lock{tasks_mu};*/
+        /*std::erase_if(tasks, [](const coro::task<>& t) { return t.is_ready(); });*/
     }
 }
 
@@ -88,6 +93,8 @@ void scheduler::shutdown() noexcept
                 }
             }
         }
+
+        running.notify_all();
     }
 }
 

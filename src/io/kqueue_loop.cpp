@@ -198,7 +198,7 @@ std::tuple<event, bool> kqueue_loop::translate_kevent(const struct kevent& ev) c
     }
 
     return {
-        {handle, res},
+        {.handle = handle, .result = res},
         true
     };
 }

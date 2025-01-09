@@ -2,9 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -198,8 +200,35 @@ struct client_response
 {
     protocol_version            version{};
     status                      status_code = status::NONE;
-    net::http::headers          headers{};
+    net::http::headers          headers;
     std::unique_ptr<io::reader> body = nullptr;
+
+    client_response() noexcept = default;
+
+    client_response(const client_response&)            = delete;
+    client_response& operator=(const client_response&) = delete;
+
+    client_response(client_response&& other) noexcept
+        : version{std::exchange(other.version, {})}
+        , status_code{std::exchange(other.status_code, status::NONE)}
+        , headers{std::exchange(other.headers, {})}
+        , body{std::exchange(other.body, nullptr)}
+    {}
+
+    client_response& operator=(client_response&& other) noexcept
+    {
+        if (this != std::addressof(other))
+        {
+            version     = std::exchange(other.version, {});
+            status_code = std::exchange(other.status_code, status::NONE);
+            headers     = std::exchange(other.headers, {});
+            body        = std::exchange(other.body, nullptr);
+        }
+
+        return *this;
+    }
+
+    ~client_response() noexcept = default;
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.
@@ -207,12 +236,12 @@ struct server_response
 {
     protocol_version   version{};
     status             status_code = status::NONE;
-    net::http::headers headers{};
+    net::http::headers headers;
     io::writer*        body = nullptr;
 };
 
-using response_encoder_result = util::result<io::writer*, std::error_condition>;
-using response_decoder_result = util::result<client_response, std::error_condition>;
+using response_encoder_result = std::expected<io::writer*, std::error_condition>;
+using response_decoder_result = std::expected<client_response, std::error_condition>;
 
 using response_encoder = coro::task<response_encoder_result> (*)(io::writer*, const server_response&) noexcept;
 using response_decoder = coro::task<response_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,

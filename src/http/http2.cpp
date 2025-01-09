@@ -3,9 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <span>
-#include <system_error>
 #include <unordered_map>
 
 #include "coro/task.hpp"
@@ -21,14 +21,13 @@ namespace net::http::http2
 
 using coro::task;
 using net::http::client_request;
-using net::http::client_response;
-using net::http::server_request;
 using net::http::server_response;
 using util::result;
 
 // https://httpwg.org/specs/rfc9113.html#ErrorCodes
 // Unknown or unsupported error codes MUST NOT trigger any special behavior.
 // These MAY be treated by an implementation as being equivalent to INTERNAL_ERROR.
+// NOLINTNEXTLINE(performance-enum-size, "size defined by RFC")
 enum class error_code : std::uint32_t
 {
     NO_ERROR            = 0x00,
@@ -113,6 +112,7 @@ struct NET_PACKED rst_stream_frame
 
 // From: https://httpwg.org/specs/rfc9113.html#SettingValues
 // NOTE: unknown ids must be ignored
+// NOLINTNEXTLINE(performance-enum-size, "size defined by RFC")
 enum class setting_id : std::uint16_t
 {
     SETTINGS_HEADER_TABLE_SIZE      = 0x01,
@@ -162,8 +162,7 @@ struct NET_PACKED window_update_frame
     std::uint32_t window_size_increment : 31;
 };
 
-struct NET_PACKED continuation_frame
-{
+struct NET_PACKED continuation_frame{
     // field_block_fragment fragment;
 };
 
@@ -234,19 +233,16 @@ struct connection
     std::uint32_t max_header_list_size;   // Default is unlimited.
 };
 
-task<result<io::writer*, std::error_condition>> request_encode(io::writer* writer, const client_request& req) noexcept
+task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept {}
+
+task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept {}
+
+task<request_decoder_result> request_decode(std::unique_ptr<io::buffered_reader> reader,
+                                            std::size_t                          max_header_bytes) noexcept
 {}
 
-task<result<io::writer*, std::error_condition>> response_encode(io::writer*            writer,
-                                                                const server_response& resp) noexcept
-{}
-
-task<result<server_request, std::error_condition>> request_decode(std::unique_ptr<io::buffered_reader> reader,
-                                                                  std::size_t max_header_bytes) noexcept
-{}
-
-task<result<client_response, std::error_condition>> response_decode(std::unique_ptr<io::buffered_reader> reader,
-                                                                    std::size_t max_header_bytes) noexcept
+task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
+                                              std::size_t                          max_header_bytes) noexcept
 {}
 
 }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <memory>
 #include <string_view>
 #include <system_error>
@@ -11,15 +13,13 @@
 #include "io/buffered_reader.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
-#include "util/result.hpp"
-#include "util/string_util.hpp"
-
 #include "url.hpp"
+#include "util/string_util.hpp"
 
 namespace net::http
 {
 
-enum class request_method
+enum class request_method : std::uint8_t
 {
     CONNECT,
     DELETE,
@@ -76,7 +76,7 @@ struct client_request
     request_method     method = request_method::NONE;
     protocol_version   version{};
     url                uri{};
-    net::http::headers headers{};
+    net::http::headers headers;
 
     std::unique_ptr<io::reader> body = nullptr;
 };
@@ -87,13 +87,13 @@ struct server_request
     request_method     method = request_method::NONE;
     protocol_version   version{};
     url                uri{};
-    net::http::headers headers{};
+    net::http::headers headers;
 
     std::unique_ptr<io::reader> body = nullptr;
 };
 
-using request_decoder_result = util::result<server_request, std::error_condition>;
-using request_encoder_result = util::result<io::writer*, std::error_condition>;
+using request_decoder_result = std::expected<server_request, std::error_condition>;
+using request_encoder_result = std::expected<io::writer*, std::error_condition>;
 
 using request_decoder = coro::task<request_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
                                                                std::size_t) noexcept;
