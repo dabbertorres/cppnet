@@ -23,54 +23,37 @@ coro::task<result> buffered_writer::write(std::span<const std::byte> data)
 {
     if (data.empty()) co_return result{.count = 0};
 
-    std::size_t total = 0;
-
     // fill up the buffer as much as possible first...
-    if (buf.size() < buf.capacity())
-    {
-        auto start = buf.begin();
-        std::advance(start, buf.size());
-        auto available = std::min(buf.capacity() - buf.size(), data.size());
-        buf.resize(buf.size() + available);
-        std::copy_n(data.begin(), available, start);
+    auto available = std::min(buf.capacity() - buf.size(), data.size());
+    buf.insert(buf.end(), data.begin(), std::next(data.begin(), static_cast<std::ptrdiff_t>(available)));
 
-        total += available;
-    }
+    std::size_t total = available;
 
     // we might be done!
-    if (total == data.size()) co_return result{.count = data.size()};
+    if (total == data.size()) co_return result{.count = total};
 
-    // Note that we always write to the inner reader in buf.capacity() increments.
+    // Note that we always write to the inner writer in buf.capacity() increments.
 
-    // At this point, the buffer is full, and we have more to write, so flush it.
-    if (buf.size() == buf.capacity())
-    {
-        auto res = co_await flush_available();
-        if (res.err) co_return res;
-    }
+    // At this point, the buffer is full, and we have more to write. All of it must be flushed before writing anything
+    // else, or the output would be out of order.
+    auto flushed = co_await flush();
+    if (flushed.err) co_return result{.count = total, .err = flushed.err};
 
     // At this point, the buffer is now empty. As long as writes are larger than the capacity, bypass the buffer.
 
     while (data.size() - total > buf.capacity())
     {
         auto res = co_await impl->write(data.subspan(total, buf.capacity()));
-        if (res.err) co_return result{.count = total + res.count, .err = res.err};
-
         total += res.count;
+
+        if (res.err) co_return result{.count = total, .err = res.err};
+        if (res.count == 0) co_return result{.count = total, .err = make_error_condition(status_condition::error)};
     }
 
-    // the rest of the data, if any, is less than the buffer capacity, so buffer it.
-    // Note that the buffer is still empty at this point.
+    // the rest of the data, if any, is no more than the buffer capacity, and the buffer is empty, so buffer it.
+    buf.insert(buf.end(), data.subspan(total).begin(), data.end());
 
-    auto leftover = data.size() - total;
-    if (leftover > 0)
-    {
-        buf.resize(leftover);
-        std::copy_n(data.subspan(total).begin(), leftover, buf.begin());
-        total += leftover;
-    }
-
-    co_return result{.count = total};
+    co_return result{.count = data.size()};
 }
 
 int buffered_writer::native_handle() const noexcept { return impl->native_handle(); }
@@ -78,18 +61,25 @@ int buffered_writer::native_handle() const noexcept { return impl->native_handle
 coro::task<result> buffered_writer::flush()
 {
     std::size_t total = 0;
+    result      res;
 
     while (total < buf.size())
     {
-        auto res = co_await impl->write(std::span{buf}.subspan(total));
-        if (res.err) co_return result{.count = total + res.count, .err = res.err};
-
+        res = co_await impl->write(std::span{buf}.subspan(total));
         total += res.count;
+
+        if (res.err) break;
+        if (res.count == 0)
+        {
+            res.err = make_error_condition(status_condition::error);
+            break;
+        }
     }
 
-    buf.resize(0);
+    // drop what was written, keeping anything that wasn't for a later flush.
+    buf.erase(buf.begin(), std::next(buf.begin(), static_cast<std::ptrdiff_t>(total)));
 
-    co_return result{.count = total};
+    co_return result{.count = total, .err = res.err};
 }
 
 std::size_t buffered_writer::capacity() const noexcept { return buf.capacity(); }
@@ -103,29 +93,5 @@ void buffered_writer::reset(writer* other)
 
 // reset clears the buffer.
 void buffered_writer::reset() { buf.resize(0); }
-
-coro::task<result> buffered_writer::flush_available()
-{
-    auto res = co_await impl->write(std::span{buf});
-    if (res.count < buf.size())
-    {
-        // if short, adjust
-        auto end = buf.begin();
-        std::advance(end, res.count);
-
-        auto leftover = buf.size() - res.count;
-        auto new_end  = buf.begin();
-        std::advance(new_end, leftover);
-
-        std::copy_backward(end, buf.end(), new_end);
-        buf.resize(leftover);
-    }
-    else
-    {
-        buf.resize(0);
-    }
-
-    co_return res;
-}
 
 }

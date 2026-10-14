@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "coro/task.hpp"
 #include "io.hpp"
@@ -22,12 +24,17 @@ public:
 
     virtual ~writer() = default;
 
+    // write writes up to data.size() bytes from data, returning how many were written.
+    //
+    // A write may be partial, but a write of a non-empty span writes at least one byte, or returns an error.
     virtual coro::task<result> write(std::span<const std::byte> data) = 0;
     inline coro::task<result>  write(std::span<const char> data) { return write(std::as_bytes(data)); }
     inline coro::task<result>  write(std::string_view data) { return write(std::span{data.data(), data.length()}); }
     inline coro::task<result>  write(const std::string& data) { return write(std::span{data.data(), data.length()}); }
-    inline coro::task<result>  write(std::byte data) { return write(std::span{&data, 1}); }
-    inline coro::task<result>  write(char data) { return write(std::span{&data, 1}); }
+
+    // Single values are coroutines, so that the value lives in the coroutine frame until the write completes.
+    inline coro::task<result> write(std::byte data) { co_return co_await write(std::span{&data, 1}); }
+    inline coro::task<result> write(char data) { co_return co_await write(std::span{&data, 1}); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 

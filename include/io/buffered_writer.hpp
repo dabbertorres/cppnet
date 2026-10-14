@@ -38,8 +38,6 @@ public:
     void reset();
 
 private:
-    coro::task<result> flush_available();
-
     writer*                impl;
     std::vector<std::byte> buf;
 };

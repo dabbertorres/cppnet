@@ -63,9 +63,10 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
     while (data.size() - total > buf.capacity())
     {
         auto res = co_await impl->read(data.subspan(total, buf.capacity()));
-        if (res.err) co_return result{.count = total + res.count, .err = res.err};
-
         total += res.count;
+
+        if (res.err) co_return result{.count = total, .err = res.err};
+        if (res.count == 0) co_return result{.count = total, .err = make_error_condition(status_condition::error)};
     }
 
     // partial read of buffer capacity
@@ -146,7 +147,9 @@ coro::task<void> buffered_reader::fill()
     buf.resize(buf.capacity());
     auto res = co_await impl->read(std::span{buf.data() + start, read_more});
     buf.resize(start + res.count);
-    err = res.err;
+
+    // a reader that makes no progress without reporting why would otherwise leave callers waiting forever.
+    err = res.count == 0 && !res.err ? make_error_condition(status_condition::error) : res.err;
 }
 
 }

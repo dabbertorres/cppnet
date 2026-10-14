@@ -20,6 +20,11 @@ public:
 
     virtual ~reader() = default;
 
+    // read reads up to data.size() bytes into data, returning how many were read.
+    //
+    // A read into a non-empty span returns at least one byte, or an error. The end of the stream is reported as
+    // status_condition::closed, possibly along with the final bytes. A read into an empty span returns 0 bytes and no
+    // error.
     virtual coro::task<result> read(std::span<std::byte> data) = 0;
     inline coro::task<result>  read(std::span<char> data) { return read(std::as_writable_bytes(data)); }
     inline coro::task<result>  read(std::byte& data) { return read({&data, 1}); }

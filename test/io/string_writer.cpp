@@ -7,21 +7,23 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "coro/sync_wait.hpp"
+
 using namespace std::string_view_literals;
 
 TEST_CASE("build a string", "[io][string_writer]")
 {
     net::io::string_writer<char> writer;
 
-    auto res = writer.write("foo"sv).operator co_await().await_resume();
+    auto res = test::sync_wait(writer.write("foo"sv));
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
-    res = writer.write("bar"sv).operator co_await().await_resume();
+    res = test::sync_wait(writer.write("bar"sv));
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 3);
 
-    res = writer.write("xyzzy"sv).operator co_await().await_resume();
+    res = test::sync_wait(writer.write("xyzzy"sv));
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 5);
 
