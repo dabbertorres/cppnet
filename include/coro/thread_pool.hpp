@@ -53,20 +53,22 @@ public:
 
     ~thread_pool();
 
+    // NOTE: arguments are taken by value, as the task does not start until after the caller's full expression ends.
+    //       Use std::ref() to pass by reference.
     template<typename Func, typename... Args>
         requires(std::is_invocable_v<Func, Args...>)
-    auto schedule(Func func, Args&&... args) noexcept -> task<std::invoke_result_t<Func, Args...>>
+    auto schedule(Func func, Args... args) noexcept -> task<std::invoke_result_t<Func, Args...>>
     {
         co_await schedule();
 
         if constexpr (std::is_same_v<void, std::invoke_result_t<Func, Args...>>)
         {
-            std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+            std::invoke(std::move(func), std::move(args)...);
             co_return;
         }
         else
         {
-            co_return std::invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+            co_return std::invoke(std::move(func), std::move(args)...);
         }
     }
 

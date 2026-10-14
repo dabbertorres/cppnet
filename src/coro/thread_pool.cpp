@@ -55,16 +55,18 @@ bool thread_pool::resume(std::coroutine_handle<> handle) noexcept
 
 void thread_pool::shutdown() noexcept
 {
-    if (running.exchange(false, std::memory_order::acq_rel))
     {
-        wait.notify_all();
+        // must be modified under the lock, otherwise a worker can check the predicate, miss the notify, and sleep
+        // forever.
+        std::lock_guard lock{wait_mutex};
+        if (!running.exchange(false, std::memory_order::acq_rel)) return;
+    }
 
-        int i = 0;
-        for (auto& thread : threads)
-        {
-            if (thread.joinable()) thread.join();
-            ++i;
-        }
+    wait.notify_all();
+
+    for (auto& thread : threads)
+    {
+        if (thread.joinable()) thread.join();
     }
 }
 

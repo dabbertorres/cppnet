@@ -37,6 +37,12 @@ public:
         /* void await_transform() = delete; */
 
         void unhandled_exception() { value = std::current_exception(); }
+
+        void rethrow_if_exception() const
+        {
+            if (std::holds_alternative<std::exception_ptr>(value))
+                std::rethrow_exception(std::get<std::exception_ptr>(value));
+        }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;
@@ -49,7 +55,11 @@ public:
             : handle{handle}
         {}
 
-        void operator++() { handle.resume(); }
+        void operator++()
+        {
+            handle.resume();
+            handle.promise().rethrow_if_exception();
+        }
 
         T operator*() const { return std::get<T>(handle.promise().value); }
 
@@ -67,7 +77,7 @@ public:
     generator& operator=(const generator&) = delete;
 
     generator(generator&& other) noexcept
-        : handle{std::exchange(other.handle, std::noop_coroutine())}
+        : handle{std::exchange(other.handle, nullptr)}
     {}
 
     generator& operator=(generator&& other) noexcept
@@ -75,7 +85,7 @@ public:
         if (this != std::addressof(other))
         {
             if (handle) handle.destroy();
-            handle = std::exchange(other.handle, std::noop_coroutine());
+            handle = std::exchange(other.handle, nullptr);
         }
 
         return *this;
@@ -88,7 +98,12 @@ public:
 
     iterator begin()
     {
-        if (handle) handle.resume();
+        if (handle)
+        {
+            handle.resume();
+            handle.promise().rethrow_if_exception();
+        }
+
         return iterator{handle};
     }
 
@@ -114,8 +129,7 @@ private:
         if (!full)
         {
             handle.resume();
-            if (std::holds_alternative<std::exception_ptr>(handle.promise().value))
-                std::rethrow_exception(std::get<std::exception_ptr>(handle.promise().value));
+            handle.promise().rethrow_if_exception();
             full = true;
         }
     }
