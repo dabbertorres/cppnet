@@ -95,8 +95,10 @@ struct server_request
 using request_decoder_result = std::expected<server_request, std::error_condition>;
 using request_encoder_result = std::expected<io::writer*, std::error_condition>;
 
-using request_decoder = coro::task<request_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
-                                                               std::size_t) noexcept;
+// request_decoders borrow the connection's reader, which must outlive the decoded request's body. The reader is kept
+// for the connection, rather than per request, so that anything buffered past the end of one request is still there
+// for the next.
+using request_decoder = coro::task<request_decoder_result> (*)(io::buffered_reader*, std::size_t) noexcept;
 using request_encoder = coro::task<request_encoder_result> (*)(io::writer*, const client_request&) noexcept;
 
 }

@@ -18,6 +18,11 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
     //       or just the bytes read INTO data?
     //       (Currently returning the number of bytes read into data.)
 
+    if (data.empty()) co_return {.count = 0};
+
+    // don't read past the end of the body, into whatever follows it.
+    if (done) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
+
     std::size_t bytes_read = 0;
 
     while (bytes_read < data.size())
@@ -33,6 +38,9 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
             {
                 res = co_await validate_end_of_chunk();
                 if (res.err) co_return {.count = bytes_read, .err = res.err};
+
+                done = true;
+                if (bytes_read == 0) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
 
                 break;
             }

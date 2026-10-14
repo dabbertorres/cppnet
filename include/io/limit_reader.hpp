@@ -20,7 +20,14 @@ public:
     {}
 
     constexpr limit_reader(std::unique_ptr<reader>&& reader, std::size_t limit)
-        : parent{std::move(reader)}
+        : owned{std::move(reader)}
+        , parent{owned.get()}
+        , limit{limit}
+    {}
+
+    // reader is borrowed, and must outlive this limit_reader.
+    constexpr limit_reader(reader* reader, std::size_t limit)
+        : parent{reader}
         , limit{limit}
     {}
 
@@ -31,7 +38,8 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
-    std::unique_ptr<reader> parent   = nullptr;
+    std::unique_ptr<reader> owned    = nullptr;
+    reader*                 parent   = nullptr;
     std::size_t             limit    = 0;
     std::size_t             progress = 0;
 };
