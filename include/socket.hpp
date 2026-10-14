@@ -47,7 +47,7 @@ public:
 
     [[nodiscard]] io::handle native_handle() const noexcept override { return fd; }
 
-    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) const noexcept;
+    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
 
 protected:
     static constexpr int invalid_fd = -1;

@@ -9,10 +9,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "coro/sync_wait.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/io.hpp"
 #include "io/string_reader.hpp"
 #include "string_makers.hpp"
 #include "url.hpp"
@@ -23,9 +25,10 @@ using namespace std::string_view_literals;
 TEST_CASE("just a request line", "[http][1.1][request_decode]")
 {
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\n\r\n");
+    net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
-    auto result = std::move(task).operator co_await().await_resume();
+    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
 
@@ -50,9 +53,10 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
                                          "Accept: application/json\r\n"
                                          "X-Hello: hello world\r\n"
                                          "\r\n");
+    net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
-    auto result = std::move(task).operator co_await().await_resume();
+    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
 
@@ -87,8 +91,8 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
                                          "this is a request\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
-    auto result = std::move(task).operator co_await().await_resume();
+    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
 
@@ -108,7 +112,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
     std::string body(64, 0);
 
     auto read_task   = request.body->read(body);
-    auto read_result = std::move(read_task).operator co_await().await_resume();
+    auto read_result = test::sync_wait(std::move(read_task));
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 18);
 
@@ -139,8 +143,8 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
                                          "lines\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(std::make_unique<net::io::buffered_reader>(&content));
-    auto result = std::move(task).operator co_await().await_resume();
+    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
 
@@ -160,7 +164,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
     std::string body(64, 0);
 
     auto read_task   = request.body->read(body);
-    auto read_result = std::move(read_task).operator co_await().await_resume();
+    auto read_result = test::sync_wait(std::move(read_task));
     CHECK_FALSE(read_result.err);
     CHECK(read_result.count == 38);
 
@@ -183,5 +187,61 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
 
 TEST_CASE("chunked", "[http][1.1][request_decode]")
 {
-    // TODO
+    net::io::string_reader<char> content("POST /some/resource HTTP/1.1\r\n"
+                                         "Transfer-Encoding: chunked\r\n"
+                                         "\r\n"
+                                         "5\r\n"
+                                         "hello\r\n"
+                                         "0\r\n"
+                                         "\r\n"
+                                         "GET /next HTTP/1.1\r\n"
+                                         "\r\n");
+    net::io::buffered_reader     buf_reader(&content);
+
+    auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    REQUIRE(result.has_value());
+
+    std::string body(64, 0);
+
+    auto read_result = test::sync_wait(result->body->read(body));
+    REQUIRE_FALSE(read_result.err);
+    CHECK(body.substr(0, read_result.count) == "hello"sv);
+
+    // the body ends at the final chunk, rather than reading into the next request.
+    read_result = test::sync_wait(result->body->read(body));
+    CHECK(read_result.err == net::io::status_condition::closed);
+    CHECK(read_result.count == 0);
+
+    auto next = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    REQUIRE(next.has_value());
+    CHECK(next->method == net::http::request_method::GET);
+    CHECK(next->uri.path == "/next"sv);
+}
+
+TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
+{
+    net::io::string_reader<char> content("POST /first HTTP/1.1\r\n"
+                                         "Content-Length: 5\r\n"
+                                         "\r\n"
+                                         "hello"
+                                         "GET /second HTTP/1.1\r\n"
+                                         "\r\n");
+    net::io::buffered_reader     buf_reader(&content);
+
+    auto first = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    REQUIRE(first.has_value());
+
+    std::string body(64, 0);
+
+    auto read_result = test::sync_wait(first->body->read(body));
+    REQUIRE_FALSE(read_result.err);
+    CHECK(body.substr(0, read_result.count) == "hello"sv);
+
+    read_result = test::sync_wait(first->body->read(body));
+    CHECK(read_result.err == net::io::status_condition::closed);
+
+    auto second = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    REQUIRE(second.has_value());
+    CHECK(second->method == net::http::request_method::GET);
+    CHECK(second->uri.path == "/second"sv);
 }

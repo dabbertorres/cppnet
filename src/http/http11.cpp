@@ -308,27 +308,26 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
     co_return writer;
 }
 
-task<request_decoder_result> request_decode(std::unique_ptr<io::buffered_reader> reader,
-                                            std::size_t                          max_header_bytes) noexcept
+task<request_decoder_result> request_decode(io::buffered_reader* reader, std::size_t max_header_bytes) noexcept
 {
     server_request req;
 
-    auto err = co_await parse_request_line(reader.get(), req);
+    auto err = co_await parse_request_line(reader, req);
     if (err) co_return std::unexpected(err);
 
-    err = co_await parse_headers(reader.get(), max_header_bytes, req.headers);
+    err = co_await parse_headers(reader, max_header_bytes, req.headers);
     if (err) co_return std::unexpected(err);
 
     if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
 
     if (req.headers.is_chunked())
     {
-        req.body = std::make_unique<chunked_reader>(std::move(reader));
+        req.body = std::make_unique<chunked_reader>(static_cast<io::reader*>(reader));
     }
     else
     {
         std::size_t content_length = req.headers.get_content_length().value_or(0);
-        req.body                   = std::make_unique<io::limit_reader>(std::move(reader), content_length);
+        req.body = std::make_unique<io::limit_reader>(static_cast<io::reader*>(reader), content_length);
     }
 
     // TODO: trailers

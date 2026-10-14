@@ -237,9 +237,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept {}
 
-task<request_decoder_result> request_decode(std::unique_ptr<io::buffered_reader> reader,
-                                            std::size_t                          max_header_bytes) noexcept
-{}
+task<request_decoder_result> request_decode(io::buffered_reader* reader, std::size_t max_header_bytes) noexcept {}
 
 task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
                                               std::size_t                          max_header_bytes) noexcept

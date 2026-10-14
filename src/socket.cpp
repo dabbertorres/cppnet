@@ -196,9 +196,10 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
     co_return {.count = total_written};
 }
 
-void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const noexcept
+void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept
 {
-    if (!valid()) return;
+    // NOTE: not valid(), as that is also false for a socket with a pending error, which must still be closed.
+    if (fd == invalid_fd) return;
 
     if (graceful)
     {
@@ -209,8 +210,10 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) const n
         set_option(fd, SO_LINGER, &linger);
     }
 
-    scheduler->deregister_handle(fd);
-    ::close(fd);
+    if (scheduler != nullptr) scheduler->deregister_handle(fd);
+
+    // forget the fd, so it isn't closed again later (by which time the number may belong to another file).
+    ::close(std::exchange(fd, invalid_fd));
 }
 
 }
