@@ -53,11 +53,15 @@ public:
         : handle{std::exchange(other.handle, nullptr)}
     {}
 
+    // NOTE: handle is tested with operator bool rather than compared to nullptr. A comparison looks up operator== in
+    //       the namespaces of T (via the promise type), which can find e.g. std::expected's unconstrained operator==
+    //       and recurse forever.
+
     constexpr task& operator=(task&& other) noexcept
     {
         if (std::addressof(other) != this)
         {
-            if (handle != nullptr) handle.destroy();
+            if (handle) handle.destroy();
 
             handle = std::exchange(other.handle, nullptr);
         }
@@ -67,7 +71,7 @@ public:
 
     ~task()
     {
-        if (handle != nullptr) handle.destroy();
+        if (handle) handle.destroy();
     }
 
     auto operator co_await() const& noexcept
@@ -100,7 +104,7 @@ public:
 
     bool destroy()
     {
-        if (handle != nullptr)
+        if (handle)
         {
             handle.destroy();
             handle = nullptr;
@@ -110,7 +114,7 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool is_ready() const noexcept { return handle == nullptr || handle.done(); }
+    [[nodiscard]] bool is_ready() const noexcept { return !handle || handle.done(); }
 
     [[nodiscard]] std::coroutine_handle<promise_type> get_handle() noexcept { return handle; }
 
