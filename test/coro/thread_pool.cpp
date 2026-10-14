@@ -1,10 +1,46 @@
 #include "coro/thread_pool.hpp"
 
+#include <cstddef>
+#include <semaphore>
+#include <string>
+
 #include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 using net::coro::thread_pool;
+
+TEST_CASE("shutdown does not hang", "[coro][thread_pool]")
+{
+    // shutdown used to race with idle workers going to sleep, leaving them waiting forever.
+    for (auto i = 0; i < 1'000; ++i)
+    {
+        thread_pool pool{4};
+    }
+}
+
+TEST_CASE("schedule copies arguments", "[coro][thread_pool]")
+{
+    thread_pool pool{1};
+
+    std::binary_semaphore done{0};
+    std::size_t           size = 0;
+
+    // the temporary string is destroyed before the task runs.
+    auto task = pool.schedule(
+        [&](const std::string& s)
+        {
+            size = s.size();
+            done.release();
+        },
+        std::string(100, 'x'));
+
+    task.get_handle().resume();
+    done.acquire();
+    pool.shutdown();
+
+    CHECK(size == 100);
+}
 
 TEST_CASE("schedule simple lambda", "[coro][thread_pool]")
 {

@@ -79,7 +79,9 @@ int main()
     server.close();
 
     net::io::buffer buf;
-    scheduler.schedule(request_times.encode(buf));
+    // parameters rather than captures: the lambda object is destroyed before the coroutine runs.
+    scheduler.schedule([](const auto& metric, net::io::writer& out) -> net::coro::task<> { co_await metric.encode(out); }(
+        request_times, buf));
 
     std::cout << buf.to_string() << '\n';
 

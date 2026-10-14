@@ -70,8 +70,6 @@ public:
         if (handle != nullptr) handle.destroy();
     }
 
-    operator task<>() const&& noexcept { return task{std::move(handle)}; }
-
     auto operator co_await() const& noexcept
     {
         struct awaitable : public awaitable_base
