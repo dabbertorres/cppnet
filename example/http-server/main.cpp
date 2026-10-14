@@ -1,11 +1,12 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <string_view>
 #include <thread>
 #include <utility>
+
+#include <pthread.h>
 
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
@@ -16,8 +17,6 @@
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "http/server.hpp"
-#include "instrument/prometheus/histogram.hpp"
-#include "io/buffer.hpp"
 #include "io/scheduler.hpp"
 
 namespace http = net::http;
@@ -32,17 +31,13 @@ int main()
     logger->set_pattern("[%T.%e] [%^%-5!l%$] [%-11!n] [t %-8!t] %v");
     spdlog::set_default_logger(logger);
 
-    net::instrument::prometheus::histogram request_times{"request_latency"};
-
     http::server_config config{
         .logger = logger,
     };
     http::router router;
     router.GET("/",
-               [&](const http::server_request& req, http::response_writer& resp) -> net::coro::task<void>
+               [](const http::server_request& /*req*/, http::response_writer& resp) -> net::coro::task<void>
                {
-                   auto tracker = request_times.track();
-
                    resp.headers().set("X-Msg"sv, "Hello"sv).set("Content-Type"sv, "text/plain"sv);
                    constexpr auto msg = "hello world\r\n"sv;
 
@@ -50,10 +45,12 @@ int main()
                    co_await body->write(msg);
                });
 
+    // Block the signals before starting any threads (which inherit the mask), so that only sigwait() receives them.
     sigset_t sig_set;
     sigemptyset(&sig_set);
     sigaddset(&sig_set, SIGINT);
     sigaddset(&sig_set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &sig_set, nullptr);
 
     auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1));
 
@@ -62,7 +59,7 @@ int main()
     http::server server{&scheduler, std::move(router), config};
 
     config.logger->info("starting...");
-    scheduler.schedule(server.serve());
+    scheduler.spawn(server.serve());
 
     auto run_thread = std::thread{[&] { scheduler.run(); }};
 
@@ -76,15 +73,8 @@ int main()
 
     config.logger->info("exiting...");
 
+    // stop accepting connections, then cancel the ones still open, and wait for them to finish.
     server.close();
-
-    net::io::buffer buf;
-    // parameters rather than captures: the lambda object is destroyed before the coroutine runs.
-    scheduler.schedule([](const auto& metric, net::io::writer& out) -> net::coro::task<> { co_await metric.encode(out); }(
-        request_times, buf));
-
-    std::cout << buf.to_string() << '\n';
-
     scheduler.shutdown();
 
     if (run_thread.joinable()) run_thread.join();

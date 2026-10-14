@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io/scheduler.hpp"
@@ -48,14 +50,20 @@ public:
 
     ~listener() noexcept;
 
-    void                                 listen(std::uint16_t max_backlog);
-    [[nodiscard]] coro::task<tcp_socket> accept() const;
+    void listen(std::uint16_t max_backlog);
+
+    // accept waits for the next connection. Once the listener is shut down, it fails with
+    // std::errc::operation_canceled (as do any accepts already waiting).
+    [[nodiscard]] coro::task<std::expected<tcp_socket, std::error_condition>> accept() const;
 
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
+    // shutdown stops accepting connections. The socket is closed when the listener is destroyed.
     void shutdown() noexcept;
 
 private:
+    void close() noexcept;
+
     io::scheduler*    scheduler;
     std::atomic<bool> is_listening;
     int               main_fd;

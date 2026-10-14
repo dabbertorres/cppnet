@@ -7,8 +7,8 @@
 #include <exception>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "coro/task.hpp"
@@ -94,23 +94,29 @@ coro::task<> server::serve()
 
     while (is_serving.load(std::memory_order::acquire))
     {
+        logger->trace("waiting for connection");
+
+        auto accepted = co_await listener.accept();
+        if (!accepted.has_value())
+        {
+            // the server was closed, or the scheduler stopped.
+            if (accepted.error() == std::errc::operation_canceled) co_return;
+
+            logger->error("failed to accept connection: {}", accepted.error().message());
+            continue;
+        }
+
         try
         {
-            logger->trace("waiting for connection");
-            auto client_sock = co_await listener.accept();
-            logger->trace("connection accepted: {} -> {}", client_sock.remote_addr(), client_sock.local_addr());
-            if (!client_sock.valid())
-            {
-                if (!is_serving.load(std::memory_order::acquire)) co_return;
-                else throw std::runtime_error{"listener unexpected closed"};
-            }
-
-            scheduler->schedule(serve_connection(std::move(client_sock)));
+            logger->trace("connection accepted: {} -> {}", accepted->remote_addr(), accepted->local_addr());
         }
         catch (const std::exception& ex)
         {
-            logger->error("exception: {}", ex.what());
+            // the connection may already be gone.
+            logger->debug("accepted connection: {}", ex.what());
         }
+
+        if (!scheduler->spawn(serve_connection(std::move(*accepted)))) co_return;
     }
 }
 
