@@ -7,7 +7,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 #include <spdlog/logger.h>
 #include <spdlog/sinks/null_sink.h>
@@ -48,13 +50,22 @@ public:
     template<typename T>
     T run_to_completion(coro::task<T>&& task)
     {
-        std::optional<T> ret;
+        // std::optional<void> is ill-formed, so void tasks have nothing to store.
+        std::optional<std::conditional_t<std::is_void_v<T>, std::monostate, T>> ret;
 
         auto wrapper = [this, task = std::move(task), &ret] -> coro::task<>
         {
-            auto v = co_await task;
-            shutdown();
-            ret = v;
+            if constexpr (std::is_void_v<T>)
+            {
+                co_await task;
+                shutdown();
+            }
+            else
+            {
+                auto v = co_await task;
+                shutdown();
+                ret = v;
+            }
         };
 
         auto wrapper_task = wrapper();
@@ -66,31 +77,14 @@ public:
             throw 0; // TODO
         }
 
-        running.wait(true, std::memory_order::release);
+        running.wait(true, std::memory_order::acquire);
 
-        // NOTE: will (intentionally) throw if we didn't get a value (although we should've thrown by now if we didn't)
-        return ret.value();
-    }
-
-    template<>
-    void run_to_completion<void>(coro::task<>&& task)
-    {
-        auto wrapper = [this, task = std::move(task)] -> coro::task<>
+        if constexpr (!std::is_void_v<T>)
         {
-            co_await task;
-            shutdown();
-        };
-
-        auto wrapped_task = wrapper();
-
-        auto scheduled = schedule(std::move(wrapped_task));
-
-        if (!scheduled)
-        {
-            throw 0; // TODO
+            // NOTE: will (intentionally) throw if we didn't get a value (although we should've thrown by now if we
+            //       didn't)
+            return ret.value();
         }
-
-        running.wait(true, std::memory_order::release);
     }
 
     void shutdown() noexcept;

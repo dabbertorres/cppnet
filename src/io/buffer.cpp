@@ -13,25 +13,22 @@ namespace net::io
 
 coro::task<result> buffer::write(std::span<const std::byte> data)
 {
-    if (content.size() - write_at < data.size())
-    {
-        content.resize(content.size() - write_at + data.size());
-    }
-
-    std::copy(data.begin(), data.end(), &content[write_at]);
+    content.insert(content.end(), data.begin(), data.end());
     co_return {.count = data.size()};
 }
 
 coro::task<result> buffer::read(std::span<std::byte> data)
 {
-    auto read_amount = std::min(data.size(), content.size() - read_at);
-    std::copy_n(&content[read_at], read_amount, data.begin());
+    if (data.empty()) co_return {.count = 0};
+
+    auto unread = std::span{content}.subspan(read_at);
+    if (unread.empty()) co_return {.count = 0, .err = make_error_condition(status_condition::closed)};
+
+    auto read_amount = std::min(data.size(), unread.size());
+    std::copy_n(unread.begin(), read_amount, data.begin());
     read_at += read_amount;
 
-    result r{.count = read_amount};
-    if (read_at >= content.size()) r.err = io::status_condition::closed; // TODO: should be EOF
-
-    co_return r;
+    co_return {.count = read_amount};
 }
 
 std::string buffer::to_string() const

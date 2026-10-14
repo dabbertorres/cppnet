@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "coro/sync_wait.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/string_reader.hpp"
 
@@ -18,7 +19,7 @@ TEST_CASE("empty", "[io][readline]")
     net::io::buffered_reader buffer(&reader);
 
     auto task = net::io::readline(&buffer);
-    auto res  = std::move(task).operator co_await().await_resume();
+    auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
     auto line = res.to_value();
@@ -31,14 +32,14 @@ TEST_CASE("no newline character", "[io][readline]")
     net::io::buffered_reader buffer(&reader);
 
     auto task = net::io::readline(&buffer);
-    auto res  = std::move(task).operator co_await().await_resume();
+    auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
     auto line = res.to_value();
     CHECK(line == "foobar"sv);
 
     auto task2 = net::io::readline(&buffer);
-    auto res2  = std::move(task2).operator co_await().await_resume();
+    auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
     auto line2 = res2.to_value();
@@ -51,14 +52,14 @@ TEST_CASE("single line", "[io][readline]")
     net::io::buffered_reader buffer(&reader);
 
     auto task = net::io::readline(&buffer);
-    auto res  = std::move(task).operator co_await().await_resume();
+    auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
     auto line = res.to_value();
     CHECK(line == "foobar"sv);
 
     auto task2 = net::io::readline(&buffer);
-    auto res2  = std::move(task2).operator co_await().await_resume();
+    auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
     auto line2 = res2.to_value();
@@ -71,21 +72,21 @@ TEST_CASE("multiple lines", "[io][readline]")
     net::io::buffered_reader buffer(&reader);
 
     auto task = net::io::readline(&buffer);
-    auto res  = std::move(task).operator co_await().await_resume();
+    auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
     auto line = res.to_value();
     CHECK(line == "foo"sv);
 
     auto task2 = net::io::readline(&buffer);
-    auto res2  = std::move(task2).operator co_await().await_resume();
+    auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
     auto line2 = res2.to_value();
     CHECK(line2 == "bar"sv);
 
     auto task3 = net::io::readline(&buffer);
-    auto res3  = std::move(task2).operator co_await().await_resume();
+    auto res3  = test::sync_wait(std::move(task3));
     REQUIRE(res3.has_value());
 
     auto line3 = res3.to_value();

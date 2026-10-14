@@ -34,7 +34,8 @@ public:
 
     coro::task<result> read(std::span<std::byte> data) override
     {
-        if (idx == view.size()) co_return {.count = 0};
+        if (data.empty()) co_return {.count = 0};
+        if (idx == view.size()) co_return {.count = 0, .err = make_error_condition(status_condition::closed)};
 
         auto amount = std::min(view.size() - idx, data.size());
         auto start  = view.begin() + idx;
