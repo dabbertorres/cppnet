@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
@@ -69,20 +70,53 @@ socket::socket(io::scheduler* scheduler, io::handle fd)
     : scheduler{scheduler}
     , fd{fd}
 {
-    scheduler->register_handle(fd);
+    if (fd == invalid_fd) return;
+
+    // The scheduler only says when the socket is ready, so reads and writes must never block. Also, don't leak the
+    // socket into child processes.
+    int flags = ::fcntl(fd, F_GETFL);
+    if (flags == -1 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1 || ::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+    {
+        auto err = errno;
+        ::close(fd);
+        throw system_error_from_errno(err, "failed to make socket non-blocking");
+    }
+
+#ifdef SO_NOSIGPIPE
+    // writing to a closed socket would otherwise kill the process with SIGPIPE (Linux uses MSG_NOSIGNAL instead).
+    int yes = 1;
+    set_option(fd, SO_NOSIGPIPE, &yes);
+#endif
+
+    try
+    {
+        if (scheduler != nullptr) scheduler->register_handle(fd);
+    }
+    catch (...)
+    {
+        ::close(fd);
+        throw;
+    }
 }
 
 socket::socket(socket&& other) noexcept
     : scheduler{std::exchange(other.scheduler, nullptr)}
     , fd{std::exchange(other.fd, invalid_fd)}
+    , read_deadline{std::exchange(other.read_deadline, std::nullopt)}
+    , write_deadline{std::exchange(other.write_deadline, std::nullopt)}
 {}
 
 socket& socket::operator=(socket&& other) noexcept
 {
-    if (fd != invalid_fd) ::close(fd);
+    if (this != &other)
+    {
+        close(false);
 
-    fd        = std::exchange(other.fd, invalid_fd);
-    scheduler = std::exchange(other.scheduler, nullptr);
+        scheduler      = std::exchange(other.scheduler, nullptr);
+        fd             = std::exchange(other.fd, invalid_fd);
+        read_deadline  = std::exchange(other.read_deadline, std::nullopt);
+        write_deadline = std::exchange(other.write_deadline, std::nullopt);
+    }
 
     return *this;
 }
@@ -120,77 +154,70 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
-// TODO: timeout
+void socket::set_deadline(std::optional<io::clock::time_point> deadline) noexcept
+{
+    read_deadline  = deadline;
+    write_deadline = deadline;
+}
+
+void socket::set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept { read_deadline = deadline; }
+
+void socket::set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept { write_deadline = deadline; }
+
 coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
-    std::size_t received = 0;
+    if (data.empty()) co_return {.count = 0};
+    if (fd == invalid_fd || scheduler == nullptr)
+        co_return {.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)};
 
-    while (received < data.size())
+    while (true)
     {
-        auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
-        if (res.err && res.count == 0) co_return res;
+        const auto num = ::recv(fd, data.data(), data.size(), 0);
 
-        auto read_amount = std::min(res.count, data.size() - received);
+        if (num > 0) co_return {.count = static_cast<std::size_t>(num)};
 
-        const std::int64_t num = ::recv(fd, data.data() + received, read_amount, 0);
-        if (num < 0)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        // the other end closed the connection
+        if (num == 0) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
 
-            co_return {
-                .count = received,
-                .err   = std::error_condition{errno, std::system_category()}
-            };
-        }
+        auto err = errno;
+        if (err == EINTR) continue;
+        if (err != EAGAIN && err != EWOULDBLOCK) co_return {.count = 0, .err = {err, std::generic_category()}};
 
-        // client closed connection
-        if (num == 0)
-        {
-            co_return {
-                .count = received,
-                .err   = make_error_condition(io::status_condition::closed),
-            };
-        }
-
-        received += static_cast<std::size_t>(num);
-        break;
+        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::read, read_deadline);
+        if (wait_err) co_return {.count = 0, .err = wait_err};
     }
-
-    co_return {.count = received};
 }
 
 coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 {
+    if (fd == invalid_fd || scheduler == nullptr)
+        co_return {.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)};
+
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL; // don't raise SIGPIPE when writing to a closed socket.
+#else
+    constexpr int flags = 0;
+#endif
+
     std::size_t total_written = 0;
 
     while (total_written < data.size())
     {
-        auto res = co_await scheduler->schedule(native_handle(), io::poll_op::write, 0ms);
-        if (res.err && res.count == 0) co_return res;
+        const auto num = ::send(fd, data.data() + total_written, data.size() - total_written, flags);
 
-        auto write_amount = std::min(res.count, data.size() - total_written);
-
-        const std::int64_t num = ::send(fd, data.data() + total_written, write_amount, 0);
-        if (num < 0)
+        if (num >= 0)
         {
-            auto err = errno;
-            if (err == EAGAIN || err == EWOULDBLOCK) continue;
-            co_return {
-                .count = total_written,
-                .err   = std::make_error_condition(static_cast<std::errc>(err)),
-            };
+            total_written += static_cast<std::size_t>(num);
+            continue;
         }
 
-        // client closed connection
-        if (num == 0)
-        {
-            co_return {
-                .count = total_written,
-                .err   = make_error_condition(io::status_condition::closed),
-            };
-        }
+        auto err = errno;
+        if (err == EINTR) continue;
+        if (err != EAGAIN && err != EWOULDBLOCK)
+            co_return {.count = total_written, .err = {err, std::generic_category()}};
 
-        total_written += static_cast<std::size_t>(num);
+        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::write, write_deadline);
+        if (wait_err) co_return {.count = total_written, .err = wait_err};
     }
 
     co_return {.count = total_written};
@@ -210,6 +237,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcep
         set_option(fd, SO_LINGER, &linger);
     }
 
+    // deregister first: it cancels any waits, and epoll needs the handle to still be open.
     if (scheduler != nullptr) scheduler->deregister_handle(fd);
 
     // forget the fd, so it isn't closed again later (by which time the number may belong to another file).

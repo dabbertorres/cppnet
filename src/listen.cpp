@@ -4,7 +4,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include <fcntl.h>
@@ -105,7 +107,26 @@ listener::listener(io::scheduler*            scheduler,
 
     if (main_fd == invalid_fd) throw system_error_from_errno(last_err, "failed to bind a socket matching options");
 
-    scheduler->register_handle(main_fd);
+    // accept() must never block (the scheduler only says a connection may be ready), and the socket shouldn't leak into
+    // child processes.
+    int flags = ::fcntl(main_fd, F_GETFL);
+    if (flags == -1 || ::fcntl(main_fd, F_SETFL, flags | O_NONBLOCK) == -1
+        || ::fcntl(main_fd, F_SETFD, FD_CLOEXEC) == -1)
+    {
+        auto err = errno;
+        ::close(std::exchange(main_fd, invalid_fd));
+        throw system_error_from_errno(err, "failed to make listener non-blocking");
+    }
+
+    try
+    {
+        scheduler->register_handle(main_fd);
+    }
+    catch (...)
+    {
+        ::close(std::exchange(main_fd, invalid_fd));
+        throw;
+    }
 }
 
 listener::listener(listener&& other) noexcept
@@ -116,16 +137,19 @@ listener::listener(listener&& other) noexcept
 
 listener& listener::operator=(listener&& other) noexcept
 {
-    shutdown();
+    if (this != &other)
+    {
+        close();
 
-    scheduler    = std::exchange(other.scheduler, nullptr);
-    is_listening = other.is_listening.exchange(false, std::memory_order::acq_rel);
-    main_fd      = std::exchange(other.main_fd, invalid_fd);
+        scheduler    = std::exchange(other.scheduler, nullptr);
+        is_listening = other.is_listening.exchange(false, std::memory_order::acq_rel);
+        main_fd      = std::exchange(other.main_fd, invalid_fd);
+    }
 
     return *this;
 }
 
-listener::~listener() noexcept { shutdown(); }
+listener::~listener() noexcept { close(); }
 
 void listener::listen(std::uint16_t max_backlog)
 {
@@ -143,37 +167,58 @@ void listener::listen(std::uint16_t max_backlog)
     /* }); */
 }
 
-coro::task<tcp_socket> listener::accept() const
+coro::task<std::expected<tcp_socket, std::error_condition>> listener::accept() const
 {
-    if (!is_listening.load(std::memory_order::acquire)) throw exception{"not listening"};
+    const auto canceled = std::make_error_condition(std::errc::operation_canceled);
 
-    sockaddr_storage inc{};
-    socklen_t        inc_size = sizeof(inc);
-
-    auto res = co_await scheduler->schedule(native_handle(), io::poll_op::read, 0ms);
-    if (res.err) throw res.err;
-    if (res.count == 0) co_return tcp_socket{scheduler};
-
-    int inc_fd = ::accept(main_fd, reinterpret_cast<sockaddr*>(&inc), &inc_size);
-    if (inc_fd == -1)
+    while (true)
     {
-        // return invalid socket to indicate shutdown
-        if (!is_listening.load(std::memory_order::acquire)) co_return tcp_socket{scheduler};
+        if (!is_listening.load(std::memory_order::acquire)) co_return std::unexpected(canceled);
 
-        throw system_error_from_errno(errno);
+        int inc_fd = ::accept(main_fd, nullptr, nullptr);
+        if (inc_fd != -1) co_return tcp_socket{scheduler, inc_fd};
+
+        auto err = errno;
+        switch (err)
+        {
+        case EINTR: [[fallthrough]];
+        case ECONNABORTED: continue; // the connection was reset before we got to it: try the next one.
+
+        case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
+        case EWOULDBLOCK:
+#endif
+        {
+            auto wait_err = co_await scheduler->wait(main_fd, io::poll_op::read);
+            if (wait_err)
+            {
+                // shutdown() deregisters the handle, which may be seen as either error.
+                if (!is_listening.load(std::memory_order::acquire)) co_return std::unexpected(canceled);
+                co_return std::unexpected(wait_err);
+            }
+
+            continue;
+        }
+
+        default: co_return std::unexpected(std::error_condition{err, std::generic_category()});
+        }
     }
-
-    co_return tcp_socket{scheduler, inc_fd};
 }
 
 void listener::shutdown() noexcept
 {
-    if (is_listening.exchange(false, std::memory_order::acq_rel) && main_fd != invalid_fd)
-    {
-        ::close(main_fd);
-        scheduler->deregister_handle(main_fd);
-        main_fd = invalid_fd;
-    }
+    // NOTE: the handle stays open until the listener is destroyed, as accept() may be using it on another thread.
+    if (is_listening.exchange(false, std::memory_order::acq_rel)) scheduler->deregister_handle(main_fd);
+}
+
+void listener::close() noexcept
+{
+    if (main_fd == invalid_fd) return;
+
+    // NOTE: deregistered regardless of shutdown(), as the handle is registered before listen() is called.
+    is_listening.store(false, std::memory_order::release);
+    scheduler->deregister_handle(main_fd);
+    ::close(std::exchange(main_fd, invalid_fd));
 }
 
 }

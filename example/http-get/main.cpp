@@ -1,13 +1,10 @@
 #include <array>
-#include <condition_variable>
 #include <expected>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string_view>
 #include <system_error>
-#include <thread>
 
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
@@ -25,8 +22,7 @@ namespace http = net::http;
 namespace
 {
 
-net::coro::task<>
-run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success);
+net::coro::task<bool> run_request(http::client& client, http::client_request& req);
 
 }
 
@@ -85,23 +81,8 @@ int main(int argc, char** argv)
         // clang-format on
     };
 
-    std::mutex              is_done_mu;
-    std::condition_variable is_done_cv;
-    bool                    success = false;
-
-    auto run_thread = std::thread{[&] { scheduler.run(); }};
-
-    std::cout << "building request...\n";
-    scheduler.schedule(run_request(client, req, is_done_cv, success));
-
-    /*scheduler.run_to_completion(run_request(client, req, is_done_cv, success));*/
-
-    std::unique_lock lock{is_done_mu};
-    is_done_cv.wait(lock);
-
-    scheduler.shutdown();
-
-    if (run_thread.joinable()) run_thread.join();
+    std::cout << "sending request...\n";
+    bool success = scheduler.run_to_completion(run_request(client, req));
 
     return success ? 0 : 1;
 }
@@ -109,17 +90,13 @@ int main(int argc, char** argv)
 namespace
 {
 
-net::coro::task<>
-run_request(http::client& client, http::client_request& req, std::condition_variable& is_done, bool& success)
+net::coro::task<bool> run_request(http::client& client, http::client_request& req)
 {
-    std::cout << "sending request...\n";
     auto get_result = co_await client.send(req);
-    std::cout << "aaahhhhh\n";
     if (!get_result.has_value())
     {
         std::cerr << "Error sending request: " << get_result.error().message() << "\n";
-        is_done.notify_one();
-        co_return;
+        co_return false;
     }
 
     std::cout << "received response!\n";
@@ -150,8 +127,7 @@ run_request(http::client& client, http::client_request& req, std::condition_vari
         if (res.err)
         {
             std::cerr << "error reading body: " << res.err.message() << '\n';
-            is_done.notify_one();
-            co_return;
+            co_return false;
         }
 
         if (res.count != 0)
@@ -160,8 +136,7 @@ run_request(http::client& client, http::client_request& req, std::condition_vari
         }
     }
 
-    success = true;
-    is_done.notify_one();
+    co_return true;
 }
 
 }

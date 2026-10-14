@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -39,6 +40,12 @@ public:
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
 
+    // Deadlines limit how long reads and writes wait for the socket to be ready: once one has passed, they fail with
+    // std::errc::timed_out (until the deadline is changed). std::nullopt removes it.
+    void set_deadline(std::optional<io::clock::time_point> deadline) noexcept;
+    void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
+    void set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept;
+
     coro::task<io::result> read(std::span<std::byte> data) noexcept override;
     coro::task<io::result> write(std::span<const std::byte> data) noexcept override;
 
@@ -60,8 +67,10 @@ protected:
     }
 
 private:
-    io::scheduler* scheduler;
-    int            fd;
+    io::scheduler*                       scheduler;
+    int                                  fd;
+    std::optional<io::clock::time_point> read_deadline;
+    std::optional<io::clock::time_point> write_deadline;
 };
 
 }

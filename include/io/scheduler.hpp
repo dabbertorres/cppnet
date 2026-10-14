@@ -3,18 +3,25 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
-#include <deque>
+#include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <stdexcept>
+#include <system_error>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <spdlog/logger.h>
 #include <spdlog/sinks/null_sink.h>
 #include <spdlog/spdlog.h>
 
+#include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "io/event_loop.hpp"
@@ -24,11 +31,84 @@
 namespace net::io
 {
 
+using clock = std::chrono::steady_clock;
+
+// scheduler runs tasks on a thread pool, and resumes them when the handles they wait on are ready.
+//
+// Lifecycle:
+// - spawn() starts tasks, which the scheduler owns until they finish.
+// - run() waits for and dispatches I/O on the calling thread, until the scheduler is stopped and its tasks have
+//   finished.
+// - request_stop() refuses new tasks, and cancels every pending (and future) wait with
+//   std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still runs (e.g. to clean
+//   up), and reads/writes that don't need to wait still work.
+// - shutdown() stops the scheduler, and blocks until its tasks have finished and run() has returned.
+//
+// A scheduler can't be restarted once stopped.
 class scheduler
 {
+    struct waiter;
+
+    using timer_list = std::multimap<clock::time_point, waiter*>;
+
+    // waiter is a pending wait for a handle, owned by the suspended coroutine's wait_operation.
+    struct waiter
+    {
+        handle                              fd;
+        poll_op                             op;
+        std::optional<clock::time_point>    deadline;
+        std::coroutine_handle<>             awaiting{nullptr};
+        std::error_condition                result;
+        std::optional<timer_list::iterator> timer;
+    };
+
+    // registration holds the waiters for a handle: at most one per operation.
+    struct registration
+    {
+        waiter* read  = nullptr;
+        waiter* write = nullptr;
+    };
+
 public:
+    // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
+    // - std::errc::timed_out if the deadline passed first.
+    // - std::errc::operation_canceled if the scheduler was stopped, or the handle deregistered.
+    // - std::errc::bad_file_descriptor if the handle isn't registered.
+    // - std::errc::device_or_resource_busy if another coroutine is already waiting for the same operation.
+    class [[nodiscard]] wait_operation
+    {
+        friend class scheduler;
+
+        wait_operation(scheduler* sched, handle fd, poll_op op, std::optional<clock::time_point> deadline) noexcept
+            : sched{sched}
+            , state{.fd = fd, .op = op, .deadline = deadline, .awaiting = nullptr, .result = {}, .timer = std::nullopt}
+        {}
+
+    public:
+        wait_operation(const wait_operation&)            = delete;
+        wait_operation& operator=(const wait_operation&) = delete;
+
+        wait_operation(wait_operation&&)            = delete;
+        wait_operation& operator=(wait_operation&&) = delete;
+
+        ~wait_operation() = default;
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+        bool               await_suspend(std::coroutine_handle<> awaiting) noexcept
+        {
+            return sched->suspend(state, awaiting);
+        }
+        [[nodiscard]] std::error_condition await_resume() const noexcept { return state.result; }
+
+    private:
+        scheduler* sched;
+        waiter     state;
+    };
+
+    // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
     scheduler(std::shared_ptr<coro::thread_pool>     workers,
-              const std::shared_ptr<spdlog::logger>& logger = spdlog::create<spdlog::sinks::null_sink_mt>("scheduler"));
+              const std::shared_ptr<spdlog::logger>& logger
+              = std::make_shared<spdlog::logger>("scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
 
     scheduler(const scheduler&)            = delete;
     scheduler& operator=(const scheduler&) = delete;
@@ -36,65 +116,114 @@ public:
     scheduler(scheduler&&)            = delete;
     scheduler& operator=(scheduler&&) = delete;
 
+    // Calls shutdown(): must not be destroyed from one of its own tasks.
     ~scheduler() noexcept;
 
-    void register_handle(handle handle);
-    void deregister_handle(handle handle);
+    // register_handle must be called before waiting on a handle, and deregister_handle before closing it.
+    // deregister_handle cancels any waits on the handle.
+    void register_handle(handle fd);
+    void deregister_handle(handle fd) noexcept;
 
-    bool               schedule(coro::task<>&& task) noexcept;
-    coro::task<result> schedule(handle handle, poll_op op, std::chrono::milliseconds timeout);
-    bool               resume(std::coroutine_handle<> handle) noexcept;
+    // spawn starts task on the thread pool. If the scheduler is stopping, the task is destroyed without being run, and
+    // false is returned.
+    //
+    // Exceptions that escape the task are logged.
+    bool spawn(coro::task<> task);
+
+    wait_operation wait(handle fd, poll_op op) noexcept { return {this, fd, op, std::nullopt}; }
+    wait_operation wait_until(handle fd, poll_op op, clock::time_point deadline) noexcept
+    {
+        return {this, fd, op, deadline};
+    }
+    wait_operation wait_until(handle fd, poll_op op, std::optional<clock::time_point> deadline) noexcept
+    {
+        return {this, fd, op, deadline};
+    }
+    wait_operation wait_for(handle fd, poll_op op, clock::duration timeout) noexcept
+    {
+        return {this, fd, op, clock::now() + timeout};
+    }
 
     void run();
 
+    // run_to_completion spawns task, and runs the scheduler on the calling thread until it finishes. The scheduler is
+    // then stopped, and once its other tasks have finished, the task's result is returned (or its exception thrown).
     template<typename T>
-    T run_to_completion(coro::task<T>&& task)
+    T run_to_completion(coro::task<T> task)
     {
-        // std::optional<void> is ill-formed, so void tasks have nothing to store.
-        std::optional<std::conditional_t<std::is_void_v<T>, std::monostate, T>> ret;
+        using stored = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
 
-        auto wrapper = [this, task = std::move(task), &ret] -> coro::task<>
+        std::optional<stored> value;
+        std::exception_ptr    error;
+
+        // parameters rather than captures: the lambda object is destroyed before the coroutine finishes.
+        auto wrapper = [](scheduler* self, coro::task<T> task, std::optional<stored>* value, std::exception_ptr* error)
+            -> coro::task<>
         {
-            if constexpr (std::is_void_v<T>)
+            try
             {
-                co_await task;
-                shutdown();
+                if constexpr (std::is_void_v<T>)
+                {
+                    co_await task;
+                    value->emplace();
+                }
+                else
+                {
+                    value->emplace(co_await std::move(task));
+                }
             }
-            else
+            catch (...)
             {
-                auto v = co_await task;
-                shutdown();
-                ret = v;
+                *error = std::current_exception();
             }
+
+            self->request_stop();
         };
 
-        auto wrapper_task = wrapper();
+        if (!spawn(wrapper(this, std::move(task), &value, &error)))
+            throw std::logic_error{"run_to_completion: the scheduler is stopped"};
 
-        auto scheduled = schedule(std::move(wrapper_task));
+        run();
 
-        if (!scheduled)
-        {
-            throw 0; // TODO
-        }
-
-        running.wait(true, std::memory_order::acquire);
-
-        if constexpr (!std::is_void_v<T>)
-        {
-            // NOTE: will (intentionally) throw if we didn't get a value (although we should've thrown by now if we
-            //       didn't)
-            return ret.value();
-        }
+        if (error) std::rethrow_exception(error);
+        if constexpr (!std::is_void_v<T>) return std::move(*value);
     }
 
+    // request_stop stops the scheduler, without waiting for its tasks: it may be called from one of them.
+    void request_stop() noexcept;
+
+    [[nodiscard]] bool stop_requested() const noexcept;
+
+    // shutdown stops the scheduler, and blocks until its tasks have finished, and run() has returned (if running). It
+    // must not be called from one of the scheduler's own tasks, which would then wait for itself.
     void shutdown() noexcept;
 
 private:
+    using completions = std::vector<std::coroutine_handle<>>;
+
+    bool suspend(waiter& state, std::coroutine_handle<> awaiting) noexcept;
+
+    // Must be called while holding mu.
+    void complete(waiter* state, std::error_condition result, completions& done) noexcept;
+    void rearm(handle fd, const registration& reg, completions& done) noexcept;
+    void dispatch(std::span<const ready_event> events, completions& done) noexcept;
+    void expire_timers(completions& done) noexcept;
+
+    void resume(const completions& done) noexcept;
+
     std::shared_ptr<coro::thread_pool> workers;
+    std::shared_ptr<spdlog::logger>    logger;
     detail::event_loop                 loop;
-    std::deque<coro::task<>>           tasks;
-    std::mutex                         tasks_mu;
-    std::atomic<bool>                  running;
+
+    mutable std::mutex                       mu;
+    std::unordered_map<handle, registration> registrations;
+    timer_list                               timers;
+    bool                                     stopping = false;
+
+    std::atomic<bool> running = false;
+
+    // NOTE: declared last, so it's destroyed first: tasks use the rest of the scheduler until they finish.
+    coro::async_scope scope;
 };
 
 }

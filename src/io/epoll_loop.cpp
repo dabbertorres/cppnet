@@ -6,73 +6,50 @@
 
 // keep parent header above this
 
+#    include <algorithm>
 #    include <array>
-#    include <atomic>
 #    include <cerrno>
 #    include <chrono>
-#    include <coroutine>
+#    include <climits>
 #    include <cstddef>
 #    include <cstdint>
-#    include <cstring>
-#    include <memory>
-#    include <mutex>
-#    include <stdexcept>
-#    include <string>
-#    include <system_error>
-#    include <type_traits>
+#    include <optional>
+#    include <span>
 
 #    include <sys/epoll.h>
 #    include <sys/eventfd.h>
-#    include <sys/ioctl.h>
-#    include <sys/time.h>
-#    include <sys/timerfd.h>
 #    include <unistd.h>
 
-#    include <spdlog/logger.h>
-
-#    include "coro/generator.hpp"
-#    include "coro/task.hpp"
 #    include "exception.hpp"
-#    include "io/event.hpp"
+#    include "io/event_loop.hpp"
 #    include "io/io.hpp"
 #    include "io/poll.hpp"
 
 namespace
 {
 
-EPOLL_EVENTS convert_poll_op(net::io::poll_op op)
+std::uint32_t to_epoll_events(net::io::poll_op op) noexcept
 {
-    using net::io::poll_op;
-
-    using namespace std::string_literals;
-
-    switch (op)
-    {
-    case poll_op::read: return EPOLLIN;
-    case poll_op::write: return EPOLLOUT;
-    case poll_op::read_write:
-        return static_cast<EPOLL_EVENTS>(EPOLLIN | EPOLLOUT);
-    [[unlikely]] default:
-        throw std::runtime_error("invalid poll_op value: "s
-                                 + std::to_string(static_cast<std::underlying_type_t<poll_op>>(op)));
-    }
+    // EPOLLONESHOT disables the handle once it has been reported, until it is armed again. It's also set when no
+    // operations are wanted, as otherwise EPOLLHUP and EPOLLERR (which can't be masked) would be reported over and
+    // over.
+    std::uint32_t events = EPOLLONESHOT;
+    if (net::io::is_readable(op)) events |= EPOLLIN | EPOLLRDHUP;
+    if (net::io::is_writable(op)) events |= EPOLLOUT;
+    return events;
 }
 
-std::size_t roughly_get_socket_buffer_size(int fd, net::io::poll_op op)
+net::io::poll_op from_epoll_events(std::uint32_t events) noexcept
 {
     using net::io::poll_op;
 
-    std::size_t request = 0;
+    // hangups and errors are reported as ready: the next read or write will find out what happened.
+    constexpr std::uint32_t closed = EPOLLHUP | EPOLLERR;
 
-    if (is_readable(op)) request = FIONREAD;
-    else if (is_writable(op)) request = TIOCOUTQ;
-    else return 0;
-
-    int  value  = 0;
-    auto status = ioctl(fd, request, &value);
-    if (status == -1) return 0;
-
-    return static_cast<std::size_t>(value);
+    auto op = poll_op::none;
+    if ((events & (EPOLLIN | EPOLLRDHUP | closed)) != 0) op = op | poll_op::read;
+    if ((events & (EPOLLOUT | closed)) != 0) op = op | poll_op::write;
+    return op;
 }
 
 }
@@ -80,223 +57,100 @@ std::size_t roughly_get_socket_buffer_size(int fd, net::io::poll_op op)
 namespace net::io::detail
 {
 
-epoll_loop::epoll_loop(const std::shared_ptr<spdlog::logger>& logger)
-    : epoll_fd{epoll_create1(EPOLL_CLOEXEC)}
-    , timer_fd(timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK))
-    , shutdown_fd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK))
-    , running{true}
-    , logger{logger->clone("epoll_loop")}
+epoll_loop::epoll_loop()
+    : epoll_fd{::epoll_create1(EPOLL_CLOEXEC)}
+    , interrupt_fd{::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)}
 {
-    if (epoll_fd == -1) throw system_error_from_errno(errno, "epoll fd");
-    if (timer_fd == -1) throw system_error_from_errno(errno, "timer fd");
-    if (shutdown_fd == -1) throw system_error_from_errno(errno, "shutdown fd");
-
-    epoll_event ev{.events = EPOLLIN};
-
-    ev.data.fd = timer_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev) == -1) throw system_error_from_errno(errno, "add timer fd");
-
-    ev.data.fd = shutdown_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, shutdown_fd, &ev) == -1)
-        throw system_error_from_errno(errno, "add shutdown fd");
-}
-
-epoll_loop::~epoll_loop()
-{
-    shutdown();
-
-    if (epoll_fd != -1) ::close(epoll_fd);
-    if (timer_fd != -1) ::close(timer_fd);
-    if (shutdown_fd != -1) ::close(shutdown_fd);
-}
-
-// NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::register_handle(handle handle)
-{
-    epoll_event event{.events = 0, .data = {nullptr}};
-
-    auto status = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, handle, &event);
-    if (status == -1)
+    if (epoll_fd == -1 || interrupt_fd == -1)
     {
         auto err = errno;
-        if (err != EEXIST) // ignore already added fds
-            throw system_error_from_errno(err, "registering handle");
+        if (epoll_fd != -1) ::close(epoll_fd);
+        if (interrupt_fd != -1) ::close(interrupt_fd);
+        throw system_error_from_errno(err, "failed to create epoll");
+    }
+
+    epoll_event ev{.events = EPOLLIN, .data = {.fd = interrupt_fd}};
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, interrupt_fd, &ev) == -1)
+    {
+        auto err = errno;
+        ::close(epoll_fd);
+        ::close(interrupt_fd);
+        throw system_error_from_errno(err, "failed to register epoll interrupt event");
     }
 }
 
-// NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::deregister_handle(handle handle)
+epoll_loop::~epoll_loop() noexcept
 {
-    epoll_event ev{.events = 0, .data = {nullptr}};
+    ::close(epoll_fd);
+    ::close(interrupt_fd);
+}
 
-    auto status = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, handle, &ev);
-    if (status == -1)
+// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
+void epoll_loop::add(handle fd)
+{
+    epoll_event ev{.events = to_epoll_events(poll_op::none), .data = {.fd = fd}};
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1 && errno != EEXIST)
+        throw system_error_from_errno(errno, "failed to add handle to epoll");
+}
+
+void epoll_loop::remove(handle fd) noexcept
+{
+    // NOTE: fails if the handle is already closed, which removes it anyway.
+    ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
+void epoll_loop::arm(handle fd, poll_op op)
+{
+    epoll_event ev{.events = to_epoll_events(op), .data = {.fd = fd}};
+    if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) throw system_error_from_errno(errno, "failed to arm handle");
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
+std::size_t epoll_loop::wait(std::span<ready_event> events, std::optional<std::chrono::nanoseconds> timeout)
+{
+    std::array<epoll_event, 64> epoll_events{};
+    const auto                  max_events = std::min(epoll_events.size(), events.size());
+
+    // epoll_wait() only takes milliseconds: round up, so we don't wake up just before a deadline and spin.
+    int timeout_ms = -1;
+    if (timeout)
     {
-        auto err = errno;
-        if (err != ENOENT) // ignore already gone fds
-            throw system_error_from_errno(err, "deregister_handle()");
+        auto ms    = std::chrono::ceil<std::chrono::milliseconds>(*timeout).count();
+        timeout_ms = static_cast<int>(std::clamp<decltype(ms)>(ms, 0, INT_MAX));
     }
 
-    // TODO: remove from timeout_list and ready_fds if needed
-}
-
-coro::task<result> epoll_loop::queue(handle handle, poll_op op, std::chrono::milliseconds timeout)
-{
-    auto r = co_await operation{this, handle, op, timeout};
-    co_return r;
-}
-
-coro::generator<event> epoll_loop::dispatch()
-{
-    if (!running.load(std::memory_order::acquire)) co_return;
-
-    std::array<epoll_event, 16> events{};
-
-    auto count = epoll_wait(epoll_fd, events.data(), static_cast<int>(events.size()), -1);
-    if (count == -1) throw system_error_from_errno(errno, "epoll_wait");
-
-    bool dispatch_timeouts = false;
-
-    for (auto i = 0u; i < static_cast<std::size_t>(count); ++i)
+    auto count = ::epoll_wait(epoll_fd, epoll_events.data(), static_cast<int>(max_events), timeout_ms);
+    if (count == -1)
     {
-        epoll_event& ev = events[i];
+        if (errno == EINTR) return 0;
+        throw system_error_from_errno(errno, "failed to wait for epoll events");
+    }
 
-        if (ev.data.ptr == &timer_fd)
+    std::size_t num_ready = 0;
+
+    for (const auto& ev : std::span{epoll_events}.first(static_cast<std::size_t>(count)))
+    {
+        if (ev.data.fd == interrupt_fd)
         {
-            dispatch_timeouts = true;
+            std::uint64_t value = 0;
+            [[maybe_unused]] auto _ = ::read(interrupt_fd, &value, sizeof(value));
             continue;
         }
 
-        if (ev.data.ptr == &shutdown_fd) continue;
-
-        auto handle = std::coroutine_handle<promise>::from_address(ev.data.ptr);
-
-        // NOTE: epoll doesn't tell us how much data is available. We can get it,
-        // but we don't store the fd on the event.
-        //
-        // So how do we resolve this? Use the language's coroutine machinerys! Where is that?
-        // On the awaitable! (operation). Specifically, in operation::await_resume();
-        io::result res = {};
-        if ((ev.events & EPOLLERR) == EPOLLERR) res.err = std::make_error_condition(static_cast<std::errc>(errno));
-        else if ((ev.events & EPOLLRDHUP) == EPOLLRDHUP) res.err = make_error_condition(status_condition::closed);
-        else if ((ev.events & EPOLLHUP) == EPOLLHUP) res.err = make_error_condition(status_condition::closed);
-
-        co_yield event{handle, res};
+        events[num_ready++] = {.fd = ev.data.fd, .ready = from_epoll_events(ev.events)};
     }
 
-    if (dispatch_timeouts)
-    {
-        std::lock_guard lock{timeout_list_mu};
-
-        auto now = clock::now();
-
-        while (!timeout_list.empty() && timeout_list.top().timeout_at <= now)
-        {
-            auto op = timeout_list.top();
-            timeout_list.pop();
-
-            // drop already completed coroutines
-            if (!op.handle || op.handle.done()) continue;
-
-            io::result res = {
-                .count = 0,
-                .err   = make_error_condition(status_condition::timed_out),
-            };
-            co_yield event{op.handle, res};
-        }
-
-        if (!timeout_list.empty())
-        {
-            auto next_timeout = timeout_list.top().timeout_at - clock::now();
-            update_timer(std::chrono::duration_cast<std::chrono::milliseconds>(next_timeout));
-        }
-    }
+    return num_ready;
 }
 
-void epoll_loop::shutdown() noexcept
+// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
+void epoll_loop::interrupt() noexcept
 {
-    running.store(false, std::memory_order::release);
     std::uint64_t value = 1;
-    ::write(shutdown_fd, &value, sizeof(value));
-}
 
-bool epoll_loop::operation::await_ready() const noexcept
-{
-    auto count = roughly_get_socket_buffer_size(fd, op);
-    return count > 0;
-}
-
-result epoll_loop::operation::await_resume()
-{
-    auto res = awaiting.promise().result();
-    if (res.err == status_condition::timed_out)
-    {
-        loop->disable_events(fd);
-    }
-
-    auto count = roughly_get_socket_buffer_size(fd, op);
-    if (count > 0) res.count = count;
-
-    return res;
-}
-
-void epoll_loop::operation::await_suspend(std::coroutine_handle<promise> await_on)
-{
-    awaiting = await_on;
-    loop->queue(awaiting, fd, op, timeout);
-}
-
-void epoll_loop::queue(std::coroutine_handle<promise> awaiting,
-                       handle                         handle,
-                       poll_op                        op,
-                       std::chrono::milliseconds      timeout)
-{
-    epoll_event ev{.events = convert_poll_op(op) | EPOLLONESHOT | EPOLLRDHUP};
-    ev.data.ptr = awaiting.address();
-
-    auto status = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, handle, &ev);
-    if (status == -1) throw system_error_from_errno(errno);
-
-    // If this timeout is shorter than the current (if any), check if we need to update the timer.
-    if (timeout > decltype(timeout)::zero())
-    {
-        std::lock_guard lock{timeout_list_mu};
-
-        auto timeout_at = timeout + clock::now();
-
-        if (timeout_list.empty() || timeout_list.top().timeout_at > timeout_at)
-        {
-            update_timer(timeout);
-        }
-
-        timeout_list.push(timeout_operation{
-            .handle     = awaiting,
-            .timeout_at = timeout_at,
-        });
-    }
-}
-
-// NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::disable_events(handle handle)
-{
-    epoll_event ev{.events = 0, .data = {nullptr}};
-
-    auto status = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, handle, &ev);
-    if (status == -1) throw system_error_from_errno(errno);
-}
-
-// NOLINTNEXTLINE(readability-make-member-function-const, "not really const")
-void epoll_loop::update_timer(std::chrono::milliseconds timeout)
-{
-    auto sec  = std::chrono::duration_cast<std::chrono::seconds>(timeout);
-    auto nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout) - sec;
-
-    itimerspec timeout_at = {
-        .it_interval = {          .tv_sec = 0,            .tv_nsec = 0},
-        .it_value    = {.tv_sec = sec.count(), .tv_nsec = nsec.count()},
-    };
-    auto status = timerfd_settime(timer_fd, 0, &timeout_at, nullptr);
-    if (status == -1) throw system_error_from_errno(errno, "updating timer");
+    // NOTE: can only fail if the counter would overflow, in which case an interrupt is already pending.
+    [[maybe_unused]] auto _ = ::write(interrupt_fd, &value, sizeof(value));
 }
 
 }
