@@ -90,8 +90,10 @@ struct http_metrics::state
     state(http::request_handler&& next, std::vector<double>&& buckets)
         : next{std::move(next)}
         , buckets{std::move(buckets)}
-        , active{prometheus::registry::register_metric(
-              prometheus::gauge{"http_server_active_requests", "Number of HTTP requests being handled."})}
+        , active{
+              prometheus::registry::register_metric(
+                  prometheus::gauge{"http_server_active_requests", "Number of HTTP requests being handled."}),
+          }
     {}
 
     prometheus::histogram& duration(http::request_method method, http::status code, std::string_view route)
@@ -103,7 +105,7 @@ struct http_metrics::state
             if (auto iter = durations.find(key); iter != durations.end()) return *iter->second;
         }
 
-        std::lock_guard lock{mutex};
+        std::scoped_lock lock{mutex};
         if (auto iter = durations.find(key); iter != durations.end()) return *iter->second;
 
         auto& h = prometheus::registry::register_metric(prometheus::histogram{

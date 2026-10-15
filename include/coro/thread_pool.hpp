@@ -80,7 +80,7 @@ public:
         std::size_t new_jobs = 0;
 
         {
-            std::lock_guard lock{wait_mutex};
+            std::scoped_lock lock{wait_mutex};
             for (const auto& handle : handles)
             {
                 if (handle != nullptr) [[likely]]

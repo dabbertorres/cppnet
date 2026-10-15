@@ -14,7 +14,7 @@ namespace net::coro
 
 bool async_scope::join_operation::await_suspend(std::coroutine_handle<> awaiting) noexcept
 {
-    std::lock_guard lock{scope->mu};
+    std::scoped_lock lock{scope->mu};
     if (scope->count == 0) return false;
 
     scope->joiners.push_back(awaiting);
@@ -35,7 +35,7 @@ async_scope::~async_scope()
 bool async_scope::spawn(task<> task)
 {
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
         if (is_closed) return false;
         ++count;
     }
@@ -79,7 +79,7 @@ async_scope::detached async_scope::run(async_scope* scope, task<> task)
 
 void async_scope::close() noexcept
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
     if (std::exchange(is_closed, true)) return;
 
     if (count == 0 && on_drained) on_drained();
@@ -87,13 +87,13 @@ void async_scope::close() noexcept
 
 bool async_scope::closed() const noexcept
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
     return is_closed;
 }
 
 std::size_t async_scope::size() const noexcept
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
     return count;
 }
 
@@ -109,7 +109,7 @@ void async_scope::finish() noexcept
 
     {
         // NOTE: everything is done under the lock, as once it is released, a joiner may destroy the scope.
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
         if (--count != 0) return;
 
         to_resume.swap(joiners);

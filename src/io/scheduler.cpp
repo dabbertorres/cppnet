@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -44,8 +45,7 @@ namespace net::io
 {
 
 scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shared_ptr<spdlog::logger>& logger)
-    : workers{std::move(workers)}
-    // a few threads, so that one slow lookup doesn't hold up the rest.
+    : workers{std::move(workers)} // a few threads, so that one slow lookup doesn't hold up the rest.
     , blocking{std::make_unique<coro::thread_pool>(4)}
     , logger{logger}
     , scope{[this](const std::exception_ptr& ex)
@@ -70,7 +70,7 @@ scheduler::~scheduler() noexcept { shutdown(); }
 
 void scheduler::register_handle(handle fd)
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
 
     if (registrations.contains(fd)) return;
 
@@ -83,7 +83,7 @@ void scheduler::deregister_handle(handle fd) noexcept
     completions done;
 
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
 
         auto it = registrations.find(fd);
         if (it == registrations.end()) return;
@@ -276,7 +276,7 @@ void scheduler::run()
         std::optional<clock::duration> timeout;
 
         {
-            std::lock_guard lock{mu};
+            std::scoped_lock lock{mu};
 
             // NOTE: the scope interrupts the loop once it has drained after being closed.
             if (stopping && scope.empty()) return;
@@ -287,7 +287,7 @@ void scheduler::run()
         auto num_ready = loop.wait(events, timeout);
 
         {
-            std::lock_guard lock{mu};
+            std::scoped_lock lock{mu};
             dispatch(std::span{events}.first(num_ready), done);
             expire_timers(done);
         }
@@ -353,7 +353,7 @@ void scheduler::request_stop() noexcept
     completions done;
 
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
         if (std::exchange(stopping, true)) return;
 
         auto canceled = std::make_error_condition(std::errc::operation_canceled);
@@ -385,7 +385,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
     completions done;
 
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
 
         // NOTE: equal keys are kept in the order they were inserted, and lower_bound finds the first (find needn't).
         while (true)
@@ -403,7 +403,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
 
 bool scheduler::stop_requested() const noexcept
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
     return stopping;
 }
 
