@@ -18,7 +18,7 @@ template<typename K, typename V>
 class cache
 {
 public:
-    cache(std::size_t capacity)
+    explicit cache(std::size_t capacity)
         : capacity{capacity}
         , hand{entries.end()}
     {
@@ -88,7 +88,7 @@ public:
         return false;
     }
 
-    bool contains(K key) const noexcept
+    [[nodiscard]] bool contains(K key) const noexcept
     {
         std::shared_lock lock{mu};
 

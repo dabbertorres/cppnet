@@ -13,7 +13,7 @@ template<std::invocable<std::chrono::duration<double>> Callback, typename Clock 
 struct tracker
 {
 public:
-    tracker(Callback&& callback)
+    explicit tracker(Callback&& callback)
         : callback{std::move(callback)}
         , start{Clock::now()}
     {}

@@ -124,7 +124,7 @@ public:
     };
 
     // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
-    scheduler(std::shared_ptr<coro::thread_pool>     workers,
+    explicit scheduler(std::shared_ptr<coro::thread_pool>     workers,
               const std::shared_ptr<spdlog::logger>& logger
               = std::make_shared<spdlog::logger>("scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
 
@@ -270,6 +270,7 @@ public:
         run();
 
         if (error) std::rethrow_exception(error);
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access): the task either set it, or threw.
         if constexpr (!std::is_void_v<T>) return std::move(*value);
     }
 

@@ -14,6 +14,7 @@
 namespace net
 {
 
+// NOLINTNEXTLINE(bugprone-exception-escape): split_string's substr positions are in range.
 std::optional<ipv6_addr> ipv6_addr::parse(std::string_view str) noexcept
 {
     // NOTE: currently limited to parsing only fully-specified addresses,

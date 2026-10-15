@@ -126,6 +126,7 @@ constexpr bool less_ignore_case(String lhs, String rhs) noexcept
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 constexpr String trim_string(String str) noexcept
 {
     using namespace std::literals::string_view_literals;
@@ -177,6 +178,7 @@ String join(Args join_with, std::initializer_list<Args> strings) noexcept
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 constexpr String unquote(String str) noexcept
 {
     // need at least 2 characters to be quoted

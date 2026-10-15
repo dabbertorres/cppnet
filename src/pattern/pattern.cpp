@@ -38,15 +38,6 @@ bool is_operator(net::pattern::expr::string_view str) noexcept
     return is_operator(str[0]);
 }
 
-}
-
-namespace net::pattern
-{
-
-expr::expr(const char* str) { parse(str, states); }
-expr::expr(const string& str) { parse(str, states); }
-expr::expr(string_view str) { parse(str, states); }
-
 enum class op
 {
     // by precedence, weakest -> strongest
@@ -65,7 +56,7 @@ enum class op
     paren_close,
 };
 
-constexpr expr::string_view op_to_char(op op)
+constexpr net::pattern::expr::string_view op_to_char(op op)
 {
     switch (op)
     {
@@ -123,6 +114,14 @@ constexpr bool operator<=(op lhs, op rhs) noexcept
         }
     }
 }
+}
+
+namespace net::pattern
+{
+
+expr::expr(const char* str) { parse(str, states); }
+expr::expr(const string& str) { parse(str, states); }
+expr::expr(string_view str) { parse(str, states); }
 
 expr expr::parse(string_view str)
 {

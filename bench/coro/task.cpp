@@ -94,6 +94,7 @@ public:
             T await_resume()
             {
                 if (handle.promise().error) std::rethrow_exception(handle.promise().error);
+                // NOLINTNEXTLINE(bugprone-unchecked-optional-access): the task either set it, or threw.
                 return std::move(*handle.promise().value);
             }
         };
@@ -105,6 +106,7 @@ public:
     T run()
     {
         handle.resume();
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access): the task must have finished, and set it.
         return std::move(*handle.promise().value);
     }
 

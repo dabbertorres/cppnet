@@ -28,13 +28,13 @@ public:
     // The trailer section, altogether.
     static constexpr std::size_t max_trailers = 8'192;
 
-    constexpr chunked_reader(std::unique_ptr<io::buffered_reader>&& reader)
+    explicit constexpr chunked_reader(std::unique_ptr<io::buffered_reader>&& reader)
         : owned{std::move(reader)}
         , parent{owned.get()}
     {}
 
     // reader is borrowed, and must outlive this chunked_reader.
-    constexpr chunked_reader(io::buffered_reader* reader)
+    explicit constexpr chunked_reader(io::buffered_reader* reader)
         : parent{reader}
     {}
 

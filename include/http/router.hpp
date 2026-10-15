@@ -38,49 +38,31 @@ request_handler make_handler(H&& h)
 class router final
 {
 public:
-    router& GET(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::GET, route, std::forward<handler_func>(h));
-    }
+    router& GET(std::string_view route, handler_func&& h) { return add(request_method::GET, route, std::move(h)); }
 
-    router& POST(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::POST, route, std::forward<handler_func>(h));
-    }
+    router& POST(std::string_view route, handler_func&& h) { return add(request_method::POST, route, std::move(h)); }
 
     router& DELETE(std::string_view route, handler_func&& h)
     {
-        return add(request_method::DELETE, route, std::forward<handler_func>(h));
+        return add(request_method::DELETE, route, std::move(h));
     }
 
-    router& PUT(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::PUT, route, std::forward<handler_func>(h));
-    }
+    router& PUT(std::string_view route, handler_func&& h) { return add(request_method::PUT, route, std::move(h)); }
 
-    router& PATCH(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::PATCH, route, std::forward<handler_func>(h));
-    }
+    router& PATCH(std::string_view route, handler_func&& h) { return add(request_method::PATCH, route, std::move(h)); }
 
-    router& HEAD(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::HEAD, route, std::forward<handler_func>(h));
-    }
+    router& HEAD(std::string_view route, handler_func&& h) { return add(request_method::HEAD, route, std::move(h)); }
 
     router& CONNECT(std::string_view route, handler_func&& h)
     {
-        return add(request_method::CONNECT, route, std::forward<handler_func>(h));
+        return add(request_method::CONNECT, route, std::move(h));
     }
 
-    router& TRACE(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::TRACE, route, std::forward<handler_func>(h));
-    }
+    router& TRACE(std::string_view route, handler_func&& h) { return add(request_method::TRACE, route, std::move(h)); }
 
     router& OPTIONS(std::string_view route, handler_func&& h)
     {
-        return add(request_method::OPTIONS, route, std::forward<handler_func>(h));
+        return add(request_method::OPTIONS, route, std::move(h));
     }
 
     router& add(request_method method, std::string_view route, handler_func&& h);

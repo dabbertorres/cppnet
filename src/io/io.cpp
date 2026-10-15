@@ -38,14 +38,11 @@ struct status_condition_category : std::error_category
             case std::errc::network_down:
             case std::errc::network_reset:
             case std::errc::network_unreachable:
-            case std::errc::no_message_available:
             case std::errc::no_message:
-            case std::errc::no_stream_resources:
             case std::errc::no_such_device_or_address:
             case std::errc::no_such_device:
             case std::errc::no_such_process:
             case std::errc::not_a_socket:
-            case std::errc::not_a_stream:
             case std::errc::not_connected:
             case std::errc::operation_canceled:
             case std::errc::owner_dead:
@@ -57,8 +54,7 @@ struct status_condition_category : std::error_category
         case net::io::status_condition::timed_out:
             switch (code_value)
             {
-            case std::errc::timed_out:
-            case std::errc::stream_timeout: return true;
+            case std::errc::timed_out: return true;
 
             default: return false;
             }

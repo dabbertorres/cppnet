@@ -198,7 +198,7 @@ struct keepalive_server
 
             if (when == closing::on_second && ++on_connection == 2) break;
 
-            if (delay > 0ms) co_await sched->sleep_until(net::io::clock::now() + delay);
+            if (delay > 0ms) (void)co_await sched->sleep_until(net::io::clock::now() + delay);
 
             auto response = when == closing::with_header
                               ? "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"sv
@@ -368,7 +368,7 @@ TEST_CASE("idle connections the server closed aren't reused", "[http][client][po
 
             // every other time, give the server's close time to arrive, so it's seen before reusing the connection.
             // Otherwise, the request fails on the closed connection, and is retried.
-            if (i % 2 == 0) co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            if (i % 2 == 0) (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
         }
         co_return bodies;
     };
@@ -452,7 +452,7 @@ TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool
                    keepalive_server*    server) -> task<std::pair<net::http::connection_stats, int>>
     {
         co_await fetch(client, "127.0.0.1", server->port);
-        co_await sched->sleep_until(net::io::clock::now() + 300ms);
+        (void)co_await sched->sleep_until(net::io::clock::now() + 300ms);
 
         // the server has seen it close.
         co_return std::pair{client->stats(), server->active.load()};
@@ -640,7 +640,7 @@ TEST_CASE("a response before the whole body was sent is still read", "[http][cli
     net::http::client client{&sched};
 
     auto req = post_request(server.port);
-    req.set_body(std::string(4 * 1'024 * 1'024, 'x'));
+    req.set_body(std::string(std::size_t{4} * 1'024 * 1'024, 'x'));
 
     REQUIRE(sched.spawn(server.serve()));
     // NOTE: not moved inside CHECK, which expands its expression twice (once unevaluated).
@@ -705,7 +705,7 @@ struct stalling_server
         if (where == stall::before_reading)
         {
             // until the test ends (which cancels it).
-            co_await sched->sleep_until(net::io::clock::now() + 1h);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 1h);
             co_return;
         }
 
@@ -758,7 +758,7 @@ std::pair<T, net::io::clock::duration> timed(net::io::scheduler& sched, task<T> 
     return {std::move(result), net::io::clock::now() - start};
 }
 
-const std::string timed_out = "error: " + std::make_error_condition(std::errc::timed_out).message();
+std::string timed_out() { return "error: " + std::make_error_condition(std::errc::timed_out).message(); }
 
 }
 
@@ -771,7 +771,7 @@ TEST_CASE("waiting for a response's head times out", "[http][client][timeout]")
     REQUIRE(sched.spawn(server.serve()));
     auto [result, elapsed] = timed(sched, fetch(&client, "127.0.0.1", server.port));
 
-    CHECK(result == timed_out);
+    CHECK(result == timed_out());
     CHECK(elapsed >= 100ms);
     CHECK(elapsed < 5s);
     CHECK(client.stats() == net::http::connection_stats{});
@@ -808,7 +808,7 @@ TEST_CASE("a stalled request body times out", "[http][client][timeout]")
     // NOTE: it's only a stall once the connection's buffers are full, which can take a while: e.g. Linux grows its
     //       receive window a little at a time, so writes keep making some progress (~2.6MB over ~5s here, with debug
     //       builds, where macOS takes ~0.5MB, and ~0.1s).
-    CHECK(result == timed_out);
+    CHECK(result == timed_out());
     CHECK(elapsed >= 100ms);
     CHECK(elapsed < 30s);
 }
@@ -820,7 +820,7 @@ TEST_CASE("timeouts don't limit what makes progress", "[http][client][timeout]")
     net::http::client  client{&sched, {.response_header_timeout = 500ms, .io_timeout = 500ms}};
 
     // big enough to take more than one wait to send and receive.
-    std::string big(8 * 1'024 * 1'024, 'x');
+    std::string big(std::size_t{8} * 1'024 * 1'024, 'x');
 
     auto req = post_request(server.port);
     req.set_body(big);

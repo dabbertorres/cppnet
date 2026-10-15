@@ -26,10 +26,12 @@ public:
 
     constexpr ip_addr() noexcept = default;
 
+    // NOLINTNEXTLINE(*-explicit-constructor): an ip_addr is either, so converts from both.
     constexpr ip_addr(ipv4_addr addr) noexcept
         : addr{addr}
     {}
 
+    // NOLINTNEXTLINE(*-explicit-constructor): an ip_addr is either, so converts from both.
     constexpr ip_addr(ipv6_addr addr) noexcept
         : addr{addr}
     {}
@@ -41,6 +43,7 @@ public:
     [[nodiscard]] const constexpr ipv6_addr& to_ipv6() const { return std::get<ipv6_addr>(addr); }
 
     // NOTE: not null-terminated
+    // NOLINTNEXTLINE(bugprone-exception-escape): the variant can't be valueless.
     [[nodiscard]] constexpr explicit operator const std::uint8_t*() const noexcept
     {
         return std::visit([](const auto& v) { return static_cast<const std::uint8_t*>(v); }, addr);
@@ -69,6 +72,7 @@ private:
     std::variant<ipv4_addr, ipv6_addr> addr;
 };
 
+// NOLINTNEXTLINE(bugprone-exception-escape): the variant can't be valueless.
 constexpr std::partial_ordering operator<=>(const ip_addr& lhs, const ip_addr& rhs) noexcept
 {
     if (lhs.is_ipv4() && rhs.is_ipv4()) return lhs.to_ipv4() <=> rhs.to_ipv4();

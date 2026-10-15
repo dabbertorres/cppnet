@@ -31,7 +31,7 @@ namespace
 {
 
 // The most of an unread request body to read and discard, rather than closing the connection.
-constexpr std::size_t max_discard_bytes = 64 * 1'024;
+constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
 
 // discard_body reads and drops the rest of body, returning whether it reached the end of it.
 net::coro::task<bool> discard_body(net::io::reader& body)
@@ -64,7 +64,7 @@ using namespace std::chrono_literals;
 net::coro::task<> linger_before_close(net::tcp_socket& conn) noexcept
 {
     constexpr auto        linger_time = 2s;
-    constexpr std::size_t max_drain   = 256 * 1'024;
+    constexpr std::size_t max_drain   = std::size_t{256} * 1'024;
 
     conn.shutdown_write();
     conn.set_read_deadline(net::io::clock::now() + linger_time);

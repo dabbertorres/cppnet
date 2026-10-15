@@ -47,7 +47,7 @@ public:
 
     struct awaitable_base
     {
-        constexpr awaitable_base(std::coroutine_handle<promise_type> handle) noexcept
+        explicit constexpr awaitable_base(std::coroutine_handle<promise_type> handle) noexcept
             : handle{handle}
         {}
 
@@ -115,7 +115,7 @@ public:
             auto await_resume() { return this->handle.promise().result(); }
         };
 
-        return awaitable{handle};
+        return awaitable{awaitable_base{handle}};
     }
 
     auto operator co_await() const&& noexcept
@@ -125,7 +125,7 @@ public:
             auto await_resume() { return std::move(this->handle.promise()).result(); }
         };
 
-        return awaitable{handle};
+        return awaitable{awaitable_base{handle}};
     }
 
     [[nodiscard]] bool resume() const noexcept

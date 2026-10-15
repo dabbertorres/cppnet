@@ -217,7 +217,7 @@ public:
 
     string_map& operator=(std::initializer_list<value_type> ilist) { values = ilist; }
 
-    allocator_type get_allocator() const noexcept { return values.get_allocator(); }
+    [[nodiscard]] allocator_type get_allocator() const noexcept { return values.get_allocator(); }
 
     [[nodiscard]] iterator       begin() noexcept { return values.begin(); }
     [[nodiscard]] const_iterator begin() const noexcept { return values.begin(); }
@@ -402,10 +402,10 @@ public:
         values.merge(std::move(source).values);
     }
 
-    mapped_type&       at(const String& key) { return values.at(key); }
-    const mapped_type& at(const String& key) const { return values.at(key); }
-    mapped_type&       at(StringView key) { return values.at(key); }
-    const mapped_type& at(StringView key) const { return values.at(key); }
+    mapped_type&                     at(const String& key) { return values.at(key); }
+    [[nodiscard]] const mapped_type& at(const String& key) const { return values.at(key); }
+    mapped_type&                     at(StringView key) { return values.at(key); }
+    [[nodiscard]] const mapped_type& at(StringView key) const { return values.at(key); }
 
     mapped_type& operator[](const String& key) { return values[key]; }
 
@@ -421,8 +421,8 @@ public:
         return iter->second;
     }
 
-    size_type count(const String& key) const { return values.count(key); }
-    size_type count(StringView key) const { return values.count(key); }
+    [[nodiscard]] size_type count(const String& key) const { return values.count(key); }
+    [[nodiscard]] size_type count(StringView key) const { return values.count(key); }
 
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201811L
     template<typename K>
@@ -432,10 +432,10 @@ public:
     }
 #endif
 
-    iterator       find(const String& key) { return values.find(key); }
-    const_iterator find(const String& key) const { return values.find(key); }
-    iterator       find(StringView key) { return values.find(key); }
-    const_iterator find(StringView key) const { return values.find(key); }
+    iterator                     find(const String& key) { return values.find(key); }
+    [[nodiscard]] const_iterator find(const String& key) const { return values.find(key); }
+    iterator                     find(StringView key) { return values.find(key); }
+    [[nodiscard]] const_iterator find(StringView key) const { return values.find(key); }
 
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201811L
     template<typename K>
@@ -462,10 +462,16 @@ public:
     }
 #endif
 
-    std::pair<iterator, iterator>             equal_range(const String& key) { return values.equal_range(key); }
-    std::pair<const_iterator, const_iterator> equal_range(const String& key) const { return values.equal_range(key); }
-    std::pair<iterator, iterator>             equal_range(StringView key) { return values.equal_range(key); }
-    std::pair<const_iterator, const_iterator> equal_range(StringView key) const { return values.equal_range(key); }
+    std::pair<iterator, iterator> equal_range(const String& key) { return values.equal_range(key); }
+    [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range(const String& key) const
+    {
+        return values.equal_range(key);
+    }
+    std::pair<iterator, iterator> equal_range(StringView key) { return values.equal_range(key); }
+    [[nodiscard]] std::pair<const_iterator, const_iterator> equal_range(StringView key) const
+    {
+        return values.equal_range(key);
+    }
 
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201811L
     template<typename K>
@@ -481,20 +487,20 @@ public:
     }
 #endif
 
-    local_iterator       begin(size_type n) { return values.begin(n); }
-    const_local_iterator begin(size_type n) const { return values.begin(n); }
-    const_local_iterator cbegin(size_type n) const { return values.begin(n); }
+    local_iterator                     begin(size_type n) { return values.begin(n); }
+    [[nodiscard]] const_local_iterator begin(size_type n) const { return values.begin(n); }
+    [[nodiscard]] const_local_iterator cbegin(size_type n) const { return values.begin(n); }
 
-    local_iterator       end(size_type n) { return values.end(n); }
-    const_local_iterator end(size_type n) const { return values.end(n); }
-    const_local_iterator cend(size_type n) const { return values.end(n); }
+    local_iterator                     end(size_type n) { return values.end(n); }
+    [[nodiscard]] const_local_iterator end(size_type n) const { return values.end(n); }
+    [[nodiscard]] const_local_iterator cend(size_type n) const { return values.end(n); }
 
-    size_type bucket_count() const { return values.bucket_count(); }
-    size_type max_bucket_count() const { return values.max_bucket_count(); }
-    size_type bucket_size(size_type n) const { return values.bucket_size(n); }
+    [[nodiscard]] size_type bucket_count() const { return values.bucket_count(); }
+    [[nodiscard]] size_type max_bucket_count() const { return values.max_bucket_count(); }
+    [[nodiscard]] size_type bucket_size(size_type n) const { return values.bucket_size(n); }
 
-    size_type bucket(const String& key) const { return values.bucket(key); }
-    size_type bucket(StringView key) const { return values.bucket(key); }
+    [[nodiscard]] size_type bucket(const String& key) const { return values.bucket(key); }
+    [[nodiscard]] size_type bucket(StringView key) const { return values.bucket(key); }
 
     [[nodiscard]] float load_factor() const { return values.load_factor(); }
 
@@ -504,8 +510,8 @@ public:
     void rehash(size_type count) { values.rehash(count); }
     void reserve(size_type count) { values.reserve(count); }
 
-    Hash     hash_function() const { return values.hash_function(); }
-    KeyEqual key_eq() const { return values.key_eq(); }
+    [[nodiscard]] Hash     hash_function() const { return values.hash_function(); }
+    [[nodiscard]] KeyEqual key_eq() const { return values.key_eq(); }
 
     friend bool operator==(const string_map& lhs, const string_map& rhs) noexcept { return lhs.values == rhs.values; }
     friend bool operator!=(const string_map& lhs, const string_map& rhs) noexcept { return lhs.values != rhs.values; }

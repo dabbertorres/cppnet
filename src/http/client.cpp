@@ -30,7 +30,7 @@ namespace
 using namespace std::string_view_literals;
 
 // a server's response head can't use up all of the client's memory.
-constexpr std::size_t max_response_header_bytes = 1'024 * 1'024;
+constexpr std::size_t max_response_header_bytes = std::size_t{1'024} * 1'024;
 
 // pooled_body reads a response's body from a leased connection, which it returns to the pool once the body has been
 // read to its end (or closes, if it's destroyed before then).

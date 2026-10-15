@@ -94,7 +94,7 @@ struct base_metric
 {
     // NOTE: throws std::invalid_argument if name or labels are invalid (see detail::validate_name and
     //       detail::normalize_labels). The labels are sorted by key.
-    base_metric(std::string&& name, std::string&& help = "", metric_labels&& labels = {})
+    explicit base_metric(std::string&& name, std::string&& help = "", metric_labels&& labels = {})
         : name{std::move(name)}
         , help{std::move(help)}
         , labels{detail::normalize_labels(std::move(labels))}

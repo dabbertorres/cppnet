@@ -43,7 +43,7 @@ public:
         std::coroutine_handle<> awaiting{nullptr};
     };
 
-    thread_pool(std::size_t concurrency = hardware_concurrency());
+    explicit thread_pool(std::size_t concurrency = hardware_concurrency());
 
     thread_pool(const thread_pool&)            = delete;
     thread_pool& operator=(const thread_pool&) = delete;
