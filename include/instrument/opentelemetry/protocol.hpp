@@ -63,7 +63,7 @@ void to_json(nlohmann::json& j, const key_value& value);
 struct resource
 {
     std::vector<key_value> attributes;
-    std::uint32_t          dropped_attributes_count;
+    std::uint32_t          dropped_attributes_count{};
 };
 
 void to_json(nlohmann::json& j, const resource& value);
@@ -110,26 +110,27 @@ enum class span_kind
     consumer    = 5,
 };
 
-using time_point = std::chrono::time_point<std::chrono::steady_clock, std::chrono::nanoseconds>;
+// NOTE: system_clock's, as OTLP's times are since the Unix epoch.
+using time_point = std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds>;
 
 struct event
 {
     time_point             time;
     std::string            name;
     std::vector<key_value> attributes;
-    std::uint32_t          dropped_attributes_count;
+    std::uint32_t          dropped_attributes_count{};
 };
 
 void to_json(nlohmann::json& j, const event& value);
 
 struct link
 {
-    trace_id_t             trace_id;
-    span_id_t              span_id;
+    trace_id_t             trace_id{};
+    span_id_t              span_id{};
     std::string            trace_state;
     std::vector<key_value> attributes;
-    std::uint32_t          dropped_attributes_count;
-    span_flags             flags;
+    std::uint32_t          dropped_attributes_count{};
+    span_flags             flags{};
 };
 
 void to_json(nlohmann::json& j, const link& value);
@@ -144,29 +145,29 @@ enum class status_code
 struct status
 {
     std::string message;
-    status_code code;
+    status_code code{};
 };
 
 void to_json(nlohmann::json& j, const status& value);
 
 struct span
 {
-    std::byte                version;
-    trace_id_t               trace_id;
+    std::byte                version{};
+    trace_id_t               trace_id{};
     std::optional<span_id_t> parent_span_id;
-    span_id_t                span_id;
+    span_id_t                span_id{};
     std::string              trace_state;
-    span_flags               flags;
+    span_flags               flags{};
     std::string              name;
-    span_kind                kind;
+    span_kind                kind{};
     time_point               start_time;
     time_point               end_time;
     std::vector<key_value>   attributes;
-    std::uint32_t            dropped_attributes_count;
+    std::uint32_t            dropped_attributes_count{};
     std::vector<event>       events;
-    std::uint32_t            dropped_events_count;
+    std::uint32_t            dropped_events_count{};
     std::vector<link>        links;
-    std::uint32_t            dropped_links_count;
+    std::uint32_t            dropped_links_count{};
     struct status            status;
 };
 
@@ -177,7 +178,7 @@ struct instrumentation_scope
     std::string            name;
     std::string            version;
     std::vector<key_value> attributes;
-    std::uint32_t          dropped_attributes_count;
+    std::uint32_t          dropped_attributes_count{};
 };
 
 void to_json(nlohmann::json& j, const instrumentation_scope& value);
@@ -230,8 +231,8 @@ struct exemplar
     std::vector<key_value>             filtered_attributes;
     time_point                         time;
     std::variant<double, std::int64_t> value;
-    span_id_t                          span_id;
-    trace_id_t                         trace_id;
+    span_id_t                          span_id{};
+    trace_id_t                         trace_id{};
 };
 
 void to_json(nlohmann::json& j, const exemplar& value);
@@ -243,7 +244,7 @@ struct number_data_point
     time_point                         time;
     std::variant<double, std::int64_t> value;
     std::vector<exemplar>              exemplars;
-    data_point_flags                   flags;
+    data_point_flags                   flags{};
 };
 
 void to_json(nlohmann::json& j, const number_data_point& value);
@@ -264,8 +265,10 @@ enum class aggregation_temporality : std::uint8_t
 struct sum
 {
     std::vector<number_data_point> data_points;
-    enum aggregation_temporality   aggregation_temporality;
-    bool                           is_monotonic;
+    enum aggregation_temporality aggregation_temporality
+    {
+    };
+    bool is_monotonic{};
 };
 
 void to_json(nlohmann::json& j, const sum& value);
@@ -277,18 +280,20 @@ struct histogram
         std::vector<key_value>     attributes;
         time_point                 start_time;
         time_point                 time;
-        std::uint64_t              count;
+        std::uint64_t              count{};
         std::optional<double>      sum;
         std::vector<std::uint64_t> bucket_counts;
         std::vector<double>        explicit_bounds;
         std::vector<exemplar>      exemplars;
-        data_point_flags           flags;
+        data_point_flags           flags{};
         std::optional<double>      min;
         std::optional<double>      max;
     };
 
-    std::vector<data_point>      data_points;
-    enum aggregation_temporality aggregation_temporality;
+    std::vector<data_point> data_points;
+    enum aggregation_temporality aggregation_temporality
+    {
+    };
 };
 
 void to_json(nlohmann::json& j, const histogram& value);
@@ -299,28 +304,30 @@ struct exponential_histogram
     {
         struct buckets
         {
-            std::int32_t               offset;
+            std::int32_t               offset{};
             std::vector<std::uint64_t> bucket_counts;
         };
 
         std::vector<key_value> attributes;
         time_point             start_time;
         time_point             time;
-        std::uint64_t          count;
+        std::uint64_t          count{};
         std::optional<double>  sum;
-        std::int32_t           scale;
-        std::uint64_t          zero_count;
+        std::int32_t           scale{};
+        std::uint64_t          zero_count{};
         buckets                positive;
         buckets                negative;
-        data_point_flags       flags;
+        data_point_flags       flags{};
         std::vector<exemplar>  exemplars;
         std::optional<double>  min;
         std::optional<double>  max;
-        double                 zero_threshold;
+        double                 zero_threshold{};
     };
 
-    std::vector<data_point>      data_points;
-    enum aggregation_temporality aggregation_temporality;
+    std::vector<data_point> data_points;
+    enum aggregation_temporality aggregation_temporality
+    {
+    };
 };
 
 void to_json(nlohmann::json& j, const exponential_histogram& value);
@@ -331,17 +338,17 @@ struct summary
     {
         struct value_at_quantile
         {
-            double quantile;
-            double value;
+            double quantile{};
+            double value{};
         };
 
         std::vector<key_value>         attributes;
         time_point                     start_time;
         time_point                     time;
-        std::uint64_t                  count;
-        double                         sum;
+        std::uint64_t                  count{};
+        double                         sum{};
         std::vector<value_at_quantile> quantile_values;
-        data_point_flags               flags;
+        data_point_flags               flags{};
     };
 
     std::vector<data_point> data_points;
@@ -397,7 +404,7 @@ void to_json(nlohmann::json& j, const export_trace_service_request& value);
 
 struct export_trace_partial_success
 {
-    std::int64_t rejected_spans;
+    std::int64_t rejected_spans{};
     std::string  error_message;
 };
 
@@ -419,7 +426,7 @@ void to_json(nlohmann::json& j, const export_metrics_service_request& value);
 
 struct export_metrics_partial_success
 {
-    std::int64_t rejected_data_points;
+    std::int64_t rejected_data_points{};
     std::string  error_message;
 };
 
