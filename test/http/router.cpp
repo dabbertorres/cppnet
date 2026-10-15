@@ -13,6 +13,7 @@
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
+#include "http/route_pattern.hpp"
 #include "io/string_writer.hpp"
 
 namespace http = net::http;
@@ -225,4 +226,17 @@ TEST_CASE("HEAD is handled by GET, unless the route has its own", "[http][router
     CHECK(called == "HEAD");
 
     CHECK(route(router, http::request_method::HEAD, "/c").status == http::status::METHOD_NOT_ALLOWED);
+}
+
+TEST_CASE("routes can be made at runtime, by parsing them", "[http][router][route_pattern]")
+{
+    const std::string from_config = "/items/:id";
+
+    auto pattern = http::route_pattern::parse(from_config);
+    REQUIRE(pattern.has_value());
+
+    http::router router;
+    router.GET(*pattern, ok);
+
+    CHECK(route(router, http::request_method::GET, "/items/7").route == "/items/:id");
 }

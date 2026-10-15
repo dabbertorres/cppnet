@@ -21,9 +21,9 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-router& router::add(request_method method, std::string_view route, handler_func&& h)
+router& router::add(request_method method, route_pattern route, handler_func&& h)
 {
-    auto& sub                   = get_subrouter(route);
+    auto& sub                   = get_subrouter(route.view());
     sub.method_handlers[method] = std::move(h);
 
     return *this;
@@ -112,22 +112,14 @@ std::string router::allowed_methods() const
 
 router& router::get_subrouter(std::string_view route)
 {
-    if (route.starts_with('/'))
-    {
-        route = route.substr(1);
-    }
+    // NOTE: route_pattern has checked the route on its own: it starts with '/', and its parameters have names.
+    route = route.substr(1);
 
     auto* current = this;
     for (const auto part : util::split_string(route, '/'))
     {
-        // wildcard
         if (part.starts_with(':'))
         {
-            if (part.length() == 1)
-            {
-                throw std::runtime_error{"wildcard name must not be empty"};
-            }
-
             if (current->wildcard == nullptr)
             {
                 current->wildcard          = std::make_unique<router>();
@@ -136,7 +128,9 @@ router& router::get_subrouter(std::string_view route)
             }
             else if (current->wildcard_name != part.substr(1))
             {
-                throw std::runtime_error{"mismatched wildcard name"};
+                // the router keeps one parameter per position, which path_value finds by its name.
+                throw std::invalid_argument{"route parameter " + std::string{part} + " conflicts with :"
+                                            + current->wildcard_name + ", which another route has in its place"};
             }
 
             current = current->wildcard.get();
