@@ -207,3 +207,89 @@ TEST_CASE("http_tracing makes a server span for each request", "[instrument][mid
         CHECK(attribute(spans[0], "http.response.status_code") == "500");
     }
 }
+
+TEST_CASE("handlers can continue the request's trace", "[instrument][middleware][tracing]")
+{
+    std::vector<opentelemetry::span> spans;
+    http::headers                    outgoing;
+    bool                             had_trace = false;
+
+    http::router router;
+    router.GET("/calls",
+               [&](const http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   const auto* trace = req.extensions.get<net::instrument::trace>();
+                   had_trace         = trace != nullptr;
+                   if (trace == nullptr) co_return;
+
+                   trace->span().attributes.push_back({.key = "app.user", .value = {.value = std::string{"42"}}});
+
+                   // e.g. a request to another service.
+                   auto child = trace->start_child("GET users", opentelemetry::span_kind::client);
+                   opentelemetry::tracecontext::inject(child, outgoing);
+                   trace->end(std::move(child));
+
+                   co_await resp.send(http::status::OK, 0);
+               });
+
+    SECTION("not without http_tracing")
+    {
+        CHECK_FALSE(call(router, "/calls"));
+        CHECK_FALSE(had_trace);
+    }
+
+    SECTION("with http_tracing")
+    {
+        const net::instrument::http_tracing handler{std::move(router),
+                                                    [&](opentelemetry::span&& s) { spans.push_back(std::move(s)); }};
+
+        http::headers incoming;
+        incoming.set("traceparent"sv, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"sv);
+
+        CHECK_FALSE(call(handler, "/calls", incoming));
+        REQUIRE(had_trace);
+
+        // the child ends first.
+        REQUIRE(spans.size() == 2);
+        const auto& child  = spans[0];
+        const auto& server = spans[1];
+
+        CHECK(server.kind == opentelemetry::span_kind::server);
+        CHECK(attribute(server, "app.user") == "42");
+
+        CHECK(child.kind == opentelemetry::span_kind::client);
+        CHECK(child.name == "GET users");
+        CHECK(child.trace_id == server.trace_id);
+        CHECK(child.parent_span_id == server.span_id);
+        CHECK(child.span_id != server.span_id);
+        CHECK(child.flags == server.flags);
+        CHECK(child.start_time <= child.end_time);
+
+        // the next service continues the trace as the client span's child.
+        auto next = opentelemetry::tracecontext::parse(outgoing);
+        REQUIRE(next.has_value());
+        CHECK(next->trace_id == server.trace_id);
+        CHECK(next->parent_span_id == child.span_id);
+    }
+}
+
+TEST_CASE("the trace is removed from the request once it's handled", "[instrument][middleware][tracing]")
+{
+    const net::instrument::http_tracing handler{test_router(), [](opentelemetry::span&&) {}};
+
+    http::server_request req{
+        .method  = http::request_method::GET,
+        .version = {.major = 1, .minor = 1}
+    };
+    req.target.path = "/users/1";
+
+    net::io::string_writer<char> out;
+    http::server_response        base{
+        .version = {.major = 1, .minor = 1},
+        .body    = &out
+    };
+    http::response_writer resp{&out, &base, http::http11::response_encode};
+
+    test::sync_wait(handler(req, resp));
+    CHECK(req.extensions.get<net::instrument::trace>() == nullptr);
+}
