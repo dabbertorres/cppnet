@@ -120,7 +120,7 @@ template<typename CharT  = char,
 constexpr bool less_ignore_case(String lhs, String rhs) noexcept
 {
     constexpr auto compare = [](unsigned char l, unsigned char r) { return std::tolower(l) < std::tolower(r); };
-    return std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
+    return std::lexicographical_compare(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
 }
 
 template<typename CharT  = char,
@@ -130,19 +130,14 @@ constexpr String trim_string(String str) noexcept
 {
     using namespace std::literals::string_view_literals;
 
-    // source https://en.wikipedia.org/wiki/Whitespace_character#Unicode
-    constexpr auto whitespace =
-        " \b\f\n\r\t\v\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202f\u205f\u3000"sv;
+    // ASCII whitespace only: the bytes of a multi-byte (UTF-8) character would otherwise be taken for whitespace.
+    constexpr auto whitespace = " \t\n\v\f\r"sv;
 
-    std::size_t first_not_space = str.find_first_not_of(whitespace);
-    std::size_t last_not_space  = str.find_last_not_of(whitespace);
+    const auto first = str.find_first_not_of(whitespace);
+    if (first == String::npos) return str.substr(str.size()); // all whitespace
 
-    if (first_not_space == String::npos) first_not_space = 0;
-    if (last_not_space == String::npos) last_not_space = str.length();
-
-    last_not_space -= first_not_space - 1;
-
-    return str.substr(first_not_space, last_not_space);
+    const auto last = str.find_last_not_of(whitespace);
+    return str.substr(first, last - first + 1);
 }
 
 template<typename CharT  = char,

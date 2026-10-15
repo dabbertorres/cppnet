@@ -2,6 +2,7 @@
 
 #include <array>
 #include <charconv>
+#include <cstddef>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -20,13 +21,18 @@ std::optional<ipv6_addr> ipv6_addr::parse(std::string_view str) noexcept
 
     std::array<std::uint16_t, 8> values{};
 
-    auto* it = values.end() - 1;
+    // the parts are stored last first.
+    std::size_t parsed = 0;
     for (auto part : util::split_string(str, ':'))
     {
-        auto res = std::from_chars(part.begin(), part.end(), *it, 16);
-        if (res.ec != std::errc()) return std::nullopt;
-        --it;
+        if (parsed == values.size()) return std::nullopt;
+
+        auto& value     = values[values.size() - 1 - parsed++];
+        auto [end, err] = std::from_chars(part.data(), part.data() + part.size(), value, 16);
+        if (err != std::errc{} || end != part.data() + part.size() || part.empty()) return std::nullopt;
     }
+
+    if (parsed != values.size()) return std::nullopt;
 
     return ipv6_addr(values);
 }
