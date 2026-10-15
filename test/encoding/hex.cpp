@@ -1,10 +1,12 @@
 #include "encoding/hex.hpp"
 
+#include <array>
 #include <concepts>
 #include <cstddef>
 #include <exception> // IWYU pragma: keep
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <catch.hpp>
@@ -121,4 +123,17 @@ TEST_CASE("decode", "[encoding][hex]")
         CHECK(result.has_value());
         CHECK(result == tc.expect);
     }
+}
+
+TEST_CASE("decode_to needs exactly enough input", "[encoding][hex]")
+{
+    std::array<std::byte, 2> out{};
+
+    // shorter input than out needs used to be read past its end.
+    constexpr std::string_view input = "abcd";
+    CHECK_FALSE(net::encoding::hex::decode_to(input.substr(0, 2), out));
+    CHECK_FALSE(net::encoding::hex::decode_to(std::string_view{"abcdef"}, out));
+
+    REQUIRE(net::encoding::hex::decode_to(input, out));
+    CHECK(out == std::array{std::byte{0xab}, std::byte{0xcd}});
 }
