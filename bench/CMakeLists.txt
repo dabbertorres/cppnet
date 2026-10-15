@@ -11,3 +11,6 @@ function(add_benchmark name)
 endfunction()
 
 add_benchmark(bench_task coro/task.cpp)
+
+add_benchmark(bench_router http/router.cpp)
+target_link_libraries(bench_router PRIVATE net)
