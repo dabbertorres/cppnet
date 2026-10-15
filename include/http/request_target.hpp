@@ -49,8 +49,4 @@ struct request_target
 std::expected<request_target, std::error_condition> parse_request_target(request_method   method,
                                                                          std::string_view target) noexcept;
 
-// origin_form returns the target to request u from its origin server ("/path?query"), percent-encoding its (decoded)
-// path and query as needed.
-std::string origin_form(const url& u);
-
 }
