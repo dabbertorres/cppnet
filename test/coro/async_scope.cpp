@@ -1,6 +1,7 @@
+#include "coro/async_scope.hpp"
+
 #include <atomic>
 #include <chrono>
-#include <coroutine>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -11,7 +12,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 

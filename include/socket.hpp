@@ -1,14 +1,11 @@
 #pragma once
 
 #include <chrono>
-#include <cstddef>
 #include <optional>
-#include <span>
 #include <string>
 
 #include <sys/socket.h>
 
-#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"

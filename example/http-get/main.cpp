@@ -1,19 +1,28 @@
 #include <array>
+#include <chrono>
 #include <expected>
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include <spdlog/common.h>
+#include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
+#include "http/headers.hpp"
+#include "http/http.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "url.hpp"
 

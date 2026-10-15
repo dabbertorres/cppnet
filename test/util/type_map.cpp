@@ -3,8 +3,6 @@
 #include <exception> // IWYU pragma: keep
 #include <string>
 
-#include <catch.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 using net::util::type_map;

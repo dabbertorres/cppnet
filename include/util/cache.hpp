@@ -3,12 +3,14 @@
 #include <atomic>
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <list>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 namespace net::util
 {

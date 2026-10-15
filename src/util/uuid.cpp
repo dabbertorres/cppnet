@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <random>
+#include <ratio>
 #include <span>
 #include <stdexcept>
 #include <string_view>

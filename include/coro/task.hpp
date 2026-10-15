@@ -1,7 +1,7 @@
 #pragma once
 
 #include <atomic>
-#include <coroutine>
+#include <coroutine> // IWYU pragma: export (coroutines need it, wherever they use these)
 #include <exception>
 #include <memory>
 #include <stdexcept>

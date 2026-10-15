@@ -1,14 +1,13 @@
 // fuzz_url checks that url's functions don't crash (they're noexcept, so exceptions count), and that:
 // - build() output parses back to the same url.
 // - build() and origin_form() output only printable ASCII, so nothing in a url can end an HTTP request line.
-#include <cstddef>
+#include "url.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <string_view>
-
-#include "url.hpp"
 
 static void fail(const char* what, std::string_view input, std::string_view got)
 {

@@ -4,19 +4,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception> // IWYU pragma: keep
+#include <expected>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
-
-#include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
+#include "http/headers.hpp"
+#include "http/http.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"

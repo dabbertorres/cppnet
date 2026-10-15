@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <coroutine>
+#include <compare>
 #include <cstdint>
 #include <exception>
 #include <memory>

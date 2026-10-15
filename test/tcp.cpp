@@ -2,9 +2,10 @@
 
 #include <array>
 #include <chrono>
+#include <compare>
 #include <exception>
-#include <optional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -12,10 +13,10 @@
 #include <sys/socket.h>
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
-
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <netinet/in.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"

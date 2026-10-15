@@ -1,5 +1,6 @@
 #include "instrument/opentelemetry/tracecontext.hpp"
 
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <exception> // IWYU pragma: keep
@@ -7,8 +8,7 @@
 #include <string>
 #include <string_view>
 
-#include <catch.hpp>
-
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 

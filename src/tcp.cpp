@@ -6,11 +6,9 @@
 #include <memory>
 #include <string>
 #include <system_error>
-#include <utility>
 
 #include <netdb.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 
 #include "coro/task.hpp"
 #include "exception.hpp"

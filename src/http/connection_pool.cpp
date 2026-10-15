@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <compare>
 #include <cstdint>
 #include <expected>
 #include <iterator>
@@ -17,7 +18,6 @@
 #include <utility>
 
 #include <sys/socket.h>
-#include <sys/types.h>
 
 #include "coro/task.hpp"
 #include "io/scheduler.hpp"

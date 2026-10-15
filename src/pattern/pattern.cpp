@@ -1,5 +1,6 @@
 #include "pattern/pattern.hpp"
 
+#include <algorithm>
 #include <queue>
 #include <stack>
 

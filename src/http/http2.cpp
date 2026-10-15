@@ -15,7 +15,6 @@
 #include "io/buffered_reader.hpp"
 #include "io/writer.hpp"
 #include "util/packed.hpp"
-#include "util/result.hpp"
 
 namespace
 {

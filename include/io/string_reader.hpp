@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <iosfwd>
 #include <span>
 #include <string>
 #include <string_view>

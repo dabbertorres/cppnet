@@ -1,7 +1,6 @@
 #pragma once
 
-#include <cctype>
-#include <concepts>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>

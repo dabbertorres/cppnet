@@ -1,5 +1,6 @@
 #include "encoding/base64.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 

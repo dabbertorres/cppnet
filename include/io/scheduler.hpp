@@ -2,11 +2,10 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <concepts>
-#include <coroutine>
-#include <functional>
+#include <cstdint>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,7 +21,6 @@
 
 #include <spdlog/logger.h>
 #include <spdlog/sinks/null_sink.h>
-#include <spdlog/spdlog.h>
 
 #include "coro/async_scope.hpp"
 #include "coro/task.hpp"

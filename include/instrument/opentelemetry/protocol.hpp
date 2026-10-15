@@ -15,9 +15,10 @@
 namespace net::instrument::opentelemetry
 {
 
-struct key_value;
-struct array_value;
-struct any_value;
+// NOTE: these types refer to each other.
+struct key_value;   // IWYU pragma: keep
+struct array_value; // IWYU pragma: keep
+struct any_value;   // IWYU pragma: keep
 
 struct key_value_list
 {

@@ -9,6 +9,7 @@
 
 #include "coro/task.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"

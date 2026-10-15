@@ -4,15 +4,17 @@
 #include <exception> // IWYU pragma: keep
 #include <string>
 #include <string_view>
+#include <system_error>
 
-#include <catch.hpp>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "coro/sync_wait.hpp"
 #include "instrument/prometheus/registry.hpp"
+#include "io/io.hpp"
 #include "io/string_writer.hpp"
 
 using namespace std::string_literals;

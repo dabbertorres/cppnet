@@ -2,14 +2,12 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstring>
 #include <exception> // IWYU pragma: keep
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-
-#include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

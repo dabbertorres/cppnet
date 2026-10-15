@@ -8,7 +8,6 @@
 #include <vector>
 
 #include "coro/task.hpp"
-#include "io.hpp"
 #include "reader.hpp"
 
 namespace net::io

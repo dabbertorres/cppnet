@@ -2,13 +2,9 @@
 
 #include <atomic>
 #include <memory>
-#include <string>
 #include <utility>
 
-#include "coro/task.hpp"
 #include "instrument/prometheus/metric.hpp"
-#include "io/io.hpp"
-#include "io/writer.hpp"
 
 namespace net::instrument::prometheus
 {

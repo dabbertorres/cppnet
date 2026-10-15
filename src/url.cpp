@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
-
 
 namespace
 {

@@ -3,12 +3,16 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <vector>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
 #include "coro/sync_wait.hpp"
 #include "coro/task.hpp"
+#include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
-#include <iterator>
 #include <span>
 #include <system_error>
 #include <tuple>

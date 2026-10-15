@@ -4,8 +4,6 @@
 #include <semaphore>
 #include <string>
 
-#include <catch.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 using net::coro::thread_pool;

@@ -6,11 +6,12 @@
 #include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <utility>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"

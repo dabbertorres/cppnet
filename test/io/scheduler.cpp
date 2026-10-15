@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -18,7 +19,6 @@
 #include <vector>
 
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <catch2/catch_test_macros.hpp>

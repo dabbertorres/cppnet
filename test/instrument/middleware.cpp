@@ -1,29 +1,38 @@
 #include "instrument/middleware.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <compare>
 #include <cstdint>
 #include <exception> // IWYU pragma: keep
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
-#include <catch.hpp>
-
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "coro/sync_wait.hpp"
 #include "coro/task.hpp"
+#include "http/headers.hpp"
+#include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
 #include "instrument/opentelemetry/tracecontext.hpp"
 #include "instrument/prometheus/registry.hpp"
+#include "io/io.hpp"
 #include "io/string_writer.hpp"
+#include "util/type_map.hpp"
 
 namespace http          = net::http;
 namespace opentelemetry = net::instrument::opentelemetry;

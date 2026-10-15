@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <iterator>
 #include <span>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"

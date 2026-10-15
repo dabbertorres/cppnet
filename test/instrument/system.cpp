@@ -2,12 +2,13 @@
 
 #include <array>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <exception> // IWYU pragma: keep
 #include <latch>
+#include <ratio>
 #include <thread>
 
-#include <catch.hpp>
 #include <sys/socket.h>
 #include <unistd.h>
 

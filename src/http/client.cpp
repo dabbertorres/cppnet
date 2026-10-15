@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
@@ -20,8 +22,10 @@
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
+#include "url.hpp"
 #include "util/string_util.hpp"
 
 namespace

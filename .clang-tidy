@@ -26,6 +26,7 @@ Checks: >-
   -google-readability-namespace-comments,
   misc-*,
   -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
   -misc-no-recursion,
   modernize-*,
   -modernize-use-trailing-return-type,
@@ -45,6 +46,7 @@ WarningsAsErrors: false
 # - cppcoreguidelines-avoid-reference-coroutine-parameters: tasks are lazy, and awaited where they're made, so
 #   reference parameters (e.g. reader/writer, request handlers) outlive them.
 # - cppcoreguidelines-pro-bounds-*: they flag every operator[] and pointer arithmetic.
+# - misc-include-cleaner: include-what-you-use (see iwyu.imp) decides the includes, and they disagree.
 # - portability-avoid-pragma-once: the headers use #pragma once.
 # - readability-trailing-comma: it disagrees with clang-format, which wraps long lists without adding one.
 CheckOptions:
