@@ -35,6 +35,15 @@ struct counter : public base_metric<counter>
         return new_value;
     }
 
+    // set replaces the value, for a counter that mirrors a count kept elsewhere (e.g. by the OS, see
+    // register_process_metrics). The value mustn't decrease.
+    template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
+    void set(double v, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
+    {
+        value.store(v, std::memory_order_release);
+        set_updated_at(updated_at);
+    }
+
     double operator+=(double v) noexcept;
     double operator++() noexcept;
     double operator++(int) noexcept;
