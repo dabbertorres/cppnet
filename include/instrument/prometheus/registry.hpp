@@ -62,8 +62,8 @@ public:
     {
         auto* r = get();
 
-        std::lock_guard lock{r->mutex};
-        return std::get<T>(r->add(metric{std::move(m)}).get());
+        std::scoped_lock lock{r->mutex};
+        return std::get<T>(r->add(metric{std::forward<T>(m)}).get());
     }
 
     // get_metric returns the metric of that type, name and labels, if it's registered.

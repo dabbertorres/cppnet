@@ -117,7 +117,7 @@ public:
 
     void put(pointer_type&& res)
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
 
         --num_borrowed;
 
@@ -149,7 +149,7 @@ public:
 
     std::size_t available_resources() const noexcept
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
         return pool.size();
     }
 

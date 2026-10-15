@@ -1,3 +1,5 @@
+#include "io/scheduler.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -19,15 +21,13 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
-
 #include <catch2/catch_test_macros.hpp>
+#include <netinet/in.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "io/io.hpp"
 #include "io/poll.hpp"
-#include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "socket.hpp"
 #include "tcp.hpp"
@@ -49,7 +49,10 @@ std::pair<net::socket, net::socket> make_socket_pair(scheduler* sched)
 {
     std::array<int, 2> fds{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
-    return {net::socket{sched, fds[0]}, net::socket{sched, fds[1]}};
+    return {
+        net::socket{sched, fds[0]},
+        net::socket{sched, fds[1]}
+    };
 }
 
 // eventually polls until check passes, or the test times out.
@@ -156,8 +159,8 @@ TEST_CASE("reads time out once their deadline passes", "[io][scheduler]")
 TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up", "[io][scheduler]")
 {
     scheduler sched{make_pool()};
-    auto [idle_reader, idle_writer]     = make_socket_pair(&sched);
-    auto [timed_reader, timed_writer]   = make_socket_pair(&sched);
+    auto [idle_reader, idle_writer]   = make_socket_pair(&sched);
+    auto [timed_reader, timed_writer] = make_socket_pair(&sched);
 
     // with only this wait, the loop waits without a timeout.
     std::error_condition idle_err;
@@ -286,7 +289,7 @@ TEST_CASE("a read and a write can wait on the same socket at once", "[io][schedu
     auto [near, far] = make_socket_pair(&sched);
 
     // fill the socket's buffer, so the next write has to wait.
-    std::size_t      prefilled = 0;
+    std::size_t       prefilled = 0;
     std::vector<char> chunk(std::size_t{64} * 1'024, 'x');
     while (true)
     {
@@ -300,7 +303,8 @@ TEST_CASE("a read and a write can wait on the same socket at once", "[io][schedu
     net::io::result  write_res;
     std::string      received;
 
-    auto reader = [](net::socket* sock, std::string* received, net::io::result* res, std::atomic<int>* finished) -> task<>
+    auto reader =
+        [](net::socket* sock, std::string* received, net::io::result* res, std::atomic<int>* finished) -> task<>
     {
         *res = co_await read_some(sock, received);
         finished->fetch_add(1);
@@ -502,7 +506,7 @@ TEST_CASE("notify_one wakes waiters in order", "[io][scheduler][wait_on]")
         auto err = co_await sched->wait_on(word, 0);
         if (err) co_return;
 
-        std::lock_guard lock{order_mu};
+        std::scoped_lock lock{order_mu};
         order.push_back(id);
     };
 
@@ -626,7 +630,7 @@ TEST_CASE("socket write timeouts", "[io][socket][timeout]")
     // nothing reads, so the socket's buffers fill, and the write has to wait.
     auto write_lots = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
     {
-        std::vector<std::byte> lots(64 * 1'024 * 1'024);
+        std::vector<std::byte> lots(static_cast<std::size_t>(64 * 1'024) * 1'024);
         auto                   res = co_await writer->write(lots);
         co_return std::pair{res.count, res.err};
     };

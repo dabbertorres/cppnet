@@ -67,8 +67,8 @@ public:
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] bool        empty() const noexcept { return size() == 0; }
 
-    // join completes once the scope is empty. If it isn't empty yet, the awaiting coroutine is resumed on the thread that
-    // finishes the scope's last task.
+    // join completes once the scope is empty. If it isn't empty yet, the awaiting coroutine is resumed on the thread
+    // that finishes the scope's last task.
     [[nodiscard]] join_operation join() noexcept { return join_operation{this}; }
 
     // join_blocking blocks the calling thread until the scope is empty. It must not be called from one of the scope's
@@ -88,10 +88,7 @@ private:
                 : scope{scope}
             {}
 
-            detached get_return_object() noexcept
-            {
-                return {std::coroutine_handle<promise_type>::from_promise(*this)};
-            }
+            detached get_return_object() noexcept { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
 
             std::suspend_always initial_suspend() noexcept { return {}; }
 

@@ -29,7 +29,7 @@ void registry::add_collector(std::function<void()> collect)
 {
     auto* r = get();
 
-    std::lock_guard lock{r->mutex};
+    std::scoped_lock lock{r->mutex};
     r->collectors.push_back(std::move(collect));
 }
 

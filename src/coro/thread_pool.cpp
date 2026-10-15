@@ -58,7 +58,7 @@ void thread_pool::shutdown() noexcept
     {
         // must be modified under the lock, otherwise a worker can check the predicate, miss the notify, and sleep
         // forever.
-        std::lock_guard lock{wait_mutex};
+        std::scoped_lock lock{wait_mutex};
         if (!running.exchange(false, std::memory_order::acq_rel)) return;
     }
 
@@ -122,7 +122,7 @@ void thread_pool::schedule(std::coroutine_handle<> handle)
     num_jobs.fetch_add(1, std::memory_order::release);
 
     {
-        std::lock_guard lock{wait_mutex};
+        std::scoped_lock lock{wait_mutex};
         jobs.emplace_back(handle);
         wait.notify_one();
     }

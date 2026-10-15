@@ -1,12 +1,16 @@
 #include "http/connection_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <expected>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -64,7 +68,7 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
         std::uint64_t seen = 0;
 
         {
-            std::lock_guard lock{mu};
+            std::scoped_lock lock{mu};
 
             // the most recently used first, as the least likely to have been closed by the server.
             // NOTE: forget() erases the host's entry when it closes its last connection, so it's looked up each time.
@@ -82,10 +86,10 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
             auto& host_conns = hosts[key];
 
             // at the limit altogether, but not for this host: make room by closing another host's idle connection.
-            const bool room = has_room(host_conns)
-                           || ((config.max_connections_per_host == 0
-                                || host_conns.open < config.max_connections_per_host)
-                               && evict_idle(key, closing));
+            const bool room =
+                has_room(host_conns)
+                || ((config.max_connections_per_host == 0 || host_conns.open < config.max_connections_per_host)
+                    && evict_idle(key, closing));
 
             if (room)
             {
@@ -111,15 +115,17 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
     // connect within what's left of the timeout.
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - io::clock::now());
     auto conn      = co_await tcp_socket::connect(scheduler,
-                                             host,
-                                             port,
-                                             {.timeout = std::max(remaining, std::chrono::milliseconds{1}),
-                                                   .keepalive = config.tcp_keepalive});
+                                                  host,
+                                                  port,
+                                                  {
+                                                      .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
+                                                      .keepalive = config.tcp_keepalive,
+                                                  });
 
     if (!conn.has_value())
     {
         {
-            std::lock_guard lock{mu};
+            std::scoped_lock lock{mu};
             forget(key, nullptr, closing);
         }
 
@@ -137,9 +143,9 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
 
     try
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
 
-        if (reusable && config.keep_alive && config.idle_timeout > config.idle_timeout.zero())
+        if (reusable && config.keep_alive && config.idle_timeout > std::chrono::milliseconds::zero())
         {
             hosts[leased.key].idle.push_back(
                 {.conn = std::move(leased.conn), .expires = io::clock::now() + config.idle_timeout});
@@ -153,6 +159,7 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
     }
     catch (const std::bad_alloc&)
     {
+        // TODO: log? throw?
         // the connection is closed, along with leased (but its place in the pool isn't freed: there's no memory).
     }
 
@@ -161,7 +168,7 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
     if (start_reaping && !scheduler->spawn(reap(weak_from_this(), scheduler)))
     {
         // the scheduler is stopping.
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
         reaping = false;
     }
 }
@@ -171,7 +178,7 @@ void connection_pool::close_idle() noexcept
     connections closing;
 
     {
-        std::lock_guard lock{mu};
+        std::scoped_lock lock{mu};
 
         for (auto it = hosts.begin(); it != hosts.end();)
         {
@@ -191,7 +198,7 @@ void connection_pool::close_idle() noexcept
 
 connection_stats connection_pool::stats() const
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
 
     connection_stats out{.open = open};
     for (const auto& [_, conns] : hosts) out.idle += conns.idle.size();
@@ -200,7 +207,7 @@ connection_stats connection_pool::stats() const
 
 connection_stats connection_pool::stats(const std::string& host, const std::string& port) const
 {
-    std::lock_guard lock{mu};
+    std::scoped_lock lock{mu};
 
     auto it = hosts.find(make_key(host, port));
     if (it == hosts.end()) return {};
@@ -220,7 +227,7 @@ coro::task<> connection_pool::reap(std::weak_ptr<connection_pool> weak, io::sche
 
             connections closing;
             {
-                std::lock_guard lock{pool->mu};
+                std::scoped_lock lock{pool->mu};
                 next = pool->close_expired(closing);
             }
 
@@ -234,7 +241,7 @@ coro::task<> connection_pool::reap(std::weak_ptr<connection_pool> weak, io::sche
             // the scheduler is stopping.
             if (auto pool = weak.lock())
             {
-                std::lock_guard lock{pool->mu};
+                std::scoped_lock lock{pool->mu};
                 pool->reaping = false;
             }
 
