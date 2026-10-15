@@ -1,10 +1,13 @@
 #pragma once
 
+#include <expected>
 #include <string>
+#include <system_error>
 
 namespace net
 {
 
-std::string hostname() noexcept;
+// hostname returns this machine's host name.
+std::expected<std::string, std::error_condition> hostname();
 
 }

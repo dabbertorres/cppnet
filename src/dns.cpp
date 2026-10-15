@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <numbers>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -93,7 +94,8 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
     };
 
     addrinfo* servinfo = nullptr;
-    auto      sts      = ::getaddrinfo(hostname.data(), nullptr, &hints, &servinfo);
+    // NOTE: a copy, as getaddrinfo needs it null-terminated.
+    auto sts = ::getaddrinfo(std::string{hostname}.c_str(), nullptr, &hints, &servinfo);
     if (sts != 0) throw_for_gai_error(sts);
 
     util::defer freeservinfo{[&] noexcept { freeaddrinfo(servinfo); }};

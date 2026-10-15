@@ -1,28 +1,32 @@
 #include "net.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <climits>
+#include <cstddef>
+#include <expected>
+#include <string>
+#include <system_error>
 
 #include <unistd.h>
 
 namespace net
 {
 
-std::string hostname() noexcept
+std::expected<std::string, std::error_condition> hostname()
 {
-    auto len = static_cast<std::size_t>(sysconf(_SC_HOST_NAME_MAX) + 1);
-    if (len < 0) len = _POSIX_HOST_NAME_MAX;
+    // the limit, if there is one, doesn't include the terminating null.
+    const auto max = sysconf(_SC_HOST_NAME_MAX);
+    const auto len = static_cast<std::size_t>(max > 0 ? max : _POSIX_HOST_NAME_MAX) + 1;
 
     std::string name(len, '\0');
-    auto        err = gethostname(name.data(), name.size());
-    if (err != 0)
-        ; // TODO
-
-    auto end = name.find_first_of('\0');
-    if (end != std::string::npos)
+    if (gethostname(name.data(), name.size()) != 0)
     {
-        name.resize(end);
-        name.shrink_to_fit();
+        return std::unexpected(std::error_condition{errno, std::generic_category()});
     }
+
+    // it may be truncated without being terminated, if it's too long for the buffer.
+    name.resize(std::min(name.find('\0'), name.size()));
     return name;
 }
 
