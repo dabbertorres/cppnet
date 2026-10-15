@@ -14,7 +14,6 @@
 #include "io/io.hpp"
 #include "io/writer.hpp"
 #include "util/hash.hpp"
-#include "util/string_util.hpp"
 
 namespace net::instrument::prometheus
 {
@@ -32,30 +31,17 @@ enum class metric_type
 
 std::string_view metric_type_string(metric_type type) noexcept;
 
+// format_value formats a sample's value (or a histogram bucket's bound) as the text format expects: in as few digits as
+// read back as the same double, or as +Inf, -Inf or NaN.
+std::string format_value(double value);
+
 template<typename T>
 struct base_metric;
-
-template<typename T>
-concept self_encoder = requires(const T* t, io::writer& out)
-// clang-format off
-{
-    { t->encode_self(out) } -> std::same_as<io::result>;
-};
-// clang-format on
-
-template<typename T>
-concept value_encoder = requires(const T* t, io::writer& out)
-// clang-format off
-{
-    { t->encode_value(out) } -> std::same_as<io::result>;
-};
-// clang-format on
 
 // clang-format off
 template<typename T>
 concept metric_impl = std::derived_from<T, base_metric<T>>
-    && (self_encoder<T> || value_encoder<T>)
-    && requires(const T* t, io::writer& out)
+    && requires
     {
         { T::type() } -> std::same_as<metric_type>;
     };
@@ -70,6 +56,30 @@ struct metric_label
 };
 
 using metric_labels = std::vector<metric_label>;
+
+namespace detail
+{
+
+// add adds v to value, as one atomic step, and returns the result.
+// NOTE: rather than fetch_add, which not every standard library has for floating-point atomics yet.
+inline double add(std::atomic<double>& value, double v) noexcept
+{
+    auto current = value.load(std::memory_order_relaxed);
+    while (!value.compare_exchange_weak(current, current + v, std::memory_order_relaxed))
+    {
+    }
+
+    return current + v;
+}
+
+// append_escaped appends text to out, escaping it for HELP text (backslashes and newlines) or, if label_value, for a
+// label's value (also double quotes).
+void append_escaped(std::string& out, std::string_view text, bool label_value);
+
+// write_text writes all of text, as a write may be partial.
+coro::task<io::result> write_text(io::writer& out, std::string text);
+
+}
 
 template<typename T>
 struct base_metric
@@ -146,96 +156,89 @@ struct base_metric
         last_update.store(seconds, std::memory_order_relaxed);
     }
 
+    // encode writes the metric in Prometheus' text format.
     coro::task<io::result> encode(io::writer& out) const
     {
-        if constexpr (self_encoder<T>)
+        std::string text;
+        encode_to(text);
+        co_return co_await detail::write_text(out, std::move(text));
+    }
+
+    // encode_to appends the metric, in Prometheus' text format, to out.
+    //
+    // NOTE: the text is built synchronously, and only then written, so nothing it's made from need outlive a
+    //       suspension (e.g. temporaries, held by reference in a lazy task's frame), and it's a snapshot of the metric.
+    void encode_to(std::string& out) const
+    {
+        const auto* self = static_cast<const T*>(this);
+
+        // NOTE: checked here, rather than with a concept, as this is a friend of T, whose encode_self is private.
+        if constexpr (requires { self->encode_self(out); })
         {
-            return static_cast<const T*>(this)->encode_self(out);
-        }
-        else if constexpr (value_encoder<T>)
-        {
-            return io::write_all(
-                out,
-                [this](io::writer& out) { return encode_help(out); },
-                [this](io::writer& out) { return encode_type(out); },
-                name,
-                [this](io::writer& out) { return encode_labels(out); },
-                ' ',
-                [this](io::writer& out) { return static_cast<const T*>(this)->encode_value(out); },
-                ' ',
-                [this](io::writer& out) { return encode_timestamp(out); },
-                '\n');
+            self->encode_self(out);
         }
         else
         {
-            std::unreachable();
+            static_assert(requires { { self->get() } -> std::convertible_to<double>; },
+                          "a metric needs an encode_self, or a get() of its value");
+
+            // NOTE: no timestamp, as Prometheus then uses the time of the scrape. (The text format's are milliseconds
+            //       since the Unix epoch, which last_update, from steady_clock, isn't.)
+            encode_help(out);
+            encode_type(out);
+            out += name;
+            encode_labels(out);
+            out += ' ';
+            out += format_value(self->get());
+            out += '\n';
         }
     }
 
 protected:
-    coro::task<io::result> encode_help(io::writer& out) const
+    void encode_help(std::string& out) const
     {
-        if (!help.empty())
+        if (help.empty()) return;
+
+        out += "# HELP ";
+        out += name;
+        out += ' ';
+        detail::append_escaped(out, help, false);
+        out += '\n';
+    }
+
+    void encode_type(std::string& out) const
+    {
+        out += "# TYPE ";
+        out += name;
+        out += ' ';
+        out += metric_type_string(T::type());
+        out += '\n';
+    }
+
+    // encode_labels appends the labels, if any, e.g. {a="1",b="2"}. A first label (e.g. a histogram bucket's "le") is
+    // written before them, if first_key isn't empty.
+    void encode_labels(std::string& out, std::string_view first_key = {}, std::string_view first_value = {}) const
+    {
+        if (labels.empty() && first_key.empty()) return;
+
+        out += '{';
+
+        bool first = true;
+        auto label = [&](std::string_view key, std::string_view value)
         {
-            co_return co_await io::write_all(out, "# HELP "sv, name, ' ', help, '\n');
-        }
+            if (!first) out += ',';
+            first = false;
 
-        co_return {.count = 0};
-    }
+            out += key;
+            out += R"(=")";
+            detail::append_escaped(out, value, true);
+            out += '"';
+        };
 
-    coro::task<io::result> encode_type(io::writer& out) const
-    {
-        return io::write_all(out, "# TYPE "sv, name, ' ', metric_type_string(T::type()), '\n');
-    }
+        if (!first_key.empty()) label(first_key, first_value);
+        for (const auto& [key, value] : labels) label(key, value);
 
-    coro::task<io::result> encode_labels(io::writer& out) const
-    {
-        if (!labels.empty())
-        {
-            co_return co_await io::write_all(out, '{', [this](io::writer& out) { return encode_all_labels(out); }, '}');
-        }
-
-        co_return {.count = 0};
-    }
-
-    coro::task<io::result> encode_all_labels(io::writer& out) const
-    {
-        std::size_t total = 0;
-
-        for (const auto& [label_name, label_value] : labels)
-        {
-            auto res = co_await encode_one_label(out, label_name, label_value);
-            total += res.count;
-            if (res.err) co_return {.count = total, .err = res.err};
-        }
-
-        co_return {.count = total};
-    }
-
-    coro::task<io::result>
-    encode_one_label(io::writer& out, std::string_view label_name, std::string_view label_value) const
-    {
-        return io::write_all(
-            out,
-            label_name,
-            R"(=")"sv,
-            [=](io::writer& out)
-            {
-                // clang-format off
-                return util::replace_all_to(out, label_value, {
-                    {R"(\)", R"(\\)"},
-                    {R"(")", R"(\")"},
-                    { "\n",  R"(\n)"},
-                });
-                // clang-format on
-            },
-            R"(",)"sv);
-    }
-
-    coro::task<io::result> encode_timestamp(io::writer& out) const
-    {
-        auto ts = last_update.load(std::memory_order_acquire);
-        co_return out.write(std::to_string(ts.count()));
+        out += '}';
     }
 
     std::atomic<std::chrono::seconds> last_update;

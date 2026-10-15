@@ -30,9 +30,7 @@ struct counter : public base_metric<counter>
     template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
     double increment(double v = 1.0, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
     {
-        auto current   = value.load(std::memory_order_acquire);
-        auto new_value = current + v;
-        value.store(new_value, std::memory_order_release);
+        auto new_value = detail::add(value, v);
         set_updated_at(updated_at);
         return new_value;
     }
@@ -42,10 +40,6 @@ struct counter : public base_metric<counter>
     double operator++(int) noexcept;
 
 private:
-    friend struct base_metric<counter>;
-
-    coro::task<io::result> encode_value(io::writer& out) const;
-
     std::atomic<double> value = 0.0;
 };
 

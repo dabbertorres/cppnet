@@ -45,10 +45,4 @@ double counter::operator+=(double v) noexcept { return increment(v); }
 double counter::operator++() noexcept { return increment(1); }
 double counter::operator++(int) noexcept { return increment(1) - 1; }
 
-coro::task<io::result> counter::encode_value(io::writer& out) const
-{
-    auto val = value.load(std::memory_order_acquire);
-    return out.write(std::to_string(val));
-}
-
 }

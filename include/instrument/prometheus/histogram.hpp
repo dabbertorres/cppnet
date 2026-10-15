@@ -2,16 +2,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstddef>
-#include <shared_mutex>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
-#include <version>
 
 #include "buckets.hpp"
-#include "coro/task.hpp"
-#include "io/io.hpp"
-#include "io/writer.hpp"
 #include "metric.hpp"
 #include "tracker.hpp"
 
@@ -22,11 +18,14 @@ struct histogram : public base_metric<histogram>
 {
     static constexpr metric_type type() noexcept { return metric_type::histogram; }
 
+    // buckets are the buckets' upper bounds, which must be increasing (or std::invalid_argument is thrown). A +Inf
+    // bucket is added, if they don't end with one.
     histogram(std::string&&         name,
               std::string&&         help    = "",
               metric_labels&&       labels  = {},
               std::vector<double>&& buckets = default_buckets());
 
+    // NOTE: copying or moving isn't safe while observing.
     histogram(const histogram& other);
     histogram& operator=(const histogram& other);
 
@@ -35,24 +34,28 @@ struct histogram : public base_metric<histogram>
 
     ~histogram() = default;
 
+    // observe counts v in the first bucket whose upper bound is at least v (NaN only in the +Inf bucket), and adds it
+    // to the sum. It's safe to call from any number of threads at once.
     void observe(double v) noexcept;
 
+    // track returns a tracker, which observes how long it lived, in seconds.
     auto track() noexcept
     {
-        return tracker{[this](std::chrono::seconds seconds) { observe(static_cast<double>(seconds.count())); }};
+        return tracker{[this](std::chrono::duration<double> elapsed) { observe(elapsed.count()); }};
     }
 
 private:
     friend struct base_metric<histogram>;
 
-    coro::task<io::result> encode_self(io::writer& out) const;
-    void                   on_derive(histogram& child);
+    void encode_self(std::string& out) const;
+    void on_derive(histogram& child);
 
-    std::vector<double>       buckets;
-    std::vector<std::size_t>  bucket_values;
-    std::atomic<std::size_t>  count = 0;
-    std::atomic<double>       sum   = 0.0;
-    mutable std::shared_mutex mutex;
+    // NOTE: each bucket counts only the observations that belong in it, rather than also those in the buckets before
+    //       it (as the output does), so an observation is one atomic increment, and the output adds them up: then its
+    //       buckets never decrease, and the +Inf bucket always equals the count.
+    std::vector<double>                           bounds;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> counts;
+    std::atomic<double>                           sum = 0.0;
 };
 
 }

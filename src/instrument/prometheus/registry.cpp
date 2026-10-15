@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -17,7 +18,6 @@
 #include "instrument/prometheus/metric.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
-#include "util/overloaded.hpp"
 
 namespace net::instrument::prometheus
 {
@@ -31,8 +31,15 @@ coro::task<io::result> registry::record(io::writer& writer)
 {
     auto* r = get();
 
-    std::shared_lock lock{r->mutex};
-    return r->record_all(writer);
+    // NOTE: the text is built under the lock, and only written once it's released: a lock can't be held across a
+    //       suspension, as the task may then resume on another thread.
+    std::string text;
+    {
+        std::shared_lock lock{r->mutex};
+        for (const auto& m : r->metrics) std::visit([&](const auto& metric) { metric.encode_to(text); }, m);
+    }
+
+    co_return co_await detail::write_text(writer, std::move(text));
 }
 
 registry* registry::get()
@@ -63,28 +70,6 @@ std::optional<registry::metric_ref> registry::get_metric(std::string_view name, 
     }
 
     return std::nullopt;
-}
-
-coro::task<io::result> registry::record_all(io::writer& out) const
-{
-    std::size_t total = 0;
-
-    for (const auto& m : metrics)
-    {
-        auto res = co_await std::visit(
-            util::overloaded{
-                [&](const counter& counter) { return counter.encode(out); },
-                [&](const gauge& gauge) { return gauge.encode(out); },
-                [&](const histogram& histogram) { return histogram.encode(out); },
-            },
-            m);
-
-        total += res.count;
-
-        if (res.err) co_return {.count = total, .err = res.err};
-    }
-
-    co_return {.count = total};
 }
 
 }
