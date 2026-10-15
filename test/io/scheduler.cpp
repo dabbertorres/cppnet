@@ -2,8 +2,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -443,4 +445,142 @@ TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
     { co_return co_await sched->run_blocking([]() -> int { throw std::runtime_error{"boom"}; }); };
 
     CHECK_THROWS_AS(sched.run_to_completion(throws(&sched)), std::runtime_error);
+}
+
+TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")
+{
+    scheduler                  sched{make_pool()};
+    std::atomic<std::uint64_t> word{0};
+    std::atomic<int>           woken{0};
+
+    auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::atomic<int>* woken) -> task<>
+    {
+        auto err = co_await sched->wait_on(*word, 0);
+        if (!err) ++*woken;
+    };
+
+    auto notifier = [&](scheduler* sched) -> task<bool>
+    {
+        // NOTE: no REQUIRE on the worker threads: Catch2's assertions aren't thread-safe.
+        for (int i = 0; i < 3; ++i)
+            if (!sched->spawn(waiter(sched, &word, &woken))) co_return false;
+
+        // give the waiters time to wait, so it's the notification that wakes them.
+        co_await sched->sleep_until(net::io::clock::now() + 50ms);
+        bool none_early = woken == 0;
+
+        ++word;
+        sched->notify_all(word);
+        co_return none_early;
+    };
+
+    CHECK(sched.run_to_completion(notifier(&sched)));
+    CHECK(woken == 3);
+}
+
+TEST_CASE("wait_on doesn't wait once the word has changed", "[io][scheduler][wait_on]")
+{
+    scheduler                  sched{make_pool()};
+    std::atomic<std::uint64_t> word{1};
+
+    // with no notification to come, it would wait forever.
+    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_condition>
+    { co_return co_await sched->wait_on(*word, 0); };
+
+    CHECK_FALSE(sched.run_to_completion(wait(&sched, &word)));
+}
+
+TEST_CASE("notify_one wakes waiters in order", "[io][scheduler][wait_on]")
+{
+    scheduler                  sched{make_pool()};
+    std::atomic<std::uint64_t> word{0};
+    std::mutex                 order_mu;
+    std::vector<int>           order;
+
+    auto waiter = [&](scheduler* sched, int id) -> task<>
+    {
+        auto err = co_await sched->wait_on(word, 0);
+        if (err) co_return;
+
+        std::lock_guard lock{order_mu};
+        order.push_back(id);
+    };
+
+    auto notifier = [&](scheduler* sched) -> task<>
+    {
+        // one at a time, so they start waiting in order.
+        for (int id = 0; id < 3; ++id)
+        {
+            if (!sched->spawn(waiter(sched, id))) co_return;
+            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+        }
+
+        word = 1;
+        for (int i = 0; i < 3; ++i)
+        {
+            sched->notify_one(word);
+            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+        }
+    };
+
+    sched.run_to_completion(notifier(&sched));
+    CHECK(order == std::vector{0, 1, 2});
+}
+
+TEST_CASE("wait_on times out", "[io][scheduler][wait_on]")
+{
+    scheduler                  sched{make_pool()};
+    std::atomic<std::uint64_t> word{0};
+
+    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_condition>
+    { co_return co_await sched->wait_on(*word, 0, net::io::clock::now() + 20ms); };
+
+    CHECK(sched.run_to_completion(wait(&sched, &word)) == std::errc::timed_out);
+}
+
+TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][scheduler][sleep_until]")
+{
+    SECTION("sleeping")
+    {
+        scheduler sched{make_pool()};
+
+        auto sleep = [](scheduler* sched) -> task<std::pair<std::error_condition, net::io::clock::duration>>
+        {
+            auto start = net::io::clock::now();
+            auto err   = co_await sched->sleep_until(start + 50ms);
+            co_return std::pair{err, net::io::clock::now() - start};
+        };
+
+        auto [err, slept] = sched.run_to_completion(sleep(&sched));
+        CHECK_FALSE(err);
+        CHECK(slept >= 50ms);
+    }
+
+    SECTION("stopping")
+    {
+        scheduler                  sched{make_pool()};
+        std::atomic<std::uint64_t> word{0};
+        std::error_condition       sleep_err;
+        std::error_condition       wait_err;
+
+        auto sleeper = [](scheduler* sched, std::error_condition* err) -> task<>
+        { *err = co_await sched->sleep_until(net::io::clock::now() + 1h); };
+
+        auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::error_condition* err) -> task<>
+        { *err = co_await sched->wait_on(*word, 0); };
+
+        auto stopper = [&](scheduler* sched) -> task<>
+        {
+            if (!sched->spawn(sleeper(sched, &sleep_err)) || !sched->spawn(waiter(sched, &word, &wait_err))) co_return;
+            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+        };
+
+        // run_to_completion stops the scheduler once the stopper finishes, which must cancel the others.
+        auto start = net::io::clock::now();
+        sched.run_to_completion(stopper(&sched));
+
+        CHECK(net::io::clock::now() - start < 10s);
+        CHECK(sleep_err == std::errc::operation_canceled);
+        CHECK(wait_err == std::errc::operation_canceled);
+    }
 }

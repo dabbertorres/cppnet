@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <concepts>
 #include <coroutine>
 #include <functional>
@@ -41,8 +42,8 @@ using clock = std::chrono::steady_clock;
 // - spawn() starts tasks, which the scheduler owns until they finish.
 // - run() waits for and dispatches I/O on the calling thread, until the scheduler is stopped and its tasks have
 //   finished.
-// - request_stop() refuses new tasks, and cancels every pending (and future) wait with
-//   std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still runs (e.g. to clean
+// - request_stop() refuses new tasks, and cancels every pending (and future) wait (including wait_on() and
+//   sleep_until()) with std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still runs (e.g. to clean
 //   up), and reads/writes that don't need to wait still work.
 // - shutdown() stops the scheduler, and blocks until its tasks have finished and run() has returned.
 //
@@ -51,17 +52,24 @@ class scheduler
 {
     struct waiter;
 
-    using timer_list = std::multimap<clock::time_point, waiter*>;
+    using timer_list   = std::multimap<clock::time_point, waiter*>;
+    using watched_list = std::multimap<const std::atomic<std::uint64_t>*, waiter*>;
 
-    // waiter is a pending wait for a handle, owned by the suspended coroutine's wait_operation.
+    // waiter is a pending wait, owned by the suspended coroutine's wait_operation. It's one of:
+    // - a wait for a handle (op is read or write).
+    // - a wait for a notification about word (op is none, and word is set).
+    // - a sleep, until the deadline (op is none, and word isn't set).
     struct waiter
     {
-        handle                              fd;
-        poll_op                             op;
-        std::optional<clock::time_point>    deadline;
-        std::coroutine_handle<>             awaiting{nullptr};
-        std::error_condition                result;
-        std::optional<timer_list::iterator> timer;
+        handle                                fd;
+        poll_op                               op;
+        std::optional<clock::time_point>      deadline;
+        std::coroutine_handle<>               awaiting{nullptr};
+        std::error_condition                  result;
+        std::optional<timer_list::iterator>   timer;
+        const std::atomic<std::uint64_t>*     word     = nullptr;
+        std::uint64_t                         expected = 0;
+        std::optional<watched_list::iterator> watch;
     };
 
     // registration holds the waiters for a handle: at most one per operation.
@@ -83,7 +91,15 @@ public:
 
         wait_operation(scheduler* sched, handle fd, poll_op op, std::optional<clock::time_point> deadline) noexcept
             : sched{sched}
-            , state{.fd = fd, .op = op, .deadline = deadline, .awaiting = nullptr, .result = {}, .timer = std::nullopt}
+            , state{.fd = fd, .op = op, .deadline = deadline}
+        {}
+
+        wait_operation(scheduler*                        sched,
+                       const std::atomic<std::uint64_t>* word,
+                       std::uint64_t                     expected,
+                       std::optional<clock::time_point>  deadline) noexcept
+            : sched{sched}
+            , state{.fd = -1, .op = poll_op::none, .deadline = deadline, .word = word, .expected = expected}
         {}
 
     public:
@@ -145,6 +161,27 @@ public:
     {
         return {this, fd, op, clock::now() + timeout};
     }
+
+    // wait_on waits for notify_one() or notify_all() to be called with word, unless word no longer holds expected (so
+    // nothing needs to wait for it). It's how a task waits for something another task does: e.g. to wait for a
+    // condition, read word, check the condition, and wait unless it holds; and to notify, change the condition and
+    // word (in that order), then notify. Then a notification between the check and the wait isn't lost, as it changed
+    // word first.
+    //
+    // It fails with std::errc::timed_out if the deadline passes first, or std::errc::operation_canceled if the
+    // scheduler is stopped. Waiters are notified in the order they started waiting.
+    wait_operation wait_on(const std::atomic<std::uint64_t>& word,
+                           std::uint64_t                     expected,
+                           std::optional<clock::time_point>  deadline = std::nullopt) noexcept
+    {
+        return {this, &word, expected, deadline};
+    }
+
+    void notify_one(const std::atomic<std::uint64_t>& word) noexcept;
+    void notify_all(const std::atomic<std::uint64_t>& word) noexcept;
+
+    // sleep_until waits until deadline. It fails with std::errc::operation_canceled if the scheduler is stopped first.
+    wait_operation sleep_until(clock::time_point deadline) noexcept { return {this, nullptr, 0, deadline}; }
 
     // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo()), so it doesn't hold up the
     // worker threads, and then continues on the worker threads. Stopping the scheduler doesn't interrupt func.
@@ -254,6 +291,7 @@ private:
     void complete(waiter* state, std::error_condition result, completions& done) noexcept;
     void rearm(handle fd, const registration& reg, completions& done) noexcept;
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
+    void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;
     void expire_timers(completions& done) noexcept;
 
     void resume(const completions& done) noexcept;
@@ -266,6 +304,7 @@ private:
     mutable std::mutex                       mu;
     std::unordered_map<handle, registration> registrations;
     timer_list                               timers;
+    watched_list                             watched;
     bool                                     stopping = false;
 
     std::atomic<bool> running = false;

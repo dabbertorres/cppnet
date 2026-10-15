@@ -112,6 +112,42 @@ bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcep
     };
 
     if (stopping) return fail(std::errc::operation_canceled);
+
+    // a wait for a notification, or a sleep.
+    if (state.op == poll_op::none)
+    {
+        if (state.word != nullptr && state.word->load(std::memory_order::acquire) != state.expected)
+        {
+            // the notification already came.
+            state.result = {};
+            return false;
+        }
+
+        if (state.word == nullptr && !state.deadline) return fail(std::errc::invalid_argument);
+
+        if (state.deadline && *state.deadline <= clock::now())
+        {
+            // a sleep that's over isn't an error.
+            if (state.word == nullptr) return false;
+            return fail(std::errc::timed_out);
+        }
+
+        if (state.word != nullptr) state.watch = watched.emplace(state.word, &state);
+        state.awaiting = awaiting;
+
+        bool earliest = false;
+        if (state.deadline)
+        {
+            state.timer = timers.emplace(*state.deadline, &state);
+            earliest    = *state.timer == timers.begin();
+        }
+
+        lock.unlock();
+
+        if (earliest) loop.interrupt();
+        return true;
+    }
+
     if (state.op != poll_op::read && state.op != poll_op::write) return fail(std::errc::invalid_argument);
 
     auto it = registrations.find(state.fd);
@@ -155,11 +191,20 @@ bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcep
 
 void scheduler::complete(waiter* state, std::error_condition result, completions& done) noexcept
 {
-    auto it = registrations.find(state->fd);
-    if (it != registrations.end())
+    if (state->op != poll_op::none)
     {
-        auto& slot = state->op == poll_op::read ? it->second.read : it->second.write;
-        if (slot == state) slot = nullptr;
+        auto it = registrations.find(state->fd);
+        if (it != registrations.end())
+        {
+            auto& slot = state->op == poll_op::read ? it->second.read : it->second.write;
+            if (slot == state) slot = nullptr;
+        }
+    }
+
+    if (state->watch)
+    {
+        watched.erase(*state->watch);
+        state->watch.reset();
     }
 
     if (state->timer)
@@ -289,11 +334,17 @@ void scheduler::expire_timers(completions& done) noexcept
     {
         auto* state = timers.begin()->second;
         auto  fd    = state->fd;
+        auto  op    = state->op;
 
-        complete(state, timed_out, done);
+        // a sleep that's over isn't an error.
+        const bool sleep = op == poll_op::none && state->word == nullptr;
+        complete(state, sleep ? std::error_condition{} : timed_out, done);
 
         // stop watching for the operation that timed out.
-        if (auto it = registrations.find(fd); it != registrations.end()) rearm(fd, it->second, done);
+        if (op != poll_op::none)
+        {
+            if (auto it = registrations.find(fd); it != registrations.end()) rearm(fd, it->second, done);
+        }
     }
 }
 
@@ -312,6 +363,10 @@ void scheduler::request_stop() noexcept
             if (reg.read != nullptr) complete(reg.read, canceled, done);
             if (reg.write != nullptr) complete(reg.write, canceled, done);
         }
+
+        // then waits for notifications, and (all that's left with a timer) sleeps.
+        while (!watched.empty()) complete(watched.begin()->second, canceled, done);
+        while (!timers.empty()) complete(timers.begin()->second, canceled, done);
     }
 
     scope.close();
@@ -319,6 +374,31 @@ void scheduler::request_stop() noexcept
 
     // wake run(), so it notices once the scope has drained.
     loop.interrupt();
+}
+
+void scheduler::notify_one(const std::atomic<std::uint64_t>& word) noexcept { notify(word, false); }
+
+void scheduler::notify_all(const std::atomic<std::uint64_t>& word) noexcept { notify(word, true); }
+
+void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcept
+{
+    completions done;
+
+    {
+        std::lock_guard lock{mu};
+
+        // NOTE: equal keys are kept in the order they were inserted, and lower_bound finds the first (find needn't).
+        while (true)
+        {
+            auto it = watched.lower_bound(&word);
+            if (it == watched.end() || it->first != &word) break;
+
+            complete(it->second, {}, done);
+            if (!all) break;
+        }
+    }
+
+    resume(done);
 }
 
 bool scheduler::stop_requested() const noexcept
