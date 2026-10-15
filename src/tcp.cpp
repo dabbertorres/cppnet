@@ -29,7 +29,6 @@ resolve(const std::string& host, const std::string& port, net::protocol proto) n
 {
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags    = AI_ADDRCONFIG; // only addresses this host can reach
 
     switch (proto)
     {
@@ -38,9 +37,20 @@ resolve(const std::string& host, const std::string& port, net::protocol proto) n
     case net::protocol::ipv6: hints.ai_family = AF_INET6; break;
     }
 
+    // An IP address is used as is. A name only resolves to the kinds of address this host has (AI_ADDRCONFIG), but that
+    // would also reject an IPv6 address (even "::1") when there's no IPv6 network configured: glibc doesn't count
+    // loopback addresses.
     addrinfo* found = nullptr;
-    if (auto err = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found); err != 0)
-        return std::unexpected(net::make_gai_error_condition(err));
+
+    hints.ai_flags = AI_NUMERICHOST;
+    auto err       = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found);
+    if (err == EAI_NONAME)
+    {
+        hints.ai_flags = AI_ADDRCONFIG;
+        err            = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found);
+    }
+
+    if (err != 0) return std::unexpected(net::make_gai_error_condition(err));
 
     return addrinfo_ptr{found, &::freeaddrinfo};
 }
