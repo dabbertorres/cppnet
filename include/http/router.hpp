@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -17,6 +18,20 @@ namespace net::http
 {
 
 using handler_func = std::function<coro::task<void>(const server_request&, response_writer&)>;
+
+// request_handler is what a server calls for each request: e.g. a router, or middleware wrapping one (see
+// instrument/middleware.hpp). Unlike a handler_func, it can change the request (e.g. a router sets its route).
+using request_handler = std::function<coro::task<void>(server_request&, response_writer&)>;
+
+// make_handler makes a request_handler of h, which needn't be copyable (as a router isn't): copies of the
+// request_handler share it.
+template<typename H>
+    requires std::invocable<std::decay_t<H>&, server_request&, response_writer&>
+request_handler make_handler(H&& h)
+{
+    auto shared = std::make_shared<std::decay_t<H>>(std::forward<H>(h));
+    return [shared](server_request& req, response_writer& resp) { return std::invoke(*shared, req, resp); };
+}
 
 // TODO: it'd be neat if we could build a "perfect" router at compile time...
 
@@ -75,9 +90,13 @@ public:
     {
         auto& sub = get_subrouter(route);
         std::invoke(std::forward<I>(sub_builder), sub);
+        return *this;
     }
 
-    coro::task<void> operator()(const server_request&, response_writer&) const;
+    // operator() calls the handler for the request's method and path, after setting its route to the pattern that
+    // matched, or responds 404 Not Found (if no route matched) or 405 Method Not Allowed (if one did, but not for
+    // its method).
+    coro::task<void> operator()(server_request&, response_writer&) const;
 
 private:
     router& get_subrouter(std::string_view route);
@@ -86,6 +105,8 @@ private:
     util::string_map<router>                         children;
     std::unique_ptr<router>                          wildcard;
     std::string                                      wildcard_name;
+    // pattern is the route to this router: e.g. "/users/:id".
+    std::string pattern;
 };
 
 }

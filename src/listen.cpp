@@ -15,6 +15,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include "coro/task.hpp"
 #include "exception.hpp"
 #include "io/poll.hpp"
@@ -165,6 +168,23 @@ void listener::listen(std::uint16_t max_backlog)
     /*     .fd     = main_fd, */
     /*     .events = POLLIN, */
     /* }); */
+}
+
+std::uint16_t listener::local_port() const
+{
+    sockaddr_storage addr{};
+    socklen_t        size = sizeof(addr);
+    if (::getsockname(main_fd, reinterpret_cast<sockaddr*>(&addr), &size) == -1)
+    {
+        throw system_error_from_errno(errno, "failed to get the listener's address");
+    }
+
+    switch (addr.ss_family)
+    {
+    case AF_INET: return ntohs(reinterpret_cast<const sockaddr_in*>(&addr)->sin_port);
+    case AF_INET6: return ntohs(reinterpret_cast<const sockaddr_in6*>(&addr)->sin6_port);
+    default: throw exception{"the listener's address isn't IPv4 or IPv6"};
+    }
 }
 
 coro::task<std::expected<tcp_socket, std::error_condition>> listener::accept() const

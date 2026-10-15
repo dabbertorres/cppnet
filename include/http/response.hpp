@@ -258,6 +258,9 @@ public:
     net::http::headers&     headers() noexcept;
     coro::task<io::writer*> send(status status_code, std::size_t content_length);
 
+    // status_code is the status that was sent, or status::NONE if the response hasn't been yet.
+    [[nodiscard]] status status_code() const noexcept { return resp->status_code; }
+
 private:
     io::writer*      writer;
     server_response* resp;

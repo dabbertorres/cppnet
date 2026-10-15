@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 #include "http/headers.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
@@ -69,19 +70,23 @@ bool all_zero(std::span<const std::byte> data) noexcept
     return std::ranges::all_of(data, [](std::byte b) { return b == std::byte{0}; });
 }
 
-// new_span_id returns a random (non-zero) span id.
-span_id_t new_span_id()
+// random_id returns a random (non-zero) id.
+template<std::size_t N>
+std::array<std::byte, N> random_id()
 {
     thread_local std::mt19937_64 random{std::random_device{}()};
 
-    span_id_t id{};
+    std::array<std::byte, N> id{};
     do
     {
-        auto v = random();
-        for (auto& b : id)
+        for (std::size_t i = 0; i < N; i += sizeof(std::uint64_t))
         {
-            b = static_cast<std::byte>(v & 0xff);
-            v >>= 8;
+            auto v = random();
+            for (std::size_t j = i; j < std::min(N, i + sizeof(v)); ++j)
+            {
+                id[j] = static_cast<std::byte>(v & 0xff);
+                v >>= 8;
+            }
         }
     }
     while (all_zero(id));
@@ -125,7 +130,7 @@ std::optional<span> parse_traceparent(std::string_view traceparent)
     if (all_zero(s.trace_id) || all_zero(*s.parent_span_id)) return std::nullopt;
 
     s.flags   = static_cast<span_flags>(flags[0]);
-    s.span_id = new_span_id();
+    s.span_id = net::instrument::opentelemetry::tracecontext::new_span_id();
     return s;
 }
 
@@ -158,6 +163,10 @@ std::optional<span> parse(const http::headers& headers)
 
     return s;
 }
+
+trace_id_t new_trace_id() { return random_id<std::tuple_size_v<trace_id_t>>(); }
+
+span_id_t new_span_id() { return random_id<std::tuple_size_v<span_id_t>>(); }
 
 void inject(const span& span, http::headers& headers)
 {

@@ -106,6 +106,9 @@ struct server_request
     // The host the request is for: from the target, if it has one, otherwise the Host header.
     std::string host;
 
+    // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
+    std::string route;
+
     std::unique_ptr<io::reader> body = nullptr;
 };
 

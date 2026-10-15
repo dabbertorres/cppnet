@@ -23,7 +23,7 @@ router& router::add(request_method method, std::string_view route, handler_func&
     return *this;
 }
 
-coro::task<void> router::operator()(const server_request& req, response_writer& resp) const
+coro::task<void> router::operator()(server_request& req, response_writer& resp) const
 {
     std::string_view route = req.target.path;
 
@@ -55,6 +55,15 @@ coro::task<void> router::operator()(const server_request& req, response_writer& 
         }
     }
 
+    // a router with no handlers is only part of the way to a route.
+    if (parent->method_handlers.empty())
+    {
+        co_await resp.send(status::NOT_FOUND, 0);
+        co_return;
+    }
+
+    req.route = parent->pattern;
+
     auto iter = parent->method_handlers.find(req.method);
     if (iter == parent->method_handlers.end())
     {
@@ -85,8 +94,9 @@ router& router::get_subrouter(std::string_view route)
 
             if (current->wildcard == nullptr)
             {
-                current->wildcard      = std::make_unique<router>();
-                current->wildcard_name = part.substr(1);
+                current->wildcard          = std::make_unique<router>();
+                current->wildcard_name     = part.substr(1);
+                current->wildcard->pattern = current->pattern + '/' + std::string{part};
             }
             else if (current->wildcard_name != part.substr(1))
             {
@@ -97,7 +107,10 @@ router& router::get_subrouter(std::string_view route)
         }
         else
         {
-            current = &current->children[part];
+            auto [iter, added] = current->children.try_emplace(std::string{part});
+            if (added) iter->second.pattern = current->pattern + '/' + std::string{part};
+
+            current = &iter->second;
         }
     }
 

@@ -16,6 +16,12 @@ namespace net::instrument::opentelemetry::tracecontext
 // specification requires).
 std::optional<span> parse(const http::headers& headers);
 
+// new_trace_id returns a random (non-zero) trace id, for the root span of a new trace.
+trace_id_t new_trace_id();
+
+// new_span_id returns a random (non-zero) span id.
+span_id_t new_span_id();
+
 // inject sets the headers that carry span's trace (and span as the parent) to the next service.
 void inject(const span& span, http::headers& headers);
 
