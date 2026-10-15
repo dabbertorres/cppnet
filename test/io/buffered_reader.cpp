@@ -1,11 +1,8 @@
 #include "io/buffered_reader.hpp"
 
-#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
-
-#include <catch.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 

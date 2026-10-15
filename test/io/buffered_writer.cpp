@@ -6,8 +6,7 @@
 #include <span>
 #include <string>
 #include <string_view>
-
-#include <catch.hpp>
+#include <system_error>
 
 #include <catch2/catch_test_macros.hpp>
 

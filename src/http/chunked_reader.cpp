@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include "http/headers.hpp"
 #include "io/io.hpp"
 #include "io/util.hpp"
+#include "util/result.hpp"
 
 namespace
 {

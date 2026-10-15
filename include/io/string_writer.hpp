@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <deque>
-#include <memory>
+#include <iosfwd>
 #include <span>
 #include <string>
 

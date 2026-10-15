@@ -1,6 +1,5 @@
 #include "coro/async_scope.hpp"
 
-#include <coroutine>
 #include <cstddef>
 #include <exception>
 #include <mutex>

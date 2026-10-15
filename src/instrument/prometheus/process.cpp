@@ -1,10 +1,10 @@
 #include "instrument/prometheus/process.hpp"
 
 #include <chrono>
-#include <cstddef>
 #include <expected>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>

@@ -5,9 +5,6 @@
 #include <thread>
 #include <utility>
 
-#include <catch.hpp>
-
-#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 using net::util::resource_pool;

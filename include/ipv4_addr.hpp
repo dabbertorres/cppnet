@@ -1,7 +1,6 @@
 #pragma once
 
 #include <array>
-#include <compare>
 #include <cstdint>
 #include <optional>
 #include <string>

@@ -1,0 +1,22 @@
+# Mappings for include-what-you-use (https://include-what-you-use.org), e.g.:
+#   iwyu_tool.py -p build -- -Xiwyu --mapping_file=$PWD/iwyu.imp
+[
+  # macOS's libc splits its headers into private ones, which IWYU would otherwise suggest.
+  { include: ["<_ctype.h>", "private", "<cctype>", "public"] },
+  { include: ["<_stdio.h>", "private", "<cstdio>", "public"] },
+  { include: ["<_stdlib.h>", "private", "<cstdlib>", "public"] },
+  { include: ["<_string.h>", "private", "<cstring>", "public"] },
+
+  # Mach's API is used through its umbrella header.
+  { include: ["<mach/kern_return.h>", "private", "<mach/mach.h>", "public"] },
+  { include: ["<mach/mach_init.h>", "private", "<mach/mach.h>", "public"] },
+  { include: ["<mach/message.h>", "private", "<mach/mach.h>", "public"] },
+  { include: ["<mach/task.h>", "private", "<mach/mach.h>", "public"] },
+  { include: ["<mach/task_info.h>", "private", "<mach/mach.h>", "public"] },
+
+  # proc_pidinfo's types come with it.
+  { include: ["<sys/proc_info.h>", "private", "<libproc.h>", "public"] },
+
+  # fmt is spdlog's, so it's used through spdlog.
+  { include: ["@<fmt/.*>", "private", "<spdlog/fmt/fmt.h>", "public"] },
+]

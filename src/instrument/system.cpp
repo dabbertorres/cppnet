@@ -4,13 +4,13 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <ratio>
 #include <system_error>
 
 #include <sys/resource.h>
-#include <sys/time.h>
 #include <unistd.h>
 
-#include "config.hpp"
+#include "config.hpp" // IWYU pragma: keep (for the platform macros)
 
 #ifdef NET_IS_LINUX
 #    include <charconv>

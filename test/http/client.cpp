@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,18 +18,22 @@
 #include <sys/socket.h>
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
-
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <netinet/in.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "http/connection_pool.hpp"
+#include "http/headers.hpp"
+#include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/string_reader.hpp"
 #include "listen.hpp"

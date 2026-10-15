@@ -4,8 +4,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <expected>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <new>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,7 @@
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 #include "io/limit_reader.hpp"
+#include "io/reader.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"

@@ -3,13 +3,14 @@
 #include <exception> // IWYU pragma: keep
 #include <stdexcept>
 #include <string>
-
-#include <catch.hpp>
+#include <system_error>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "coro/sync_wait.hpp"
 #include "instrument/prometheus/counter.hpp"
+#include "instrument/prometheus/gauge.hpp"
+#include "instrument/prometheus/histogram.hpp"
 #include "io/string_writer.hpp"
 
 using net::instrument::prometheus::counter;

@@ -1,7 +1,6 @@
 #include "io/buffer.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <span>
 #include <string>
 

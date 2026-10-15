@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>

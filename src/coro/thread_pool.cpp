@@ -1,7 +1,6 @@
 #include "coro/thread_pool.hpp"
 
 #include <atomic>
-#include <coroutine>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>

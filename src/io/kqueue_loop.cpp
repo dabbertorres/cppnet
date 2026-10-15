@@ -1,4 +1,4 @@
-#include "config.hpp"
+#include "config.hpp" // IWYU pragma: keep (for the platform macros)
 
 #ifdef NET_HAS_KQUEUE
 
@@ -12,10 +12,11 @@
 #    include <cstdint>
 #    include <ctime>
 #    include <optional>
+#    include <ratio>
 #    include <span>
+#    include <string>
 
 #    include <sys/event.h>
-#    include <sys/types.h>
 #    include <unistd.h>
 
 #    include "exception.hpp"

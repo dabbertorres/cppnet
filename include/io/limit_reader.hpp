@@ -2,11 +2,8 @@
 
 #include <cstddef>
 #include <memory>
-#include <span>
 #include <utility>
 
-#include "coro/task.hpp"
-#include "io/io.hpp"
 #include "io/reader.hpp"
 
 namespace net::io

@@ -1,15 +1,16 @@
 // fuzz_request_target checks that parse_request_target doesn't crash, and that:
 // - normalizing a path is idempotent, and leaves no dot segments.
 // - what the client sends (url::origin_form()) is always a valid target.
-#include <cstddef>
+#include "http/request_target.hpp"
+
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <expected>
 #include <string>
 #include <string_view>
 
 #include "http/request.hpp"
-#include "http/request_target.hpp"
 #include "url.hpp"
 
 using net::http::parse_request_target;

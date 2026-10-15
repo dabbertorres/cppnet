@@ -1,9 +1,9 @@
 #pragma once
 
 #include <cstddef>
-#include <expected>
 #include <limits>
 #include <memory>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "http/request.hpp"

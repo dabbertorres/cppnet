@@ -1,7 +1,6 @@
 #pragma once
 
 #include <condition_variable>
-#include <coroutine>
 #include <cstddef>
 #include <exception>
 #include <functional>

@@ -1,6 +1,10 @@
 #include <iostream>
+#include <string>
+#include <string_view>
 
+#include "coro/generator.hpp"
 #include "dns.hpp"
+#include "ip_addr.hpp"
 
 int main(int argc, char** argv)
 {

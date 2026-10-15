@@ -9,17 +9,17 @@
 //   Clang 23, Linux:  symmetric 12.0 / 9.8   handshake 17.5 / 16.3
 //   Clang 23, macOS:  symmetric 43.5 / 26.6  handshake 51.9 / 33.4  (macOS's allocator is slower)
 //   GCC 16, Linux:    symmetric 49.0 / 24.5  handshake 60.5 / 30.7
+#include "coro/task.hpp"
+
 #include <algorithm>
 #include <chrono>
-#include <coroutine>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <ratio>
 #include <utility>
 #include <vector>
-
-#include "coro/task.hpp"
 
 namespace
 {

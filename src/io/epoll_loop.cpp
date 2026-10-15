@@ -1,4 +1,4 @@
-#include "config.hpp"
+#include "config.hpp" // IWYU pragma: keep (for the platform macros)
 
 #ifdef NET_HAS_EPOLL
 

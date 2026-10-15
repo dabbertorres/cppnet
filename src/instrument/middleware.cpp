@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -17,13 +18,16 @@
 #include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
 #include "instrument/opentelemetry/tracecontext.hpp"
 #include "instrument/prometheus/gauge.hpp"
 #include "instrument/prometheus/histogram.hpp"
+#include "instrument/prometheus/metric.hpp"
 #include "instrument/prometheus/registry.hpp"
+#include "util/type_map.hpp"
 
 namespace
 {

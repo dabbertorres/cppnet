@@ -6,6 +6,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"

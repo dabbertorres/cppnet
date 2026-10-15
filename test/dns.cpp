@@ -3,8 +3,6 @@
 #include <exception> // IWYU pragma: keep
 #include <string_view>
 
-#include <catch.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 TEST_CASE("dns_lookup", "[dns]")

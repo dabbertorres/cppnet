@@ -5,7 +5,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
-#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -37,7 +37,7 @@ std::string_view metric_type_string(metric_type type) noexcept;
 std::string format_value(double value);
 
 template<typename T>
-struct base_metric;
+struct base_metric; // IWYU pragma: keep
 
 // clang-format off
 template<typename T>

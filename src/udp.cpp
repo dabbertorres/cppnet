@@ -4,14 +4,10 @@
 #include <string_view>
 
 #include <netdb.h>
-#include <unistd.h>
-
 #include <sys/socket.h>
-#include <sys/types.h>
-
-#include "io/scheduler.hpp"
 
 #include "exception.hpp"
+#include "io/scheduler.hpp"
 #include "ip_addr.hpp"
 #include "socket.hpp"
 

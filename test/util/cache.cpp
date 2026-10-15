@@ -2,8 +2,6 @@
 
 #include <exception> // IWYU pragma: keep
 
-#include <catch.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 using net::util::cache;

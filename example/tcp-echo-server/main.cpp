@@ -3,8 +3,10 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdlib>
+#include <expected>
 #include <memory>
 #include <span>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -12,10 +14,12 @@
 #include <pthread.h>
 
 #include <spdlog/common.h>
+#include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
