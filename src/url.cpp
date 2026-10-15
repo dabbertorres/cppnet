@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -11,6 +12,14 @@
 
 namespace
 {
+
+std::optional<int> hex_digit_value(char c) noexcept
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return std::nullopt;
+}
 
 using net::url;
 using net::url_parse_state;
@@ -326,29 +335,29 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
 
 std::string url::decode(std::string_view str) noexcept
 {
-    std::ostringstream out;
+    // Follows the WHATWG URL standard's percent-decode: a '%' that isn't followed by two hex digits is kept as it is.
+    std::string out;
+    out.reserve(str.size());
 
-    std::size_t idx = 0;
-    while ((idx = str.find('%')) != std::string::npos)
+    for (std::size_t i = 0; i < str.size(); ++i)
     {
-        auto hex_val = str.substr(idx + 1, 2);
-
-        std::uint8_t val = 0;
-
-        auto result = std::from_chars(hex_val.begin(), hex_val.end(), val, 16);
-        // drop invalid values
-        if (result.ec == std::errc())
+        if (str[i] == '%' && str.size() - i > 2)
         {
-            out << str.substr(0, idx);
-            out << val;
+            auto high = hex_digit_value(str[i + 1]);
+            auto low  = hex_digit_value(str[i + 2]);
+
+            if (high && low)
+            {
+                out.push_back(static_cast<char>((*high << 4) | *low));
+                i += 2;
+                continue;
+            }
         }
 
-        str = str.substr(idx + 3);
+        out.push_back(str[i]);
     }
 
-    out << str;
-
-    return out.str();
+    return out;
 }
 
 url::parse_result url::parse(const char* s) noexcept { return parse(std::string_view(s)); }

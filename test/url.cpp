@@ -2,10 +2,12 @@
 
 #include <exception> // IWYU pragma: keep
 #include <string>
+#include <string_view>
 
 #include <catch.hpp>
 
 #include <catch2/catch_message.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_tostring.hpp>
 
@@ -289,4 +291,41 @@ TEST_CASE("url encoding 'foo%bar' <=> 'foo%25bar'", "[url][urlencoding]")
         auto result = net::url::decode(expect);
         CHECK(result == input);
     }
+}
+
+TEST_CASE("url::decode", "[url][urlencoding]")
+{
+    using namespace std::string_view_literals;
+
+    struct test_case
+    {
+        std::string_view input;
+        std::string_view expect;
+    };
+
+    auto tc = GENERATE(test_case{.input = "", .expect = ""},
+                       test_case{.input = "plain", .expect = "plain"},
+                       test_case{.input = "%41%42", .expect = "AB"},
+                       test_case{.input = "%2f%2F", .expect = "//"},
+                       test_case{.input = "%00", .expect = "\0"sv},
+                       test_case{.input = "%%41", .expect = "%A"},
+                       // invalid escapes are kept as they are
+                       test_case{.input = "%", .expect = "%"},
+                       test_case{.input = "/%", .expect = "/%"},
+                       test_case{.input = "abc%", .expect = "abc%"},
+                       test_case{.input = "%4", .expect = "%4"},
+                       test_case{.input = "%4g", .expect = "%4g"},
+                       test_case{.input = "a%4gb", .expect = "a%4gb"},
+                       test_case{.input = "abc%zzdef", .expect = "abc%zzdef"},
+                       test_case{.input = "%-1", .expect = "%-1"});
+
+    CAPTURE(tc.input);
+    CHECK(net::url::decode(tc.input) == tc.expect);
+}
+
+TEST_CASE("url::parse keeps invalid escapes", "[url][parse]")
+{
+    auto result = net::url::parse("/a%zz/%");
+    REQUIRE(result.has_value());
+    CHECK(result.to_value().path == "/a%zz/%");
 }
