@@ -19,3 +19,24 @@ TEST_CASE("task of std::expected can be destroyed", "[coro][task]")
     REQUIRE(value.has_value());
     CHECK(*value == nullptr);
 }
+
+namespace
+{
+
+net::coro::task<int> one() { co_return 1; }
+
+net::coro::task<long> count_to(long n)
+{
+    long total = 0;
+    for (long i = 0; i < n; ++i) total += co_await one();
+    co_return total;
+}
+
+}
+
+TEST_CASE("co_awaiting tasks that finish without suspending doesn't grow the stack", "[coro][task]")
+{
+    // With symmetric transfer, each of these nests a little deeper, unless the compiler makes the transfers tail calls
+    // (which GCC doesn't without optimizations, or with ASan), and the stack overflows.
+    CHECK(test::sync_wait(count_to(1'000'000)) == 1'000'000);
+}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <coroutine>
 #include <exception>
 #include <memory>
@@ -14,6 +15,29 @@ namespace net::coro
 template<typename T>
 class promise;
 
+// task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it finishes.
+//
+// How co_await hands over to a task (and back), and why:
+//
+// The usual way is symmetric transfer: await_suspend returns the task's handle (so the awaiting coroutine suspends, and
+// the task resumes), and the task's final_suspend returns the awaiting coroutine's handle (so it resumes). That's
+// cheapest, but it only keeps the stack from growing if the compiler makes those transfers tail calls. Otherwise, a
+// task that finishes without suspending (e.g. a read of what's already buffered) resumes its awaiter from inside its
+// own frame, which is inside the awaiter's frame, and so on: a loop of such co_awaits grows the stack until it
+// overflows. Clang makes them tail calls even without optimizations (as far as has been tested: x86-64 and arm64), but
+// GCC only does when optimizing, and not with ASan (which the debug presets use).
+//
+// So instead, await_suspend resumes the task directly, and only suspends the awaiting coroutine if the task suspended:
+// one that finishes straight away just returns to await_suspend, which then lets the awaiting coroutine carry on in its
+// own frame. A task that suspends (to wait for I/O) and finishes later, on another thread, resumes the awaiting
+// coroutine itself. An atomic flag in the promise decides which side continues the awaiting coroutine, as the task
+// may finish (on another thread) at any moment after it suspends.
+//
+// That's one code path for all compilers, which keeps the stack's depth independent of the compiler and its flags, at
+// the cost of an atomic exchange per co_await: about 6-10ns more than symmetric transfer, for a co_await of a task that
+// finishes straight away (e.g. 12 -> 18ns with Clang, 49 -> 60ns with GCC, on x86-64 Linux, where allocating the
+// task's frame is most of the rest). That's small next to I/O (a recv() is microseconds), but bench/coro/task.cpp
+// measures both ways, to check again later.
 template<typename T = void>
 class [[nodiscard]] task
 {
@@ -29,10 +53,20 @@ public:
 
         [[nodiscard]] bool await_ready() const noexcept { return !handle || handle.done(); }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> continuation) noexcept
+        // await_suspend starts the task, and only suspends the awaiting coroutine if the task suspended (see task's
+        // comment, for why not symmetric transfer).
+        bool await_suspend(std::coroutine_handle<> continuation) noexcept
         {
-            handle.promise().set_continuation(continuation);
-            return handle;
+            auto& promise = handle.promise();
+            promise.set_continuation(continuation);
+
+            handle.resume();
+
+            // usually, it's already finished: then a load is enough to know it, rather than an exchange.
+            if (promise.finished()) return false;
+
+            // otherwise, whichever of this and the task's final_suspend comes second continues the awaiting coroutine.
+            return !promise.mark_awaiter_or_finished();
         }
 
         std::coroutine_handle<promise_type> handle{nullptr};
@@ -136,6 +170,15 @@ public:
 
     void set_continuation(std::coroutine_handle<> handle) noexcept { continuation = handle; }
 
+    // mark_awaiter_or_finished is called by the task as it finishes, and by the awaiting coroutine (once it's started
+    // the task) unless it's already seen the task finish. It returns true for whichever comes second, which is then
+    // the one to continue the awaiting coroutine: the awaiter by not suspending, or the task by resuming it.
+    bool mark_awaiter_or_finished() noexcept { return second.exchange(true, std::memory_order::acq_rel); }
+
+    // finished returns whether the task has finished, if the awaiting coroutine hasn't called mark_awaiter_or_finished
+    // yet (it's the only other thing that sets the flag).
+    [[nodiscard]] bool finished() const noexcept { return second.load(std::memory_order::acquire); }
+
 private:
     friend struct final_awaitable;
 
@@ -147,14 +190,20 @@ private:
         std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> coro) noexcept
         {
             auto& promise = coro.promise();
-            if (promise.continuation != nullptr) return promise.continuation;
-            return std::noop_coroutine();
+
+            // the awaiting coroutine is still in its await_suspend (or nothing awaits this task): returning there
+            // continues it.
+            if (!promise.mark_awaiter_or_finished() || promise.continuation == nullptr) return std::noop_coroutine();
+
+            // it suspended, waiting for this task.
+            return promise.continuation;
         }
 
         void await_resume() noexcept { /* noop */ }
     };
 
     std::coroutine_handle<> continuation{nullptr};
+    std::atomic<bool>       second{false};
 };
 
 template<typename T>
