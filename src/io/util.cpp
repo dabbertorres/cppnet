@@ -32,7 +32,13 @@ coro::task<readline_result> readline(buffered_reader* reader, std::string_view e
     while (!line.ends_with(end_of_line))
     {
         auto [next, have_next] = co_await reader->peek();
-        if (!have_next) break; // nothing more to read
+        if (!have_next)
+        {
+            // the end of the stream ends the line, but anything else (e.g. a timeout) is an error.
+            auto err = reader->error();
+            if (err && err != status_condition::closed) co_return err;
+            break;
+        }
 
         add_size();
         auto [count, err] = co_await reader->read(std::span{line.data() + (line.size() - 1), 1});

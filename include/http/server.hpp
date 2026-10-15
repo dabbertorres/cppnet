@@ -31,7 +31,9 @@ struct server_config
     std::string                     host;
     std::string                     port                    = "8080";
     std::size_t                     max_header_bytes        = 8'192;
-    std::chrono::seconds            header_read_timeout     = 5s;
+    // How long to wait for a request's headers, from when the server starts waiting for them, so it includes waiting
+    // for the next request on a kept-alive connection. The connection is closed once it passes. 0 disables it.
+    std::chrono::seconds header_read_timeout = 5s;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
     bool                            http11                  = true;
@@ -70,8 +72,9 @@ private:
     std::shared_ptr<spdlog::logger> logger;
     io::scheduler*                  scheduler;
 
-    std::size_t   max_header_bytes;
-    std::uint16_t max_pending_connections;
+    std::size_t          max_header_bytes;
+    std::chrono::seconds header_read_timeout;
+    std::uint16_t        max_pending_connections;
 };
 
 }

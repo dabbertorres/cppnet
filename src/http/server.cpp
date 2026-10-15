@@ -58,17 +58,13 @@ namespace net::http
 using namespace std::string_view_literals;
 
 server::server(io::scheduler* scheduler, router&& handler, const server_config& cfg)
-    : listener{scheduler,
-               cfg.host,
-               cfg.port,
-               network::tcp,
-               protocol::not_care,
-               std::chrono::duration_cast<std::chrono::microseconds>(cfg.header_read_timeout)}
+    : listener{scheduler, cfg.host, cfg.port, network::tcp}
     , is_serving{false}
     , handler{std::move(handler)}
     , logger{cfg.logger}
     , scheduler{scheduler}
     , max_header_bytes{cfg.max_header_bytes}
+    , header_read_timeout{cfg.header_read_timeout}
     , max_pending_connections{cfg.max_pending_connections}
 {}
 
@@ -142,18 +138,20 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             default: decode = http11::request_decode; break;
             }
 
+            // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
+            if (header_read_timeout > header_read_timeout.zero())
+                conn.set_read_deadline(io::clock::now() + header_read_timeout);
+
             auto req_result = co_await decode(&reader, max_header_bytes);
+
+            conn.set_read_deadline(std::nullopt);
+
             if (!req_result.has_value())
             {
                 auto err = req_result.error();
-                if (static_cast<io::status_condition>(err.value()) == io::status_condition::closed)
-                {
-                    logger->debug("connection closed");
-                }
-                else
-                {
-                    logger->debug("request decoding error: {} '{}'", err.value(), err.message());
-                }
+                if (err == io::status_condition::closed) logger->debug("connection closed");
+                else if (err == std::errc::timed_out) logger->debug("timed out waiting for request headers");
+                else logger->debug("request decoding error: {} '{}'", err.value(), err.message());
                 break;
             }
 
