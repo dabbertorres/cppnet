@@ -36,5 +36,6 @@ add_fuzzer(
   "${PROJECT_SOURCE_DIR}/src/io/buffered_reader.cpp"
   "${PROJECT_SOURCE_DIR}/src/io/io.cpp"
   "${PROJECT_SOURCE_DIR}/src/io/limit_reader.cpp"
+  "${PROJECT_SOURCE_DIR}/src/io/limit_writer.cpp"
   "${PROJECT_SOURCE_DIR}/src/io/util.cpp"
 )

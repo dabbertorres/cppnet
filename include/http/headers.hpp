@@ -94,6 +94,9 @@ public:
     headers& set(std::string_view key, std::initializer_list<std::string_view> vals);
     headers& add(std::string_view key, std::string_view val);
 
+    // remove removes key's values, if it has any.
+    headers& remove(std::string_view key);
+
     headers& set_content_length(std::size_t length);
     headers& set_content_type(const content_type& content_type);
 

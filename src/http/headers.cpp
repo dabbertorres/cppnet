@@ -130,6 +130,12 @@ headers& headers::set(std::string_view key, std::initializer_list<std::string_vi
 
 headers& headers::add(std::string_view key, std::string_view val) { return add(std::string(key), val); }
 
+headers& headers::remove(std::string_view key)
+{
+    values.erase(key);
+    return *this;
+}
+
 headers& headers::set_content_length(std::size_t length) { return set("Content-Length"sv, std::to_string(length)); }
 
 headers& headers::set_content_type(const content_type& content_type)

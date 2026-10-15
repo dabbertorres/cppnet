@@ -304,6 +304,17 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
         }
 
         if (rw.status_code() == status::NONE) co_await rw.send(status::OK, 0);
+
+        // the client would wait for the rest of the body, so it's told there's no more by closing the connection.
+        if (rw.body_remaining() > 0)
+        {
+            logger->warn("handler for {} {} wrote {} bytes less than its Content-Length",
+                         method_string(req.method),
+                         req.target.path,
+                         rw.body_remaining());
+            co_await writer.flush();
+            co_return serve_state::close;
+        }
     }
 
     logger->trace("flushing writer");

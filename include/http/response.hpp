@@ -13,6 +13,7 @@
 #include "http/http.hpp"
 #include "http/request.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/limit_writer.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 
@@ -248,8 +249,15 @@ struct response_writer
 public:
     response_writer(io::writer* writer, server_response* base, response_encoder encoder);
 
-    net::http::headers&     headers() noexcept;
+    net::http::headers& headers() noexcept;
+
+    // send sends the response's status and headers, with a Content-Length of content_length (except for statuses
+    // that have no content: 1xx, 204 and 304), and returns the writer for its body. Writing more than content_length
+    // fails with std::errc::value_too_large; writing less leaves the server to close the connection.
     coro::task<io::writer*> send(status status_code, std::size_t content_length);
+
+    // body_remaining is how much of the body the handler has yet to write.
+    [[nodiscard]] std::size_t body_remaining() const noexcept { return body.remaining(); }
 
     // status_code is the status that was sent, or status::NONE if the response hasn't been yet.
     [[nodiscard]] status status_code() const noexcept { return resp->status_code; }
@@ -258,6 +266,7 @@ private:
     io::writer*      writer;
     server_response* resp;
     response_encoder encode;
+    io::limit_writer body;
 };
 
 }

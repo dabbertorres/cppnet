@@ -8,10 +8,13 @@
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
+#include "io/limit_writer.hpp"
 #include "io/writer.hpp"
 
 namespace net::http
 {
+
+using namespace std::string_view_literals;
 
 status parse_status(std::string_view str) noexcept
 {
@@ -35,8 +38,14 @@ headers& response_writer::headers() noexcept { return resp->headers; }
 
 coro::task<io::writer*> response_writer::send(status status_code, std::size_t content_length)
 {
+    // 1xx and 204 responses have no content, and mustn't say how long it is; nor need a 304, whose length would have
+    // to be the 200's (RFC 9110, section 8.6).
+    const bool has_content =
+        !status_is_information(status_code) && status_code != status::NO_CONTENT && status_code != status::NOT_MODIFIED;
+
     resp->status_code = status_code;
-    resp->headers.set_content_length(content_length);
+    if (has_content) resp->headers.set_content_length(content_length);
+    else resp->headers.remove("Content-Length"sv);
     auto res = co_await encode(writer, *resp);
     if (!res.has_value())
     {
@@ -45,7 +54,8 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
         throw std::system_error{res.error().value(), res.error().category(), "failed to send response"};
     }
 
-    co_return resp->body;
+    body = io::limit_writer{resp->body, has_content ? content_length : 0};
+    co_return &body;
 }
 
 }
