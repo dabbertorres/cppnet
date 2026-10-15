@@ -1,9 +1,13 @@
 #include "instrument/opentelemetry/protocol.hpp"
 
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -15,10 +19,58 @@
 #include "encoding/hex.hpp"
 #include "util/overloaded.hpp"
 
-namespace net::instrument::opentelemetry
+namespace
 {
 
 using json = nlohmann::json;
+
+// json_double is a double as proto3's JSON mapping writes it: a number, or (as JSON numbers can't be) "NaN",
+// "Infinity" or "-Infinity".
+json json_double(double v)
+{
+    if (std::isnan(v)) return "NaN";
+    if (std::isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
+    return v;
+}
+
+json json_doubles(const std::vector<double>& values)
+{
+    auto out = json::array();
+    for (double v : values) out.push_back(json_double(v));
+    return out;
+}
+
+// int64_from reads an int64 field, which proto3's JSON mapping usually writes as a string, but may be a number. It's
+// 0 if absent.
+std::int64_t int64_from(const json& j, const char* key)
+{
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return 0;
+    if (!it->is_string()) return it->get<std::int64_t>();
+
+    const auto& text = it->get_ref<const std::string&>();
+
+    std::int64_t v  = 0;
+    auto [end, err] = std::from_chars(text.data(), text.data() + text.size(), v);
+    if (err != std::errc{} || end != text.data() + text.size())
+    {
+        throw std::invalid_argument{std::string{"invalid "} + key + ": \"" + text + '"'};
+    }
+
+    return v;
+}
+
+std::string string_from(const json& j, const char* key)
+{
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return "";
+    return it->get<std::string>();
+}
+
+}
+
+namespace net::instrument::opentelemetry
+{
 
 void to_json(nlohmann::json& j, const key_value_list& value) { j["values"] = value.values; }
 
@@ -31,7 +83,7 @@ void to_json(json& j, const any_value& value)
             [&](const std::string& s) { j["stringValue"] = s; },
             [&](bool b) { j["boolValue"] = b; },
             [&](std::int64_t i) { j["intValue"] = i; },
-            [&](double d) { j["doubleValue"] = d; },
+            [&](double d) { j["doubleValue"] = json_double(d); },
             [&](const array_value& a) { j["arrayValue"]["values"] = a.values; },
             [&](const key_value_list& l) { j["kvlistValue"]["values"] = l.values; },
             [&](const std::vector<std::byte>& b)
@@ -130,7 +182,7 @@ void to_json(nlohmann::json& j, const exemplar& value)
     j["timeUnixNano"]       = value.time.time_since_epoch().count();
     std::visit(
         util::overloaded{
-            [&](double v) { j["asDouble"] = v; },
+            [&](double v) { j["asDouble"] = json_double(v); },
             [&](std::int64_t v) { j["asInt"] = v; },
         },
         value.value);
@@ -145,7 +197,7 @@ void to_json(nlohmann::json& j, const number_data_point& value)
     j["timeUnixNano"]      = value.time.time_since_epoch().count();
     std::visit(
         util::overloaded{
-            [&](double v) { j["asDouble"] = v; },
+            [&](double v) { j["asDouble"] = json_double(v); },
             [&](std::int64_t v) { j["asInt"] = v; },
         },
         value.value);
@@ -168,13 +220,13 @@ void to_json(nlohmann::json& j, const histogram::data_point& value)
     j["startTimeUnixNano"] = value.start_time.time_since_epoch().count();
     j["timeUnixNano"]      = value.time.time_since_epoch().count();
     j["count"]             = value.count;
-    if (value.sum.has_value()) j["sum"] = value.sum.value();
+    if (value.sum.has_value()) j["sum"] = json_double(value.sum.value());
     j["bucketCounts"]   = value.bucket_counts;
-    j["explicitBounds"] = value.explicit_bounds;
+    j["explicitBounds"] = json_doubles(value.explicit_bounds);
     j["exemplars"]      = value.exemplars;
     j["flags"]          = std::to_underlying(value.flags);
-    if (value.min.has_value()) j["min"] = value.min.value();
-    if (value.max.has_value()) j["max"] = value.max.value();
+    if (value.min.has_value()) j["min"] = json_double(value.min.value());
+    if (value.max.has_value()) j["max"] = json_double(value.max.value());
 }
 
 void to_json(nlohmann::json& j, const histogram& value)
@@ -195,15 +247,16 @@ void to_json(nlohmann::json& j, const exponential_histogram::data_point& value)
     j["startTimeUnixNano"] = value.start_time.time_since_epoch().count();
     j["timeUnixNano"]      = value.time.time_since_epoch().count();
     j["count"]             = value.count;
-    if (value.sum.has_value()) j["sum"] = value.sum.value();
+    if (value.sum.has_value()) j["sum"] = json_double(value.sum.value());
+    j["scale"]     = value.scale;
     j["zeroCount"] = value.zero_count;
     j["positive"]  = value.positive;
     j["negative"]  = value.negative;
     j["flags"]     = std::to_underlying(value.flags);
     j["exemplars"] = value.exemplars;
-    if (value.min.has_value()) j["min"] = value.min.value();
-    if (value.max.has_value()) j["max"] = value.max.value();
-    j["zeroThreshold"] = value.zero_threshold;
+    if (value.min.has_value()) j["min"] = json_double(value.min.value());
+    if (value.max.has_value()) j["max"] = json_double(value.max.value());
+    j["zeroThreshold"] = json_double(value.zero_threshold);
 }
 
 void to_json(nlohmann::json& j, const exponential_histogram& value)
@@ -214,8 +267,8 @@ void to_json(nlohmann::json& j, const exponential_histogram& value)
 
 void to_json(nlohmann::json& j, const summary::data_point::value_at_quantile& value)
 {
-    j["quantile"] = value.quantile;
-    j["value"]    = value.value;
+    j["quantile"] = json_double(value.quantile);
+    j["value"]    = json_double(value.value);
 }
 
 void to_json(nlohmann::json& j, const summary::data_point& value)
@@ -224,7 +277,7 @@ void to_json(nlohmann::json& j, const summary::data_point& value)
     j["startTimeUnixNano"] = value.start_time.time_since_epoch().count();
     j["timeUnixNano"]      = value.time.time_since_epoch().count();
     j["count"]             = value.count;
-    j["sum"]               = value.sum;
+    j["sum"]               = json_double(value.sum);
     j["quantileValues"]    = value.quantile_values;
     j["flags"]             = std::to_underlying(value.flags);
 }
@@ -269,8 +322,8 @@ void to_json(nlohmann::json& j, const export_metrics_service_request& value)
 
 void from_json(const nlohmann::json& j, export_metrics_partial_success& value)
 {
-    value.rejected_data_points = j.value("rejectedDataPoints", 0);
-    value.error_message        = j.value("errorMessage", "");
+    value.rejected_data_points = int64_from(j, "rejectedDataPoints");
+    value.error_message        = string_from(j, "errorMessage");
 }
 
 void from_json(const nlohmann::json& j, export_metrics_service_response& value)
@@ -290,8 +343,8 @@ void to_json(nlohmann::json& j, const export_trace_service_request& value)
 
 void from_json(const nlohmann::json& j, export_trace_partial_success& value)
 {
-    value.rejected_spans = j.value("rejectedSpans", 0);
-    value.error_message  = j.value("errorMessage", "");
+    value.rejected_spans = int64_from(j, "rejectedSpans");
+    value.error_message  = string_from(j, "errorMessage");
 }
 
 void from_json(const nlohmann::json& j, export_trace_service_response& value)

@@ -1,8 +1,11 @@
 #include "instrument/opentelemetry/protocol.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <exception> // IWYU pragma: keep
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -159,4 +162,66 @@ TEST_CASE("serialize any_value", "[instrument][opentelemetry][protocol][serializ
     {
         CHECK(j.dump(2) == v.expect);
     }
+}
+
+TEST_CASE("serialize non-finite doubles", "[instrument][opentelemetry][protocol][serialize]")
+{
+    // as proto3's JSON mapping does, rather than as null.
+    CHECK(json(any_value{.value = std::numeric_limits<double>::quiet_NaN()}).dump() == R"({"doubleValue":"NaN"})");
+    CHECK(json(any_value{.value = std::numeric_limits<double>::infinity()}).dump() == R"({"doubleValue":"Infinity"})");
+    CHECK(json(any_value{.value = -std::numeric_limits<double>::infinity()}).dump()
+          == R"({"doubleValue":"-Infinity"})");
+    CHECK(json(any_value{.value = 1.5}).dump() == R"({"doubleValue":1.5})");
+}
+
+TEST_CASE("serialize a span's times since the Unix epoch", "[instrument][opentelemetry][protocol][serialize]")
+{
+    using namespace std::chrono;
+
+    net::instrument::opentelemetry::span s{};
+    s.start_time = sys_days{year{2026} / 1 / 1};
+    s.end_time   = s.start_time + 1500ms;
+
+    json j = s;
+    CHECK(j["startTimeUnixNano"] == 1'767'225'600'000'000'000);
+    CHECK(j["endTimeUnixNano"] == 1'767'225'601'500'000'000);
+
+    // and its unset fields are zero, rather than whatever was in memory.
+    CHECK(j["droppedAttributesCount"] == 0);
+    CHECK(j["droppedEventsCount"] == 0);
+    CHECK(j["droppedLinksCount"] == 0);
+    CHECK(j["kind"] == 0);
+    CHECK(j["traceId"] == "00000000000000000000000000000000");
+}
+
+TEST_CASE("serialize an exponential histogram's scale", "[instrument][opentelemetry][protocol][serialize]")
+{
+    net::instrument::opentelemetry::exponential_histogram::data_point point{};
+    point.scale = -3;
+
+    json j = net::instrument::opentelemetry::exponential_histogram{.data_points = {point}};
+    CHECK(j["dataPoints"][0]["scale"] == -3);
+}
+
+TEST_CASE("deserialize partial success counts", "[instrument][opentelemetry][protocol][deserialize]")
+{
+    using net::instrument::opentelemetry::export_metrics_service_response;
+    using net::instrument::opentelemetry::export_trace_service_response;
+
+    // as a string (as proto3's JSON mapping writes int64s), a number, or absent.
+    auto traces = json::parse(R"({"partialSuccess":{"rejectedSpans":"9007199254740993","errorMessage":"some"}})")
+                      .get<export_trace_service_response>();
+    REQUIRE(traces.partial_success.has_value());
+    CHECK(traces.partial_success->rejected_spans == 9'007'199'254'740'993);
+    CHECK(traces.partial_success->error_message == "some");
+
+    auto metrics = json::parse(R"({"partialSuccess":{"rejectedDataPoints":3}})").get<export_metrics_service_response>();
+    REQUIRE(metrics.partial_success.has_value());
+    CHECK(metrics.partial_success->rejected_data_points == 3);
+    CHECK(metrics.partial_success->error_message.empty());
+
+    CHECK_FALSE(json::parse("{}").get<export_trace_service_response>().partial_success.has_value());
+
+    CHECK_THROWS_AS(json::parse(R"({"partialSuccess":{"rejectedSpans":"lots"}})").get<export_trace_service_response>(),
+                    std::invalid_argument);
 }
