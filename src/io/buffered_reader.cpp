@@ -30,16 +30,7 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
     if (data.size() <= buf.size())
     {
         std::copy_n(buf.begin(), data.size(), data.begin());
-
-        auto end = buf.begin();
-        std::advance(end, data.size());
-
-        auto leftover = buf.size() - data.size();
-        auto new_end  = buf.begin();
-        std::advance(new_end, leftover);
-
-        std::copy_backward(end, buf.end(), new_end);
-        buf.resize(leftover);
+        consume(data.size());
 
         co_return result{.count = data.size()};
     }
@@ -81,12 +72,7 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
         std::copy_n(buf.begin(), available, data.subspan(total).begin());
 
         total += available;
-
-        auto end = buf.begin();
-        std::advance(end, available);
-        std::copy(end, buf.end(), buf.begin());
-
-        buf.resize(buf.size() - available);
+        consume(available);
 
         // only report an error if we couldn't fulfill the caller's request
         if (available < leftover) co_return result{.count = total, .err = err};
@@ -135,6 +121,12 @@ void buffered_reader::reset(reader* other)
 }
 
 void buffered_reader::reset() { buf.resize(0); }
+
+void buffered_reader::consume(std::size_t count) noexcept
+{
+    // NOTE: erase shifts what's left to the front, keeping the capacity.
+    buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(std::min(count, buf.size())));
+}
 
 std::error_condition buffered_reader::error() const { return err; }
 

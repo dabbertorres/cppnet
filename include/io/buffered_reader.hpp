@@ -46,6 +46,14 @@ public:
     // If no next byte is available, next is not modified, and false is returned.
     [[nodiscard]] coro::task<std::tuple<std::byte, bool>> peek();
 
+    // buffered returns what's buffered, without reading any more. Unlike read(), looking through it doesn't need a
+    // coroutine per byte: when reads complete without suspending, each co_await can deepen the stack (where symmetric
+    // transfer isn't a tail call, e.g. GCC without optimizations).
+    [[nodiscard]] std::span<const std::byte> buffered() const noexcept { return buf; }
+
+    // consume drops the first count bytes of what's buffered, as if they had been read.
+    void consume(std::size_t count) noexcept;
+
     [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
     [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }
 
