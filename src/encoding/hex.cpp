@@ -82,7 +82,8 @@ std::optional<std::vector<std::byte>> decode(std::span<const char> data) noexcep
 
 bool decode_to(std::span<const char> data, std::span<std::byte> out) noexcept
 {
-    if (data.size() % 2 != 0 || data.size() > out.size() * 2) return false;
+    // NOTE: exactly: shorter would read past the end of data.
+    if (data.size() != out.size() * 2) return false;
 
     for (auto i = 0u; i < out.size(); ++i)
     {
