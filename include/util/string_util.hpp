@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cctype>
+#include <algorithm>
 #include <concepts>
 #include <cstddef>
 #include <initializer_list>
@@ -8,35 +9,99 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <iterator>
+#include <type_traits>
 #include <utility>
-
-#include "coro/generator.hpp"
-#include "coro/task.hpp"
-#include "io/io.hpp"
-#include "io/writer.hpp"
 
 namespace net::util
 {
 
+// string_parts is the parts of a string, split at each separator (see split_string).
+template<typename String, typename CharT>
+class string_parts
+{
+public:
+    using size_type = typename String::size_type;
+
+    class iterator
+    {
+    public:
+        using value_type      = String;
+        using difference_type = std::ptrdiff_t;
+
+        constexpr iterator() noexcept = default;
+
+        constexpr String operator*() const { return parts->input.substr(begin, end - begin); }
+
+        constexpr iterator& operator++() noexcept
+        {
+            // after the last part (which ends at the end of the input, rather than at a separator), there are none.
+            if (end == parts->input.length()) begin = String::npos;
+            else
+            {
+                begin = end + 1;
+                end   = parts->part_end(begin);
+            }
+
+            return *this;
+        }
+
+        constexpr void operator++(int) noexcept { ++*this; }
+
+        friend constexpr bool operator==(const iterator& it, std::default_sentinel_t) noexcept
+        {
+            return it.begin == String::npos;
+        }
+
+    private:
+        friend class string_parts;
+
+        constexpr iterator(const string_parts* parts, size_type begin) noexcept
+            : parts{parts}
+            , begin{begin}
+            , end{begin == String::npos ? String::npos : parts->part_end(begin)}
+        {}
+
+        const string_parts* parts = nullptr;
+        size_type           begin = String::npos;
+        size_type           end   = String::npos;
+    };
+
+    constexpr string_parts(String input, CharT sep, size_type start) noexcept(
+        std::is_nothrow_move_constructible_v<String>)
+        : input{std::move(input)}
+        , sep{sep}
+        , start{start}
+    {}
+
+    // NOTE: iterators refer to this, so it must outlive them (as it does in a range-based for loop).
+    [[nodiscard]] constexpr iterator begin() const noexcept
+    {
+        return {this, start <= input.length() ? start : String::npos};
+    }
+
+    [[nodiscard]] constexpr std::default_sentinel_t end() const noexcept { return {}; }
+
+private:
+    [[nodiscard]] constexpr size_type part_end(size_type from) const noexcept
+    {
+        auto found = input.find(sep, from);
+        return found == String::npos ? input.length() : found;
+    }
+
+    String    input;
+    CharT     sep;
+    size_type start;
+};
+
+// split_string splits input, from start, at each sep: e.g. "a,,b" into "a", "", and "b", and "a," into "a" and "".
+// Unlike std::views::split, an empty input is one (empty) part, rather than none.
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
-coro::generator<String> split_string(String input, CharT sep, typename String::size_type start = 0)
+constexpr string_parts<String, CharT> split_string(String input, CharT sep, typename String::size_type start = 0)
 {
-    for (auto i = start; i <= input.length(); ++i)
-    {
-        auto next = input.find(sep, i);
-
-        if (next == String::npos)
-        {
-            co_yield input.substr(i);
-            break;
-        }
-
-        co_yield input.substr(i, next - i);
-
-        i = next;
-    }
+    return {std::move(input), sep, start};
 }
 
 template<typename CharT  = char,
@@ -180,45 +245,6 @@ constexpr void replace_all_to(std::ostream& os, View view, std::initializer_list
             view = view.substr(1);
         }
     }
-}
-
-template<typename CharT  = char,
-         typename Traits = std::char_traits<CharT>,
-         typename String = std::basic_string<CharT, Traits>,
-         typename View   = std::basic_string_view<CharT, Traits>>
-coro::task<io::result>
-replace_all_to(io::writer& out, View view, std::initializer_list<std::pair<View, View>> replacements)
-{
-    std::size_t total = 0;
-
-    while (!view.empty())
-    {
-        bool replaced = false;
-        for (const auto& [replace, with_this] : replacements)
-        {
-            if (view.starts_with(replace))
-            {
-                auto res = co_await out.write(with_this);
-                total += res.count;
-                if (res.err) co_return {.count = total, .err = res.err};
-
-                view     = view.substr(replace.length());
-                replaced = true;
-                break;
-            }
-        }
-
-        if (!replaced)
-        {
-            auto res = co_await out.write(view.front());
-            total += res.count;
-            if (res.err) co_return {.count = total, .err = res.err};
-
-            view = view.substr(1);
-        }
-    }
-
-    co_return {.count = total};
 }
 
 template<typename CharT  = char,

@@ -1,7 +1,10 @@
 #include "util/string_util.hpp"
 
 #include <exception> // IWYU pragma: keep
+#include <ranges>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <catch.hpp>
 
@@ -9,52 +12,62 @@
 
 using namespace std::literals::string_view_literals;
 
+namespace
+{
+
+template<typename Parts>
+std::vector<std::string_view> collect(const Parts& parts)
+{
+    std::vector<std::string_view> out;
+    for (auto part : parts) out.push_back(part);
+    return out;
+}
+
+}
+
+static_assert(std::ranges::input_range<decltype(net::util::split_string("a/b"sv, '/'))>);
+
 TEST_CASE("split on '/'", "[util][split_string]")
 {
-    auto gen = net::util::split_string("/foo/bar/baz"sv, '/');
-
-    REQUIRE(gen);
-    REQUIRE(gen() == ""sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "foo"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "bar"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "baz"sv);
-
-    REQUIRE_FALSE(gen);
+    CHECK(collect(net::util::split_string("/foo/bar/baz"sv, '/')) == std::vector{""sv, "foo"sv, "bar"sv, "baz"sv});
 }
 
 TEST_CASE("split on '/', non-zero start", "[util][split_string]")
 {
-    auto gen = net::util::split_string("/foo/bar/baz"sv, '/', 1);
+    CHECK(collect(net::util::split_string("/foo/bar/baz"sv, '/', 1)) == std::vector{"foo"sv, "bar"sv, "baz"sv});
 
-    REQUIRE(gen);
-    REQUIRE(gen() == "foo"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "bar"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "baz"sv);
-
-    REQUIRE_FALSE(gen);
+    // a start at the end is an empty part, and one past it none.
+    CHECK(collect(net::util::split_string("a/"sv, '/', 2)) == std::vector{""sv});
+    CHECK(collect(net::util::split_string("a/"sv, '/', 3)).empty());
 }
 
 TEST_CASE("split on '/', trailing separator", "[util][split_string]")
 {
-    auto gen = net::util::split_string("/foo/bar/baz/"sv, '/');
+    CHECK(collect(net::util::split_string("/foo/bar/baz/"sv, '/'))
+          == std::vector{""sv, "foo"sv, "bar"sv, "baz"sv, ""sv});
+}
 
-    REQUIRE(gen);
-    REQUIRE(gen() == ""sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "foo"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "bar"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == "baz"sv);
-    REQUIRE(gen);
-    REQUIRE(gen() == ""sv);
+TEST_CASE("split with empty parts", "[util][split_string]")
+{
+    CHECK(collect(net::util::split_string("a,,b"sv, ',')) == std::vector{"a"sv, ""sv, "b"sv});
+    CHECK(collect(net::util::split_string(","sv, ',')) == std::vector{""sv, ""sv});
 
-    REQUIRE_FALSE(gen);
+    // unlike std::views::split, an empty string is one empty part.
+    CHECK(collect(net::util::split_string(""sv, ',')) == std::vector{""sv});
+}
+
+TEST_CASE("split without a separator", "[util][split_string]")
+{
+    CHECK(collect(net::util::split_string("foo"sv, '/')) == std::vector{"foo"sv});
+}
+
+TEST_CASE("split a temporary string", "[util][split_string]")
+{
+    // the parts keep their own copy of a string (rather than a view of a temporary).
+    std::vector<std::string> parts;
+    for (auto part : net::util::split_string(std::string{"foo/bar"}, '/')) parts.push_back(part);
+
+    CHECK(parts == std::vector<std::string>{"foo", "bar"});
 }
 
 TEST_CASE("range-based for loop", "[util][split_string]")
