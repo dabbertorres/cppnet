@@ -51,6 +51,12 @@ if(BUILD_TESTING)
   add_subdirectory("test/")
 endif()
 
+# Benchmarks for implementation choices (see bench/CMakeLists.txt). Built with the tests, by default.
+option(BUILD_BENCHMARKS "Build the benchmarks" ${BUILD_TESTING})
+if(BUILD_BENCHMARKS)
+  add_subdirectory("bench/")
+endif()
+
 if(BUILD_EXAMPLE)
   file(GLOB example_dirs LIST_DIRECTORIES true "example/*")
   foreach(dir ${example_dirs})
