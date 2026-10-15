@@ -2,9 +2,9 @@
 
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
 #include <expected>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -76,18 +76,6 @@ listener::listener(
             continue;
         }
 
-        /* struct timeval tv = { */
-        /*     .tv_sec  = 0, */
-        /*     .tv_usec = static_cast<decltype(tv.tv_usec)>(timeout.count()), */
-        /* }; */
-        /* sts = ::setsockopt(main_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); */
-        /* if (sts != 0) */
-        /* { */
-        /*     ::close(main_fd); */
-        /*     main_fd = invalid_fd; */
-        /*     continue; */
-        /* } */
-
         sts = ::bind(main_fd, info->ai_addr, info->ai_addrlen);
         if (sts != 0)
         {
@@ -151,18 +139,15 @@ listener::~listener() noexcept { close(); }
 
 void listener::listen(std::uint16_t max_backlog)
 {
-    if (is_listening.exchange(true, std::memory_order::acq_rel))
-    {
-        // TODO: throw "already listening"
-        return;
-    }
+    if (is_listening.exchange(true, std::memory_order::acq_rel)) throw std::logic_error{"already listening"};
 
     int res = ::listen(main_fd, max_backlog);
-    if (res == -1) throw system_error_from_errno(errno, "failed to listen");
-    /* fds.push_back(pollfd{ */
-    /*     .fd     = main_fd, */
-    /*     .events = POLLIN, */
-    /* }); */
+    if (res == -1)
+    {
+        const int err = errno;
+        is_listening.store(false, std::memory_order::release);
+        throw system_error_from_errno(err, "failed to listen");
+    }
 }
 
 std::uint16_t listener::local_port() const

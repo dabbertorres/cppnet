@@ -18,13 +18,12 @@ std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
 {
     std::array<std::uint8_t, 4> values{};
 
-    // the parts are stored last first.
     std::size_t parsed = 0;
     for (auto part : util::split_string(str, '.'))
     {
         if (parsed == values.size()) return std::nullopt;
 
-        auto& value     = values[values.size() - 1 - parsed++];
+        auto& value     = values[parsed++];
         auto [end, err] = std::from_chars(part.data(), part.data() + part.size(), value);
         if (err != std::errc{} || end != part.data() + part.size() || part.empty()) return std::nullopt;
     }
@@ -40,16 +39,11 @@ std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
 
     char* end = buffer.begin();
 
-    // network byte order (big endian)
-    for (auto i = data.size() - 1; i > 0; --i)
+    for (std::size_t i = 0; i < data.size(); ++i)
     {
-        auto result = std::to_chars(end, end + 3, data[i]);
-        end         = result.ptr;
-        *end++      = '.';
+        if (i != 0) *end++ = '.';
+        end = std::to_chars(end, end + 3, data[i]).ptr;
     }
-
-    auto result = std::to_chars(end, end + 3, data[0]);
-    end         = result.ptr;
 
     return std::string{buffer.data(), end};
 }

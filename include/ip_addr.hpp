@@ -51,10 +51,6 @@ public:
 
     [[nodiscard]] std::string to_string() const
     {
-        /* if (is_ipv4()) return to_ipv4().to_string(); */
-        /* if (is_ipv6()) return to_ipv6().to_string(); */
-
-        /* return ""; */
         return std::visit([](const auto& v) { return v.to_string(); }, addr);
     }
 

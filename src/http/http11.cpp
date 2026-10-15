@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -577,6 +578,10 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
 {
     if (!valid_fields(resp.headers)) co_return std::unexpected(invalid());
 
+    // a status code is three digits, from 100 to 599 (RFC 9110, section 15).
+    const auto code = static_cast<std::uint16_t>(resp.status_code);
+    if (code < 100 || code > 599) co_return std::unexpected(invalid());
+
     auto res = co_await writer->write("HTTP/"sv);
     if (res.err) co_return std::unexpected(res.err);
 
@@ -590,7 +595,14 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
     res = co_await writer->write(version_buf);
     if (res.err) co_return std::unexpected(res.err);
 
-    res = co_await writer->write(status_text(resp.status_code));
+    std::array<char, 4> status_buf{};
+    std::to_chars(status_buf.begin(), status_buf.begin() + 3, code);
+    status_buf[3] = ' ';
+
+    res = co_await writer->write(status_buf);
+    if (res.err) co_return std::unexpected(res.err);
+
+    res = co_await writer->write(reason_phrase(resp.status_code));
     if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);

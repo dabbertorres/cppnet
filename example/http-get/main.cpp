@@ -111,7 +111,7 @@ net::coro::task<bool> run_request(http::client& client, const http::client_reque
 
     auto& resp = get_result.value();
 
-    std::cout << http::status_text(resp.status_code) << '\n';
+    std::cout << static_cast<int>(resp.status_code) << ' ' << http::reason_phrase(resp.status_code) << '\n';
 
     for (const auto& [k, vals] : resp.headers)
     {

@@ -18,7 +18,6 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
-#include "http/http2.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
@@ -186,20 +185,13 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
 {
     logger->trace("decoding request");
 
-    request_decoder decode = nullptr;
-    switch (0) // TODO: determine version of HTTP before full decoding
-    {
-    case 1: decode = http11::request_decode; break;
-    case 2: decode = http2::request_decode; break;
-
-    default: decode = http11::request_decode; break;
-    }
-
     // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
     if (header_read_timeout > std::chrono::seconds::zero())
         conn.set_read_deadline(io::clock::now() + header_read_timeout);
 
-    auto req_result = co_await decode(&reader, max_header_bytes);
+    // NOTE: HTTP/2 (parked) would be told apart here by its connection preface ("PRI * HTTP/2.0"), which HTTP/1.1
+    // decoding rejects as not_supported, so it gets a 501 Not Implemented.
+    auto req_result = co_await http11::request_decode(&reader, max_header_bytes);
 
     conn.set_read_deadline(std::nullopt);
 
