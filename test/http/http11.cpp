@@ -245,3 +245,15 @@ TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
     CHECK(second->method == net::http::request_method::GET);
     CHECK(second->uri.path == "/second"sv);
 }
+
+TEST_CASE("invalid percent-encoding in the target", "[http][1.1][request_decode]")
+{
+    // used to throw out of url::decode (which is noexcept), terminating the server.
+    net::io::string_reader<char> content("GET /% HTTP/1.1\r\n"
+                                         "\r\n");
+    net::io::buffered_reader     buf_reader(&content);
+
+    auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    REQUIRE(result.has_value());
+    CHECK(result->uri.path == "/%"sv);
+}
