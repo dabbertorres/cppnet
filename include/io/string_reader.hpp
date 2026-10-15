@@ -5,6 +5,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -49,6 +50,34 @@ public:
 private:
     std::span<const std::byte> view;
     std::size_t                idx = 0;
+};
+
+// owned_string_reader reads from a string that it owns.
+class owned_string_reader final : public reader
+{
+public:
+    explicit owned_string_reader(std::string content)
+        : content{std::move(content)}
+        , impl{this->content}
+    {}
+
+    // NOTE: impl refers to content, which moving would leave behind.
+    owned_string_reader(const owned_string_reader&)            = delete;
+    owned_string_reader& operator=(const owned_string_reader&) = delete;
+    owned_string_reader(owned_string_reader&&)                 = delete;
+    owned_string_reader& operator=(owned_string_reader&&)      = delete;
+
+    ~owned_string_reader() override = default;
+
+    coro::task<result> read(std::span<std::byte> data) override { return impl.read(data); }
+
+    using reader::read;
+
+    [[nodiscard]] int native_handle() const noexcept override { return 0; }
+
+private:
+    std::string               content;
+    string_reader<char> impl;
 };
 
 }

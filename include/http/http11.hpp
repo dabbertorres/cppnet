@@ -18,6 +18,14 @@ namespace net::http::http11
 using coro::task;
 using util::result;
 
+// check_request checks that a request can be encoded, as request_encode does first. It fails with:
+// - std::errc::invalid_argument if a header field is malformed, or the body doesn't fit its framing (e.g. a
+//   Content-Length without a body, or a body without one in HTTP/1.0, which can't send it chunked).
+// - std::errc::not_supported for transfer codings other than chunked, or versions other than HTTP/1.0 and 1.1.
+std::error_condition check_request(const client_request& req) noexcept;
+
+// request_encode writes a request, including its body: with its Content-Length (which it must match), or chunked.
+// POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
 task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept;
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;

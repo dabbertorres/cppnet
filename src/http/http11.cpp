@@ -14,9 +14,11 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "http/chunked_reader.hpp"
+#include "http/chunked_writer.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -36,6 +38,7 @@ namespace
 using namespace std::string_view_literals;
 
 using net::coro::task;
+using net::http::client_request;
 using net::http::client_response;
 using net::http::headers;
 using net::http::parse_method;
@@ -281,6 +284,138 @@ private:
     std::unique_ptr<net::io::reader> body;
 };
 
+// request_framing is how a request's body is sent.
+struct request_framing
+{
+    enum class kind : std::uint8_t
+    {
+        none,
+        length,
+        chunked,
+    };
+
+    kind        how    = kind::none;
+    std::size_t length = 0;
+
+    // A field to add for it, if the request doesn't have it.
+    std::string_view field;
+};
+
+protocol_version effective_version(const client_request& req) noexcept
+{
+    // an unset version is HTTP/1.0.
+    if (req.version == protocol_version{}) return {.major = 1, .minor = 0};
+    return req.version;
+}
+
+// frame_request decides how a request's body is sent (RFC 9112, section 6), from its Content-Length or
+// Transfer-Encoding if it has them.
+std::expected<request_framing, std::error_condition> frame_request(const client_request& req)
+{
+    using enum request_framing::kind;
+
+    const auto version = effective_version(req);
+    if (version.major != 1 || version.minor > 1) return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+    const bool has_te = req.headers.get_all("Transfer-Encoding"sv).has_value();
+    const bool has_cl = req.headers.get_all("Content-Length"sv).has_value();
+
+    if (has_te)
+    {
+        // only chunked is implemented, and HTTP/1.0 has no transfer codings.
+        auto codings = req.headers.get_list("Transfer-Encoding"sv);
+        if (has_cl || version.minor == 0) return std::unexpected(invalid());
+        if (codings.size() != 1 || !net::util::equal_ignore_case(codings.front(), "chunked"sv))
+            return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+        return request_framing{.how = chunked, .length = 0, .field = {}};
+    }
+
+    if (has_cl)
+    {
+        auto content_length = req.headers.get_content_length();
+        if (!content_length.has_value() || (req.body == nullptr && *content_length != 0))
+            return std::unexpected(invalid());
+
+        return request_framing{.how = length, .length = *content_length, .field = {}};
+    }
+
+    if (req.body != nullptr)
+    {
+        // a body of unknown length needs chunked.
+        if (version.minor == 0) return std::unexpected(invalid());
+        return request_framing{.how = chunked, .length = 0, .field = "Transfer-Encoding: chunked\r\n"sv};
+    }
+
+    // methods that expect content say there's none (RFC 9110, section 8.6).
+    const bool expects_content = req.method == request_method::POST || req.method == request_method::PUT
+                              || req.method == request_method::PATCH;
+    return request_framing{.how = none, .length = 0, .field = expects_content ? "Content-Length: 0\r\n"sv : ""sv};
+}
+
+task<std::error_condition> write_full(net::io::writer& out, std::span<const std::byte> data)
+{
+    while (!data.empty())
+    {
+        auto res = co_await out.write(data);
+        if (res.err) co_return res.err;
+        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+
+        data = data.subspan(res.count);
+    }
+
+    co_return std::error_condition{};
+}
+
+// body_buffer is how much of a body is read at a time.
+constexpr std::size_t body_buffer = 16 * 1'024;
+
+// copy_length copies exactly length bytes from body, which mustn't end before then.
+task<std::error_condition> copy_length(net::io::reader& body, net::io::writer& out, std::size_t length)
+{
+    std::vector<std::byte> buf(std::min(length, body_buffer));
+
+    while (length > 0)
+    {
+        auto res = co_await body.read(std::span{buf}.first(std::min(buf.size(), length)));
+
+        if (auto err = co_await write_full(out, std::span{buf}.first(res.count)); err) co_return err;
+        length -= res.count;
+
+        if (length == 0) break;
+
+        // a body shorter than its Content-Length is the caller's mistake.
+        if (res.err == net::io::status_condition::closed) co_return invalid();
+        if (res.err) co_return res.err;
+        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+    }
+
+    co_return std::error_condition{};
+}
+
+// copy_chunked copies body, until it ends, as chunks.
+task<std::error_condition> copy_chunked(net::io::reader& body, net::io::writer& out)
+{
+    net::http::http11::chunked_writer chunked{&out};
+    std::vector<std::byte>            buf(body_buffer);
+
+    while (true)
+    {
+        auto res = co_await body.read(buf);
+
+        if (res.count > 0)
+        {
+            if (auto written = co_await chunked.write(std::span{buf}.first(res.count)); written.err) co_return written.err;
+        }
+
+        if (res.err == net::io::status_condition::closed) break;
+        if (res.err) co_return res.err;
+        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+    }
+
+    co_return (co_await chunked.finish()).err;
+}
+
 // valid_fields checks that every field can be written without changing what's around it.
 bool valid_fields(const headers& fields) noexcept
 {
@@ -324,9 +459,29 @@ namespace net::http::http11
 
 using coro::task;
 
+std::error_condition check_request(const client_request& req) noexcept
+{
+    try
+    {
+        if (!valid_fields(req.headers)) return invalid();
+
+        auto framing = frame_request(req);
+        if (!framing.has_value()) return framing.error();
+
+        return {};
+    }
+    catch (const std::bad_alloc&)
+    {
+        return std::make_error_condition(std::errc::not_enough_memory);
+    }
+}
+
 task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept
 {
-    if (!valid_fields(req.headers)) co_return std::unexpected(invalid());
+    if (auto err = check_request(req); err) co_return std::unexpected(err);
+
+    // NOTE: can't fail, having been checked.
+    const auto framing = *frame_request(req);
 
     auto res = co_await writer->write(method_string(req.method));
     if (res.err) co_return std::unexpected(res.err);
@@ -341,19 +496,12 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     res = co_await writer->write(" HTTP/"sv);
     if (res.err) co_return std::unexpected(res.err);
 
-    auto major_version = req.version.major;
-    auto minor_version = req.version.minor;
-    if (major_version == 0 && minor_version == 0)
-    {
-        major_version = 1;
-        minor_version = 0;
-    }
-
     // NOTE: unlike the status line, nothing follows the version.
+    const auto          version = effective_version(req);
     std::array<char, 3> version_buf{
-        static_cast<char>(major_version + '0'),
+        static_cast<char>(version.major + '0'),
         '.',
-        static_cast<char>(minor_version + '0'),
+        static_cast<char>(version.minor + '0'),
     };
 
     res = co_await writer->write(version_buf);
@@ -374,13 +522,47 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
         if (res.err) co_return std::unexpected(res.err);
     }
 
+    if (!framing.field.empty())
+    {
+        res = co_await writer->write(framing.field);
+        if (res.err) co_return std::unexpected(res.err);
+    }
+
     res.err = co_await write_headers(*writer, req.headers);
     if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write("\r\n"sv);
     if (res.err) co_return std::unexpected(res.err);
 
-    // TODO: copy req.body to writer
+    try
+    {
+        std::error_condition err;
+
+        switch (framing.how)
+        {
+        case request_framing::kind::none: break;
+        case request_framing::kind::length:
+            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length);
+            break;
+        case request_framing::kind::chunked:
+            // a chunked request without a body (only if it asked for chunked) is just the last chunk.
+            if (req.body != nullptr)
+            {
+                err = co_await copy_chunked(*req.body, *writer);
+            }
+            else
+            {
+                err = co_await write_full(*writer, std::as_bytes(std::span{"0\r\n\r\n"sv}));
+            }
+            break;
+        }
+
+        if (err) co_return std::unexpected(err);
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+    }
 
     co_return writer;
 }

@@ -160,6 +160,9 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
     if (!request.uri.scheme.empty() && !util::equal_ignore_case(std::string_view{request.uri.scheme}, "http"sv))
         co_return std::unexpected(std::make_error_condition(std::errc::protocol_not_supported));
 
+    // before taking a connection, which a request that can't be sent would waste.
+    if (auto err = http11::check_request(request); err) co_return std::unexpected(err);
+
     const auto port = !request.uri.port.empty() ? request.uri.port : std::string{"80"};
 
     // a request that closes its connection can't be followed by another.
@@ -174,8 +177,12 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
         const bool reused = leased->reused;
         auto       body   = std::make_unique<pooled_body>(pool, std::move(*leased));
 
+        // NOTE: not with a body, which has been read.
         const auto retry = [&](std::error_condition err)
-        { return reused && attempt == 0 && is_idempotent(request.method) && closed_early(err); };
+        {
+            return reused && attempt == 0 && request.body == nullptr && is_idempotent(request.method)
+                && closed_early(err);
+        };
 
         // the head in one write, rather than one per field.
         io::buffered_writer out{body->connection(), 4'096};
@@ -186,20 +193,26 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
             if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);
         }
 
-        if (!res.has_value())
+        // a server may respond before reading all of the body (e.g. 413 Content Too Large), and then close the
+        // connection, failing the rest of the write. The response is still worth reading, if it's there.
+        const bool write_failed = !res.has_value();
+        if (write_failed)
         {
             if (retry(res.error())) continue;
-            co_return std::unexpected(res.error());
+            if (request.body == nullptr || !closed_early(res.error())) co_return std::unexpected(res.error());
         }
 
         auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
         if (!resp.has_value())
         {
+            if (write_failed) co_return std::unexpected(res.error());
             if (retry(resp.error())) continue;
             co_return std::unexpected(resp.error());
         }
 
-        const bool reuse = reusable_request && http11::connection_reusable(*resp, request.method);
+        // the server didn't get all of the request, so the connection is no use for another.
+        const bool reuse =
+            !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
         body->attach(std::move(resp->body), reuse, known_length(*resp, request.method));
         resp->body = std::move(body);
 
