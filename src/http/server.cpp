@@ -24,6 +24,7 @@
 #include "http/router.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
+#include "io/discard_writer.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -239,10 +240,13 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
     // Only HTTP/1.x is implemented. In particular, http2::response_encode is a stub.
     const bool supported = req.version.major == 1;
 
+    // A response to HEAD has the headers a GET would, but no body: what the handler writes as one is dropped.
+    io::discard_writer no_body;
+
     server_response resp{
         .version = supported ? req.version : protocol_version{.major = 1, .minor = 1},
         .headers = {},
-        .body    = &writer,
+        .body    = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &writer,
     };
 
     response_writer rw{&writer, &resp, http11::response_encode};

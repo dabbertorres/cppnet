@@ -1,6 +1,7 @@
 #include "http/server.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception> // IWYU pragma: keep
@@ -27,6 +28,8 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
+#include "io/writer.hpp"
+#include "tcp.hpp"
 #include "url.hpp"
 
 namespace http = net::http;
@@ -34,6 +37,7 @@ namespace http = net::http;
 namespace
 {
 
+using namespace std::chrono_literals;
 using namespace std::string_view_literals;
 
 using net::coro::task;
@@ -76,6 +80,35 @@ task<response> get(net::io::scheduler* sched, std::uint16_t port, std::string pa
     co_return out;
 }
 
+// exchange sends request to the server on port as it is, and reads until the server closes the connection.
+task<std::string> exchange(net::io::scheduler* sched, std::uint16_t port, std::string request)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+    if (!conn.has_value()) co_return "error: " + conn.error().message();
+    conn->set_read_timeout(5s);
+
+    auto res = co_await net::io::write_all(*conn, request);
+    if (res.err) co_return "error: " + res.err.message();
+
+    std::string                out;
+    std::array<std::byte, 256> buf{};
+    while (true)
+    {
+        auto read = co_await conn->read(buf);
+        out.append(reinterpret_cast<const char*>(buf.data()), read.count);
+        if (read.err) break;
+    }
+
+    co_return out;
+}
+
+// count counts the occurrences of what in str.
+std::size_t count(std::string_view str, std::string_view what)
+{
+    std::size_t n = 0;
+    for (auto pos = str.find(what); pos != std::string_view::npos; pos = str.find(what, pos + what.size())) ++n;
+    return n;
+}
 }
 
 TEST_CASE("the server responds for handlers that don't", "[http][server]")
@@ -113,4 +146,36 @@ TEST_CASE("the server responds for handlers that don't", "[http][server]")
         CHECK(resp.connection == "close");
         CHECK(resp.body.empty());
     }
+}
+
+TEST_CASE("responses to HEAD requests have no body", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/hello",
+               [](const http::server_request&, http::response_writer& resp) -> task<void>
+               {
+                   auto* body = co_await resp.send(http::status::OK, 5);
+                   co_await net::io::write_all(*body, "hello"sv);
+               });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // a body after the HEAD response would be read as the start of the next response.
+    auto out = sched.run_to_completion(exchange(&sched,
+                                                server.local_port(),
+                                                "HEAD /hello HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    CAPTURE(out);
+
+    CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+    CHECK(count(out, "Content-Length: 5\r\n") == 2);
+    CHECK(count(out, "hello") == 1);
+    CHECK(out.ends_with("\r\n\r\nhello"));
 }

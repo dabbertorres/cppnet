@@ -439,13 +439,13 @@ public:
 
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201811L
     template<typename K>
-    iterator find(const K& x)
+    [[nodiscard]] iterator find(const K& x)
     {
         return values.find(x);
     }
 
     template<typename K>
-    const_iterator find(const K& x) const
+    [[nodiscard]] const_iterator find(const K& x) const
     {
         return values.find(x);
     }

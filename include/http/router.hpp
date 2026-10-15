@@ -33,8 +33,14 @@ request_handler make_handler(H&& h)
     return [shared](server_request& req, response_writer& resp) { return std::invoke(*shared, req, resp); };
 }
 
-// TODO: it'd be neat if we could build a "perfect" router at compile time...
-
+// router routes requests to handlers by method and path.
+//
+// A route is a path of segments separated by '/'. A segment starting with ':' is a parameter (e.g. "/users/:id"),
+// which matches any one non-empty segment; handlers get its value from server_request::path_value. A literal segment
+// is matched in preference to a parameter, and a request whose path then leads nowhere isn't tried with the parameter
+// instead: e.g. with "/users/me/settings" and "/users/:id/posts", "/users/me/posts" isn't found.
+//
+// A route's GET handler also handles HEAD, unless the route has its own (the server drops the body).
 class router final
 {
 public:
@@ -82,6 +88,9 @@ public:
 
 private:
     router& get_subrouter(std::string_view route);
+
+    // allowed_methods lists the methods this route handles, for an Allow header.
+    [[nodiscard]] std::string allowed_methods() const;
 
     std::unordered_map<request_method, handler_func> method_handlers;
     util::string_map<router>                         children;

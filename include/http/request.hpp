@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -8,6 +9,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -110,10 +112,21 @@ struct server_request
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
     std::string route{};
 
+    // The values of the route's parameters, decoded, which the router sets: see path_value.
+    std::vector<std::pair<std::string, std::string>> path_values{};
+
     // Values for handling the request, which middleware passes to handlers: e.g. instrument::trace.
     util::type_map extensions{};
 
     std::unique_ptr<io::reader> body = nullptr;
+
+    // path_value is the value of the route's parameter name: e.g. "42" for "id", for the route "/users/:id" and the
+    // path "/users/42". It's empty if the route has no such parameter (a parameter never matches an empty segment).
+    [[nodiscard]] std::string_view path_value(std::string_view name) const noexcept
+    {
+        auto iter = std::ranges::find(path_values, name, &std::pair<std::string, std::string>::first);
+        return iter != path_values.end() ? std::string_view{iter->second} : std::string_view{};
+    }
 };
 
 using request_decoder_result = std::expected<server_request, std::error_condition>;
