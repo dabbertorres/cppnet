@@ -158,6 +158,26 @@ coro::task<void> http_metrics::operator()(http::server_request& req, http::respo
     return state::handle(shared, req, resp);
 }
 
+opentelemetry::span trace::start_child(std::string name, opentelemetry::span_kind kind) const
+{
+    opentelemetry::span child;
+    child.trace_id       = server_span->trace_id;
+    child.parent_span_id = server_span->span_id;
+    child.span_id        = opentelemetry::tracecontext::new_span_id();
+    child.trace_state    = server_span->trace_state;
+    child.flags          = server_span->flags;
+    child.name           = std::move(name);
+    child.kind           = kind;
+    child.start_time     = std::chrono::system_clock::now();
+    return child;
+}
+
+void trace::end(opentelemetry::span&& child) const
+{
+    if (child.end_time == opentelemetry::time_point{}) child.end_time = std::chrono::system_clock::now();
+    (*on_end)(std::move(child));
+}
+
 struct http_tracing::state
 {
     http::request_handler next;
@@ -183,6 +203,8 @@ struct http_tracing::state
         span.kind       = opentelemetry::span_kind::server;
         span.start_time = std::chrono::system_clock::now();
 
+        req.extensions.emplace<trace>(&span, &self->on_end);
+
         std::exception_ptr failure;
         try
         {
@@ -192,6 +214,8 @@ struct http_tracing::state
         {
             failure = std::current_exception();
         }
+
+        req.extensions.erase<trace>();
 
         span.end_time = std::chrono::system_clock::now();
 

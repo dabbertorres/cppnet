@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "coro/task.hpp"
@@ -57,6 +58,44 @@ private:
 // throw.
 using span_handler = std::function<void(opentelemetry::span&&)>;
 
+// trace is a handle to the trace of the request being handled, which http_tracing puts in the request's extensions:
+//
+//   if (const auto* trace = req.extensions.get<instrument::trace>()) ...
+//
+// e.g. to continue it in a request to another service:
+//
+//   auto child = trace->start_child("GET users", opentelemetry::span_kind::client);
+//   opentelemetry::tracecontext::inject(child, out.headers);
+//   auto resp = co_await client.send(out);
+//   trace->end(std::move(child));
+//
+// It's only valid until the handler returns, when http_tracing removes it.
+class trace
+{
+public:
+    trace(opentelemetry::span* server_span, const span_handler* on_end) noexcept
+        : server_span{server_span}
+        , on_end{on_end}
+    {}
+
+    // span is the request's server span, which ends when the handler returns. e.g. a handler can add attributes or
+    // events to it.
+    //
+    // NOTE: it isn't synchronized: it mustn't be changed by more than one thread at once.
+    [[nodiscard]] opentelemetry::span& span() const noexcept { return *server_span; }
+
+    // start_child starts a child of the server span, in the same trace: e.g. a client span, for a request to another
+    // service (whose trace context headers opentelemetry::tracecontext::inject sets).
+    [[nodiscard]] opentelemetry::span start_child(std::string name, opentelemetry::span_kind kind) const;
+
+    // end ends a child span (unless its end time is already set), and passes it on as the server span will be.
+    void end(opentelemetry::span&& child) const;
+
+private:
+    opentelemetry::span* server_span;
+    const span_handler*  on_end;
+};
+
 // http_tracing makes a server span for each request its handler handles: the child of the span in the request's trace
 // context (its traceparent and tracestate headers, see opentelemetry::tracecontext), or else the root of a new trace,
 // which is sampled. Every finished span is passed to on_end, sampled or not (its flags say).
@@ -66,7 +105,8 @@ using span_handler = std::function<void(opentelemetry::span&&)>;
 // http.response.status_code. Its status is an error if the response is a 5xx, or if the handler threw (with the
 // exception's message).
 //
-// NOTE: the handler can't get the span yet, so it can't propagate the trace to the requests it makes.
+// The handler can get the trace from the request's extensions (see trace): e.g. to propagate it to the requests it
+// makes.
 //
 // Copies share the handler and on_end.
 class http_tracing

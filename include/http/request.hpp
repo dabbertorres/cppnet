@@ -19,6 +19,7 @@
 #include "io/writer.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
+#include "util/type_map.hpp"
 
 namespace net::http
 {
@@ -108,6 +109,9 @@ struct server_request
 
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
     std::string route;
+
+    // Values for handling the request, which middleware passes to handlers: e.g. instrument::trace.
+    util::type_map extensions;
 
     std::unique_ptr<io::reader> body = nullptr;
 };
