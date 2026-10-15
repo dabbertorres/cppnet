@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <coroutine>
+#include <functional>
 #include <exception>
 #include <map>
 #include <memory>
@@ -144,6 +146,51 @@ public:
         return {this, fd, op, clock::now() + timeout};
     }
 
+    // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo()), so it doesn't hold up the
+    // worker threads, and then continues on the worker threads. Stopping the scheduler doesn't interrupt func.
+    template<std::invocable F>
+    coro::task<std::invoke_result_t<F>> run_blocking(F func)
+    {
+        using result_type = std::invoke_result_t<F>;
+
+        co_await blocking->schedule();
+
+        // the awaiting coroutine must continue on the workers, even if func throws.
+        std::exception_ptr error;
+
+        if constexpr (std::is_void_v<result_type>)
+        {
+            try
+            {
+                std::invoke(std::move(func));
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+
+            co_await workers->schedule();
+            if (error) std::rethrow_exception(error);
+        }
+        else
+        {
+            std::optional<result_type> result;
+
+            try
+            {
+                result.emplace(std::invoke(std::move(func)));
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+
+            co_await workers->schedule();
+            if (error) std::rethrow_exception(error);
+            co_return std::move(*result);
+        }
+    }
+
     void run();
 
     // run_to_completion spawns task, and runs the scheduler on the calling thread until it finishes. The scheduler is
@@ -212,6 +259,7 @@ private:
     void resume(const completions& done) noexcept;
 
     std::shared_ptr<coro::thread_pool> workers;
+    std::unique_ptr<coro::thread_pool> blocking;
     std::shared_ptr<spdlog::logger>    logger;
     detail::event_loop                 loop;
 
