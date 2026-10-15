@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <system_error>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
+#include "http/request_target.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
@@ -86,8 +88,11 @@ struct server_request
 {
     request_method     method = request_method::NONE;
     protocol_version   version{};
-    url                uri{};
+    request_target     target{};
     net::http::headers headers;
+
+    // The host the request is for: from the target, if it has one, otherwise the Host header.
+    std::string host;
 
     std::unique_ptr<io::reader> body = nullptr;
 };

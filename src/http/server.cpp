@@ -149,9 +149,27 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             if (!req_result.has_value())
             {
                 auto err = req_result.error();
-                if (err == io::status_condition::closed) logger->debug("connection closed");
-                else if (err == std::errc::timed_out) logger->debug("timed out waiting for request headers");
-                else logger->debug("request decoding error: {} '{}'", err.value(), err.message());
+                if (err == io::status_condition::closed)
+                {
+                    logger->debug("connection closed");
+                }
+                else if (err == std::errc::timed_out)
+                {
+                    logger->debug("timed out waiting for request headers");
+                }
+                else
+                {
+                    logger->debug("request decoding error: {} '{}'", err.value(), err.message());
+
+                    // the rest of the connection can't be trusted to be where the next request starts, so close it.
+                    server_response resp{.version = {.major = 1, .minor = 1}, .body = &writer};
+                    resp.headers.set("Connection"sv, "close"sv);
+
+                    response_writer rw{&writer, &resp, http11::response_encode};
+                    co_await rw.send(status::BAD_REQUEST, 0);
+                    co_await writer.flush();
+                }
+
                 break;
             }
 
@@ -160,7 +178,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             auto& req = req_result.value();
             logger->trace("request {} {} as HTTP/{}.{}",
                           method_string(req.method),
-                          req.uri.path,
+                          req.target.path,
                           req.version.major,
                           req.version.minor);
 
