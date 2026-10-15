@@ -31,9 +31,7 @@ struct gauge : public base_metric<gauge>
     template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
     double increment(double v = 1.0, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
     {
-        auto current   = value.load(std::memory_order_acquire);
-        auto new_value = current + v;
-        value.store(new_value, std::memory_order_release);
+        auto new_value = detail::add(value, v);
         set_updated_at(updated_at);
         return new_value;
     }
@@ -41,9 +39,7 @@ struct gauge : public base_metric<gauge>
     template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
     double decrement(double v = 1.0, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
     {
-        auto current   = value.load(std::memory_order_acquire);
-        auto new_value = current - v;
-        value.store(new_value, std::memory_order_release);
+        auto new_value = detail::add(value, -v);
         set_updated_at(updated_at);
         return new_value;
     }
@@ -64,14 +60,10 @@ struct gauge : public base_metric<gauge>
 
     auto track() noexcept
     {
-        return tracker{[this](std::chrono::seconds seconds) { set(static_cast<double>(seconds.count())); }};
+        return tracker{[this](std::chrono::duration<double> elapsed) { set(elapsed.count()); }};
     }
 
 private:
-    friend struct base_metric<gauge>;
-
-    coro::task<io::result> encode_value(io::writer& out) const;
-
     std::atomic<double> value = 0.0;
 };
 

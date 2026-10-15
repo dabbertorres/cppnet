@@ -48,10 +48,4 @@ double gauge::operator-=(double v) noexcept { return decrement(v); }
 double gauge::operator--() noexcept { return decrement(1); }
 double gauge::operator--(int) noexcept { return decrement(1) - 1; }
 
-coro::task<io::result> gauge::encode_value(io::writer& out) const
-{
-    auto val = value.load(std::memory_order_acquire);
-    return out.write(std::to_string(val));
-}
-
 }

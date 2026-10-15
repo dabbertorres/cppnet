@@ -84,6 +84,7 @@ public:
             .transform([](metric_ref val) -> std::reference_wrapper<T> { return std::ref(std::get<T>(val.get())); });
     }
 
+    // record writes every metric, in Prometheus' text format.
     static coro::task<io::result> record(io::writer& writer);
 
 private:
@@ -101,7 +102,6 @@ private:
 
     metric_ref                register_metric(std::string_view name, const metric_labels& labels, metric&& m);
     std::optional<metric_ref> get_metric(std::string_view name, const metric_labels& labels);
-    coro::task<io::result>    record_all(io::writer& out) const;
 
     std::shared_mutex  mutex;
     std::deque<metric> metrics;
