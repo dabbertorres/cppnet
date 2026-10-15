@@ -33,10 +33,19 @@ request_decode(io::buffered_reader* reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
-// HEAD requests have no body.
+// HEAD requests have no body. The body owns reader.
 task<response_decoder_result>
 response_decode(std::unique_ptr<io::buffered_reader> reader,
                 request_method                       method           = request_method::GET,
                 std::size_t                          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+
+// response_decode decodes a response's head, as above, but the body borrows reader, which must outlive it.
+task<response_decoder_result> response_decode(io::buffered_reader* reader,
+                                              request_method       method,
+                                              std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+
+// connection_reusable returns whether the connection can carry another request once the response's body has been read
+// to its end: the response is HTTP/1.1, without "Connection: close", and its body doesn't end with the connection.
+bool connection_reusable(const client_response& resp, request_method method) noexcept;
 
 }

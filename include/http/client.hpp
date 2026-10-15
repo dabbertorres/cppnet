@@ -2,9 +2,12 @@
 
 #include <chrono>
 #include <expected>
+#include <memory>
+#include <string>
 #include <system_error>
 
 #include "coro/task.hpp"
+#include "http/connection_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
@@ -12,16 +15,18 @@
 namespace net::http
 {
 
-using namespace std::chrono_literals;
-
-// client sends HTTP/1.x requests.
+// client sends HTTP/1.x requests, reusing connections within the limits of its client_options.
 //
-// Each request uses a new connection, which belongs to the response, and is closed along with it.
-// TODO: reuse connections (which needs a connection pool that doesn't block, and knows when a response is finished).
+// A connection is reused once the response's body has been read to its end (until a read reports
+// status_condition::closed, or all of its Content-Length has been read). Destroying a response whose body hasn't been
+// read to its end closes its connection.
+//
+// Copies of a client share its connections. They're all closed once the client (and its copies) and the responses
+// using them are gone, and none may outlive the scheduler.
 class client
 {
 public:
-    client(io::scheduler* scheduler, std::chrono::milliseconds connect_timeout = 10s, bool keepalives = true);
+    explicit client(io::scheduler* scheduler, const client_options& options = {});
 
     client(const client&)            = default;
     client& operator=(const client&) = default;
@@ -31,12 +36,18 @@ public:
 
     ~client() = default;
 
+    // send sends a request, and returns the response once its head has been received. Requests that are safe to
+    // repeat (e.g. GET) are sent again (once) if a reused connection turns out to have been closed by the server.
     coro::task<std::expected<client_response, std::error_condition>> send(const client_request& request);
 
+    // close_idle closes the connections that are waiting to be reused.
+    void close_idle() noexcept;
+
+    [[nodiscard]] connection_stats stats() const;
+    [[nodiscard]] connection_stats stats(const std::string& host, const std::string& port) const;
+
 private:
-    io::scheduler*            scheduler;
-    std::chrono::milliseconds connect_timeout;
-    bool                      keepalives;
+    std::shared_ptr<detail::connection_pool> pool;
 };
 
 }
