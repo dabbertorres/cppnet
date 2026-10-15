@@ -109,7 +109,12 @@ TEST_CASE("histogram encodes bounds and values exactly", "[instrument][prometheu
 {
     // small bounds don't lose their digits (e.g. to 0.000000), and infinite and NaN values are spelled as Prometheus
     // expects.
-    auto h = histogram{"test", "", {}, {-1.5, 1e-7, 0.1}};
+    auto h = histogram{
+        "test",
+        "",
+        {},
+        {-1.5, 1e-7, 0.1}
+    };
     h.observe(-std::numeric_limits<double>::infinity());
     h.observe(1e-7);
     h.observe(std::numeric_limits<double>::infinity());
@@ -139,11 +144,33 @@ test_count 1
 
 TEST_CASE("histogram buckets must be increasing", "[instrument][prometheus][histogram][buckets]")
 {
-    CHECK_THROWS_AS((histogram{"test", "", {}, {1.0, 1.0}}), std::invalid_argument);
-    CHECK_THROWS_AS((histogram{"test", "", {}, {2.0, 1.0}}), std::invalid_argument);
-    CHECK_THROWS_AS((histogram{"test", "", {}, {1.0, std::numeric_limits<double>::quiet_NaN()}}),
+    CHECK_THROWS_AS((histogram{
+                        "test",
+                        "",
+                        {},
+                        {1.0, 1.0}
+    }),
                     std::invalid_argument);
-    CHECK_THROWS_AS((histogram{"test", "", {}, {std::numeric_limits<double>::infinity(), 1.0}}),
+    CHECK_THROWS_AS((histogram{
+                        "test",
+                        "",
+                        {},
+                        {2.0, 1.0}
+    }),
+                    std::invalid_argument);
+    CHECK_THROWS_AS((histogram{
+                        "test",
+                        "",
+                        {},
+                        {1.0, std::numeric_limits<double>::quiet_NaN()}
+    }),
+                    std::invalid_argument);
+    CHECK_THROWS_AS((histogram{
+                        "test",
+                        "",
+                        {},
+                        {std::numeric_limits<double>::infinity(), 1.0}
+    }),
                     std::invalid_argument);
 
     // "le" is the buckets' label.
@@ -188,7 +215,12 @@ test_count 400000
 
 TEST_CASE("histogram tracks fractions of a second", "[instrument][prometheus][histogram][track]")
 {
-    auto h = histogram{"test", "", {}, {0.001, 60.0}};
+    auto h = histogram{
+        "test",
+        "",
+        {},
+        {0.001, 60.0}
+    };
 
     {
         auto tracker = h.track();

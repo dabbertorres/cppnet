@@ -93,31 +93,64 @@ TEST_CASE("metric names and labels are validated", "[instrument][prometheus][met
     CHECK_THROWS_AS((counter{"name", "", {{"", "x"}}}), std::invalid_argument);
     CHECK_THROWS_AS((counter{"name", "", {{"a:b", "x"}}}), std::invalid_argument);
     CHECK_THROWS_AS((counter{"name", "", {{"__reserved", "x"}}}), std::invalid_argument);
-    CHECK_THROWS_AS((counter{"name", "", {{"a", "x"}, {"a", "y"}}}), std::invalid_argument);
+    CHECK_THROWS_AS((counter{
+                        "name",
+                        "",
+                        {{"a", "x"}, {"a", "y"}}
+    }),
+                    std::invalid_argument);
 }
 
 TEST_CASE("metric labels are sorted", "[instrument][prometheus][metric]")
 {
-    auto c = counter{"name", "", {{"b", "2"}, {"a", "1"}}};
-    CHECK(c.labels == metric_labels{{"a", "1"}, {"b", "2"}});
+    auto c = counter{
+        "name",
+        "",
+        {{"b", "2"}, {"a", "1"}}
+    };
+    CHECK(c.labels
+          == metric_labels{
+              {"a", "1"},
+              {"b", "2"}
+    });
 }
 
 TEST_CASE("derive_child adds labels", "[instrument][prometheus][metric]")
 {
-    auto parent = histogram{"latency", "Latency.", {{"a", "1"}}, {0.5, 1.0}};
+    auto parent = histogram{
+        "latency",
+        "Latency.",
+        {{"a", "1"}},
+        {0.5, 1.0}
+    };
     parent.observe(0.1);
 
     // a label it already has isn't replaced.
-    auto child = derive_child(parent, {{"b", "2"}, {"a", "other"}});
+    auto child = derive_child(parent,
+                              {
+                                  {"b",     "2"},
+                                  {"a", "other"}
+    });
 
     CHECK(child.name == "latency");
     CHECK(child.help == "Latency.");
-    CHECK(child.labels == metric_labels{{"a", "1"}, {"b", "2"}});
+    CHECK(child.labels
+          == metric_labels{
+              {"a", "1"},
+              {"b", "2"}
+    });
     CHECK(child.buckets() == parent.buckets());
 
     // and it has nothing observed.
     CHECK(encode(child).find(R"(latency_count{a="1",b="2"} 0)") != std::string::npos);
 
-    auto c = derive_child(counter{"total"}, {{"x", "y"}});
-    CHECK(c.labels == metric_labels{{"x", "y"}});
+    auto c = derive_child(
+        counter{
+            "total"
+    },
+        {{"x", "y"}});
+    CHECK(c.labels
+          == metric_labels{
+              {"x", "y"}
+    });
 }

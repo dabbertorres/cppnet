@@ -26,13 +26,13 @@ using net::instrument::opentelemetry::span_kind;
 
 // traceparent is "{version}-{trace-id}-{parent-id}-{flags}", in lowercase hex: e.g.
 // "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01". Later versions may add fields after these.
-constexpr std::size_t version_length   = 2;
-constexpr std::size_t trace_id_offset  = version_length + 1;
-constexpr std::size_t trace_id_length  = 32;
-constexpr std::size_t parent_id_offset = trace_id_offset + trace_id_length + 1;
-constexpr std::size_t parent_id_length = 16;
-constexpr std::size_t flags_offset     = parent_id_offset + parent_id_length + 1;
-constexpr std::size_t flags_length     = 2;
+constexpr std::size_t version_length     = 2;
+constexpr std::size_t trace_id_offset    = version_length + 1;
+constexpr std::size_t trace_id_length    = 32;
+constexpr std::size_t parent_id_offset   = trace_id_offset + trace_id_length + 1;
+constexpr std::size_t parent_id_length   = 16;
+constexpr std::size_t flags_offset       = parent_id_offset + parent_id_length + 1;
+constexpr std::size_t flags_length       = 2;
 constexpr std::size_t traceparent_length = flags_offset + flags_length;
 
 constexpr auto hex_digits = "0123456789abcdef"sv;

@@ -58,8 +58,9 @@ registry* registry::get()
 
 registry::metric_ref registry::add(metric&& m)
 {
-    const auto& [name, help, labels] = std::visit(
-        [](const auto& metric) { return std::tie(metric.name, metric.help, metric.labels); }, std::as_const(m));
+    const auto& [name, help, labels] =
+        std::visit([](const auto& metric) { return std::tie(metric.name, metric.help, metric.labels); },
+                   std::as_const(m));
 
     auto it = families.find(name);
     if (it != families.end())

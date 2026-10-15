@@ -1,15 +1,15 @@
 #pragma once
 
-#include <cctype>
 #include <algorithm>
+#include <cctype>
 #include <concepts>
 #include <cstddef>
 #include <initializer_list>
+#include <iterator>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <iterator>
 #include <type_traits>
 #include <utility>
 
@@ -67,8 +67,9 @@ public:
         size_type           end   = String::npos;
     };
 
-    constexpr string_parts(String input, CharT sep, size_type start) noexcept(
-        std::is_nothrow_move_constructible_v<String>)
+    constexpr string_parts(String    input,
+                           CharT     sep,
+                           size_type start) noexcept(std::is_nothrow_move_constructible_v<String>)
         : input{std::move(input)}
         , sep{sep}
         , start{start}

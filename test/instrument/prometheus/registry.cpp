@@ -46,10 +46,16 @@ TEST_CASE("can register counter", "[instrument][prometheus][registry][register]"
 
     CHECK(c.name == "my_counter");
     CHECK(c.help.empty());
-    CHECK(c.labels == metric_labels{{"foo", "bar"}});
+    CHECK(c.labels
+          == metric_labels{
+              {"foo", "bar"}
+    });
 
     // it's the registered metric.
-    auto found = registry::get_metric<counter>("my_counter", {{"foo", "bar"}});
+    auto found = registry::get_metric<counter>("my_counter",
+                                               {
+                                                   {"foo", "bar"}
+    });
     REQUIRE(found.has_value());
     CHECK(&found->get() == &c);
 }
@@ -59,7 +65,12 @@ TEST_CASE("can register gauge", "[instrument][prometheus][registry][register]")
     auto& g = registry::register_metric(gauge{"my_gauge", "", {{"foo", "bar"}}});
 
     CHECK(g.name == "my_gauge");
-    CHECK(&registry::get_metric<gauge>("my_gauge", {{"foo", "bar"}})->get() == &g);
+    CHECK(&registry::get_metric<gauge>("my_gauge",
+                                       {
+                                           {"foo", "bar"}
+    })
+               ->get()
+          == &g);
 }
 
 TEST_CASE("can register histogram", "[instrument][prometheus][registry][register]")
@@ -67,20 +78,38 @@ TEST_CASE("can register histogram", "[instrument][prometheus][registry][register
     auto& h = registry::register_metric(histogram{"my_histogram", "", {{"foo", "bar"}}});
 
     CHECK(h.name == "my_histogram");
-    CHECK(&registry::get_metric<histogram>("my_histogram", {{"foo", "bar"}})->get() == &h);
+    CHECK(&registry::get_metric<histogram>("my_histogram",
+                                           {
+                                               {"foo", "bar"}
+    })
+               ->get()
+          == &h);
 }
 
 TEST_CASE("registering a metric again returns the first", "[instrument][prometheus][registry][register]")
 {
-    auto& first = registry::register_metric(counter{"registry_again", "", {{"a", "1"}, {"b", "2"}}});
+    auto& first = registry::register_metric(counter{
+        "registry_again",
+        "",
+        {{"a", "1"}, {"b", "2"}}
+    });
     ++first;
 
     // labels in another order are the same metric.
-    auto& again = registry::register_metric(counter{"registry_again", "", {{"b", "2"}, {"a", "1"}}});
+    auto& again = registry::register_metric(counter{
+        "registry_again",
+        "",
+        {{"b", "2"}, {"a", "1"}}
+    });
     CHECK(&again == &first);
     CHECK(again.get() == 1);
 
-    CHECK(registry::get_metric<counter>("registry_again", {{"b", "2"}, {"a", "1"}}).has_value());
+    CHECK(registry::get_metric<counter>("registry_again",
+                                        {
+                                            {"b", "2"},
+                                            {"a", "1"}
+    })
+              .has_value());
 }
 
 TEST_CASE("a metric family has one type and help", "[instrument][prometheus][registry][register]")
@@ -96,7 +125,11 @@ TEST_CASE("a metric family has one type and help", "[instrument][prometheus][reg
                     std::invalid_argument);
 
     // asking for it as another type finds nothing.
-    CHECK_FALSE(registry::get_metric<gauge>("registry_family", {{"a", "1"}}).has_value());
+    CHECK_FALSE(registry::get_metric<gauge>("registry_family",
+                                            {
+                                                {"a", "1"}
+    })
+                    .has_value());
 }
 
 TEST_CASE("registry records each family once", "[instrument][prometheus][registry][record]")
