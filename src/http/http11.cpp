@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <expected>
 #include <memory>
 #include <new>
@@ -207,34 +208,78 @@ std::expected<std::unique_ptr<net::io::reader>, std::error_condition> make_reque
     return std::make_unique<net::io::limit_reader>(static_cast<net::io::reader*>(reader), 0);
 }
 
-// make_response_body decides how long the response's body is (RFC 9112, section 6.3), which is up to the end of the
-// connection if nothing else says.
-std::expected<std::unique_ptr<net::io::reader>, std::error_condition>
-make_response_body(std::unique_ptr<buffered_reader> reader, const client_response& resp, request_method method)
+// response_framing is how a response's body ends (RFC 9112, section 6.3).
+enum class response_framing : std::uint8_t
 {
-    if (resp.status_code == status::SWITCHING_PROTOCOLS) return reader; // the connection is the new protocol's.
+    none,      // there's no body.
+    chunked,   // with the last chunk.
+    length,    // after Content-Length bytes.
+    connection // with the connection: if nothing else says, or after a 101 (when it's the new protocol's).
+};
+
+std::expected<response_framing, std::error_condition> framing_of(const client_response& resp, request_method method)
+{
+    if (resp.status_code == status::SWITCHING_PROTOCOLS) return response_framing::connection;
 
     if (method == request_method::HEAD || net::http::status_is_information(resp.status_code)
         || resp.status_code == status::NO_CONTENT || resp.status_code == status::NOT_MODIFIED)
-        return std::make_unique<net::io::limit_reader>(std::move(reader), 0);
+        return response_framing::none;
 
+    // if chunked isn't last, the body ends with the connection.
     if (resp.headers.get_all("Transfer-Encoding"sv).has_value())
-    {
-        // if chunked isn't last, the body ends with the connection.
-        if (!resp.headers.is_chunked()) return reader;
-        return std::make_unique<net::http::http11::chunked_reader>(std::move(reader));
-    }
+        return resp.headers.is_chunked() ? response_framing::chunked : response_framing::connection;
 
     if (resp.headers.get_all("Content-Length"sv).has_value())
     {
-        auto length = resp.headers.get_content_length();
-        if (!length.has_value()) return std::unexpected(invalid());
-
-        return std::make_unique<net::io::limit_reader>(std::move(reader), *length);
+        if (!resp.headers.get_content_length().has_value()) return std::unexpected(invalid());
+        return response_framing::length;
     }
 
-    return reader;
+    return response_framing::connection;
 }
+
+// make_response_body wraps reader (which it borrows) to read only the response's body.
+std::expected<std::unique_ptr<net::io::reader>, std::error_condition>
+make_response_body(buffered_reader* reader, const client_response& resp, request_method method)
+{
+    auto framing = framing_of(resp, method);
+    if (!framing.has_value()) return std::unexpected(framing.error());
+
+    auto* parent = static_cast<net::io::reader*>(reader);
+
+    switch (*framing)
+    {
+    case response_framing::none: return std::make_unique<net::io::limit_reader>(parent, 0);
+    case response_framing::chunked: return std::make_unique<net::http::http11::chunked_reader>(reader);
+    case response_framing::length:
+        return std::make_unique<net::io::limit_reader>(parent, *resp.headers.get_content_length());
+    case response_framing::connection:
+        return std::make_unique<net::io::limit_reader>(parent, std::numeric_limits<std::size_t>::max());
+    }
+
+    std::unreachable();
+}
+
+// owning_body reads a body from a reader that it also owns.
+class owning_body final : public net::io::reader
+{
+public:
+    owning_body(std::unique_ptr<net::io::reader> owned, std::unique_ptr<net::io::reader> body) noexcept
+        : owned{std::move(owned)}
+        , body{std::move(body)}
+    {}
+
+    task<net::io::result> read(std::span<std::byte> data) override { return body->read(data); }
+
+    using net::io::reader::read;
+
+    [[nodiscard]] int native_handle() const noexcept override { return body->native_handle(); }
+
+private:
+    // NOTE: declared first, so it's destroyed last: body reads from it.
+    std::unique_ptr<net::io::reader> owned;
+    std::unique_ptr<net::io::reader> body;
+};
 
 // valid_fields checks that every field can be written without changing what's around it.
 bool valid_fields(const headers& fields) noexcept
@@ -401,14 +446,13 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
     }
 }
 
-coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
-                                                    request_method                       method,
-                                                    std::size_t                          max_header_bytes) noexcept
+coro::task<response_decoder_result>
+response_decode(io::buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
 {
     try
     {
         client_response resp;
-        head_reader     head{.reader = reader.get(), .remaining = max_header_bytes};
+        head_reader     head{.reader = reader, .remaining = max_header_bytes};
 
         // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are skipped (other than 101,
         // which is the last thing on the connection in HTTP/1.1).
@@ -423,7 +467,7 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
             if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
         } while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
 
-        auto body = make_response_body(std::move(reader), resp, method);
+        auto body = make_response_body(reader, resp, method);
         if (!body.has_value()) co_return std::unexpected(body.error());
         resp.body = std::move(*body);
 
@@ -432,6 +476,45 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
     catch (const std::bad_alloc&)
     {
         co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+    }
+}
+
+coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
+                                                    request_method                       method,
+                                                    std::size_t                          max_header_bytes) noexcept
+{
+    auto resp = co_await response_decode(reader.get(), method, max_header_bytes);
+    if (!resp.has_value()) co_return resp;
+
+    try
+    {
+        resp->body = std::make_unique<owning_body>(std::move(reader), std::move(resp->body));
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+    }
+
+    co_return resp;
+}
+
+bool connection_reusable(const client_response& resp, request_method method) noexcept
+{
+    try
+    {
+        // HTTP/1.0 connections close by default, and are kept only by a keep-alive extension that isn't implemented.
+        if (resp.version != protocol_version{.major = 1, .minor = 1}) return false;
+
+        auto connection = resp.headers.get_list("Connection"sv);
+        if (std::ranges::any_of(connection, [](auto option) { return util::equal_ignore_case(option, "close"sv); }))
+            return false;
+
+        auto framing = framing_of(resp, method);
+        return framing.has_value() && *framing != response_framing::connection;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return false;
     }
 }
 
