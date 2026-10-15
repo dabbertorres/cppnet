@@ -396,7 +396,9 @@ TEST_CASE("connections can be accepted, read from, and written to", "[io][schedu
 
     auto client = [](scheduler* sched, std::string port) -> task<std::string>
     {
-        net::tcp_socket conn{sched, "127.0.0.1", port};
+        auto connected = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+        if (!connected.has_value()) co_return "connect failed: " + connected.error().message();
+        auto& conn = *connected;
 
         auto res = co_await conn.write(std::as_bytes(std::span{"hello"sv}));
         if (res.err) co_return "write failed: " + res.err.message();
@@ -412,4 +414,33 @@ TEST_CASE("connections can be accepted, read from, and written to", "[io][schedu
     };
 
     CHECK(sched.run_to_completion(client(&sched, local_port(listener))) == "hello");
+}
+
+TEST_CASE("run_blocking runs on another thread, and continues on the workers", "[io][scheduler][run_blocking]")
+{
+    scheduler sched{make_pool()};
+
+    auto check = [](scheduler* sched) -> task<std::pair<bool, bool>>
+    {
+        auto worker   = std::this_thread::get_id();
+        auto blocking = co_await sched->run_blocking([] { return std::this_thread::get_id(); });
+        auto after    = std::this_thread::get_id();
+
+        // after may be a different worker, but it's not the blocking thread.
+        co_return std::pair{blocking != worker, after != blocking};
+    };
+
+    auto [ran_elsewhere, came_back] = sched.run_to_completion(check(&sched));
+    CHECK(ran_elsewhere);
+    CHECK(came_back);
+}
+
+TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
+{
+    scheduler sched{make_pool()};
+
+    auto throws = [](scheduler* sched) -> task<int>
+    { co_return co_await sched->run_blocking([]() -> int { throw std::runtime_error{"boom"}; }); };
+
+    CHECK_THROWS_AS(sched.run_to_completion(throws(&sched)), std::runtime_error);
 }

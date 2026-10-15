@@ -6,8 +6,29 @@
 
 #include <netdb.h>
 
+namespace
+{
+
+struct gai_error_category : std::error_category
+{
+    [[nodiscard]] const char* name() const noexcept override { return "getaddrinfo"; }
+    [[nodiscard]] std::string message(int err) const override { return ::gai_strerror(err); }
+};
+
+const gai_error_category the_gai_category;
+
+}
+
 namespace net
 {
+
+const std::error_category& gai_category() noexcept { return the_gai_category; }
+
+std::error_condition make_gai_error_condition(int err) noexcept
+{
+    if (err == EAI_SYSTEM) return {errno, std::generic_category()};
+    return {err, the_gai_category};
+}
 
 [[nodiscard]] std::system_error system_error_from_errno(int err, const std::string& what) noexcept
 {
@@ -28,7 +49,7 @@ bool throw_for_gai_error(int err)
     case EAI_FAMILY: throw exception{"selected protocol is not supported"};
     case EAI_MEMORY: throw exception{"memory allocation failure"};
     case EAI_NODATA: throw exception{"no address associated with hostname"};
-    case EAI_NONAME: throw exception{"at least one of host and port must be specified"};
+    case EAI_NONAME: throw exception{"host or port not found"};
     case EAI_SERVICE: throw exception{"unsupported port for selected network type"};
     case EAI_SOCKTYPE: throw exception{"selected network is not supported"};
     case EAI_SYSTEM: throw system_error_from_errno(errno);

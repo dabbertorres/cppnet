@@ -5,118 +5,73 @@
 #include <expected>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <shared_mutex>
-#include <string>
 #include <system_error>
 #include <utility>
 
 #include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
-#include "http/http2.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
 
+namespace
+{
+
+// connection_reader reads a response from the connection it owns, so the connection lives as long as the response.
+//
+// NOTE: the socket is held in a base class, so that it's constructed before (and destroyed after) the buffered_reader
+//       that reads from it.
+struct socket_holder
+{
+    std::unique_ptr<net::tcp_socket> socket;
+};
+
+class connection_reader final
+    : private socket_holder
+    , public net::io::buffered_reader
+{
+public:
+    explicit connection_reader(std::unique_ptr<net::tcp_socket> conn)
+        : socket_holder{std::move(conn)}
+        , net::io::buffered_reader{socket.get()}
+    {}
+};
+
+}
+
 namespace net::http
 {
 
-client::client(io::scheduler*            scheduler,
-               std::size_t               max_connections_per_host,
-               std::chrono::microseconds timeout,
-               bool                      keepalives)
+client::client(io::scheduler* scheduler, std::chrono::milliseconds connect_timeout, bool keepalives)
     : scheduler{scheduler}
-    , max_connections_per_host{max_connections_per_host}
+    , connect_timeout{connect_timeout}
     , keepalives{keepalives}
-    , timeout{timeout}
 {}
-
-client::client(client&& other) noexcept
-    : scheduler{std::exchange(other.scheduler, nullptr)}
-    , max_connections_per_host{std::exchange(other.max_connections_per_host, 0)}
-    , keepalives{std::exchange(other.keepalives, false)}
-    , timeout{std::exchange(other.timeout, 0us)}
-{
-    std::unique_lock lock{other.connections_mu};
-    connections = std::exchange(other.connections, connection_pool{});
-}
-
-client& client::operator=(client&& other) noexcept
-{
-    std::scoped_lock lock{connections_mu, other.connections_mu};
-
-    max_connections_per_host = std::exchange(other.max_connections_per_host, 0);
-    connections              = std::exchange(other.connections, connection_pool{});
-
-    return *this;
-}
 
 coro::task<std::expected<client_response, std::error_condition>> client::send(const client_request& request)
 {
-    request_encoder  encode = nullptr;
-    response_decoder decode = nullptr;
+    // Only HTTP/1.x is implemented. In particular, the http2 encoders are stubs.
+    if (request.version.major > 1) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
 
-    if (request.version.major <= 1)
-    {
-        encode = &http11::request_encode;
-        decode = &http11::response_decode;
-    }
-    else if (request.version == protocol_version{.major = 2, .minor = 0})
-    {
-        encode = &http2::request_encode;
-        decode = &http2::response_decode;
-    }
-    else
-    {
-        // TODO: return unsupported protocol
-        co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
-    }
+    auto conn = co_await tcp_socket::connect(scheduler,
+                                             request.uri.host,
+                                             !request.uri.port.empty() ? request.uri.port : "80",
+                                             {.timeout = connect_timeout, .keepalive = keepalives});
+    if (!conn.has_value()) co_return std::unexpected(conn.error());
 
-    auto conn = get_connection(request.uri.host, request.uri.port);
-    auto res  = co_await encode(conn.get(), request);
+    auto sock = std::make_unique<tcp_socket>(std::move(*conn));
+
+    auto res = co_await http11::request_encode(sock.get(), request);
     if (!res.has_value()) co_return std::unexpected(res.error());
 
-    auto reader = std::make_unique<io::buffered_reader>(conn.get());
-    auto resp   = co_await decode(std::move(reader), std::numeric_limits<std::size_t>::max());
+    auto resp = co_await http11::response_decode(std::make_unique<connection_reader>(std::move(sock)),
+                                                 std::numeric_limits<std::size_t>::max());
     if (!resp.has_value()) co_return std::unexpected(resp.error());
 
-    co_return {std::move(resp.value())};
-}
-
-client::host_connections::borrowed_resource client::get_connection(const std::string& host, const std::string& port)
-{
-    auto connection_host = host + ":" + (!port.empty() ? port : "80");
-
-    std::shared_lock read_lock{connections_mu};
-
-    auto it = connections.find(connection_host);
-    if (it == connections.end())
-    {
-        read_lock.unlock();
-
-        {
-            std::lock_guard write_lock{connections_mu};
-
-            // check again if someone else added it before us...
-            it = connections.find(connection_host);
-            if (it == connections.end())
-            {
-                connections[connection_host] = std::make_unique<host_connections>(
-                    max_connections_per_host,
-                    max_connections_per_host,
-                    [&, this] { return std::make_unique<tcp_socket>(scheduler, host, (!port.empty() ? port : "80")); });
-            }
-        }
-
-        // restore the lock
-        read_lock.lock();
-    }
-
-    it = connections.find(connection_host);
-    return it->second->get();
+    co_return std::move(*resp);
 }
 
 }
