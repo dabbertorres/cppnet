@@ -179,6 +179,7 @@ constexpr std::string_view status_text(status s) noexcept
     }
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): status_text's strings are all longer than the code it skips.
 constexpr std::string_view status_string(status s) noexcept
 {
     return status_text(s).substr(4); // chop off the status code

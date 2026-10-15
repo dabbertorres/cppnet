@@ -20,7 +20,7 @@ class string_reader : public reader
 public:
     using string = std::basic_string_view<CharT, Traits>;
 
-    string_reader(string view)
+    explicit string_reader(string view)
         : view{std::as_bytes(std::span{view})}
     {}
 

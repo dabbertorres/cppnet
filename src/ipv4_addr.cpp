@@ -14,6 +14,7 @@
 namespace net
 {
 
+// NOLINTNEXTLINE(bugprone-exception-escape): split_string's substr positions are in range.
 std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
 {
     std::array<std::uint8_t, 4> values{};

@@ -203,6 +203,7 @@ void to_json(nlohmann::json& j, const resource_spans& value);
 
 enum class data_point_flags : std::uint8_t
 {
+    none              = 0,
     no_recorded_value = 1,
 };
 
@@ -258,8 +259,9 @@ void to_json(nlohmann::json& j, const gauge& value);
 
 enum class aggregation_temporality : std::uint8_t
 {
-    delta      = 1,
-    cumulative = 2,
+    unspecified = 0,
+    delta       = 1,
+    cumulative  = 2,
 };
 
 struct sum
@@ -296,6 +298,7 @@ struct histogram
     };
 };
 
+void to_json(nlohmann::json& j, const histogram::data_point& value);
 void to_json(nlohmann::json& j, const histogram& value);
 
 struct exponential_histogram
@@ -330,6 +333,8 @@ struct exponential_histogram
     };
 };
 
+void to_json(nlohmann::json& j, const exponential_histogram::data_point::buckets& value);
+void to_json(nlohmann::json& j, const exponential_histogram::data_point& value);
 void to_json(nlohmann::json& j, const exponential_histogram& value);
 
 struct summary
@@ -354,6 +359,8 @@ struct summary
     std::vector<data_point> data_points;
 };
 
+void to_json(nlohmann::json& j, const summary::data_point::value_at_quantile& value);
+void to_json(nlohmann::json& j, const summary::data_point& value);
 void to_json(nlohmann::json& j, const summary& value);
 
 struct metric

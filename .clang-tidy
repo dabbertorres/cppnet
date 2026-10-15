@@ -48,6 +48,9 @@ WarningsAsErrors: false
 # - portability-avoid-pragma-once: the headers use #pragma once.
 # - readability-trailing-comma: it disagrees with clang-format, which wraps long lists without adding one.
 CheckOptions:
+# running out of memory is fatal, so noexcept functions may allocate.
+- key:   bugprone-exception-escape.IgnoredExceptions
+  value: 'bad_alloc,bad_array_new_length,length_error'
 - key:   bugprone-signed-bitwise.IgnorePositiveIntegerLiterals
   value: 'true'
 - key:   cert-dcl16-c.NewSuffixes

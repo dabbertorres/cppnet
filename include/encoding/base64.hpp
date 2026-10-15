@@ -48,7 +48,7 @@ struct encoding
 {
 public:
     // to disable padding, pass 0 for padchar.
-    encoding(alphabet alphabet = standard_alphabet(), char padchar = '=') noexcept;
+    explicit encoding(alphabet alphabet = standard_alphabet(), char padchar = '=') noexcept;
 
     [[nodiscard]] std::size_t encoded_size(std::size_t input_size) const noexcept;
     [[nodiscard]] std::size_t decoded_size(std::size_t input_size) const noexcept;

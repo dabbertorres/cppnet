@@ -17,7 +17,7 @@ namespace net::io
 class buffered_reader : public reader
 {
 public:
-    buffered_reader(reader* impl, std::size_t bufsize = 1'024);
+    explicit buffered_reader(reader* impl, std::size_t bufsize = 1'024);
 
     coro::task<result> read(std::span<std::byte> data) override;
 

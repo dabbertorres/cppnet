@@ -18,6 +18,7 @@ namespace
 {
 
 // trim_ows trims optional whitespace (spaces and tabs, RFC 9110 section 5.6.3) from both ends of str.
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 std::string_view trim_ows(std::string_view str) noexcept
 {
     constexpr auto ows = " \t";
@@ -329,6 +330,7 @@ bool is_valid_field_value(std::string_view value) noexcept
                                 });
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 std::optional<std::pair<std::string_view, std::string_view>> parse_field_line(std::string_view line) noexcept
 {
     auto colon = line.find(':');

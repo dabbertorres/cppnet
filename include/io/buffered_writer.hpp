@@ -14,7 +14,7 @@ namespace net::io
 class buffered_writer : public writer
 {
 public:
-    buffered_writer(writer* underlying, std::size_t bufsize = 1'024);
+    explicit buffered_writer(writer* underlying, std::size_t bufsize = 1'024);
 
     coro::task<result> write(std::span<const std::byte> data) override;
 

@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <system_error>
 
+namespace
+{
+
 consteval std::size_t num_rounds(std::size_t key_length_bits) noexcept { return key_length_bits / 32 + 6; }
 consteval std::size_t buffer_size(std::size_t key_length_bits) noexcept { return key_length_bits / 8 + 28; }
 
@@ -20,6 +23,8 @@ struct state
 
     std::array<std::uint32_t, buffer_size(key_bits)> buffer;
 };
+
+}
 
 namespace net::crypto::aes
 {

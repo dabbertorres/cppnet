@@ -81,6 +81,7 @@ std::optional<protocol_version> parse_http_version(std::string_view str) noexcep
 }
 
 // parse_status_line parses "HTTP/1.1 200 OK". The reason (and the space before it) may be missing: it's ignored anyway.
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range (after the size check).
 std::error_condition parse_status_line(std::string_view line, client_response& resp) noexcept
 {
     auto version = parse_http_version(line.substr(0, line.find(' ')));
@@ -97,6 +98,7 @@ std::error_condition parse_status_line(std::string_view line, client_response& r
 }
 
 // parse_request_line parses "GET /path HTTP/1.1" (RFC 9112, section 3), with exactly one space between each part.
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 std::error_condition parse_request_line(std::string_view line, server_request& req) noexcept
 {
     auto method_end = line.find(' ');
@@ -160,7 +162,7 @@ std::error_condition parse_host_header(server_request& req)
     std::string host;
     if (lines == 1)
     {
-        auto value = *req.headers.get("Host"sv);
+        auto value = req.headers.get("Host"sv).value_or(""sv);
 
         // an empty value is allowed, for targets without a host.
         if (!value.empty())
@@ -255,6 +257,7 @@ make_response_body(buffered_reader* reader, const client_response& resp, request
     case response_framing::none: return std::make_unique<net::io::limit_reader>(parent, 0);
     case response_framing::chunked: return std::make_unique<net::http::http11::chunked_reader>(reader);
     case response_framing::length:
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access): only chosen when there's a valid Content-Length.
         return std::make_unique<net::io::limit_reader>(parent, *resp.headers.get_content_length());
     case response_framing::connection:
         return std::make_unique<net::io::limit_reader>(parent, std::numeric_limits<std::size_t>::max());
@@ -368,7 +371,7 @@ task<std::error_condition> write_full(net::io::writer& out, std::span<const std:
 }
 
 // body_buffer is how much of a body is read at a time.
-constexpr std::size_t body_buffer = 16 * 1'024;
+constexpr std::size_t body_buffer = std::size_t{16} * 1'024;
 
 // copy_length copies exactly length bytes from body, which mustn't end before then.
 task<std::error_condition> copy_length(net::io::reader& body, net::io::writer& out, std::size_t length)

@@ -17,13 +17,8 @@
 #include "util/packed.hpp"
 #include "util/result.hpp"
 
-namespace net::http::http2
+namespace
 {
-
-using coro::task;
-using net::http::client_request;
-using net::http::server_response;
-using util::result;
 
 // https://httpwg.org/specs/rfc9113.html#ErrorCodes
 // Unknown or unsupported error codes MUST NOT trigger any special behavior.
@@ -233,6 +228,13 @@ struct connection
     std::uint32_t max_frame_size;         // Default is 16384. Must be between that and 16777215.
     std::uint32_t max_header_list_size;   // Default is unlimited.
 };
+
+}
+
+namespace net::http::http2
+{
+
+using coro::task;
 
 task<request_encoder_result> request_encode(io::writer* /*writer*/, const client_request& /*req*/) noexcept
 {

@@ -157,7 +157,7 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
             forget(leased.key, std::move(leased.conn), closing);
         }
     }
-    catch (const std::bad_alloc&)
+    catch (const std::bad_alloc&) // NOLINT(bugprone-empty-catch): see below.
     {
         // TODO: log? throw?
         // the connection is closed, along with leased (but its place in the pool isn't freed: there's no memory).

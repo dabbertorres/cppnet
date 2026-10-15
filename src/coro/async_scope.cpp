@@ -77,6 +77,7 @@ async_scope::detached async_scope::run(async_scope* scope, task<> task)
     }
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): on_drained is checked before it's called.
 void async_scope::close() noexcept
 {
     std::scoped_lock lock{mu};
@@ -103,6 +104,7 @@ void async_scope::join_blocking() noexcept
     drained.wait(lock, [this] { return count == 0; });
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): on_drained is checked before it's called.
 void async_scope::finish() noexcept
 {
     std::vector<std::coroutine_handle<>> to_resume;

@@ -30,7 +30,7 @@ public:
         bool keepalive = true;
     };
 
-    tcp_socket(io::scheduler* scheduler) noexcept;
+    explicit tcp_socket(io::scheduler* scheduler) noexcept;
     tcp_socket(io::scheduler* scheduler, int fd);
 
     // connect resolves host, and connects to the first of its addresses that accepts. It fails with:

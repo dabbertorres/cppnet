@@ -19,18 +19,22 @@ public:
 
     constexpr result() = delete;
 
+    // NOLINTNEXTLINE(*-explicit-constructor): converts from a value or an error, as std::expected does.
     constexpr result(const Value& value) noexcept(std::is_nothrow_copy_constructible_v<Value>)
         : value{value}
     {}
 
+    // NOLINTNEXTLINE(*-explicit-constructor): converts from a value or an error, as std::expected does.
     constexpr result(Value&& value) noexcept(std::is_nothrow_move_constructible_v<Value>)
         : value{std::move(value)}
     {}
 
+    // NOLINTNEXTLINE(*-explicit-constructor): converts from a value or an error, as std::expected does.
     constexpr result(const Error& error) noexcept(std::is_nothrow_copy_constructible_v<Error>)
         : value{error}
     {}
 
+    // NOLINTNEXTLINE(*-explicit-constructor): converts from a value or an error, as std::expected does.
     constexpr result(Error&& error) noexcept(std::is_nothrow_move_constructible_v<Error>)
         : value{std::move(error)}
     {}
@@ -63,8 +67,8 @@ public:
     [[nodiscard]] constexpr bool has_value() const noexcept { return std::holds_alternative<Value>(value); }
     [[nodiscard]] constexpr bool has_error() const noexcept { return std::holds_alternative<Error>(value); }
 
-    const constexpr Value& to_value() const { return std::get<Value>(value); }
-    const constexpr Error& to_error() const { return std::get<Error>(value); }
+    [[nodiscard]] const constexpr Value& to_value() const { return std::get<Value>(value); }
+    [[nodiscard]] const constexpr Error& to_error() const { return std::get<Error>(value); }
 
     constexpr Value&& to_value() { return std::get<Value>(std::move(value)); }
     constexpr Error&& to_error() { return std::get<Error>(std::move(value)); }
@@ -106,7 +110,7 @@ public:
         return to_value();
     }
 
-    constexpr Value or_else(Value other) const noexcept
+    [[nodiscard]] constexpr Value or_else(Value other) const noexcept
     {
         if (has_error()) return other;
         return value;

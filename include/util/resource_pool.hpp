@@ -67,7 +67,7 @@ public:
         pool.reserve(target_size);
     }
 
-    resource_pool(std::size_t max_size, make_function&& make = std::make_unique<T>)
+    explicit resource_pool(std::size_t max_size, make_function&& make = std::make_unique<T>)
         : resource_pool(max_size, max_size, std::move(make))
     {}
 

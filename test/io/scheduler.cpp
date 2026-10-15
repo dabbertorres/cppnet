@@ -470,7 +470,7 @@ TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")
             if (!sched->spawn(waiter(sched, &word, &woken))) co_return false;
 
         // give the waiters time to wait, so it's the notification that wakes them.
-        co_await sched->sleep_until(net::io::clock::now() + 50ms);
+        (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
         bool none_early = woken == 0;
 
         ++word;
@@ -516,14 +516,14 @@ TEST_CASE("notify_one wakes waiters in order", "[io][scheduler][wait_on]")
         for (int id = 0; id < 3; ++id)
         {
             if (!sched->spawn(waiter(sched, id))) co_return;
-            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
         }
 
         word = 1;
         for (int i = 0; i < 3; ++i)
         {
             sched->notify_one(word);
-            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
         }
     };
 
@@ -576,7 +576,7 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
         auto stopper = [&](scheduler* sched) -> task<>
         {
             if (!sched->spawn(sleeper(sched, &sleep_err)) || !sched->spawn(waiter(sched, &word, &wait_err))) co_return;
-            co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
         };
 
         // run_to_completion stops the scheduler once the stopper finishes, which must cancel the others.
@@ -600,7 +600,7 @@ TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][s
     {
         for (int i = 0; i < 8; ++i)
         {
-            co_await sched->sleep_until(net::io::clock::now() + 40ms);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 40ms);
             co_await writer->write(std::as_bytes(std::span{"x"sv}));
         }
     };

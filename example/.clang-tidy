@@ -1,0 +1,8 @@
+# vim: ft=yaml
+
+# an exception escaping main() terminates the program, which is fine for these.
+CheckOptions:
+- key:   bugprone-exception-escape.CheckMain
+  value: 'false'
+
+InheritParentConfig: true

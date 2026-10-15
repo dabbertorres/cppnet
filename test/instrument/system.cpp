@@ -127,5 +127,5 @@ TEST_CASE("process usage", "[instrument][system]")
     auto resident = system_stats::process_resident_memory();
     REQUIRE(resident.has_value());
     CHECK(usage->max_resident_set_size >= *resident / 2);
-    CHECK(usage->max_resident_set_size > 1024 * 1024);
+    CHECK(usage->max_resident_set_size > std::size_t{1'024} * 1'024);
 }

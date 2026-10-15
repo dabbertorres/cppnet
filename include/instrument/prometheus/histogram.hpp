@@ -20,10 +20,10 @@ struct histogram : public base_metric<histogram>
 
     // buckets are the buckets' upper bounds, which must be increasing (or std::invalid_argument is thrown). A +Inf
     // bucket is added, if they don't end with one. The labels can't include "le", which the buckets use.
-    histogram(std::string&&         name,
-              std::string&&         help    = "",
-              metric_labels&&       labels  = {},
-              std::vector<double>&& buckets = default_buckets());
+    explicit histogram(std::string&&         name,
+                       std::string&&         help    = "",
+                       metric_labels&&       labels  = {},
+                       std::vector<double>&& buckets = default_buckets());
 
     // NOTE: copying or moving isn't safe while observing.
     histogram(const histogram& other);

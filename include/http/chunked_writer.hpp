@@ -15,7 +15,7 @@ namespace net::http::http11
 class chunked_writer : public io::writer
 {
 public:
-    constexpr chunked_writer(io::writer* writer)
+    explicit constexpr chunked_writer(io::writer* writer)
         : parent{writer}
     {}
 

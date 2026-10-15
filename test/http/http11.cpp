@@ -581,8 +581,8 @@ std::unique_ptr<net::io::reader> body_of(std::string content)
     return std::make_unique<net::io::owned_string_reader>(std::move(content));
 }
 
-const std::string invalid_argument = "error: " + std::make_error_condition(std::errc::invalid_argument).message();
-const std::string not_supported    = "error: " + std::make_error_condition(std::errc::not_supported).message();
+std::string invalid_argument() { return "error: " + std::make_error_condition(std::errc::invalid_argument).message(); }
+std::string not_supported() { return "error: " + std::make_error_condition(std::errc::not_supported).message(); }
 
 }
 
@@ -638,14 +638,14 @@ TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][reques
         auto req = make_request(request_method::POST);
         req.headers.set_content_length(10);
         req.body = body_of("hello");
-        CHECK(encode_request(req) == invalid_argument);
+        CHECK(encode_request(req) == invalid_argument());
     }
 
     SECTION("a Content-Length without a body")
     {
         auto req = make_request(request_method::POST);
         req.headers.set_content_length(5);
-        CHECK(encode_request(req) == invalid_argument);
+        CHECK(encode_request(req) == invalid_argument());
     }
 
     SECTION("an invalid Content-Length")
@@ -653,7 +653,7 @@ TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][reques
         auto req = make_request(request_method::POST);
         req.headers.set("Content-Length"sv, "5x"sv);
         req.body = body_of("hello");
-        CHECK(encode_request(req) == invalid_argument);
+        CHECK(encode_request(req) == invalid_argument());
     }
 
     SECTION("both Content-Length and Transfer-Encoding")
@@ -661,7 +661,7 @@ TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][reques
         auto req = make_request(request_method::POST);
         req.set_body("hello");
         req.headers.set("Transfer-Encoding"sv, "chunked"sv);
-        CHECK(encode_request(req) == invalid_argument);
+        CHECK(encode_request(req) == invalid_argument());
     }
 
     SECTION("a transfer coding that isn't implemented")
@@ -669,14 +669,14 @@ TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][reques
         auto req = make_request(request_method::POST);
         req.headers.set("Transfer-Encoding"sv, "gzip, chunked"sv);
         req.body = body_of("hello");
-        CHECK(encode_request(req) == not_supported);
+        CHECK(encode_request(req) == not_supported());
     }
 
     SECTION("HTTP/1.0 can't send a body of unknown length")
     {
         auto req = make_request(request_method::POST, 0);
         req.body = body_of("hello");
-        CHECK(encode_request(req) == invalid_argument);
+        CHECK(encode_request(req) == invalid_argument());
     }
 }
 

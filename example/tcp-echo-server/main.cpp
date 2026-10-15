@@ -20,6 +20,9 @@
 #include "listen.hpp"
 #include "tcp.hpp"
 
+namespace
+{
+
 net::coro::task<> serve_connection(net::tcp_socket socket)
 {
     spdlog::info("serving new connection from {} on {}", socket.remote_addr(), socket.local_addr());
@@ -53,6 +56,8 @@ net::coro::task<> run_echo_server(net::io::scheduler& scheduler, net::listener& 
 
         if (!scheduler.spawn(serve_connection(std::move(*socket)))) co_return;
     }
+}
+
 }
 
 int main()
