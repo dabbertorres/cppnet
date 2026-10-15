@@ -67,6 +67,8 @@ public:
     // encode percent-encodes the characters in reserved, and any that aren't printable ASCII.
     static std::string encode(std::string_view str, std::string_view reserved = reserved_characters) noexcept;
     static std::string decode(std::string_view str) noexcept;
+    // decode_append decodes str (as decode does) onto the end of out.
+    static void decode_append(std::string& out, std::string_view str) noexcept;
 
     // parse_query decodes a query (without its '?') as application/x-www-form-urlencoded (so '+' is a space).
     static query_values parse_query(std::string_view query);

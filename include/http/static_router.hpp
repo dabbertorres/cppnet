@@ -34,7 +34,7 @@
 //
 //     auto routes = make_static_router(
 //         GET("/users/:id"_route,
-//             [](const server_request& req, response_writer& resp, const params<"/users/:id">& p) -> task<void>
+//             [](const server_request& req, response_writer& resp, params<"/users/:id"> p) -> task<void>
 //             { ... p.get<"id">() ... }),
 //         group("/api"_route, GET("/health"_route, health)));
 //
@@ -103,8 +103,9 @@ namespace detail
 // params gives a handler its route's parameters, by name: e.g. p.get<"id">() for "/users/:id". A name the pattern
 // doesn't have fails to compile.
 //
-// It views the request, so mustn't outlive it. A route's params convert to those of a route it ends with, so that a
-// handler written for "/users/:id" can take them when it's in a group under a prefix.
+// Handlers take it by value (it's a pointer and an index): it's made for the call, which returns the handler's task
+// before it runs. It views the request, so mustn't outlive it. A route's params convert to those of a route it ends
+// with, so that a handler written for "/users/:id" can take them when it's in a group under a prefix.
 template<util::fixed_string Pattern>
 class params
 {
@@ -495,19 +496,71 @@ namespace detail
         return out;
     }
 
-    // match walks path through the tree. If it leads to a node with routes, it returns that node, along with the route
-    // for method (or none), and the parameters' values in values.
+    // match walks req's path through the tree. If it leads to a node with routes, it returns that node, along with the
+    // route for req's method (or none), having added the parameters to req's path_values.
     struct match_result
     {
         const node*   found = nullptr;
         std::uint32_t route = none;
     };
 
-    match_result match(std::span<const node>                             nodes,
-                       std::span<const slot>                             slots,
-                       std::string_view                                  path,
-                       request_method                                    method,
-                       std::vector<std::pair<std::string, std::string>>& values);
+    match_result match(std::span<const node> nodes, std::span<const slot> slots, server_request& req);
+
+    // handler_signature finds the type a handler takes its params as, if its signature can be inspected: it can't for
+    // e.g. a generic lambda.
+    template<typename F>
+    struct handler_signature
+    {};
+
+    template<typename R, typename A, typename B, typename P>
+    struct handler_signature<R (*)(A, B, P)>
+    {
+        using params_type = P;
+    };
+
+    template<typename R, typename A, typename B, typename P>
+    struct handler_signature<R (*)(A, B, P) noexcept>
+    {
+        using params_type = P;
+    };
+
+    template<typename R, typename C, typename A, typename B, typename P>
+    struct handler_signature<R (C::*)(A, B, P) const>
+    {
+        using params_type = P;
+    };
+
+    template<typename R, typename C, typename A, typename B, typename P>
+    struct handler_signature<R (C::*)(A, B, P) const noexcept>
+    {
+        using params_type = P;
+    };
+
+    template<typename R, typename C, typename A, typename B, typename P>
+    struct handler_signature<R (C::*)(A, B, P)>
+    {
+        using params_type = P;
+    };
+
+    template<typename R, typename C, typename A, typename B, typename P>
+    struct handler_signature<R (C::*)(A, B, P) noexcept>
+    {
+        using params_type = P;
+    };
+
+    template<typename H>
+    struct handler_traits : handler_signature<H>
+    {};
+
+    template<typename H>
+        requires requires { &H::operator(); }
+    struct handler_traits<H> : handler_signature<decltype(&H::operator())>
+    {};
+
+    // takes_params_by_reference is whether a handler (that can be inspected) takes its params by reference.
+    template<typename H>
+    concept takes_params_by_reference = requires { typename handler_traits<H>::params_type; }
+                                     && std::is_reference_v<typename handler_traits<H>::params_type>;
 
     // allowed_methods lists the methods n handles, for an Allow header.
     std::string allowed_methods(const node& n);
@@ -541,13 +594,10 @@ public:
     // Found, or 405 Method Not Allowed.
     coro::task<void> operator()(server_request& req, response_writer& resp) const
     {
-        std::vector<std::pair<std::string, std::string>> values;
-
-        const auto found = detail::match(table.nodes, table.slots, req.target.path, req.method, values);
+        const auto found = detail::match(table.nodes, table.slots, req);
         if (found.found == nullptr) return detail::respond(resp, status::NOT_FOUND);
 
-        req.route       = found.found->pattern;
-        req.path_values = std::move(values);
+        req.route = found.found->pattern;
 
         if (found.route == detail::none)
         {
@@ -563,40 +613,38 @@ private:
     using entry_type = std::tuple_element_t<I, std::tuple<Entries...>>;
 
     template<std::size_t I>
-    static constexpr bool takes_params = std::invocable<const decltype(entry_type<I>::handler)&,
-                                                        const server_request&,
-                                                        response_writer&,
-                                                        const params<entry_type<I>::pattern>&>;
+    using handler_type = decltype(entry_type<I>::handler);
+
+    template<std::size_t I>
+    static constexpr bool takes_params =
+        std::invocable<const handler_type<I>&, const server_request&, response_writer&, params<entry_type<I>::pattern>>;
 
     // call calls the handler of route I, with its params if it takes them.
     template<std::size_t I>
     static coro::task<void> call(const static_router& self, server_request& req, response_writer& resp)
     {
-        // NOTE: called directly, not through std::invoke: a handler in a group converts p to its own route's params,
-        //       and that temporary must be in this coroutine's frame, to outlive the handler's (lazy) task.
-        const params<entry_type<I>::pattern> p{req};
-        co_await std::get<I>(self.entries).handler(std::as_const(req), resp, p);
-    }
+        const auto& handler = std::get<I>(self.entries).handler;
 
-    // call_plain calls the handler of route I, which doesn't take params, without a coroutine frame of its own.
-    template<std::size_t I>
-    static coro::task<void> call_plain(const static_router& self, server_request& req, response_writer& resp)
-    {
-        return std::invoke(std::get<I>(self.entries).handler, std::as_const(req), resp);
+        if constexpr (takes_params<I>)
+        {
+            // the params are made for the call, which returns the handler's task before it runs: a reference would
+            // dangle.
+            static_assert(!detail::takes_params_by_reference<handler_type<I>>,
+                          "a handler takes its params by value (they're a pointer and an index)");
+
+            return handler(std::as_const(req), resp, params<entry_type<I>::pattern>{req});
+        }
+        else
+        {
+            return std::invoke(handler, std::as_const(req), resp);
+        }
     }
 
     using handler_call = coro::task<void> (*)(const static_router&, server_request&, response_writer&);
 
-    template<std::size_t I>
-    static constexpr handler_call handler_for() noexcept
-    {
-        if constexpr (takes_params<I>) return &call<I>;
-        else return &call_plain<I>;
-    }
-
     // the jump table: the route's handler, by its index.
     static constexpr auto handlers = []<std::size_t... I>(std::index_sequence<I...>)
-    { return std::array<handler_call, sizeof...(I)>{handler_for<I>()...}; }(std::index_sequence_for<Entries...>{});
+    { return std::array<handler_call, sizeof...(I)>{&call<I>...}; }(std::index_sequence_for<Entries...>{});
 
     std::tuple<Entries...> entries;
 };

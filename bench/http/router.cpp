@@ -4,12 +4,15 @@
 //
 // Each request is routed to a handler that does nothing, so the time is the router's: matching the path (decoding
 // its segments, and collecting parameters) and calling the handler (whose coroutine frame is allocated either way).
+// It also counts heap allocations per request: those more than without a router are the router's.
 #include "http/router.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <print>
 #include <ratio>
 #include <string>
@@ -22,6 +25,27 @@
 #include "http/response.hpp"
 #include "http/static_router.hpp"
 #include "io/discard_writer.hpp"
+
+// NOLINTBEGIN(misc-new-delete-overloads,cppcoreguidelines-no-malloc,cppcoreguidelines-avoid-non-const-global-variables,readability-inconsistent-declaration-parameter-name):
+// counting allocations, by replacing these.
+namespace
+{
+
+// the heap allocations so far (on any thread, though the benchmark only uses one).
+std::size_t allocations = 0;
+
+}
+
+void* operator new(std::size_t size)
+{
+    ++allocations;
+    if (void* p = std::malloc(size)) return p;
+    throw std::bad_alloc{};
+}
+
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t /*size*/) noexcept { std::free(p); }
+// NOLINTEND(misc-new-delete-overloads,cppcoreguidelines-no-malloc,cppcoreguidelines-avoid-non-const-global-variables,readability-inconsistent-declaration-parameter-name)
 
 namespace
 {
@@ -36,8 +60,14 @@ task<void> nothing(const http::server_request& /*req*/, http::response_writer& /
 constexpr int iterations = 1'000'000;
 constexpr int repeats    = 7;
 
+struct result
+{
+    double nanoseconds = 0; // per request, the best of the runs
+    double allocations = 0; // per request
+};
+
 template<typename Router>
-double measure(const Router& router, const std::vector<std::pair<http::request_method, std::string>>& requests)
+result measure(const Router& router, const std::vector<std::pair<http::request_method, std::string>>& requests)
 {
     net::io::discard_writer out;
     std::vector<double>     runs;
@@ -69,9 +99,35 @@ double measure(const Router& router, const std::vector<std::pair<http::request_m
     }
 
     std::ranges::sort(runs);
-    return runs.front();
+
+    // and once more, counting allocations.
+    const auto before = allocations;
+    for (const auto& [method, path] : requests)
+    {
+        http::server_request req{.method = method};
+        req.target.path = path;
+
+        http::server_response resp{
+            .version = {.major = 1, .minor = 1},
+            .body    = &out
+        };
+        http::response_writer rw{&out, &resp, http::http11::response_encode};
+
+        auto routed = router(req, rw);
+        routed.get_handle().resume();
+    }
+
+    return {.nanoseconds = runs.front(),
+            .allocations = static_cast<double>(allocations - before) / static_cast<double>(requests.size())};
 }
 
+void print(const char* name, result r)
+{
+    std::println("{:14} best {:7.1f} ns per request, {:4.1f} allocations per request",
+                 name,
+                 r.nanoseconds,
+                 r.allocations);
+}
 }
 
 int main()
@@ -126,8 +182,8 @@ int main()
     // the same, without routing: what making the request costs, and calling a handler.
     const auto direct = [](http::server_request& req, http::response_writer& resp) { return nothing(req, resp); };
 
-    std::println("no router      best {:7.1f} ns per request", measure(direct, requests));
-    std::println("router         best {:7.1f} ns per request", measure(dynamic, requests));
-    std::println("static_router  best {:7.1f} ns per request", measure(fixed, requests));
+    print("no router", measure(direct, requests));
+    print("router", measure(dynamic, requests));
+    print("static_router", measure(fixed, requests));
     return 0;
 }

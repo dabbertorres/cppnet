@@ -20,6 +20,7 @@
 #include "io/string_reader.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"
+#include "util/small_vector.hpp"
 #include "util/string_util.hpp"
 #include "util/type_map.hpp"
 
@@ -110,10 +111,17 @@ struct server_request
     std::string host{};
 
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
-    std::string route{};
+    // It views the router's copy, so is only valid while the router is (as it is while the router handles it).
+    std::string_view route{};
 
-    // The values of the route's parameters, decoded, which the router sets: see path_value.
-    std::vector<std::pair<std::string, std::string>> path_values{};
+    // The route's parameters (name, then decoded value), which the router sets: see path_value. The values view the
+    // request's path, or path_value_storage if they needed decoding, so are only valid while the request is, and
+    // isn't moved (as it isn't while it's being handled).
+    util::small_vector<std::pair<std::string_view, std::string_view>, 4> path_values{};
+
+    // path_value_storage holds the path_values that needed decoding, for the router: it's reserved to the length of
+    // the rest of the path from the first of them, which they can't be longer than together, so they never move.
+    std::string path_value_storage{};
 
     // Values for handling the request, which middleware passes to handlers: e.g. instrument::trace.
     util::type_map extensions{};
@@ -124,9 +132,13 @@ struct server_request
     // path "/users/42". It's empty if the route has no such parameter (a parameter never matches an empty segment).
     [[nodiscard]] std::string_view path_value(std::string_view name) const noexcept
     {
-        auto iter = std::ranges::find(path_values, name, &std::pair<std::string, std::string>::first);
-        return iter != path_values.end() ? std::string_view{iter->second} : std::string_view{};
+        const auto* iter = std::ranges::find(path_values, name, &std::pair<std::string_view, std::string_view>::first);
+        return iter != path_values.end() ? iter->second : std::string_view{};
     }
+
+    // add_path_value adds the parameter name, for encoded, which it decodes if need be. encoded must be part of
+    // target.path, after any added before it, and name must outlive the request (e.g. being the router's).
+    void add_path_value(std::string_view name, std::string_view encoded);
 };
 
 using request_decoder_result = std::expected<server_request, std::error_condition>;

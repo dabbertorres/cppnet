@@ -5,13 +5,10 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 #include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
-#include "url.hpp"
 
 namespace
 {
@@ -72,13 +69,18 @@ constexpr bool decodes_to(std::string_view encoded, std::string_view literal) no
 namespace net::http::detail
 {
 
-match_result match(std::span<const node>                             nodes,
-                   std::span<const slot>                             slots,
-                   std::string_view                                  path,
-                   request_method                                    method,
-                   std::vector<std::pair<std::string, std::string>>& values)
+match_result match(std::span<const node> nodes, std::span<const slot> slots, server_request& req)
 {
+    std::string_view path = req.target.path;
     if (path.starts_with('/')) path.remove_prefix(1);
+
+    // the parameters are added as they're found, and removed if the path leads nowhere.
+    const auto not_found = [&req] -> match_result
+    {
+        req.path_values.clear();
+        req.path_value_storage.clear();
+        return {};
+    };
 
     // The path is split before it's decoded, so an encoded '/' ("%2F") is part of a segment rather than separating two.
     // A literal segment is taken over a parameter, and never given up for it later: there's no backtracking.
@@ -103,19 +105,19 @@ match_result match(std::span<const node>                             nodes,
             }
         }
 
-        if (current->param_child == none || segment.empty()) return {};
+        if (current->param_child == none || segment.empty()) return not_found();
 
-        values.emplace_back(current->param_name, url::decode(segment));
+        req.add_path_value(current->param_name, segment);
         current = &nodes[current->param_child];
     }
 
     // a node with no routes is only part of the way to some.
-    if (current->pattern.empty()) return {};
+    if (current->pattern.empty()) return not_found();
 
-    auto route = current->routes[static_cast<std::size_t>(method)];
+    auto route = current->routes[static_cast<std::size_t>(req.method)];
 
     // HEAD is GET without the body (which the server drops), unless the route has its own handler for it.
-    if (route == none && method == request_method::HEAD)
+    if (route == none && req.method == request_method::HEAD)
         route = current->routes[static_cast<std::size_t>(request_method::GET)];
 
     return {.found = current, .route = route};

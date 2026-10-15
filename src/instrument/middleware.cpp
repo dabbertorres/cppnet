@@ -228,14 +228,15 @@ struct http_tracing::state
         const auto method = method_name(req.method);
         const auto code   = responded_status(resp, failure != nullptr);
 
-        span.name = req.route.empty() ? std::string{method} : std::string{method} + ' ' + req.route;
+        span.name = std::string{method};
+        if (!req.route.empty()) span.name.append(1, ' ').append(req.route);
 
         // version 2 and later have no minor version.
         auto version = std::to_string(req.version.major);
         if (req.version.major < 2) version += '.' + std::to_string(req.version.minor);
 
         span.attributes.push_back(attribute("http.request.method", std::string{method}));
-        if (!req.route.empty()) span.attributes.push_back(attribute("http.route", req.route));
+        if (!req.route.empty()) span.attributes.push_back(attribute("http.route", std::string{req.route}));
         span.attributes.push_back(attribute("url.path", req.target.path));
         span.attributes.push_back(attribute("url.scheme", std::string{"http"}));
         span.attributes.push_back(attribute("network.protocol.version", std::move(version)));
