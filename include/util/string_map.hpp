@@ -357,7 +357,16 @@ public:
     iterator  erase(const_iterator pos) { return values.erase(pos); }
     iterator  erase(const_iterator first, const_iterator last) { return values.erase(first, last); }
     size_type erase(const String& key) { return values.erase(key); }
-    size_type erase(StringView key) { return values.erase(key); }
+    // NOTE: erase and extract by a StringView find the key first, as erasing by a key of another type needs C++23's
+    //       heterogeneous erasure, which not every standard library has yet.
+    size_type erase(StringView key)
+    {
+        auto iter = values.find(key);
+        if (iter == values.end()) return 0;
+
+        values.erase(iter);
+        return 1;
+    }
 
 #if defined(__cpp_lib_associative_heterogeneous_erasure) && __cpp_lib_associative_heterogeneous_erasure >= 202110L
     template<typename K>
@@ -380,7 +389,11 @@ public:
 
     node_type extract(const_iterator position) { return values.extract(position); }
     node_type extract(const String& k) { return values.extract(k); }
-    node_type extract(StringView k) { return values.extract(k); }
+    node_type extract(StringView k)
+    {
+        auto iter = values.find(k);
+        return iter != values.end() ? values.extract(iter) : node_type{};
+    }
 
 #if defined(__cpp_lib_associative_heterogeneous_erasure) && __cpp_lib_associative_heterogeneous_erasure >= 202110L
     template<typename K>

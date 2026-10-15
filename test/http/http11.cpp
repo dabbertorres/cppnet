@@ -26,6 +26,7 @@
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
 #include "io/string_writer.hpp"
+#include "io/writer.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
 
@@ -491,6 +492,40 @@ TEST_CASE("status codes outside 100-599 aren't encoded", "[http][1.1][response_e
     REQUIRE_FALSE(res.has_value());
     CHECK(res.error() == std::errc::invalid_argument);
     CHECK(out.build().empty());
+}
+
+TEST_CASE("responses without content have no Content-Length, and no body", "[http][1.1][response_writer]")
+{
+    struct test_case
+    {
+        net::http::status status;
+        bool              content_length;
+    };
+
+    // RFC 9110, section 8.6: 1xx and 204 responses mustn't have one, and a 304's would have to be the 200's.
+    auto tc = GENERATE(test_case{.status = net::http::status::OK, .content_length = true},
+                       test_case{.status = net::http::status::NOT_FOUND, .content_length = true},
+                       test_case{.status = net::http::status::CONTINUE, .content_length = false},
+                       test_case{.status = net::http::status::NO_CONTENT, .content_length = false},
+                       test_case{.status = net::http::status::NOT_MODIFIED, .content_length = false});
+    CAPTURE(static_cast<int>(tc.status));
+
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 1},
+        .body    = &out
+    };
+    net::http::response_writer rw{&out, &resp, net::http::http11::response_encode};
+
+    // e.g. a handler setting it itself, as well.
+    rw.headers().set_content_length(3);
+
+    auto* body = test::sync_wait(rw.send(tc.status, 3));
+    auto  res  = test::sync_wait(net::io::write_all(*body, "abc"sv));
+
+    CHECK(out.build().contains("Content-Length") == tc.content_length);
+    CHECK(static_cast<bool>(res.err) == !tc.content_length);
+    CHECK(out.build().ends_with("abc") == tc.content_length);
 }
 
 TEST_CASE("unsafe header fields aren't encoded", "[http][1.1][response_encode][strict]")

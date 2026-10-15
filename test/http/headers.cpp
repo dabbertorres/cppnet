@@ -53,3 +53,16 @@ TEST_CASE("is_chunked only if chunked is last", "[http][headers][is_chunked]")
     CHECK_FALSE(chunked("chunked, gzip"));
     CHECK_FALSE(chunked("xchunked"));
 }
+
+TEST_CASE("remove a field", "[http][headers]")
+{
+    net::http::headers fields;
+    fields.set("Content-Length"sv, "3"sv).set("X-Other"sv, "y"sv);
+
+    fields.remove("content-length"sv);
+    CHECK_FALSE(fields.get("Content-Length"sv).has_value());
+    CHECK(fields.get("X-Other"sv) == "y");
+
+    // removing a field that isn't there does nothing.
+    fields.remove("Content-Length"sv);
+}

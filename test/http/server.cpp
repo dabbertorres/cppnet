@@ -179,3 +179,64 @@ TEST_CASE("responses to HEAD requests have no body", "[http][server]")
     CHECK(count(out, "hello") == 1);
     CHECK(out.ends_with("\r\n\r\nhello"));
 }
+
+TEST_CASE("a response's body is as long as its Content-Length", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    std::error_condition long_err;
+
+    http::router router;
+    router
+        .GET("/short",
+             [](const http::server_request&, http::response_writer& resp) -> task<void>
+             {
+                 auto* body = co_await resp.send(http::status::OK, 10);
+                 co_await net::io::write_all(*body, "hello"sv);
+             })
+        .GET("/long",
+             [&](const http::server_request&, http::response_writer& resp) -> task<void>
+             {
+                 auto* body = co_await resp.send(http::status::OK, 5);
+                 long_err   = (co_await net::io::write_all(*body, "hello, world"sv)).err;
+             })
+        .GET("/ok",
+             [](const http::server_request&, http::response_writer& resp) -> task<void>
+             {
+                 auto* body = co_await resp.send(http::status::OK, 2);
+                 co_await net::io::write_all(*body, "ok"sv);
+             });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    SECTION("a body that's too short closes the connection, rather than leave the client waiting")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "GET /short HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                    "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(out.ends_with("\r\n\r\nhello"));
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 1);
+    }
+
+    SECTION("what's too long isn't written, so the connection can still be used")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "GET /long HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                    "GET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(long_err == std::errc::value_too_large);
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+        CHECK(count(out, "world") == 0);
+        CHECK(out.ends_with("\r\n\r\nok"));
+    }
+}
