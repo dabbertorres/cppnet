@@ -84,9 +84,7 @@ namespace detail
         std::size_t index = 0;
         for (std::size_t start = 1; start <= pattern.size();)
         {
-            auto end = pattern.find('/', start);
-            if (end == std::string_view::npos) end = pattern.size();
-
+            const auto end     = segment_end(pattern, start);
             const auto segment = pattern.substr(start, end - start);
             start              = end + 1;
 
@@ -382,8 +380,7 @@ namespace detail
 
             for (std::size_t start = 1; start <= pattern.size();)
             {
-                auto end = pattern.find('/', start);
-                if (end == std::string_view::npos) end = pattern.size();
+                const auto end = segment_end(pattern, start);
 
                 current = descend(t, current, pattern.substr(start, end - start));
                 start   = end + 1;

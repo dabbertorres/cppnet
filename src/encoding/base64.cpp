@@ -57,7 +57,8 @@ std::string encoding::encode(std::span<const std::byte> data) const noexcept
         encode_triplet(&out[out_i], &data[in_i]);
     }
 
-    auto wrote = encode_trailing(&out[out_i], &data[in_i], data.size() - in_i);
+    // NOTE: data.data() + in_i, not &data[in_i], which is out of range when there's nothing left.
+    auto wrote = encode_trailing(&out[out_i], data.data() + in_i, data.size() - in_i);
     if (padchar != 0)
     {
         for (auto i = out_i + wrote; i < out.size(); ++i)
