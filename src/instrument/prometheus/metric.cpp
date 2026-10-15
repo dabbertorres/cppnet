@@ -1,10 +1,13 @@
 #include "instrument/prometheus/metric.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -76,6 +79,41 @@ coro::task<io::result> write_text(io::writer& out, std::string text)
     }
 
     co_return {.count = total, .err = {}};
+}
+
+void validate_name(std::string_view name)
+{
+    auto valid_first = [](char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == ':'; };
+    auto valid_rest  = [&](char c) { return valid_first(c) || std::isdigit(static_cast<unsigned char>(c)); };
+
+    if (name.empty() || !valid_first(name.front()) || !std::ranges::all_of(name.substr(1), valid_rest))
+    {
+        throw std::invalid_argument{"invalid metric name: \"" + std::string{name} + '"'};
+    }
+}
+
+metric_labels normalize_labels(metric_labels labels)
+{
+    auto valid_first = [](char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_'; };
+    auto valid_rest  = [&](char c) { return valid_first(c) || std::isdigit(static_cast<unsigned char>(c)); };
+
+    for (const auto& [key, _] : labels)
+    {
+        if (key.empty() || !valid_first(key.front()) || !std::ranges::all_of(std::string_view{key}.substr(1), valid_rest)
+            || key.starts_with("__"))
+        {
+            throw std::invalid_argument{"invalid label name: \"" + key + '"'};
+        }
+    }
+
+    std::ranges::stable_sort(labels, {}, &metric_label::key);
+
+    if (auto it = std::ranges::adjacent_find(labels, {}, &metric_label::key); it != labels.end())
+    {
+        throw std::invalid_argument{"repeated label name: \"" + it->key + '"'};
+    }
+
+    return labels;
 }
 
 }

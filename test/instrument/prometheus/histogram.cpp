@@ -146,6 +146,9 @@ TEST_CASE("histogram buckets must be increasing", "[instrument][prometheus][hist
     CHECK_THROWS_AS((histogram{"test", "", {}, {std::numeric_limits<double>::infinity(), 1.0}}),
                     std::invalid_argument);
 
+    // "le" is the buckets' label.
+    CHECK_THROWS_AS((histogram{"test", "", {{"le", "1"}}}), std::invalid_argument);
+
     // without any, there's only the +Inf bucket.
     auto h = histogram{"test", "", {}, {}};
     h.observe(1.0);

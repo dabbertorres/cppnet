@@ -38,6 +38,11 @@ histogram::histogram(std::string&& name, std::string&& help, metric_labels&& lab
     : base_metric{std::move(name), std::move(help), std::move(labels)}
     , bounds{std::move(buckets)}
 {
+    if (std::ranges::find(this->labels, "le", &metric_label::key) != this->labels.end())
+    {
+        throw std::invalid_argument{"a histogram can't have an \"le\" label, which its buckets use"};
+    }
+
     // NOTE: NaN isn't increasing, but compares false with everything.
     if (std::ranges::any_of(bounds, [](double bound) { return std::isnan(bound); })
         || std::ranges::adjacent_find(bounds, std::greater_equal{}) != bounds.end())
@@ -103,12 +108,9 @@ void histogram::observe(double v) noexcept
     detail::add(sum, v);
 }
 
-void histogram::encode_self(std::string& out) const
+void histogram::encode_own_samples(std::string& out) const
 {
     // NOTE: no timestamps, which histograms don't usually have.
-
-    encode_help(out);
-    encode_type(out);
 
     std::uint64_t total = 0;
 
@@ -141,12 +143,6 @@ void histogram::encode_self(std::string& out) const
     out += ' ';
     out += std::to_string(total);
     out += '\n';
-}
-
-void histogram::on_derive(histogram& child)
-{
-    child.bounds = bounds;
-    child.counts = zeroed_counts(bounds.size());
 }
 
 }

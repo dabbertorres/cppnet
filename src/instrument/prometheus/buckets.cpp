@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace net::instrument::prometheus
@@ -31,6 +32,11 @@ std::vector<double> default_buckets()
 
 std::vector<double> linear_buckets(double start, double width, std::size_t count)
 {
+    if (count < 2 || !std::isfinite(start) || !(width > 0) || !std::isfinite(width))
+    {
+        throw std::invalid_argument{"linear_buckets needs at least 2 buckets, and a finite start and positive width"};
+    }
+
     std::vector<double> buckets(count);
 
     auto next_upper_bound = start;
@@ -48,6 +54,11 @@ std::vector<double> linear_buckets(double start, double width, std::size_t count
 
 std::vector<double> exponential_buckets(double start, double factor, std::size_t count)
 {
+    if (count < 2 || !(start > 0) || !std::isfinite(start) || !(factor > 1) || !std::isfinite(factor))
+    {
+        throw std::invalid_argument{"exponential_buckets needs at least 2 buckets, a positive start, and a factor over 1"};
+    }
+
     std::vector<double> buckets(count);
 
     auto next_upper_bound = start;
@@ -65,6 +76,13 @@ std::vector<double> exponential_buckets(double start, double factor, std::size_t
 
 std::vector<double> exponential_buckets_from_range(double min, double max, std::size_t count)
 {
+    // NOTE: at least 2 finite bounds (min and max), and +Inf.
+    if (count < 3 || !(min > 0) || !(max > min) || !std::isfinite(max))
+    {
+        throw std::invalid_argument{
+            "exponential_buckets_from_range needs at least 3 buckets, and 0 < min < max (both finite)"};
+    }
+
     auto factor = std::pow(max / min, 1.0 / static_cast<double>(count - 2));
 
     std::vector<double> buckets(count);

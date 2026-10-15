@@ -1,20 +1,16 @@
 #include "instrument/prometheus/registry.hpp"
 
-#include <cstddef>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
 
 #include "coro/task.hpp"
-#include "instrument/prometheus/counter.hpp"
-#include "instrument/prometheus/gauge.hpp"
-#include "instrument/prometheus/histogram.hpp"
 #include "instrument/prometheus/metric.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
@@ -36,7 +32,18 @@ coro::task<io::result> registry::record(io::writer& writer)
     std::string text;
     {
         std::shared_lock lock{r->mutex};
-        for (const auto& m : r->metrics) std::visit([&](const auto& metric) { metric.encode_to(text); }, m);
+
+        for (const auto& name : r->family_order)
+        {
+            const auto& family = r->families.find(name)->second;
+
+            // one HELP and TYPE for the family, and then each of its metrics' samples.
+            std::visit([&](const auto& first) { first.encode_header(text); }, family.begin()->second.get());
+            for (const auto& [_, m] : family)
+            {
+                std::visit([&](const auto& metric) { metric.encode_samples(text); }, m.get());
+            }
+        }
     }
 
     co_return co_await detail::write_text(writer, std::move(text));
@@ -49,24 +56,58 @@ registry* registry::get()
     return instance.get();
 }
 
-registry::metric_ref registry::register_metric(std::string_view name, const metric_labels& labels, metric&& m)
+registry::metric_ref registry::add(metric&& m)
 {
-    auto found = get_metric(name, labels);
-    if (found.has_value()) return found.value();
+    const auto& [name, help, labels] = std::visit(
+        [](const auto& metric) { return std::tie(metric.name, metric.help, metric.labels); }, std::as_const(m));
+
+    auto it = families.find(name);
+    if (it != families.end())
+    {
+        if (auto found = it->second.find(labels); found != it->second.end())
+        {
+            // NOTE: the type must match too, as register_metric returns it as m's type.
+            if (found->second.get().index() != m.index())
+            {
+                throw std::invalid_argument{"metric \"" + name + "\" is already registered with another type"};
+            }
+
+            return found->second;
+        }
+
+        const auto& existing = it->second.begin()->second.get();
+        if (existing.index() != m.index())
+        {
+            throw std::invalid_argument{"metric \"" + name + "\" is already registered with another type"};
+        }
+
+        if (std::visit([](const auto& metric) -> const std::string& { return metric.help; }, existing) != help)
+        {
+            throw std::invalid_argument{"metric \"" + name + "\" is already registered with another help"};
+        }
+    }
+
+    // NOTE: copies of the name and labels, as m is moved.
+    auto key_name   = name;
+    auto key_labels = labels;
 
     auto& ref = metrics.emplace_back(std::move(m));
-    lookup[name].emplace(labels, std::ref(ref));
+
+    if (it == families.end())
+    {
+        it = families.emplace(key_name, family{}).first;
+        family_order.push_back(key_name);
+    }
+
+    it->second.emplace(std::move(key_labels), std::ref(ref));
     return ref;
 }
 
-std::optional<registry::metric_ref> registry::get_metric(std::string_view name, const metric_labels& labels)
+std::optional<registry::metric_ref> registry::find(std::string_view name, const metric_labels& labels)
 {
-    if (auto it = lookup.find(name); it != lookup.end())
+    if (auto it = families.find(name); it != families.end())
     {
-        if (auto sub_it = it->second.find(labels); sub_it != it->second.end())
-        {
-            return std::make_optional(sub_it->second);
-        }
+        if (auto found = it->second.find(labels); found != it->second.end()) return found->second;
     }
 
     return std::nullopt;

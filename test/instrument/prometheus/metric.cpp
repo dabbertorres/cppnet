@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <exception> // IWYU pragma: keep
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,12 +14,13 @@
 #include "coro/sync_wait.hpp"
 #include "instrument/prometheus/counter.hpp"
 #include "instrument/prometheus/gauge.hpp"
-#include "instrument/prometheus/registry.hpp"
+#include "instrument/prometheus/histogram.hpp"
 #include "io/string_writer.hpp"
 
 using net::instrument::prometheus::counter;
 using net::instrument::prometheus::gauge;
-using net::instrument::prometheus::registry;
+using net::instrument::prometheus::histogram;
+using net::instrument::prometheus::metric_labels;
 using net::io::string_writer;
 
 namespace
@@ -78,16 +80,44 @@ TEST_CASE("counter increments from many threads aren't lost", "[instrument][prom
     CHECK(c.get() == threads * increments);
 }
 
-TEST_CASE("registry records its metrics", "[instrument][prometheus][registry][record]")
+TEST_CASE("metric names and labels are validated", "[instrument][prometheus][metric]")
 {
-    auto& c = registry::register_metric(counter{"registry_record_test", "", {{"a", "b"}}});
-    c += 7;
+    CHECK_NOTHROW(counter{"ok_name:total"});
+    CHECK_NOTHROW(counter{"_ok", "", {{"_ok_label1", "x"}}});
 
-    string_writer<char> writer;
-    auto                res = test::sync_wait(registry::record(writer));
-    REQUIRE_FALSE(res.err);
+    CHECK_THROWS_AS(counter{""}, std::invalid_argument);
+    CHECK_THROWS_AS(counter{"1st"}, std::invalid_argument);
+    CHECK_THROWS_AS(counter{"has-dash"}, std::invalid_argument);
+    CHECK_THROWS_AS(counter{"has space"}, std::invalid_argument);
 
-    // NOTE: other tests register metrics too.
-    auto out = writer.build();
-    CHECK(out.find("# TYPE registry_record_test counter\nregistry_record_test{a=\"b\"} 7\n") != std::string::npos);
+    CHECK_THROWS_AS((counter{"name", "", {{"", "x"}}}), std::invalid_argument);
+    CHECK_THROWS_AS((counter{"name", "", {{"a:b", "x"}}}), std::invalid_argument);
+    CHECK_THROWS_AS((counter{"name", "", {{"__reserved", "x"}}}), std::invalid_argument);
+    CHECK_THROWS_AS((counter{"name", "", {{"a", "x"}, {"a", "y"}}}), std::invalid_argument);
+}
+
+TEST_CASE("metric labels are sorted", "[instrument][prometheus][metric]")
+{
+    auto c = counter{"name", "", {{"b", "2"}, {"a", "1"}}};
+    CHECK(c.labels == metric_labels{{"a", "1"}, {"b", "2"}});
+}
+
+TEST_CASE("derive_child adds labels", "[instrument][prometheus][metric]")
+{
+    auto parent = histogram{"latency", "Latency.", {{"a", "1"}}, {0.5, 1.0}};
+    parent.observe(0.1);
+
+    // a label it already has isn't replaced.
+    auto child = derive_child(parent, {{"b", "2"}, {"a", "other"}});
+
+    CHECK(child.name == "latency");
+    CHECK(child.help == "Latency.");
+    CHECK(child.labels == metric_labels{{"a", "1"}, {"b", "2"}});
+    CHECK(child.buckets() == parent.buckets());
+
+    // and it has nothing observed.
+    CHECK(encode(child).find(R"(latency_count{a="1",b="2"} 0)") != std::string::npos);
+
+    auto c = derive_child(counter{"total"}, {{"x", "y"}});
+    CHECK(c.labels == metric_labels{{"x", "y"}});
 }

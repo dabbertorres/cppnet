@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -79,16 +80,28 @@ void append_escaped(std::string& out, std::string_view text, bool label_value);
 // write_text writes all of text, as a write may be partial.
 coro::task<io::result> write_text(io::writer& out, std::string text);
 
+// validate_name throws std::invalid_argument if name isn't a valid metric name: [a-zA-Z_:][a-zA-Z0-9_:]*.
+void validate_name(std::string_view name);
+
+// normalize_labels sorts labels by key (so that the same labels in another order are the same series), and throws
+// std::invalid_argument if a key isn't a valid label name ([a-zA-Z_][a-zA-Z0-9_]*, not starting with "__", which is
+// reserved), or is repeated.
+metric_labels normalize_labels(metric_labels labels);
+
 }
 
 template<typename T>
 struct base_metric
 {
+    // NOTE: throws std::invalid_argument if name or labels are invalid (see detail::validate_name and
+    //       detail::normalize_labels). The labels are sorted by key.
     base_metric(std::string&& name, std::string&& help = "", metric_labels&& labels = {})
         : name{std::move(name)}
         , help{std::move(help)}
-        , labels{std::move(labels)}
-    {}
+        , labels{detail::normalize_labels(std::move(labels))}
+    {
+        detail::validate_name(this->name);
+    }
 
     base_metric(const base_metric& other)
         : name{other.name}
@@ -129,6 +142,8 @@ struct base_metric
 
     ~base_metric() = default;
 
+    // NOTE: changing these (rather than making a new metric) skips their validation, and can make a registered metric
+    //       impossible to find in the registry.
     std::string   name;
     std::string   help;
     metric_labels labels;
@@ -170,22 +185,36 @@ struct base_metric
     //       suspension (e.g. temporaries, held by reference in a lazy task's frame), and it's a snapshot of the metric.
     void encode_to(std::string& out) const
     {
+        encode_header(out);
+        encode_samples(out);
+    }
+
+    // encode_header appends the metric's HELP (if any) and TYPE lines, which a metric family (of the same name, with
+    // different labels) shares.
+    void encode_header(std::string& out) const
+    {
+        encode_help(out);
+        encode_type(out);
+    }
+
+    // encode_samples appends the metric's samples.
+    void encode_samples(std::string& out) const
+    {
         const auto* self = static_cast<const T*>(this);
 
-        // NOTE: checked here, rather than with a concept, as this is a friend of T, whose encode_self is private.
-        if constexpr (requires { self->encode_self(out); })
+        // NOTE: checked here, rather than with a concept, as this is a friend of T, whose encode_own_samples is
+        //       private.
+        if constexpr (requires { self->encode_own_samples(out); })
         {
-            self->encode_self(out);
+            self->encode_own_samples(out);
         }
         else
         {
             static_assert(requires { { self->get() } -> std::convertible_to<double>; },
-                          "a metric needs an encode_self, or a get() of its value");
+                          "a metric needs an encode_own_samples, or a get() of its value");
 
             // NOTE: no timestamp, as Prometheus then uses the time of the scrape. (The text format's are milliseconds
             //       since the Unix epoch, which last_update, from steady_clock, isn't.)
-            encode_help(out);
-            encode_type(out);
             out += name;
             encode_labels(out);
             out += ' ';
@@ -244,28 +273,25 @@ protected:
     std::atomic<std::chrono::seconds> last_update;
 };
 
-// clang-format off
-template<typename T>
-concept derive_hook = metric_impl<T>
-    && requires(T& parent, T& child)
-    {
-        { parent.on_derive(child) };
-    };
-// clang-format on
-
+// derive_child returns a new metric like parent (e.g. with a histogram's buckets), with new_labels added to its labels
+// (but not those it already has), and nothing recorded.
 template<metric_impl T>
 T derive_child(const T& parent, const metric_labels& new_labels)
 {
-    T child{parent.name, parent.help, parent.labels};
-
-    for (const auto& [k, v] : new_labels)
+    auto labels = parent.labels;
+    for (const auto& label : new_labels)
     {
-        child.labels.try_emplace(k, v);
+        if (std::ranges::find(labels, label.key, &metric_label::key) == labels.end()) labels.push_back(label);
     }
 
-    if constexpr (derive_hook<T>) parent.derive_hook(child);
-
-    return child;
+    if constexpr (requires { parent.buckets(); })
+    {
+        return T{std::string{parent.name}, std::string{parent.help}, std::move(labels), std::vector{parent.buckets()}};
+    }
+    else
+    {
+        return T{std::string{parent.name}, std::string{parent.help}, std::move(labels)};
+    }
 }
 
 }
