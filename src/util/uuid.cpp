@@ -12,25 +12,24 @@
 
 #include "encoding/hex.hpp"
 
-namespace net::util
-{
-
 namespace
 {
 
-    // fill_random fills data with random bytes.
-    void fill_random(std::span<std::byte> data)
+// fill_random fills data with random bytes.
+void fill_random(std::span<std::byte> data)
+{
+    std::random_device rd;
+
+    for (std::size_t i = 0; i < data.size(); i += sizeof(std::random_device::result_type))
     {
-        std::random_device rd;
-
-        for (std::size_t i = 0; i < data.size(); i += sizeof(std::random_device::result_type))
-        {
-            const auto v = rd();
-            std::memcpy(data.data() + i, &v, std::min(sizeof(v), data.size() - i));
-        }
+        const auto v = rd();
+        std::memcpy(data.data() + i, &v, std::min(sizeof(v), data.size() - i));
     }
-
 }
+}
+
+namespace net::util
+{
 
 uuid uuid::generate_v4()
 {

@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 
 #include "coro/generator.hpp"
@@ -15,11 +16,6 @@
 #include "ipv4_addr.hpp"
 #include "ipv6_addr.hpp"
 #include "util/defer.hpp"
-
-// Toggle to switch implementation of dns_lookup
-#define USE_GETADDRINFO
-
-#ifdef USE_GETADDRINFO
 
 namespace net
 {
@@ -48,7 +44,9 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
 
         switch (next->ai_family)
         {
-        case AF_INET: addr = ipv4_addr(reinterpret_cast<const sockaddr_in*>(next->ai_addr)->sin_addr.s_addr); break;
+        case AF_INET:
+            addr = ipv4_addr(ntohl(reinterpret_cast<const sockaddr_in*>(next->ai_addr)->sin_addr.s_addr));
+            break;
         case AF_INET6: addr = ipv6_addr(reinterpret_cast<const sockaddr_in6*>(next->ai_addr)->sin6_addr.s6_addr); break;
         default: continue;
         }
@@ -60,19 +58,3 @@ coro::generator<ip_addr> dns_lookup(std::string_view hostname)
 }
 
 }
-
-#else
-
-#    include "dns/resolver.hpp"
-
-namespace net
-{
-
-coro::generator<ip_addr> dns_lookup(std::string_view hostname)
-{
-    // TODO
-}
-
-}
-
-#endif

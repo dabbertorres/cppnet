@@ -17,6 +17,7 @@ public:
 
     constexpr ipv4_addr() noexcept = default;
 
+    // addr is in host byte order, e.g. 0x7f000001 for 127.0.0.1: use ntohl() on an in_addr's s_addr.
     constexpr explicit ipv4_addr(std::uint32_t addr) noexcept
         : data{
             static_cast<std::uint8_t>(addr >> 24),
@@ -56,7 +57,7 @@ public:
         // clang-format off
         return data[0] == 10
             || (data[0] == 172 && (data[1] & 0xf0) == 0x10)
-            || (data[0] == 192 && data[2] == 168);
+            || (data[0] == 192 && data[1] == 168);
         // clang-format on
     }
 

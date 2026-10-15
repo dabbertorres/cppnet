@@ -449,6 +449,50 @@ TEST_CASE("the head of a request is limited in size", "[http][1.1][request_decod
     CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\n\r\n", 64).has_value());
 }
 
+TEST_CASE("status lines", "[http][1.1][response_encode]")
+{
+    struct test_case
+    {
+        std::uint16_t    code;
+        std::string_view want;
+    };
+
+    // codes without a name are still sent, without a reason phrase.
+    auto tc = GENERATE(test_case{.code = 200, .want = "HTTP/1.1 200 OK\r\n"},
+                       test_case{.code = 505, .want = "HTTP/1.1 505 HTTP Version Not Supported\r\n"},
+                       test_case{.code = 299, .want = "HTTP/1.1 299 \r\n"},
+                       test_case{.code = 100, .want = "HTTP/1.1 100 Continue\r\n"},
+                       test_case{.code = 599, .want = "HTTP/1.1 599 Network Connect Timeout Error\r\n"});
+    CAPTURE(tc.code);
+
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version     = {.major = 1, .minor = 1},
+        .status_code = static_cast<net::http::status>(tc.code)
+    };
+
+    auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
+    REQUIRE(res.has_value());
+    CHECK(out.build().starts_with(tc.want));
+}
+
+TEST_CASE("status codes outside 100-599 aren't encoded", "[http][1.1][response_encode][strict]")
+{
+    auto code = GENERATE(std::uint16_t{0}, std::uint16_t{99}, std::uint16_t{600}, std::uint16_t{1000});
+    CAPTURE(code);
+
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version     = {.major = 1, .minor = 1},
+        .status_code = static_cast<net::http::status>(code)
+    };
+
+    auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == std::errc::invalid_argument);
+    CHECK(out.build().empty());
+}
+
 TEST_CASE("unsafe header fields aren't encoded", "[http][1.1][response_encode][strict]")
 {
     auto [name, value] = GENERATE(std::pair{"X-Y"sv, "a\r\nSet-Cookie: injected"sv},

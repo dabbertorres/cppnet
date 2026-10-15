@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <string>
@@ -15,8 +14,6 @@
 
 namespace net
 {
-
-using namespace std::chrono_literals;
 
 enum class network : std::uint8_t
 {
@@ -45,6 +42,8 @@ public:
 
     ~listener() noexcept;
 
+    // listen starts listening, with a queue of up to max_backlog connections waiting to be accepted. It throws
+    // std::logic_error if it's already listening.
     void listen(std::uint16_t max_backlog);
 
     // accept waits for the next connection. Once the listener is shut down, it fails with

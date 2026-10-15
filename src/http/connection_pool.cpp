@@ -11,7 +11,6 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -143,7 +142,6 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
     connections closing;
     bool        start_reaping = false;
 
-    try
     {
         std::scoped_lock lock{mu};
 
@@ -158,11 +156,6 @@ void connection_pool::release(lease&& leased, bool reusable) noexcept
         {
             forget(leased.key, std::move(leased.conn), closing);
         }
-    }
-    catch (const std::bad_alloc&) // NOLINT(bugprone-empty-catch): see below.
-    {
-        // TODO: log? throw?
-        // the connection is closed, along with leased (but its place in the pool isn't freed: there's no memory).
     }
 
     freed();

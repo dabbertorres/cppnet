@@ -407,11 +407,6 @@ std::string url::origin_form() const
     return out;
 }
 
-/* bool url::is_valid() const noexcept */
-/* { */
-/*     // TODO */
-/* } */
-
 bool operator==(const url::user_info& lhs, const url::user_info& rhs) noexcept
 {
     return lhs.username == rhs.username && lhs.password == rhs.password;

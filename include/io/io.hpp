@@ -8,7 +8,7 @@
 namespace net::io
 {
 
-// TODO: Linux vs OSX vs Windows, etc
+// handle is a file descriptor. (Windows, whose IOCP event loop isn't implemented, would need a SOCKET.)
 using handle = int;
 
 struct result
@@ -22,7 +22,6 @@ enum class status_condition : std::uint8_t
     closed    = 1,
     timed_out = 2,
     error     = 3,
-    // TODO?
 };
 
 std::error_condition make_error_condition(status_condition /*code*/);

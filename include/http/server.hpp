@@ -7,7 +7,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 #include <spdlog/logger.h>
@@ -37,10 +36,6 @@ struct server_config
     std::chrono::seconds            header_read_timeout     = 5s;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
-    bool                            http11                  = true;
-    bool                            http2                   = false;
-    bool                            http3                   = false;
-    std::size_t                     num_threads             = std::thread::hardware_concurrency();
 };
 
 class server
