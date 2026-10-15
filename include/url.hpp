@@ -63,19 +63,29 @@ public:
 
     static constexpr auto reserved_characters = "!#$%&'()*+,/:;=?@[]";
 
+    // encode percent-encodes the characters in reserved, and any that aren't printable ASCII.
     static std::string encode(std::string_view str, std::string_view reserved = reserved_characters) noexcept;
     static std::string decode(std::string_view str) noexcept;
 
+    // parse_query decodes a query (without its '?') as application/x-www-form-urlencoded (so '+' is a space).
+    static query_values parse_query(std::string_view query);
+
     using parse_result = util::result<url, url_parse_failure>;
 
+    // parse splits a URL as RFC 3986 does (with "//" before the authority), except that a URL with neither a scheme
+    // nor "//", and not starting with '/', starts with its host (e.g. "example.com/path").
     static parse_result parse(const char*) noexcept;
     static parse_result parse(const std::string&) noexcept;
     static parse_result parse(std::string_view) noexcept;
 
+    // build returns the URL, percent-encoding each part as needed.
     [[nodiscard]] std::string build() const noexcept;
-    /* bool        is_valid() const noexcept; */
 
-    // decoded/unescaped parts of the URL
+    // origin_form returns the path and query, percent-encoded, as sent in an HTTP request line (e.g. "/path?query"). It
+    // always starts with '/'.
+    [[nodiscard]] std::string origin_form() const;
+
+    // decoded/unescaped parts of the URL. An IPv6 host is without its brackets.
     std::string  scheme;
     user_info    userinfo;
     std::string  host;

@@ -241,7 +241,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     if (res.err) co_return std::unexpected(res.err);
 
     // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
-    res = co_await writer->write(origin_form(req.uri));
+    res = co_await writer->write(req.uri.origin_form());
     if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write(" HTTP/"sv);
@@ -271,7 +271,8 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     // HTTP/1.1 requires a Host header.
     if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
     {
-        auto host_line = "Host: " + req.uri.host;
+        // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
+        auto host_line = req.uri.host.find(':') != std::string::npos ? "Host: [" + req.uri.host + "]" : "Host: " + req.uri.host;
         if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port)) host_line += ":" + req.uri.port;
         host_line += "\r\n";
 

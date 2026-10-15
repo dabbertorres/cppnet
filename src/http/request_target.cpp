@@ -198,58 +198,12 @@ bool parse_absolute_form(std::string_view target, request_target& out)
     return parse_path_and_query(authority_end == std::string_view::npos ? ""sv : rest.substr(authority_end), out);
 }
 
-void add_query_value(net::url::query_values& values, std::string_view pair)
-{
-    const auto decode = [](std::string_view str)
-    {
-        std::string plus_as_space{str};
-        std::ranges::replace(plus_as_space, '+', ' ');
-        return net::url::decode(plus_as_space);
-    };
-
-    auto eq   = pair.find('=');
-    auto& val = values[decode(pair.substr(0, eq))];
-    if (eq != std::string_view::npos) val.push_back(decode(pair.substr(eq + 1)));
-}
-
-// percent_encode encodes every character of str that isn't allowed.
-template<typename Allowed>
-void percent_encode(std::string& out, std::string_view str, Allowed allowed)
-{
-    static constexpr auto hex = "0123456789ABCDEF"sv;
-
-    for (char c : str)
-    {
-        if (allowed(c))
-        {
-            out += c;
-        }
-        else
-        {
-            auto byte = static_cast<unsigned char>(c);
-            out += '%';
-            out += hex[byte >> 4];
-            out += hex[byte & 0x0F];
-        }
-    }
-}
-
 }
 
 namespace net::http
 {
 
-url::query_values request_target::query_values() const
-{
-    url::query_values values;
-
-    for (auto pair : util::split_string(std::string_view{query}, '&'))
-    {
-        if (!pair.empty()) add_query_value(values, pair);
-    }
-
-    return values;
-}
+url::query_values request_target::query_values() const { return url::parse_query(query); }
 
 std::expected<request_target, std::error_condition> parse_request_target(request_method   method,
                                                                          std::string_view target) noexcept
@@ -288,43 +242,6 @@ std::expected<request_target, std::error_condition> parse_request_target(request
         // only allocation can fail.
         return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
     }
-}
-
-std::string origin_form(const url& u)
-{
-    std::string out;
-
-    if (!u.path.starts_with('/')) out += '/';
-    percent_encode(out, u.path, is_path_char);
-
-    if (!u.query.empty())
-    {
-        // sorted, so the target doesn't depend on the map's order.
-        std::vector<std::pair<std::string_view, const std::vector<std::string>*>> params;
-        params.reserve(u.query.size());
-        for (const auto& [key, values] : u.query) params.emplace_back(key, &values);
-        std::ranges::sort(params);
-
-        char separator = '?';
-        for (const auto& [key, values] : params)
-        {
-            if (values->empty())
-            {
-                out += std::exchange(separator, '&');
-                percent_encode(out, key, is_unreserved);
-            }
-
-            for (const auto& value : *values)
-            {
-                out += std::exchange(separator, '&');
-                percent_encode(out, key, is_unreserved);
-                out += '=';
-                percent_encode(out, value, is_unreserved);
-            }
-        }
-    }
-
-    return out;
 }
 
 }
