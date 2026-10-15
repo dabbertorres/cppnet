@@ -12,6 +12,7 @@
 #include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "http/route_pattern.hpp"
 #include "util/string_map.hpp"
 
 namespace net::http
@@ -44,39 +45,30 @@ request_handler make_handler(H&& h)
 class router final
 {
 public:
-    router& GET(std::string_view route, handler_func&& h) { return add(request_method::GET, route, std::move(h)); }
+    router& GET(route_pattern route, handler_func&& h) { return add(request_method::GET, route, std::move(h)); }
 
-    router& POST(std::string_view route, handler_func&& h) { return add(request_method::POST, route, std::move(h)); }
+    router& POST(route_pattern route, handler_func&& h) { return add(request_method::POST, route, std::move(h)); }
 
-    router& DELETE(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::DELETE, route, std::move(h));
-    }
+    router& DELETE(route_pattern route, handler_func&& h) { return add(request_method::DELETE, route, std::move(h)); }
 
-    router& PUT(std::string_view route, handler_func&& h) { return add(request_method::PUT, route, std::move(h)); }
+    router& PUT(route_pattern route, handler_func&& h) { return add(request_method::PUT, route, std::move(h)); }
 
-    router& PATCH(std::string_view route, handler_func&& h) { return add(request_method::PATCH, route, std::move(h)); }
+    router& PATCH(route_pattern route, handler_func&& h) { return add(request_method::PATCH, route, std::move(h)); }
 
-    router& HEAD(std::string_view route, handler_func&& h) { return add(request_method::HEAD, route, std::move(h)); }
+    router& HEAD(route_pattern route, handler_func&& h) { return add(request_method::HEAD, route, std::move(h)); }
 
-    router& CONNECT(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::CONNECT, route, std::move(h));
-    }
+    router& CONNECT(route_pattern route, handler_func&& h) { return add(request_method::CONNECT, route, std::move(h)); }
 
-    router& TRACE(std::string_view route, handler_func&& h) { return add(request_method::TRACE, route, std::move(h)); }
+    router& TRACE(route_pattern route, handler_func&& h) { return add(request_method::TRACE, route, std::move(h)); }
 
-    router& OPTIONS(std::string_view route, handler_func&& h)
-    {
-        return add(request_method::OPTIONS, route, std::move(h));
-    }
+    router& OPTIONS(route_pattern route, handler_func&& h) { return add(request_method::OPTIONS, route, std::move(h)); }
 
-    router& add(request_method method, std::string_view route, handler_func&& h);
+    router& add(request_method method, route_pattern route, handler_func&& h);
 
     template<std::invocable<router&> I>
-    router& subrouter(std::string_view route, I&& sub_builder)
+    router& subrouter(route_pattern route, I&& sub_builder)
     {
-        auto& sub = get_subrouter(route);
+        auto& sub = get_subrouter(route.view());
         std::invoke(std::forward<I>(sub_builder), sub);
         return *this;
     }
