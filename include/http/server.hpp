@@ -74,7 +74,6 @@ private:
     void             serve_http2(tcp_socket conn) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
-    bool             enforce_protocol(const server_request& req, response_writer& resp) noexcept;
 
     net::listener                   listener;
     std::atomic_bool                is_serving;
