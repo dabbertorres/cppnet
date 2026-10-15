@@ -38,6 +38,10 @@ public:
 
     // send sends a request, and returns the response once its head has been received. Requests that are safe to
     // repeat (e.g. GET) are sent again (once) if a reused connection turns out to have been closed by the server.
+    //
+    // It fails with std::errc::timed_out if connecting takes longer than connect_timeout, the response's head longer
+    // than response_header_timeout, or sending the request stalls for io_timeout. Reading the body fails the same way
+    // if it stalls for io_timeout.
     coro::task<std::expected<client_response, std::error_condition>> send(const client_request& request);
 
     // close_idle closes the connections that are waiting to be reused.

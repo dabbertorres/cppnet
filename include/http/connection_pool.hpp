@@ -41,6 +41,13 @@ struct client_options
 
     // How long a connection is kept idle, waiting to be reused, before it's closed.
     std::chrono::milliseconds idle_timeout = 90s;
+
+    // How long to wait for a response's head, once its request has been sent. 0 is no limit.
+    std::chrono::milliseconds response_header_timeout = 30s;
+
+    // How long sending a request, or reading a response's body, may go without progress: each read or write of the
+    // connection may wait this long for it. Slow but steady transfers aren't limited. 0 is no limit.
+    std::chrono::milliseconds io_timeout = 30s;
 };
 
 struct connection_stats

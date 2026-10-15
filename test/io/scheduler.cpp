@@ -584,3 +584,59 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
         CHECK(wait_err == std::errc::operation_canceled);
     }
 }
+
+TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][socket][timeout]")
+{
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+    reader.set_read_timeout(100ms);
+
+    // a byte every 40ms, for longer than the timeout altogether.
+    auto trickle = [](scheduler* sched, net::socket* writer) -> task<>
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            co_await sched->sleep_until(net::io::clock::now() + 40ms);
+            co_await writer->write(std::as_bytes(std::span{"x"sv}));
+        }
+    };
+
+    auto read_all = [](net::socket* reader) -> task<std::pair<std::string, std::error_condition>>
+    {
+        std::string got;
+        while (true)
+        {
+            auto res = co_await read_some(reader, &got);
+            if (res.err) co_return std::pair{got, res.err};
+        }
+    };
+
+    REQUIRE(sched.spawn(trickle(&sched, &writer)));
+    auto [got, err] = sched.run_to_completion(read_all(&reader));
+    CHECK(got == "xxxxxxxx");
+    CHECK(err == std::errc::timed_out);
+}
+
+TEST_CASE("socket write timeouts", "[io][socket][timeout]")
+{
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+    writer.set_write_timeout(100ms);
+
+    // nothing reads, so the socket's buffers fill, and the write has to wait.
+    auto write_lots = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
+    {
+        std::vector<std::byte> lots(64 * 1'024 * 1'024);
+        auto                   res = co_await writer->write(lots);
+        co_return std::pair{res.count, res.err};
+    };
+
+    auto start        = net::io::clock::now();
+    auto [count, err] = sched.run_to_completion(write_lots(&writer));
+    auto elapsed      = net::io::clock::now() - start;
+
+    CHECK(err == std::errc::timed_out);
+    CHECK(count > 0);
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < test_timeout);
+}

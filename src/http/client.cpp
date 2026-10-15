@@ -1,6 +1,7 @@
 #include "http/client.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -112,6 +113,13 @@ private:
     std::optional<std::size_t>                          remaining;
 };
 
+// limit is a timeout from client_options, where 0 is no limit.
+std::optional<net::io::clock::duration> limit(std::chrono::milliseconds timeout) noexcept
+{
+    if (timeout <= timeout.zero()) return std::nullopt;
+    return timeout;
+}
+
 bool is_idempotent(net::http::request_method method) noexcept
 {
     using enum net::http::request_method;
@@ -176,6 +184,12 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
 
         const bool reused = leased->reused;
         auto       body   = std::make_unique<pooled_body>(pool, std::move(*leased));
+        auto*      conn   = body->connection();
+
+        // NOTE: set every time, as a reused connection has whatever its last request left.
+        const auto& options = pool->options();
+        conn->set_deadline(std::nullopt);
+        conn->set_timeout(limit(options.io_timeout));
 
         // NOTE: not with a body, which has been read.
         const auto retry = [&](std::error_condition err)
@@ -202,7 +216,12 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
             if (request.body == nullptr || !closed_early(res.error())) co_return std::unexpected(res.error());
         }
 
+        if (auto wait = limit(options.response_header_timeout)) conn->set_read_deadline(io::clock::now() + *wait);
+
         auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
+
+        // the body's reads are only limited by io_timeout.
+        conn->set_read_deadline(std::nullopt);
         if (!resp.has_value())
         {
             if (write_failed) co_return std::unexpected(res.error());

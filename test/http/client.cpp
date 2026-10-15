@@ -662,3 +662,167 @@ TEST_CASE("requests with bodies that can't be sent don't use a connection", "[ht
     CHECK(server.accepted == 0);
 }
 
+
+namespace
+{
+
+// stalling_server stalls part way through each request.
+struct stalling_server
+{
+    enum class stall : std::uint8_t
+    {
+        before_responding, // reads the request's head, but never responds
+        in_the_body,       // sends half of the body
+        before_reading,    // never reads the request
+    };
+
+    stalling_server(net::io::scheduler* sched, stall where)
+        : sched{sched}
+        , listener{sched, "127.0.0.1", "0", net::network::tcp}
+        , where{where}
+    {
+        listener.listen(64);
+        port = local_port(listener);
+    }
+
+    task<> serve()
+    {
+        while (true)
+        {
+            auto conn = co_await listener.accept();
+            if (!conn.has_value()) co_return;
+
+            if (!sched->spawn(handle(std::move(*conn)))) co_return;
+        }
+    }
+
+    task<> handle(net::tcp_socket conn)
+    {
+        std::array<std::byte, 16'384> buf{};
+
+        if (where == stall::before_reading)
+        {
+            // until the test ends (which cancels it).
+            co_await sched->sleep_until(net::io::clock::now() + 1h);
+            co_return;
+        }
+
+        std::string head;
+        while (!head.contains("\r\n\r\n"))
+        {
+            auto res = co_await conn.read(buf);
+            head.append(reinterpret_cast<const char*>(buf.data()), res.count);
+            if (res.err) co_return;
+        }
+
+        if (where == stall::in_the_body)
+        {
+            auto partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello"sv;
+            co_await conn.write(std::as_bytes(std::span{partial}));
+        }
+
+        // then nothing, until the client gives up (and closes the connection).
+        while (!(co_await conn.read(buf)).err)
+        {}
+    }
+
+    net::io::scheduler* sched;
+    net::listener       listener;
+    std::string         port;
+    stall               where;
+};
+
+// endless_reader is a body that never ends.
+class endless_reader : public net::io::reader
+{
+public:
+    net::coro::task<net::io::result> read(std::span<std::byte> data) override
+    {
+        std::ranges::fill(data, std::byte{'x'});
+        co_return {.count = data.size()};
+    }
+
+    using net::io::reader::read;
+
+    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+};
+
+// timed runs test, and returns its result, and how long it took.
+template<typename T>
+std::pair<T, net::io::clock::duration> timed(net::io::scheduler& sched, task<T> test)
+{
+    auto start  = net::io::clock::now();
+    auto result = sched.run_to_completion(std::move(test));
+    return {std::move(result), net::io::clock::now() - start};
+}
+
+const std::string timed_out = "error: " + std::make_error_condition(std::errc::timed_out).message();
+
+}
+
+TEST_CASE("waiting for a response's head times out", "[http][client][timeout]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    stalling_server    server{&sched, stalling_server::stall::before_responding};
+    net::http::client  client{&sched, {.response_header_timeout = 100ms}};
+
+    REQUIRE(sched.spawn(server.serve()));
+    auto [result, elapsed] = timed(sched, fetch(&client, "127.0.0.1", server.port));
+
+    CHECK(result == timed_out);
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < 5s);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a stalled body times out", "[http][client][timeout]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    stalling_server    server{&sched, stalling_server::stall::in_the_body};
+    net::http::client  client{&sched, {.io_timeout = 100ms}};
+
+    REQUIRE(sched.spawn(server.serve()));
+    auto [result, elapsed] = timed(sched, fetch(&client, "127.0.0.1", server.port));
+
+    // what arrived, and then why the rest didn't.
+    CHECK(result == "hello [" + std::make_error_condition(std::errc::timed_out).message() + "]");
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < 5s);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a stalled request body times out", "[http][client][timeout]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    stalling_server    server{&sched, stalling_server::stall::before_reading};
+    net::http::client  client{&sched, {.io_timeout = 100ms}};
+
+    auto req = post_request(server.port);
+    req.body = std::make_unique<endless_reader>();
+
+    REQUIRE(sched.spawn(server.serve()));
+    auto [result, elapsed] = timed(sched, post(&client, std::move(req)));
+
+    // NOTE: it's only a stall once the connection's buffers are full, which can take a while: e.g. Linux grows its
+    //       receive window a little at a time, so writes keep making some progress (~2.6MB over ~5s here, with debug
+    //       builds, where macOS takes ~0.5MB, and ~0.1s).
+    CHECK(result == timed_out);
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < 30s);
+}
+
+TEST_CASE("timeouts don't limit what makes progress", "[http][client][timeout]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    echo_server        server{&sched};
+    net::http::client  client{&sched, {.response_header_timeout = 500ms, .io_timeout = 500ms}};
+
+    // big enough to take more than one wait to send and receive.
+    std::string big(8 * 1'024 * 1'024, 'x');
+
+    auto req = post_request(server.port);
+    req.set_body(big);
+
+    REQUIRE(sched.spawn(server.serve()));
+    CHECK(sched.run_to_completion(post(&client, std::move(req))) == "200 " + big);
+}
