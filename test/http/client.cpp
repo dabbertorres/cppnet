@@ -643,7 +643,9 @@ TEST_CASE("a response before the whole body was sent is still read", "[http][cli
     req.set_body(std::string(4 * 1'024 * 1'024, 'x'));
 
     REQUIRE(sched.spawn(server.serve()));
-    CHECK(sched.run_to_completion(post(&client, std::move(req))) == "413 ");
+    // NOTE: not moved inside CHECK, which expands its expression twice (once unevaluated).
+    auto result = sched.run_to_completion(post(&client, std::move(req)));
+    CHECK(result == "413 ");
     CHECK(client.stats() == net::http::connection_stats{});
 }
 
@@ -657,8 +659,8 @@ TEST_CASE("requests with bodies that can't be sent don't use a connection", "[ht
     req.headers.set_content_length(5);
 
     REQUIRE(sched.spawn(server.serve()));
-    CHECK(sched.run_to_completion(post(&client, std::move(req)))
-          == "error: " + std::make_error_condition(std::errc::invalid_argument).message());
+    auto result = sched.run_to_completion(post(&client, std::move(req)));
+    CHECK(result == "error: " + std::make_error_condition(std::errc::invalid_argument).message());
     CHECK(server.accepted == 0);
 }
 
@@ -824,5 +826,6 @@ TEST_CASE("timeouts don't limit what makes progress", "[http][client][timeout]")
     req.set_body(big);
 
     REQUIRE(sched.spawn(server.serve()));
-    CHECK(sched.run_to_completion(post(&client, std::move(req))) == "200 " + big);
+    auto result = sched.run_to_completion(post(&client, std::move(req)));
+    CHECK(result == "200 " + big);
 }
