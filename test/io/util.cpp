@@ -1,6 +1,10 @@
 #include "io/util.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <span>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include <catch.hpp>
@@ -8,10 +12,45 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "coro/sync_wait.hpp"
+#include "coro/task.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/string_reader.hpp"
 
 using namespace std::string_view_literals;
+
+namespace
+{
+
+// timing_out_reader reads its content, and then times out (as a socket with a deadline would).
+class timing_out_reader : public net::io::reader
+{
+public:
+    explicit timing_out_reader(std::string_view content)
+        : content{content}
+    {}
+
+    net::coro::task<net::io::result> read(std::span<std::byte> data) override
+    {
+        if (content.empty())
+            co_return {.count = 0, .err = std::make_error_condition(std::errc::timed_out)};
+
+        auto count = std::min(data.size(), content.size());
+        std::ranges::copy(std::as_bytes(std::span{content.substr(0, count)}), data.begin());
+        content.remove_prefix(count);
+        co_return {.count = count};
+    }
+
+    using net::io::reader::read;
+
+    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+
+private:
+    std::string_view content;
+};
+
+}
 
 TEST_CASE("empty", "[io][readline]")
 {
@@ -91,4 +130,15 @@ TEST_CASE("multiple lines", "[io][readline]")
 
     auto line3 = res3.to_value();
     CHECK(line3.empty());
+}
+
+TEST_CASE("errors other than the end of the stream are reported", "[io][readline]")
+{
+    // e.g. a slow client, which only sent part of a line before its deadline.
+    timing_out_reader        reader("GET / HT"sv);
+    net::io::buffered_reader buffer(&reader);
+
+    auto res = test::sync_wait(net::io::readline(&buffer));
+    REQUIRE(res.has_error());
+    CHECK(res.to_error() == std::errc::timed_out);
 }
