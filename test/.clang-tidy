@@ -1,7 +1,8 @@
 # vim: ft=yaml
 
-# disable some checks triggered by Catch2 macros
+# disable some checks triggered by Catch2 macros (e.g. it doesn't know REQUIRE(opt.has_value()) ends a failed test)
 Checks: >-
+  -bugprone-unchecked-optional-access,
   -cert-err58-cpp,
   -cppcoreguidelines-avoid-non-const-global-variables,
   -readability-function-cognitive-complexity,

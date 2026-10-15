@@ -10,8 +10,10 @@ Checks: >-
   concurrency-*,
   cppcoreguidelines-*,
   -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-avoid-reference-coroutine-parameters,
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
   -cppcoreguidelines-pro-bounds-constant-array-index,
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
   -cppcoreguidelines-pro-type-reinterpret-cast,
@@ -29,15 +31,25 @@ Checks: >-
   -modernize-use-trailing-return-type,
   performance-*,
   portability-*,
+  -portability-avoid-pragma-once,
   readability-*,
   -readability-braces-around-statements,
   -readability-convert-member-functions-to-static,
   -readability-identifier-length,
   -readability-magic-numbers,
+  -readability-trailing-comma,
   -readability-uppercase-literal-suffix,
 WarningsAsErrors: false
 # AnalyzeTemporaryDtors: true
+# Why some checks are disabled:
+# - cppcoreguidelines-avoid-reference-coroutine-parameters: tasks are lazy, and awaited where they're made, so
+#   reference parameters (e.g. reader/writer, request handlers) outlive them.
+# - cppcoreguidelines-pro-bounds-*: they flag every operator[] and pointer arithmetic.
+# - portability-avoid-pragma-once: the headers use #pragma once.
+# - readability-trailing-comma: it disagrees with clang-format, which wraps long lists without adding one.
 CheckOptions:
+- key:   bugprone-signed-bitwise.IgnorePositiveIntegerLiterals
+  value: 'true'
 - key:   cert-dcl16-c.NewSuffixes
   value: 'L;LL;LU;LLU'
 - key:   cert-oop54-cpp.WarnOnlyIfThisHasSuspiciousField
@@ -48,6 +60,9 @@ CheckOptions:
   value: '1'
 - key:   google-readability-function-size.StatementThreshold
   value: '800'
+# locals aren't made const, but references and pointers that could be to const should be.
+- key:   misc-const-correctness.AnalyzeValues
+  value: 'false'
 - key:   misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
   value: '1'
 - key:   misc-non-private-member-variables-in-classes.IgnorePublicMemberVariables
@@ -57,7 +72,7 @@ CheckOptions:
 - key:   modernize-loop-convert.MinConfidence
   value: reasonable
 - key:   modernize-loop-convert.NamingStyle
-  value: CamelCase
+  value: lower_case
 - key:   modernize-pass-by-value.IncludeStyle
   value: llvm
 - key:   modernize-replace-auto-ptr.IncludeStyle
