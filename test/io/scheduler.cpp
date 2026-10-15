@@ -446,7 +446,7 @@ TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
     scheduler sched{make_pool()};
 
     auto throws = [](scheduler* sched) -> task<int>
-    { co_return co_await sched->run_blocking([]() -> int { throw std::runtime_error{"boom"}; }); };
+    { co_return co_await sched->run_blocking([] -> int { throw std::runtime_error{"boom"}; }); };
 
     CHECK_THROWS_AS(sched.run_to_completion(throws(&sched)), std::runtime_error);
 }

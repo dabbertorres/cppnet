@@ -78,7 +78,7 @@ public:
     // operator() calls the handler for the request's method and path, after setting its route to the pattern that
     // matched, or responds 404 Not Found (if no route matched) or 405 Method Not Allowed (if one did, but not for
     // its method).
-    coro::task<void> operator()(server_request&, response_writer&) const;
+    coro::task<void> operator()(server_request& /*req*/, response_writer& /*resp*/) const;
 
 private:
     router& get_subrouter(std::string_view route);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,9 +27,9 @@ public:
     using string      = std::string;
     using string_view = std::string_view;
 
-    explicit expr(const char*);
-    explicit expr(const string&);
-    explicit expr(string_view);
+    explicit expr(const char* /*str*/);
+    explicit expr(const string& /*str*/);
+    explicit expr(string_view /*str*/);
 
     expr(const expr&)            = default;
     expr& operator=(const expr&) = default;
@@ -38,14 +39,14 @@ public:
 
     ~expr() = default;
 
-    static expr parse(string_view);
+    static expr parse(string_view /*str*/);
 
     [[nodiscard]] bool match(string_view input) const noexcept;
 
 private:
     expr() = default;
 
-    enum class repetition
+    enum class repetition : std::uint8_t
     {
         once,
         zero_or_one,
@@ -89,7 +90,7 @@ private:
         [[nodiscard]] bool match(string_view str, std::size_t& offset) const noexcept;
     };
 
-    static void parse(string_view, std::vector<state>&);
+    static void parse(string_view /*str*/, std::vector<state>& /*states*/);
 
     static constexpr bool should_repeat(repetition rep, std::size_t current_matches) noexcept;
     static constexpr bool repetition_satisfied(repetition rep, std::size_t current_matches) noexcept;

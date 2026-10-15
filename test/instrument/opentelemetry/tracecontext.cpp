@@ -19,7 +19,6 @@
 using namespace std::string_view_literals;
 
 using net::http::headers;
-using net::instrument::opentelemetry::span;
 using net::instrument::opentelemetry::span_flags;
 using net::instrument::opentelemetry::span_id_t;
 using net::instrument::opentelemetry::span_kind;

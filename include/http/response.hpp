@@ -19,7 +19,7 @@
 namespace net::http
 {
 
-enum class status : std::uint32_t
+enum class status : std::uint16_t
 {
     NONE = 0,
 
@@ -178,12 +178,6 @@ constexpr std::string_view status_text(status s) noexcept
     }
 }
 
-// NOLINTNEXTLINE(bugprone-exception-escape): status_text's strings are all longer than the code it skips.
-constexpr std::string_view status_string(status s) noexcept
-{
-    return status_text(s).substr(4); // chop off the status code
-}
-
 constexpr bool status_is_information(status s) noexcept { return status::CONTINUE <= s && s < status::OK; }
 constexpr bool status_is_success(status s) noexcept { return status::OK <= s && s < status::MULTIPLE_CHOICES; }
 constexpr bool status_is_redirection(status s) noexcept
@@ -201,7 +195,7 @@ struct client_response
 {
     protocol_version            version{};
     status                      status_code = status::NONE;
-    net::http::headers          headers;
+    net::http::headers          headers{};
     std::unique_ptr<io::reader> body = nullptr;
 
     client_response() noexcept = default;
@@ -237,7 +231,7 @@ struct server_response
 {
     protocol_version   version{};
     status             status_code = status::NONE;
-    net::http::headers headers;
+    net::http::headers headers{};
     io::writer*        body = nullptr;
 };
 

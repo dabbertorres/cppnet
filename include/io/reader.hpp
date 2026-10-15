@@ -26,9 +26,9 @@ public:
     // status_condition::closed, possibly along with the final bytes. A read into an empty span returns 0 bytes and no
     // error.
     virtual coro::task<result> read(std::span<std::byte> data) = 0;
-    inline coro::task<result>  read(std::span<char> data) { return read(std::as_writable_bytes(data)); }
-    inline coro::task<result>  read(std::byte& data) { return read({&data, 1}); }
-    inline coro::task<result>  read(char& data) { return read({&data, 1}); }
+    coro::task<result>         read(std::span<char> data) { return read(std::as_writable_bytes(data)); }
+    coro::task<result>         read(std::byte& data) { return read({&data, 1}); }
+    coro::task<result>         read(char& data) { return read({&data, 1}); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 

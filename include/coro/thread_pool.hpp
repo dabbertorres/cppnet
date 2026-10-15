@@ -118,7 +118,7 @@ public:
 
 private:
     void worker();
-    void schedule(std::coroutine_handle<>);
+    void schedule(std::coroutine_handle<> /*handle*/);
 
     std::vector<std::thread>            threads;
     std::mutex                          wait_mutex;

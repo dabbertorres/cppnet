@@ -12,7 +12,7 @@
 namespace net
 {
 
-enum class protocol
+enum class protocol : std::uint8_t
 {
     not_care,
     ipv4,

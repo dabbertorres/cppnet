@@ -34,7 +34,7 @@ consteval alphabet url_alphabet() noexcept
 constexpr std::size_t encoded_size(std::size_t input_size, bool padding = true) noexcept
 {
     if (padding) return (input_size + 2) / 3 * 4;
-    return (input_size * 8 + 5) / 6;
+    return ((input_size * 8) + 5) / 6;
 }
 
 constexpr std::size_t decoded_size(std::size_t input_size, bool padding = true) noexcept

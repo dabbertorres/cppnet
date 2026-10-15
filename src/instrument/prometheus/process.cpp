@@ -17,7 +17,6 @@
 namespace
 {
 
-namespace system = net::instrument::system;
 
 using net::instrument::prometheus::counter;
 using net::instrument::prometheus::gauge;

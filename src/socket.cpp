@@ -266,7 +266,7 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcep
     ::close(std::exchange(fd, invalid_fd));
 }
 
-void socket::shutdown_write() noexcept
+void socket::shutdown_write() const noexcept
 {
     if (fd != invalid_fd) ::shutdown(fd, SHUT_WR);
 }

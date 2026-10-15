@@ -1,5 +1,6 @@
 #include "io/buffer.hpp"
 
+#include <array>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,7 +21,7 @@ namespace
 // clobber_stack overwrites the stack space a just-returned call was using.
 [[gnu::noinline]] void clobber_stack()
 {
-    volatile char junk[256];
+    std::array<volatile char, 256> junk{};
     for (auto& c : junk) c = 'Z';
 }
 

@@ -19,9 +19,13 @@
 namespace
 {
 
+// NOLINTNEXTLINE(*-avoid-c-arrays): std::atomic can't be moved, so a std::vector can't hold them.
 using counts_t = std::unique_ptr<std::atomic<std::uint64_t>[]>;
 
-counts_t zeroed_counts(std::size_t size) { return std::make_unique<std::atomic<std::uint64_t>[]>(size); }
+counts_t zeroed_counts(std::size_t size)
+{
+    return std::make_unique<std::atomic<std::uint64_t>[]>(size); // NOLINT(*-avoid-c-arrays): see counts_t.
+}
 
 counts_t copy_counts(const counts_t& from, std::size_t size)
 {

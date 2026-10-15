@@ -297,6 +297,7 @@ TEST_CASE("connections are reused", "[http][client][pool]")
     auto test = [](net::http::client* client, std::string port) -> task<std::vector<std::string>>
     {
         std::vector<std::string> bodies;
+        bodies.reserve(3);
         for (int i = 0; i < 3; ++i) bodies.push_back(co_await fetch(client, "127.0.0.1", port));
         co_return bodies;
     };
@@ -692,7 +693,7 @@ struct stalling_server
         port = local_port(listener);
     }
 
-    task<> serve()
+    task<> serve() const
     {
         while (true)
         {
@@ -703,7 +704,7 @@ struct stalling_server
         }
     }
 
-    task<> handle(net::tcp_socket conn)
+    task<> handle(net::tcp_socket conn) const
     {
         std::array<std::byte, 16'384> buf{};
 

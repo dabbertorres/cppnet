@@ -24,7 +24,7 @@
 namespace
 {
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 // json_double is a double as proto3's JSON mapping writes it: a number, or (as JSON numbers can't be) "NaN",
 // "Infinity" or "-Infinity".

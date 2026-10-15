@@ -75,7 +75,7 @@ TEST_CASE("range-based for loop", "[util][split_string]")
     {
         switch (i)
         {
-        case 0: REQUIRE(part == ""sv); break;
+        case 0: REQUIRE(part.empty()); break;
         case 1: REQUIRE(part == "foo"sv); break;
         case 2: REQUIRE(part == "bar"sv); break;
         case 3: REQUIRE(part == "baz"sv); break;
@@ -116,7 +116,7 @@ TEST_CASE("different", "[util][equal_ignore_case]")
 TEST_CASE("empty", "[util][trim_string]")
 {
     auto actual = net::util::trim_string(""sv);
-    REQUIRE(actual == ""sv);
+    REQUIRE(actual.empty());
 }
 
 TEST_CASE("already trimmed", "[util][trim_string]")

@@ -6,7 +6,7 @@
 #include "dns.hpp"
 #include "ip_addr.hpp"
 
-int main(int argc, char** argv)
+int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signature.
 {
     if (argc != 2)
     {
@@ -16,7 +16,7 @@ int main(int argc, char** argv)
 
     for (auto addr : net::dns_lookup(argv[1]))
     {
-        std::cout << (addr.is_ipv4() ? "IPv4: " : "IPv6: ") << addr.to_string() << std::endl;
+        std::cout << (addr.is_ipv4() ? "IPv4: " : "IPv6: ") << addr.to_string() << '\n';
     }
 
     return 0;

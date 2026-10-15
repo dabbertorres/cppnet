@@ -5,6 +5,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -21,7 +22,7 @@ namespace net::instrument::prometheus
 
 using namespace std::string_view_literals;
 
-enum class metric_type
+enum class metric_type : std::uint8_t
 {
     counter,
     gauge,
@@ -94,6 +95,7 @@ struct base_metric
 {
     // NOTE: throws std::invalid_argument if name or labels are invalid (see detail::validate_name and
     //       detail::normalize_labels). The labels are sorted by key.
+    // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility): derived metrics inherit it (with its access).
     explicit base_metric(std::string&& name, std::string&& help = "", metric_labels&& labels = {})
         : name{std::move(name)}
         , help{std::move(help)}
@@ -102,6 +104,7 @@ struct base_metric
         detail::validate_name(this->name);
     }
 
+    // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility): derived metrics inherit it (with its access).
     base_metric(const base_metric& other)
         : name{other.name}
         , help{other.help}
@@ -121,6 +124,7 @@ struct base_metric
         return *this;
     }
 
+    // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility): derived metrics inherit it (with its access).
     base_metric(base_metric&& other) noexcept
         : name{std::exchange(other.name, "")}
         , help{std::exchange(other.help, "")}

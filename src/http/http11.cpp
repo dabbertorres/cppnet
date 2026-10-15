@@ -520,7 +520,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
     {
         // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
-        auto host_line = req.uri.host.find(':') != std::string::npos ? "Host: [" + req.uri.host + "]" : "Host: " + req.uri.host;
+        auto host_line = req.uri.host.contains(':') ? "Host: [" + req.uri.host + "]" : "Host: " + req.uri.host;
         if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port)) host_line += ":" + req.uri.port;
         host_line += "\r\n";
 

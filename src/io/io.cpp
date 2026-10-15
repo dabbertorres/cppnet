@@ -51,13 +51,7 @@ struct status_condition_category : std::error_category
             default: return false;
             }
 
-        case net::io::status_condition::timed_out:
-            switch (code_value)
-            {
-            case std::errc::timed_out: return true;
-
-            default: return false;
-            }
+        case net::io::status_condition::timed_out: return code_value == std::errc::timed_out;
 
         case net::io::status_condition::error: return code_value != std::errc{};
 

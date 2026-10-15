@@ -92,7 +92,7 @@ TEST_CASE("histogram encodes with labels", "[instrument][prometheus][histogram][
     auto h = histogram{
         "test",
         "this is a help message",
-        {{"foo", "bar"}, {"quoted", "\"a\\b\"\n"}},
+        {{.key = "foo", .val = "bar"}, {.key = "quoted", .val = "\"a\\b\"\n"}},
         {1.0}
     };
     h.observe(2.0);
@@ -196,6 +196,7 @@ TEST_CASE("histogram observations from many threads aren't lost", "[instrument][
 
     {
         std::vector<std::jthread> workers;
+        workers.reserve(threads);
         for (std::size_t t = 0; t < threads; ++t)
         {
             workers.emplace_back(
@@ -230,7 +231,7 @@ TEST_CASE("histogram tracks fractions of a second", "[instrument][prometheus][hi
 
     // it took at least 5ms (rather than 0s, as whole seconds).
     auto out = encode(h);
-    CHECK(out.find("test_bucket{le=\"0.001\"} 0\n") != std::string::npos);
-    CHECK(out.find("test_bucket{le=\"60\"} 1\n") != std::string::npos);
-    CHECK(out.find("test_count 1\n") != std::string::npos);
+    CHECK(out.contains("test_bucket{le=\"0.001\"} 0\n"));
+    CHECK(out.contains("test_bucket{le=\"60\"} 1\n"));
+    CHECK(out.contains("test_count 1\n"));
 }

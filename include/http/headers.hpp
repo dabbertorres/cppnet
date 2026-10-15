@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -15,8 +16,8 @@ namespace net::http
 
 struct content_type
 {
-    std::string                                  type;
-    std::unordered_map<std::string, std::string> parameters;
+    std::string                                  type{};
+    std::unordered_map<std::string, std::string> parameters{};
     [[nodiscard]] std::optional<std::string>     charset() const noexcept
     {
         auto it = parameters.find("charset");

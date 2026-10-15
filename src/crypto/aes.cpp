@@ -8,12 +8,22 @@
 namespace
 {
 
-consteval std::size_t num_rounds(std::size_t key_length_bits) noexcept { return key_length_bits / 32 + 6; }
-consteval std::size_t buffer_size(std::size_t key_length_bits) noexcept { return key_length_bits / 8 + 28; }
+// NOTE: unused until AES is implemented.
+[[maybe_unused]] consteval std::size_t num_rounds(std::size_t key_length_bits) noexcept
+{
+    return (key_length_bits / 32) + 6;
+}
+[[maybe_unused]] consteval std::size_t buffer_size(std::size_t key_length_bits) noexcept
+{
+    return (key_length_bits / 8) + 28;
+}
 
-consteval std::uint32_t substitution_box_forward(std::uint32_t value) noexcept { return value ^ 0; } // TODO
+[[maybe_unused]] consteval std::uint32_t substitution_box_forward(std::uint32_t value) noexcept
+{
+    return value ^ 0;
+} // TODO
 
-std::array<std::byte, 16> key_schedule() noexcept { return {}; } // TODO
+[[maybe_unused]] std::array<std::byte, 16> key_schedule() noexcept { return {}; } // TODO
 
 template<std::size_t key_bits>
 struct state

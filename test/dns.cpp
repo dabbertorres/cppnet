@@ -11,7 +11,7 @@ TEST_CASE("dns_lookup", "[dns]")
 
     int count = 0;
 
-    for (auto _ : results) ++count;
+    for ([[maybe_unused]] const auto& _ : results) ++count;
 
     CHECK(count >= 1);
 }
@@ -22,7 +22,7 @@ TEST_CASE("dns_lookup takes the host from a view of a longer string", "[dns]")
     constexpr std::string_view authority = "localhost:8080";
 
     int count = 0;
-    for (auto _ : net::dns_lookup(authority.substr(0, authority.find(':')))) ++count;
+    for ([[maybe_unused]] const auto& _ : net::dns_lookup(authority.substr(0, authority.find(':')))) ++count;
 
     CHECK(count >= 1);
 }

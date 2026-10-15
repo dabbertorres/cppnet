@@ -6,14 +6,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <print>
 #include <string>
 #include <string_view>
 
-static void fail(const char* what, std::string_view input, std::string_view got)
+namespace
 {
-    std::fprintf(stderr, "PROPERTY FAILED: %s\n  input: [%.*s]\n  got:   [%.*s]\n", what, int(input.size()), input.data(),
-                 int(got.size()), got.data());
+
+[[noreturn]] void fail(const char* what, std::string_view input, std::string_view got)
+{
+    std::println(stderr, "PROPERTY FAILED: {}\n  input: [{}]\n  got:   [{}]", what, input, got);
     std::abort();
+}
+
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size)

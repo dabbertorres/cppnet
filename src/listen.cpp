@@ -29,18 +29,14 @@ namespace net
 
 constexpr int invalid_fd = -1;
 
-listener::listener(io::scheduler*            scheduler,
-                   const std::string&        host,
-                   const std::string&        port,
-                   network                   net,
-                   protocol                  proto,
-                   std::chrono::microseconds timeout)
+listener::listener(
+    io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
     : scheduler{scheduler}
     , main_fd{invalid_fd}
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
-    addrinfo hints = {0};
+    addrinfo hints = {.ai_flags = 0};
 #pragma clang diagnostic pop
 
     switch (proto)
@@ -66,7 +62,7 @@ listener::listener(io::scheduler*            scheduler,
 
     // find first valid addr, and use it
 
-    for (addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
+    for (const addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
         main_fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
         if (main_fd < 0) continue;

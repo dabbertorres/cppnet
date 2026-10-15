@@ -32,11 +32,11 @@ struct request_target
     std::string path = "/";
 
     // The query, without the '?', and still percent-encoded.
-    std::string query;
+    std::string query{};
 
     // From the absolute and authority forms only.
-    std::string host;
-    std::string port;
+    std::string host{};
+    std::string port{};
 
     bool operator==(const request_target&) const = default;
 

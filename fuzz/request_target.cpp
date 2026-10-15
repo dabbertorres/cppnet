@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
+#include <print>
 #include <string>
 #include <string_view>
 
@@ -16,11 +17,15 @@
 using net::http::parse_request_target;
 using net::http::request_method;
 
-static void fail(const char* what, std::string_view a, std::string_view b)
+namespace
 {
-    std::fprintf(stderr, "PROPERTY FAILED: %s\n  input: [%.*s]\n  got:   [%.*s]\n", what, int(a.size()), a.data(),
-                 int(b.size()), b.data());
+
+[[noreturn]] void fail(const char* what, std::string_view a, std::string_view b)
+{
+    std::println(stderr, "PROPERTY FAILED: {}\n  input: [{}]\n  got:   [{}]", what, a, b);
     std::abort();
+}
+
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size)
@@ -40,7 +45,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             if (!again || again->path != target->path) fail("path normalization is not idempotent", input, target->path);
 
             std::string_view p = target->path;
-            if (p.find("/./") != p.npos || p.find("/../") != p.npos || p.ends_with("/.") || p.ends_with("/.."))
+            if (p.contains("/./") || p.contains("/../") || p.ends_with("/.") || p.ends_with("/.."))
                 fail("dot segment left in path", input, target->path);
         }
     }

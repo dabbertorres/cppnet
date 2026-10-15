@@ -81,7 +81,7 @@ struct client_request
     request_method     method = request_method::NONE;
     protocol_version   version{};
     url                uri{};
-    net::http::headers headers;
+    net::http::headers headers{};
 
     // The body, which is read until it ends (or until Content-Length bytes have been read, if that's set, which it
     // must then match). Without a Content-Length, it's sent chunked, which needs HTTP/1.1. Sending the request reads
@@ -102,16 +102,16 @@ struct server_request
     request_method     method = request_method::NONE;
     protocol_version   version{};
     request_target     target{};
-    net::http::headers headers;
+    net::http::headers headers{};
 
     // The host the request is for: from the target, if it has one, otherwise the Host header.
-    std::string host;
+    std::string host{};
 
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
-    std::string route;
+    std::string route{};
 
     // Values for handling the request, which middleware passes to handlers: e.g. instrument::trace.
-    util::type_map extensions;
+    util::type_map extensions{};
 
     std::unique_ptr<io::reader> body = nullptr;
 };

@@ -16,6 +16,8 @@
 #include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/router.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
 #include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
@@ -27,12 +29,12 @@ using namespace std::chrono_literals;
 
 struct server_config
 {
-    std::string                     host;
-    std::string                     port                    = "8080";
-    std::size_t                     max_header_bytes        = 8'192;
+    std::string host{};
+    std::string port             = "8080";
+    std::size_t max_header_bytes = 8'192;
     // How long to wait for a request's headers, from when the server starts waiting for them, so it includes waiting
     // for the next request on a kept-alive connection. The connection is closed once it passes. 0 disables it.
-    std::chrono::seconds header_read_timeout = 5s;
+    std::chrono::seconds            header_read_timeout     = 5s;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
     bool                            http11                  = true;
@@ -67,7 +69,15 @@ public:
     [[nodiscard]] std::uint16_t local_port() const { return listener.local_port(); }
 
 private:
-    coro::task<>     serve_connection(tcp_socket conn) noexcept;
+    enum class serve_state : std::uint8_t
+    {
+        keep_alive,
+        close,
+    };
+
+    coro::task<> serve_connection(tcp_socket conn) noexcept;
+    coro::task<serve_state>
+                     serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffered_writer& writer) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
 

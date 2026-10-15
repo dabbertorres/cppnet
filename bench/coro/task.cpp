@@ -13,10 +13,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <optional>
+#include <print>
 #include <ratio>
 #include <utility>
 #include <vector>
@@ -117,43 +118,45 @@ private:
 // The same coroutines, for each kind of task.
 
 template<template<typename> typename Task>
-Task<long> leaf(long i)
+Task<std::int64_t> leaf(std::int64_t i)
 {
     // NOTE: depends on i, so it isn't computed in advance.
     co_return i & 1;
 }
 
 template<template<typename> typename Task>
-Task<long> middle(long i)
+Task<std::int64_t> middle(std::int64_t i)
 {
     co_return co_await leaf<Task>(i) + 1;
 }
 
 template<template<typename> typename Task>
-Task<long> loop(long n, bool nested)
+Task<std::int64_t> loop(std::int64_t n, bool nested)
 {
-    long total = 0;
-    for (long i = 0; i < n; ++i) total += nested ? co_await middle<Task>(i) : co_await leaf<Task>(i);
+    std::int64_t total = 0;
+    for (std::int64_t i = 0; i < n; ++i) total += nested ? co_await middle<Task>(i) : co_await leaf<Task>(i);
     co_return total;
 }
 
 template<typename T>
 using handshake_task = net::coro::task<T>;
 
-long run(handshake_task<long> task)
+// NOTE: unused in unoptimized builds, which don't measure.
+[[maybe_unused]] std::int64_t run(handshake_task<std::int64_t> task)
 {
     auto handle = task.get_handle();
     handle.resume();
     return std::move(task).get_promise().result();
 }
 
-long run(symmetric_task<long> task) { return task.run(); }
+[[maybe_unused]] std::int64_t run(symmetric_task<std::int64_t> task) { return task.run(); }
 
-constexpr long iterations = 20'000'000;
-constexpr int  repeats    = 7;
+constexpr std::int64_t iterations = 20'000'000;
+constexpr int          repeats    = 7;
 
+// measure prints how long Task's co_awaits take, returning whether they got the right result.
 template<template<typename> typename Task>
-void measure(const char* name)
+bool measure(const char* name)
 {
     for (bool nested : {false, true})
     {
@@ -166,11 +169,11 @@ void measure(const char* name)
             auto took  = std::chrono::steady_clock::now() - start;
 
             // the result is checked, so the work can't be skipped.
-            const long expect = nested ? iterations + iterations / 2 : iterations / 2;
+            const std::int64_t expect = nested ? iterations + (iterations / 2) : iterations / 2;
             if (total != expect)
             {
-                std::fprintf(stderr, "%s: wrong result %ld, expected %ld\n", name, total, expect);
-                std::exit(1);
+                std::println(stderr, "{}: wrong result {:d}, expected {}", name, total, expect);
+                return false;
             }
 
             const double awaits = nested ? 2.0 * iterations : iterations;
@@ -178,12 +181,14 @@ void measure(const char* name)
         }
 
         std::ranges::sort(runs);
-        std::printf("%-10s %-7s best %6.2f ns   median %6.2f ns   per co_await\n",
-                    name,
-                    nested ? "nested" : "flat",
-                    runs.front(),
-                    runs[runs.size() / 2]);
+        std::println("{:10} {:7} best {:6.2f} ns   median {:6.2f} ns   per co_await",
+                     name,
+                     nested ? "nested" : "flat",
+                     runs.front(),
+                     runs[runs.size() / 2]);
     }
+
+    return true;
 }
 
 }
@@ -192,11 +197,9 @@ int main()
 {
 #ifndef __OPTIMIZE__
     // besides not meaning much, symmetric transfer can overflow the stack here (with GCC).
-    std::fprintf(stderr, "bench_task needs an optimized build (e.g. --config Release)\n");
+    std::println(stderr, "bench_task needs an optimized build (e.g. --config Release)");
     return 1;
 #else
-    measure<symmetric_task>("symmetric");
-    measure<handshake_task>("handshake");
-    return 0;
+    return measure<symmetric_task>("symmetric") && measure<handshake_task>("handshake") ? 0 : 1;
 #endif
 }

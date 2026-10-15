@@ -73,7 +73,7 @@ coro::task<io::result> registry::record(io::writer& writer)
 
 registry* registry::get()
 {
-    std::call_once(initialized, []() { instance = std::unique_ptr<registry>(new registry()); });
+    std::call_once(initialized, [] { instance = std::unique_ptr<registry>(new registry()); });
 
     return instance.get();
 }

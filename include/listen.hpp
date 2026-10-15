@@ -18,7 +18,7 @@ namespace net
 
 using namespace std::chrono_literals;
 
-enum class network
+enum class network : std::uint8_t
 {
     tcp,
     udp,
@@ -27,26 +27,21 @@ enum class network
 class listener
 {
 public:
-    listener(io::scheduler*            scheduler,
-             const std::string&        port,
-             network                   net,
-             protocol                  proto   = protocol::not_care,
-             std::chrono::microseconds timeout = 5s)
-        : listener{scheduler, "", port, net, proto, timeout}
+    listener(io::scheduler* scheduler, const std::string& port, network net, protocol proto = protocol::not_care)
+        : listener{scheduler, "", port, net, proto}
     {}
 
-    listener(io::scheduler*            scheduler,
-             const std::string&        host,
-             const std::string&        port,
-             network                   net,
-             protocol                  proto   = protocol::not_care,
-             std::chrono::microseconds timeout = 5s);
+    listener(io::scheduler*     scheduler,
+             const std::string& host,
+             const std::string& port,
+             network            net,
+             protocol           proto = protocol::not_care);
 
     listener(const listener&)            = delete;
     listener& operator=(const listener&) = delete;
 
-    listener(listener&&) noexcept;
-    listener& operator=(listener&&) noexcept;
+    listener(listener&& /*other*/) noexcept;
+    listener& operator=(listener&& /*other*/) noexcept;
 
     ~listener() noexcept;
 

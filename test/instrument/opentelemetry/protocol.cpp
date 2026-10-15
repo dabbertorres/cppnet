@@ -31,12 +31,11 @@ std::vector<std::byte> operator""_bytes(const char* str, std::size_t length)
 
 }
 
-using any_value      = net::instrument::opentelemetry::any_value;
-using array_value    = net::instrument::opentelemetry::array_value;
-using key_value_list = net::instrument::opentelemetry::key_value_list;
-using key_value      = net::instrument::opentelemetry::key_value;
+using net::instrument::opentelemetry::any_value;
+using net::instrument::opentelemetry::array_value;
+using net::instrument::opentelemetry::key_value_list;
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 TEST_CASE("serialize any_value", "[instrument][opentelemetry][protocol][serialize]")
 {
@@ -174,10 +173,10 @@ TEST_CASE("serialize non-finite doubles", "[instrument][opentelemetry][protocol]
 
 TEST_CASE("serialize a span's times since the Unix epoch", "[instrument][opentelemetry][protocol][serialize]")
 {
-    using namespace std::chrono;
+    using namespace std::chrono_literals;
 
     net::instrument::opentelemetry::span s{};
-    s.start_time = sys_days{year{2026} / 1 / 1};
+    s.start_time = std::chrono::sys_days{std::chrono::year{2026} / 1 / 1};
     s.end_time   = s.start_time + 1500ms;
 
     json j = s;

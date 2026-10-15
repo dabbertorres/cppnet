@@ -198,7 +198,7 @@ struct NET_PACKED continuation_frame{
 //
 // closed:
 //   terminal
-enum class stream_state
+enum class stream_state : std::uint8_t
 {
     idle,
     reserved_local,
