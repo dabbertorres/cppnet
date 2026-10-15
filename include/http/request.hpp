@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -14,6 +15,7 @@
 #include "http/request_target.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/reader.hpp"
+#include "io/string_reader.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
@@ -80,7 +82,17 @@ struct client_request
     url                uri{};
     net::http::headers headers;
 
+    // The body, which is read until it ends (or until Content-Length bytes have been read, if that's set, which it
+    // must then match). Without a Content-Length, it's sent chunked, which needs HTTP/1.1. Sending the request reads
+    // it, so it can only be sent once.
     std::unique_ptr<io::reader> body = nullptr;
+
+    // set_body sets the body to content, and the Content-Length to match.
+    void set_body(std::string content)
+    {
+        headers.set_content_length(content.size());
+        body = std::make_unique<io::owned_string_reader>(std::move(content));
+    }
 };
 
 // server_request represents an incoming HTTP request from a client to a server.

@@ -20,13 +20,17 @@
 #include <netinet/in.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "http/http11.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
+#include "io/string_reader.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
@@ -495,3 +499,166 @@ TEST_CASE("requests are retried if a reused connection was closed", "[http][clie
         CHECK(server.accepted == 1);
     }
 }
+
+namespace
+{
+
+// echo_server responds to each request with its body, or (if rejecting) with 413 before reading the body.
+struct echo_server
+{
+    explicit echo_server(net::io::scheduler* sched)
+        : sched{sched}
+        , listener{sched, "127.0.0.1", "0", net::network::tcp}
+    {
+        listener.listen(64);
+        port = local_port(listener);
+    }
+
+    task<> serve()
+    {
+        while (true)
+        {
+            auto conn = co_await listener.accept();
+            if (!conn.has_value()) co_return;
+
+            if (!sched->spawn(handle(std::move(*conn)))) co_return;
+        }
+    }
+
+    task<> handle(net::tcp_socket conn)
+    {
+        ++accepted;
+
+        net::io::buffered_reader reader{&conn};
+
+        while (true)
+        {
+            auto req = co_await net::http::http11::request_decode(&reader, 8'192);
+            if (!req.has_value()) break;
+
+            ++requests;
+            if (req->headers.is_chunked()) ++chunked;
+
+            if (reject)
+            {
+                auto response = "HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"sv;
+                co_await conn.write(std::as_bytes(std::span{response}));
+
+                if (close_at_once) break;
+
+                // then read (and drop) the rest, as closing with it unread would reset the connection.
+                conn.shutdown_write();
+                std::array<std::byte, 16'384> buf{};
+                while (!(co_await conn.read(buf)).err)
+                {}
+                break;
+            }
+
+            auto body     = co_await read_all(req->body.get());
+            auto response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+            co_await conn.write(std::as_bytes(std::span{response}));
+        }
+    }
+
+    net::io::scheduler* sched;
+    net::listener       listener;
+    std::string         port;
+    bool                reject        = false;
+    bool                close_at_once = false; // after rejecting
+
+    std::atomic<int> accepted{0};
+    std::atomic<int> requests{0};
+    std::atomic<int> chunked{0};
+};
+
+net::http::client_request post_request(const std::string& port)
+{
+    auto req   = get_request("127.0.0.1", port);
+    req.method = net::http::request_method::POST;
+    return req;
+}
+
+// post sends req, and returns the response's status and body, or the error.
+task<std::string> post(net::http::client* client, net::http::client_request req)
+{
+    auto resp = co_await client->send(req);
+    if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+    auto body = co_await read_all(resp->body.get());
+    co_return std::to_string(static_cast<int>(resp->status_code)) + " " + body;
+}
+
+}
+
+TEST_CASE("request bodies are sent", "[http][client][body]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    echo_server        server{&sched};
+    net::http::client  client{&sched};
+
+    std::string big;
+    for (int i = 0; big.size() < 200'000; ++i) big += std::to_string(i) + ",";
+
+    auto test = [](net::http::client* client, std::string port, std::string big) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> results;
+
+        auto with_length = post_request(port);
+        with_length.set_body("hello");
+        results.push_back(co_await post(client, std::move(with_length)));
+
+        auto chunked = post_request(port);
+        chunked.body = std::make_unique<net::io::owned_string_reader>(big);
+        results.push_back(co_await post(client, std::move(chunked)));
+
+        results.push_back(co_await post(client, post_request(port)));
+
+        co_return results;
+    };
+
+    REQUIRE(sched.spawn(server.serve()));
+    auto results = sched.run_to_completion(test(&client, server.port, big));
+
+    CHECK(results == std::vector<std::string>{"200 hello", "200 " + big, "200 "});
+    CHECK(server.chunked == 1);
+
+    // each body was framed right, so the connection carried them all.
+    CHECK(server.accepted == 1);
+}
+
+TEST_CASE("a response before the whole body was sent is still read", "[http][client][body]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    echo_server        server{&sched};
+    server.reject = true;
+
+    // if the server reads the rest, the body is all written. If it doesn't, writing it fails (once the server has
+    // closed), but the response is there to read.
+    server.close_at_once = GENERATE(false, true);
+    CAPTURE(server.close_at_once);
+
+    net::http::client client{&sched};
+
+    auto req = post_request(server.port);
+    req.set_body(std::string(4 * 1'024 * 1'024, 'x'));
+
+    REQUIRE(sched.spawn(server.serve()));
+    CHECK(sched.run_to_completion(post(&client, std::move(req))) == "413 ");
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("requests with bodies that can't be sent don't use a connection", "[http][client][body]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    echo_server        server{&sched};
+    net::http::client  client{&sched};
+
+    auto req = post_request(server.port);
+    req.headers.set_content_length(5);
+
+    REQUIRE(sched.spawn(server.serve()));
+    CHECK(sched.run_to_completion(post(&client, std::move(req)))
+          == "error: " + std::make_error_condition(std::errc::invalid_argument).message());
+    CHECK(server.accepted == 0);
+}
+

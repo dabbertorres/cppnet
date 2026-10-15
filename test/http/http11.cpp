@@ -1,5 +1,6 @@
 #include "http/http11.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -552,4 +553,152 @@ TEST_CASE("malformed responses are rejected", "[http][1.1][response_decode]")
     auto resp = decode_response(response);
     REQUIRE_FALSE(resp.has_value());
     CHECK(resp.error() == std::errc::invalid_argument);
+}
+
+namespace
+{
+
+// encode_request encodes req, returning what was written, or the error.
+std::string encode_request(const net::http::client_request& req)
+{
+    net::io::string_writer<char> out;
+
+    auto res = test::sync_wait(net::http::http11::request_encode(&out, req));
+    if (!res.has_value()) return "error: " + res.error().message();
+    return out.build();
+}
+
+net::http::client_request make_request(net::http::request_method method, std::uint32_t minor = 1)
+{
+    net::http::client_request req{.method = method, .version = {.major = 1, .minor = minor}};
+    req.uri.host = "example.com";
+    req.uri.path = "/";
+    return req;
+}
+
+std::unique_ptr<net::io::reader> body_of(std::string content)
+{
+    return std::make_unique<net::io::owned_string_reader>(std::move(content));
+}
+
+const std::string invalid_argument = "error: " + std::make_error_condition(std::errc::invalid_argument).message();
+const std::string not_supported    = "error: " + std::make_error_condition(std::errc::not_supported).message();
+
+}
+
+TEST_CASE("request bodies are encoded", "[http][1.1][request_encode][body]")
+{
+    using net::http::request_method;
+
+    SECTION("with a Content-Length")
+    {
+        auto req = make_request(request_method::POST);
+        req.set_body("hello");
+        CHECK(encode_request(req) == "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello");
+    }
+
+    SECTION("only as much as the Content-Length")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set_content_length(3);
+        req.body = body_of("hello");
+        CHECK(encode_request(req) == "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nhel");
+    }
+
+    SECTION("chunked, without a Content-Length")
+    {
+        auto req = make_request(request_method::PUT);
+        req.body = body_of("hello");
+        CHECK(encode_request(req)
+              == "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    SECTION("chunked, as asked for")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set("Transfer-Encoding"sv, "chunked"sv);
+        req.body = body_of("");
+        CHECK(encode_request(req) == "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    }
+
+    SECTION("none, but saying so for methods that expect one")
+    {
+        CHECK(encode_request(make_request(request_method::POST))
+              == "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n");
+        CHECK(encode_request(make_request(request_method::GET)) == "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    }
+}
+
+TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][request_encode][body]")
+{
+    using net::http::request_method;
+
+    SECTION("shorter than the Content-Length")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set_content_length(10);
+        req.body = body_of("hello");
+        CHECK(encode_request(req) == invalid_argument);
+    }
+
+    SECTION("a Content-Length without a body")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set_content_length(5);
+        CHECK(encode_request(req) == invalid_argument);
+    }
+
+    SECTION("an invalid Content-Length")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set("Content-Length"sv, "5x"sv);
+        req.body = body_of("hello");
+        CHECK(encode_request(req) == invalid_argument);
+    }
+
+    SECTION("both Content-Length and Transfer-Encoding")
+    {
+        auto req = make_request(request_method::POST);
+        req.set_body("hello");
+        req.headers.set("Transfer-Encoding"sv, "chunked"sv);
+        CHECK(encode_request(req) == invalid_argument);
+    }
+
+    SECTION("a transfer coding that isn't implemented")
+    {
+        auto req = make_request(request_method::POST);
+        req.headers.set("Transfer-Encoding"sv, "gzip, chunked"sv);
+        req.body = body_of("hello");
+        CHECK(encode_request(req) == not_supported);
+    }
+
+    SECTION("HTTP/1.0 can't send a body of unknown length")
+    {
+        auto req = make_request(request_method::POST, 0);
+        req.body = body_of("hello");
+        CHECK(encode_request(req) == invalid_argument);
+    }
+}
+
+TEST_CASE("encoded request bodies decode", "[http][1.1][request_encode][body]")
+{
+    std::string content;
+    for (int i = 0; content.size() < 100'000; ++i) content += std::to_string(i) + ",";
+
+    auto with_length = GENERATE(true, false);
+    CAPTURE(with_length);
+
+    auto req = make_request(net::http::request_method::POST);
+    if (with_length)
+        req.set_body(content);
+    else
+        req.body = body_of(content);
+
+    // NOTE: the body reads from the reader, so it's kept here (unlike in decode()).
+    auto                     encoded = encode_request(req);
+    owning_buffered_reader   reader{encoded};
+    auto                     decoded = test::sync_wait(net::http::http11::request_decode(&reader, 8'192));
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->headers.is_chunked() == !with_length);
+    CHECK(read_body(*decoded->body) == content);
 }

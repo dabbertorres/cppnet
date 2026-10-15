@@ -28,6 +28,7 @@ add_fuzzer(
   http11.cpp
   "${PROJECT_SOURCE_DIR}/src/url.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/chunked_reader.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/chunked_writer.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/headers.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/http11.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/request_target.cpp"
