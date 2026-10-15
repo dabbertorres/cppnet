@@ -38,8 +38,14 @@ coro::task<void> router::operator()(server_request& req, response_writer& resp) 
         route = route.substr(1);
     }
 
-    const auto*                                      parent = this;
-    std::vector<std::pair<std::string, std::string>> values;
+    const auto* parent = this;
+
+    // the parameters are added as they're found, and removed if the path leads nowhere.
+    const auto not_found = [&req]
+    {
+        req.path_values.clear();
+        req.path_value_storage.clear();
+    };
 
     // The path is split before it's decoded, so an encoded '/' ("%2F") is part of a segment rather than separating two.
     // A literal segment is taken over a parameter, and never given up for it later: there's no backtracking.
@@ -54,11 +60,12 @@ coro::task<void> router::operator()(server_request& req, response_writer& resp) 
         }
         else if (parent->wildcard != nullptr && !part.empty())
         {
-            values.emplace_back(parent->wildcard_name, std::move(part));
+            req.add_path_value(parent->wildcard_name, encoded_part);
             parent = parent->wildcard.get();
         }
         else
         {
+            not_found();
             co_await resp.send(status::NOT_FOUND, 0);
             co_return;
         }
@@ -67,12 +74,12 @@ coro::task<void> router::operator()(server_request& req, response_writer& resp) 
     // a router with no handlers is only part of the way to a route.
     if (parent->method_handlers.empty())
     {
+        not_found();
         co_await resp.send(status::NOT_FOUND, 0);
         co_return;
     }
 
-    req.route       = parent->pattern;
-    req.path_values = std::move(values);
+    req.route = parent->pattern;
 
     auto iter = parent->method_handlers.find(req.method);
 

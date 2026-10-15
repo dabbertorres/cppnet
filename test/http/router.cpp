@@ -138,7 +138,7 @@ routed route(const http::router& r, http::request_method method, std::string pat
 
     test::sync_wait(r(req, resp));
 
-    return {.status = resp.status_code(), .route = req.route, .output = out.build()};
+    return {.status = resp.status_code(), .route = std::string{req.route}, .output = out.build()};
 }
 
 }

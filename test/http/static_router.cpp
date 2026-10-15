@@ -62,7 +62,14 @@ routed route(const Router& r, http::request_method method, std::string path)
 
     test::sync_wait(r(req, resp));
 
-    return {.status = resp.status_code(), .route = req.route, .path_values = req.path_values, .output = out.build()};
+    // NOTE: copied, as they view the request.
+    std::vector<std::pair<std::string, std::string>> values;
+    for (const auto& [name, value] : req.path_values) values.emplace_back(name, value);
+
+    return {.status      = resp.status_code(),
+            .route       = std::string{req.route},
+            .path_values = values,
+            .output      = out.build()};
 }
 
 }
@@ -138,16 +145,15 @@ TEST_CASE("static routes' handlers get their parameters by name", "[http][static
     std::string id;
     std::string post;
 
-    const auto routes =
-        http::make_static_router(http::GET("/users/:id/posts/:post"_route,
-                                           [&](const http::server_request&,
-                                               http::response_writer&                        resp,
-                                               const http::params<"/users/:id/posts/:post">& p) -> task<void>
-                                           {
-                                               id   = p.get<"id">();
-                                               post = p.get<"post">();
-                                               co_await resp.send(http::status::OK, 0);
-                                           }));
+    const auto routes = http::make_static_router(http::GET("/users/:id/posts/:post"_route,
+                                                           [&](const http::server_request&,
+                                                               http::response_writer&                 resp,
+                                                               http::params<"/users/:id/posts/:post"> p) -> task<void>
+                                                           {
+                                                               id   = p.get<"id">();
+                                                               post = p.get<"post">();
+                                                               co_await resp.send(http::status::OK, 0);
+                                                           }));
 
     CHECK(route(routes, http::request_method::GET, "/users/a%20b/posts/7").status == http::status::OK);
     CHECK(id == "a b");
@@ -159,7 +165,7 @@ TEST_CASE("handlers in a group take their own route's parameters", "[http][stati
     std::string id;
 
     const auto handler =
-        [&](const http::server_request&, http::response_writer& resp, const http::params<"/users/:id">& p) -> task<void>
+        [&](const http::server_request&, http::response_writer& resp, http::params<"/users/:id"> p) -> task<void>
     {
         id = p.get<"id">();
         co_await resp.send(http::status::OK, 0);
@@ -176,6 +182,64 @@ TEST_CASE("handlers in a group take their own route's parameters", "[http][stati
     // the group's parameters are still in the request.
     CHECK(res.path_values.front().second == "acme");
 }
+
+TEST_CASE("more parameters than path_values holds in itself", "[http][static_router][params]")
+{
+    std::vector<std::string> got;
+
+    const auto routes = http::make_static_router(
+        http::GET("/:a/:b/:c/:d/:e/:f"_route,
+                  [&](const http::server_request&, http::response_writer& resp, http::params<"/:a/:b/:c/:d/:e/:f"> p)
+                      -> task<void>
+                  {
+                      got = {std::string{p.get<"a">()}, std::string{p.get<"d">()}, std::string{p.get<"f">()}};
+                      co_await resp.send(http::status::OK, 0);
+                  }));
+
+    // some decoded, some not.
+    auto res = route(routes, http::request_method::GET, "/1/2/%33/4/5/six%21");
+    CHECK(res.status == http::status::OK);
+    CHECK(got == std::vector<std::string>{"1", "4", "six!"});
+    CHECK(res.path_values.size() == 6);
+    CHECK(res.path_values[2].second == "3");
+}
+
+TEST_CASE("decoded parameters stay valid as later ones are decoded", "[http][static_router][params]")
+{
+    http::router dynamic;
+    dynamic.GET("/:a/x/:b/:c", ok);
+
+    const auto fixed = http::make_static_router(http::GET("/:a/x/:b/:c"_route, ok));
+
+    // long enough that the decoded values are on the heap, rather than in the string itself.
+    const std::string path = "/first%20value%20is%20long/x/second%20too%20and%20longer/plain";
+
+    for (const auto& res :
+         {route(dynamic, http::request_method::GET, path), route(fixed, http::request_method::GET, path)})
+    {
+        REQUIRE(res.path_values.size() == 3);
+        CHECK(res.path_values[0].second == "first value is long");
+        CHECK(res.path_values[1].second == "second too and longer");
+        CHECK(res.path_values[2].second == "plain");
+    }
+}
+
+// handlers take their params by value: a reference would outlive them. (A generic lambda can't be checked.)
+namespace
+{
+
+using by_value = decltype([](const http::server_request&, http::response_writer&, http::params<"/:id">) -> task<void>
+                          { co_return; });
+using by_reference =
+    decltype([](const http::server_request&, http::response_writer&, const http::params<"/:id">&) -> task<void>
+             { co_return; });
+using generic = decltype([](const http::server_request&, http::response_writer&, auto) -> task<void> { co_return; });
+
+}
+
+static_assert(!http::detail::takes_params_by_reference<by_value>);
+static_assert(http::detail::takes_params_by_reference<by_reference>);
+static_assert(!http::detail::takes_params_by_reference<generic>);
 
 // params only has the names its pattern does.
 template<typename P, net::util::fixed_string Name>

@@ -269,10 +269,15 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
 
 std::string url::decode(std::string_view str) noexcept
 {
-    // Follows the WHATWG URL standard's percent-decode: a '%' that isn't followed by two hex digits is kept as it is.
     std::string out;
     out.reserve(str.size());
+    decode_append(out, str);
+    return out;
+}
 
+void url::decode_append(std::string& out, std::string_view str) noexcept
+{
+    // Follows the WHATWG URL standard's percent-decode: a '%' that isn't followed by two hex digits is kept as it is.
     for (std::size_t i = 0; i < str.size(); ++i)
     {
         if (str[i] == '%' && str.size() - i > 2)
@@ -290,8 +295,6 @@ std::string url::decode(std::string_view str) noexcept
 
         out.push_back(str[i]);
     }
-
-    return out;
 }
 
 url::query_values url::parse_query(std::string_view query)
