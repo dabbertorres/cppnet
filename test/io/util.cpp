@@ -142,3 +142,49 @@ TEST_CASE("errors other than the end of the stream are reported", "[io][readline
     REQUIRE(res.has_error());
     CHECK(res.to_error() == std::errc::timed_out);
 }
+
+TEST_CASE("terminated lines must end, and fit", "[io][read_terminated_line]")
+{
+    const auto read = [](std::string_view text, std::size_t max)
+    {
+        net::io::string_reader   reader(text);
+        net::io::buffered_reader buffer(&reader);
+        return test::sync_wait(net::io::read_terminated_line(&buffer, max));
+    };
+
+    CHECK(read("foo\r\nbar"sv, 5).to_value() == "foo");
+    CHECK(read("\r\n"sv, 2).to_value().empty());
+
+    CHECK(read("foo"sv, 100).to_error() == net::io::status_condition::closed);
+    CHECK(read(""sv, 100).to_error() == net::io::status_condition::closed);
+    CHECK(read("foo\r\n"sv, 4).to_error() == std::errc::value_too_large);
+
+    // a bare LF doesn't end the line.
+    CHECK(read("foo\nbar\r\n"sv, 100).to_value() == "foo\nbar");
+}
+
+TEST_CASE("long lines don't take a coroutine per byte", "[io][readline][read_terminated_line]")
+{
+    // reading a byte per co_await deepens the stack with each byte, where symmetric transfer isn't a tail call (e.g.
+    // GCC's debug builds), until it overflows.
+    const std::string long_line(1'000'000, 'x');
+    const std::string text = long_line + "\r\nnext";
+
+    {
+        net::io::string_reader   reader{std::string_view{text}};
+        net::io::buffered_reader buffer{&reader};
+
+        auto res = test::sync_wait(net::io::readline(&buffer));
+        REQUIRE(res.has_value());
+        CHECK(res.to_value() == long_line);
+    }
+
+    {
+        net::io::string_reader   reader{std::string_view{text}};
+        net::io::buffered_reader buffer{&reader};
+
+        auto res = test::sync_wait(net::io::read_terminated_line(&buffer, 2'000'000));
+        REQUIRE(res.has_value());
+        CHECK(res.to_value() == long_line);
+    }
+}
