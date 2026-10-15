@@ -70,8 +70,6 @@ public:
 
 private:
     coro::task<>     serve_connection(tcp_socket conn) noexcept;
-    void             serve_http11(tcp_socket conn) noexcept;
-    void             serve_http2(tcp_socket conn) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
 
