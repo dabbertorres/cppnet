@@ -345,18 +345,4 @@ bool server::is_protocol_supported(std::string_view protocol) const noexcept
     return false;
 }
 
-bool server::enforce_protocol(const server_request& req, response_writer& resp) noexcept
-{
-    // TODO:
-    // Field values containing CR, LF, or NUL characters are invalid and dangerous, due to the
-    // varying ways that implementations might parse and interpret those characters; a recipient
-    // of CR, LF, or NUL within a field value MUST either reject the message or replace each of
-    // those characters with SP before further processing or forwarding of that message.
-    // Field values containing other CTL characters are also invalid; however, recipients MAY
-    // retain such characters for the sake of robustness when they appear within a safe context
-    // (e.g., an application-specific quoted string that will not be processed by any downstream HTTP parser).
-
-    // TODO: delimiters around commas in "list-based fields"
-}
-
 }

@@ -38,3 +38,15 @@ TEST_CASE("build an empty string", "[io][string_writer]")
     auto out = writer.build();
     REQUIRE(out.empty());
 }
+
+TEST_CASE("write single characters", "[io][string_writer]")
+{
+    net::io::string_writer<char> writer;
+
+    writer.write('a');
+    REQUIRE_FALSE(test::sync_wait(writer.write("bc"sv)).err);
+    writer.write('d');
+
+    CHECK(writer.build() == "abcd");
+    CHECK(writer.length() == 4);
+}

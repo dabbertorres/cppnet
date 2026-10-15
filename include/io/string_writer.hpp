@@ -34,12 +34,7 @@ public:
     void write(CharT c)
     {
         if (parts.empty()) parts.emplace_back(1, c);
-        else
-        {
-            auto& back = parts.back();
-            if (back.size() < back.max_sie()) back.push_back(c);
-            else parts.emplace_back(1, c);
-        }
+        else parts.back().push_back(c);
     }
 
     [[nodiscard]] string build() const
