@@ -52,6 +52,46 @@ net::coro::task<bool> discard_body(net::io::reader& body)
 
 }
 
+namespace
+{
+
+using namespace std::chrono_literals;
+
+// linger_before_close reads (and drops) what the client is still sending, for a little while, after an error response.
+//
+// Closing a socket with unread input makes the kernel reset the connection, and a reset can discard the response
+// before the client has read it: e.g. a 431 sent while the client is still sending its oversized headers.
+net::coro::task<> linger_before_close(net::tcp_socket& conn) noexcept
+{
+    constexpr auto        linger_time = 2s;
+    constexpr std::size_t max_drain   = 256 * 1'024;
+
+    conn.shutdown_write();
+    conn.set_read_deadline(net::io::clock::now() + linger_time);
+
+    std::array<std::byte, 4'096> buf{};
+    std::size_t                  drained = 0;
+
+    while (drained < max_drain)
+    {
+        auto res = co_await conn.read(buf);
+        drained += res.count;
+        if (res.err) break;
+    }
+}
+
+// decode_error_status is the response to a request that couldn't be decoded.
+net::http::status decode_error_status(std::error_condition err) noexcept
+{
+    using enum net::http::status;
+
+    if (err == std::errc::value_too_large) return REQUEST_HEADER_FIELDS_TOO_LARGE;
+    if (err == std::errc::not_supported) return NOT_IMPLEMENTED;
+    return BAD_REQUEST;
+}
+
+}
+
 namespace net::http
 {
 
@@ -166,8 +206,9 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
                     resp.headers.set("Connection"sv, "close"sv);
 
                     response_writer rw{&writer, &resp, http11::response_encode};
-                    co_await rw.send(status::BAD_REQUEST, 0);
+                    co_await rw.send(decode_error_status(err), 0);
                     co_await writer.flush();
+                    co_await linger_before_close(conn);
                 }
 
                 break;
@@ -197,6 +238,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
                 logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
                 co_await rw.send(status::HTTP_VERSION_NOT_SUPPORTED, 0);
                 co_await writer.flush();
+                co_await linger_before_close(conn);
                 break;
             }
 
@@ -250,11 +292,8 @@ void server::serve_http2(tcp_socket conn) noexcept
 
 std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept
 {
-    auto upgrade = req.headers.get_all("Upgrade"sv);
-    if (!upgrade.has_value()) return ""sv;
-
     std::string_view upgrade_to;
-    for (const auto& protocol : *upgrade)
+    for (auto protocol : req.headers.get_list("Upgrade"sv))
     {
         if (is_protocol_supported(protocol))
         {

@@ -1,19 +1,18 @@
 #include "http/http11.hpp"
 
+#include <algorithm>
 #include <array>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
-#include <ranges>
+#include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
-
-#include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "http/chunked_reader.hpp"
@@ -28,7 +27,6 @@
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"
-#include "util/result.hpp"
 #include "util/string_util.hpp"
 
 namespace
@@ -36,7 +34,6 @@ namespace
 
 using namespace std::string_view_literals;
 
-using net::url;
 using net::coro::task;
 using net::http::client_response;
 using net::http::headers;
@@ -48,143 +45,206 @@ using net::http::request_method;
 using net::http::server_request;
 using net::http::status;
 using net::io::buffered_reader;
-using net::util::result;
-using net::util::split_string;
-using net::util::trim_string;
 
-result<std::uint32_t, std::errc> from_chars(std::string_view str) noexcept
+std::error_condition invalid() noexcept { return std::make_error_condition(std::errc::invalid_argument); }
+
+constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+
+// head_reader reads the lines of a message's head (its start line and fields), which are limited in size altogether.
+struct head_reader
 {
-    std::uint32_t value; // NOLINT(cppcoreguidelines-init-variables)
-    auto [_, err] = std::from_chars(str.data(), str.data() + str.size(), value);
+    buffered_reader* reader;
+    std::size_t      remaining;
 
-    if (err != std::errc()) return {err};
-    return {value};
-}
-
-result<protocol_version, std::error_condition> parse_http_version(std::string_view str)
-{
-    using namespace std::literals::string_view_literals;
-
-    static constexpr auto name = "HTTP/"sv;
-
-    if (!str.starts_with(name)) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
-
-    str.remove_prefix(name.size());
-
-    auto split_idx = str.find('.');
-    if (split_idx == std::string_view::npos) return {std::make_error_condition(std::errc::illegal_byte_sequence)};
-
-    auto major_res = from_chars(str.substr(0, split_idx));
-    if (major_res.has_error()) return {std::make_error_condition(major_res.to_error())};
-
-    auto minor_res = from_chars(str.substr(split_idx + 1));
-    if (minor_res.has_error()) return {std::make_error_condition(minor_res.to_error())};
-
-    const protocol_version version{
-        .major = major_res.to_value(),
-        .minor = minor_res.to_value(),
-    };
-
-    return {version};
-}
-
-task<std::error_condition> parse_status_line(buffered_reader* reader, client_response& resp) noexcept
-{
-    // TODO: max bytes to read
-
-    auto result = co_await readline(reader);
-    if (result.has_error()) co_return result.to_error();
-
-    auto line = result.to_value();
-    if (line.empty()) co_return make_error_condition(net::io::status_condition::closed);
-    auto view = static_cast<std::string_view>(line);
-
-    auto version_end = view.find(' ');
-    if (version_end == std::string_view::npos) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    auto res = parse_http_version(view.substr(0, version_end));
-    if (res.has_error()) co_return res.to_error();
-    resp.version = res.to_value();
-
-    auto status_start = version_end + 1;
-    auto status_end   = view.find(' ', status_start);
-    if (status_end == std::string_view::npos) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    resp.status_code = parse_status(view.substr(status_start, status_end));
-    if (resp.status_code == status::NONE) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    // we can just ignore the reason
-
-    co_return std::error_condition{};
-}
-
-task<std::error_condition> parse_request_line(buffered_reader* reader, server_request& req) noexcept
-{
-    // TODO: max bytes to read
-
-    auto result = co_await readline(reader);
-    if (result.has_error()) co_return result.to_error();
-
-    auto line = result.to_value();
-    if (line.empty()) co_return make_error_condition(net::io::status_condition::closed);
-    auto view = static_cast<std::string_view>(line);
-
-    auto method_end = view.find(' ');
-    if (method_end == std::string_view::npos) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    req.method = parse_method(view.substr(0, method_end));
-    if (req.method == request_method::NONE) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    auto uri_start = method_end + 1;
-    auto uri_end   = view.find(' ', uri_start);
-    if (uri_end == std::string_view::npos) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
-
-    auto target = parse_request_target(req.method, view.substr(uri_start, uri_end - uri_start));
-    if (!target.has_value()) co_return target.error();
-    req.target = std::move(*target);
-
-    auto res = parse_http_version(view.substr(uri_end + 1));
-    if (res.has_error()) co_return res.to_error();
-    req.version = res.to_value();
-
-    co_return std::error_condition{};
-}
-
-task<std::error_condition> parse_headers(buffered_reader* reader, std::size_t max_read, headers& headers) noexcept
-{
-    std::size_t amount_read = 0;
-
-    while (amount_read < max_read)
+    task<net::io::readline_result> next_line() noexcept
     {
-        auto maybe_line = co_await readline(reader);
-        if (!maybe_line.has_value()) co_return maybe_line.to_error();
+        auto line = co_await net::io::read_terminated_line(reader, remaining);
+        if (line.has_value()) remaining -= line.to_value().size() + 2;
+        co_return line;
+    }
+};
 
-        auto next_line = maybe_line.to_value();
-        if (next_line.length() == 0)
+// parse_http_version parses exactly "HTTP/" DIGIT "." DIGIT (RFC 9112, section 2.3).
+std::optional<protocol_version> parse_http_version(std::string_view str) noexcept
+{
+    if (str.size() != 8 || !str.starts_with("HTTP/"sv) || !is_digit(str[5]) || str[6] != '.' || !is_digit(str[7]))
+        return std::nullopt;
+
+    return protocol_version{
+        .major = static_cast<std::uint32_t>(str[5] - '0'),
+        .minor = static_cast<std::uint32_t>(str[7] - '0'),
+    };
+}
+
+// parse_status_line parses "HTTP/1.1 200 OK". The reason (and the space before it) may be missing: it's ignored anyway.
+std::error_condition parse_status_line(std::string_view line, client_response& resp) noexcept
+{
+    auto version = parse_http_version(line.substr(0, line.find(' ')));
+    if (!version.has_value() || line.size() < 12 || line[8] != ' ') return invalid();
+
+    auto code = line.substr(9, 3);
+    if (!std::ranges::all_of(code, is_digit) || code[0] < '1' || code[0] > '5') return invalid();
+    if (line.size() > 12 && line[12] != ' ') return invalid();
+    if (!net::http::is_valid_field_value(line.substr(12))) return invalid();
+
+    resp.version     = *version;
+    resp.status_code = parse_status(code);
+    return {};
+}
+
+// parse_request_line parses "GET /path HTTP/1.1" (RFC 9112, section 3), with exactly one space between each part.
+std::error_condition parse_request_line(std::string_view line, server_request& req) noexcept
+{
+    auto method_end = line.find(' ');
+    if (method_end == std::string_view::npos) return invalid();
+
+    auto target_end = line.find(' ', method_end + 1);
+    if (target_end == std::string_view::npos) return invalid();
+
+    auto method  = line.substr(0, method_end);
+    auto target  = line.substr(method_end + 1, target_end - method_end - 1);
+    auto version = parse_http_version(line.substr(target_end + 1));
+
+    if (!net::http::is_valid_field_name(method) || !version.has_value()) return invalid();
+
+    // methods are case-sensitive, and one that's well-formed, but unknown, isn't implemented (RFC 9110, section 9.1).
+    req.method = parse_method(method);
+    if (req.method == request_method::NONE || method_string(req.method) != method)
+        return std::make_error_condition(std::errc::not_supported);
+
+    req.version = *version;
+
+    auto parsed = parse_request_target(req.method, target);
+    if (!parsed.has_value()) return parsed.error();
+    req.target = std::move(*parsed);
+
+    return {};
+}
+
+// parse_fields reads field lines up to the empty line that ends them.
+task<std::error_condition> parse_fields(head_reader& head, headers& fields) noexcept
+{
+    while (true)
+    {
+        auto line = co_await head.next_line();
+        if (line.has_error()) co_return line.to_error();
+        if (line.to_value().empty()) co_return std::error_condition{};
+
+        auto field = net::http::parse_field_line(line.to_value());
+        if (!field.has_value()) co_return invalid();
+
+        // NOTE: each line is kept whole: splitting on commas would break fields that aren't lists (e.g. User-Agent).
+        fields.add(field->first, field->second);
+    }
+}
+
+// count_values counts the field lines of key.
+std::size_t count_values(const headers& fields, std::string_view key)
+{
+    auto all = fields.get_all(key);
+    return all.has_value() ? static_cast<std::size_t>(std::ranges::distance(*all)) : 0;
+}
+
+// parse_host_header checks the Host header (RFC 9112, section 3.2), and sets the request's host.
+std::error_condition parse_host_header(server_request& req)
+{
+    const auto lines = count_values(req.headers, "Host"sv);
+
+    // HTTP/1.1 requires exactly one, and HTTP/1.0 doesn't know it, but mustn't repeat it either.
+    if (lines > 1 || (lines == 0 && req.version.major == 1 && req.version.minor >= 1)) return invalid();
+
+    std::string host;
+    if (lines == 1)
+    {
+        auto value = *req.headers.get("Host"sv);
+
+        // an empty value is allowed, for targets without a host.
+        if (!value.empty())
         {
-            // blank line - we're done
-            co_return std::error_condition{};
-        }
-
-        amount_read += next_line.size();
-
-        auto split_idx = next_line.find(':');
-        if (split_idx == std::string::npos) continue; // invalid header
-
-        auto view = static_cast<std::string_view>(next_line);
-
-        auto key = trim_string(view.substr(0, split_idx));
-        auto val = trim_string(view.substr(split_idx + 1));
-
-        // TODO: validate key
-
-        for (auto v : split_string(val, ','))
-        {
-            headers.add(key, v);
+            auto parsed = net::http::parse_host(value);
+            if (!parsed.has_value()) return invalid();
+            host = std::move(parsed->host);
         }
     }
 
-    co_return std::make_error_condition(std::errc::value_too_large);
+    // a target with a host overrides the Host header (RFC 9112, section 3.2.2).
+    req.host = !req.target.host.empty() ? req.target.host : std::move(host);
+    return {};
+}
+
+// make_request_body decides how long the request's body is (RFC 9112, section 6.3), and wraps the reader to read only
+// that much. The rules are strict where requests are ambiguous, as an ambiguity between this server and anything in
+// front of it is what request smuggling exploits.
+std::expected<std::unique_ptr<net::io::reader>, std::error_condition> make_request_body(buffered_reader*      reader,
+                                                                                        const server_request& req)
+{
+    if (req.headers.get_all("Transfer-Encoding"sv).has_value())
+    {
+        // HTTP/1.0 has no transfer codings, and a length from both would be ambiguous.
+        const bool http10 = req.version.major == 1 && req.version.minor == 0;
+        if (http10 || req.headers.get_all("Content-Length"sv).has_value()) return std::unexpected(invalid());
+
+        // chunked must be last, and only applied once (RFC 9112, section 6.1).
+        auto codings  = req.headers.get_list("Transfer-Encoding"sv);
+        auto chunked  = [](std::string_view coding) { return net::util::equal_ignore_case(coding, "chunked"sv); };
+        auto how_many = std::ranges::count_if(codings, chunked);
+        if (codings.empty() || !chunked(codings.back()) || how_many > 1) return std::unexpected(invalid());
+
+        // and nothing else is implemented.
+        if (codings.size() > 1) return std::unexpected(std::make_error_condition(std::errc::not_supported));
+
+        return std::make_unique<net::http::http11::chunked_reader>(reader);
+    }
+
+    if (req.headers.get_all("Content-Length"sv).has_value())
+    {
+        auto length = req.headers.get_content_length();
+        if (!length.has_value()) return std::unexpected(invalid());
+
+        return std::make_unique<net::io::limit_reader>(static_cast<net::io::reader*>(reader), *length);
+    }
+
+    return std::make_unique<net::io::limit_reader>(static_cast<net::io::reader*>(reader), 0);
+}
+
+// make_response_body decides how long the response's body is (RFC 9112, section 6.3), which is up to the end of the
+// connection if nothing else says.
+std::expected<std::unique_ptr<net::io::reader>, std::error_condition>
+make_response_body(std::unique_ptr<buffered_reader> reader, const client_response& resp, request_method method)
+{
+    if (resp.status_code == status::SWITCHING_PROTOCOLS) return reader; // the connection is the new protocol's.
+
+    if (method == request_method::HEAD || net::http::status_is_information(resp.status_code)
+        || resp.status_code == status::NO_CONTENT || resp.status_code == status::NOT_MODIFIED)
+        return std::make_unique<net::io::limit_reader>(std::move(reader), 0);
+
+    if (resp.headers.get_all("Transfer-Encoding"sv).has_value())
+    {
+        // if chunked isn't last, the body ends with the connection.
+        if (!resp.headers.is_chunked()) return reader;
+        return std::make_unique<net::http::http11::chunked_reader>(std::move(reader));
+    }
+
+    if (resp.headers.get_all("Content-Length"sv).has_value())
+    {
+        auto length = resp.headers.get_content_length();
+        if (!length.has_value()) return std::unexpected(invalid());
+
+        return std::make_unique<net::io::limit_reader>(std::move(reader), *length);
+    }
+
+    return reader;
+}
+
+// valid_fields checks that every field can be written without changing what's around it.
+bool valid_fields(const headers& fields) noexcept
+{
+    return std::ranges::all_of(fields,
+                               [](const auto& field)
+                               {
+                                   return net::http::is_valid_field_name(field.first)
+                                       && std::ranges::all_of(field.second, net::http::is_valid_field_value);
+                               });
 }
 
 bool is_default_port(std::string_view scheme, std::string_view port) noexcept
@@ -195,31 +255,18 @@ bool is_default_port(std::string_view scheme, std::string_view port) noexcept
 
 task<std::error_condition> write_headers(net::io::writer& writer, const headers& headers) noexcept
 {
-    for (const auto& header : headers)
+    // one line per value: joining them with commas would change fields that aren't lists (e.g. Set-Cookie).
+    for (const auto& [name, values] : headers)
     {
-        auto res = co_await writer.write(header.first);
-        if (res.err) co_return res.err;
-
-        res = co_await writer.write(": "sv);
-        if (res.err) co_return res.err;
-
-        if (!header.second.empty())
+        for (const auto& value : values)
         {
-            res = co_await writer.write(header.second.front());
-            if (res.err) co_return res.err;
-
-            for (const auto& value : std::ranges::drop_view(header.second, 1))
+            const std::array<std::string_view, 4> parts{name, ": "sv, value, "\r\n"sv};
+            for (auto part : parts)
             {
-                res = co_await writer.write(", "sv);
-                if (res.err) co_return res.err;
-
-                res = co_await writer.write(value);
+                auto res = co_await writer.write(part);
                 if (res.err) co_return res.err;
             }
         }
-
-        res = co_await writer.write("\r\n"sv);
-        if (res.err) co_return res.err;
     }
 
     co_return std::error_condition{};
@@ -234,6 +281,8 @@ using coro::task;
 
 task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept
 {
+    if (!valid_fields(req.headers)) co_return std::unexpected(invalid());
+
     auto res = co_await writer->write(method_string(req.method));
     if (res.err) co_return std::unexpected(res.err);
 
@@ -293,6 +342,8 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept
 {
+    if (!valid_fields(resp.headers)) co_return std::unexpected(invalid());
+
     auto res = co_await writer->write("HTTP/"sv);
     if (res.err) co_return std::unexpected(res.err);
 
@@ -323,54 +374,65 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
 
 task<request_decoder_result> request_decode(io::buffered_reader* reader, std::size_t max_header_bytes) noexcept
 {
-    server_request req;
-
-    auto err = co_await parse_request_line(reader, req);
-    if (err) co_return std::unexpected(err);
-
-    err = co_await parse_headers(reader, max_header_bytes, req.headers);
-    if (err) co_return std::unexpected(err);
-
-    // RFC 9112, section 3.2.2: a target with a host overrides the Host header.
-    req.host = !req.target.host.empty() ? req.target.host : std::string{req.headers.get("Host"sv).value_or(""sv)};
-
-    if (req.headers.is_chunked())
+    try
     {
-        req.body = std::make_unique<chunked_reader>(static_cast<io::reader*>(reader));
+        server_request req;
+        head_reader    head{.reader = reader, .remaining = max_header_bytes};
+
+        auto line = co_await head.next_line();
+
+        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
+        if (line.has_value() && line.to_value().empty()) line = co_await head.next_line();
+        if (line.has_error()) co_return std::unexpected(line.to_error());
+
+        if (auto err = parse_request_line(line.to_value(), req); err) co_return std::unexpected(err);
+        if (auto err = co_await parse_fields(head, req.headers); err) co_return std::unexpected(err);
+        if (auto err = parse_host_header(req); err) co_return std::unexpected(err);
+
+        auto body = make_request_body(reader, req);
+        if (!body.has_value()) co_return std::unexpected(body.error());
+        req.body = std::move(*body);
+
+        co_return req;
     }
-    else
+    catch (const std::bad_alloc&)
     {
-        std::size_t content_length = req.headers.get_content_length().value_or(0);
-        req.body = std::make_unique<io::limit_reader>(static_cast<io::reader*>(reader), content_length);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
     }
-
-    // TODO: trailers
-
-    co_return req;
 }
 
 coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
+                                                    request_method                       method,
                                                     std::size_t                          max_header_bytes) noexcept
 {
-    client_response resp;
-
-    if (auto err = co_await parse_status_line(reader.get(), resp); err) co_return std::unexpected(err);
-    if (auto err = co_await parse_headers(reader.get(), max_header_bytes, resp.headers); err)
-        co_return std::unexpected(err);
-
-    if (resp.headers.is_chunked())
+    try
     {
-        resp.body = std::make_unique<chunked_reader>(std::move(reader));
+        client_response resp;
+        head_reader     head{.reader = reader.get(), .remaining = max_header_bytes};
+
+        // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are skipped (other than 101,
+        // which is the last thing on the connection in HTTP/1.1).
+        do
+        {
+            resp.headers = {};
+
+            auto line = co_await head.next_line();
+            if (line.has_error()) co_return std::unexpected(line.to_error());
+
+            if (auto err = parse_status_line(line.to_value(), resp); err) co_return std::unexpected(err);
+            if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
+        } while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
+
+        auto body = make_response_body(std::move(reader), resp, method);
+        if (!body.has_value()) co_return std::unexpected(body.error());
+        resp.body = std::move(*body);
+
+        co_return resp;
     }
-    else
+    catch (const std::bad_alloc&)
     {
-        const std::size_t content_length = resp.headers.get_content_length().value_or(0);
-        resp.body                        = std::make_unique<io::limit_reader>(std::move(reader), content_length);
+        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
     }
-
-    // TODO: trailers
-
-    co_return resp;
 }
 
 }

@@ -1,68 +1,76 @@
 #include "http/chunked_writer.hpp"
 
-#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <string_view>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
+#include "io/writer.hpp"
 
-// calculates the maximum decimal value that would fit in size digits.
-// e.g. given 3, return 999.
-consteval auto max_decimal_for_length_digits(auto size) noexcept
+namespace
 {
-    if (size == 0) return 0;
 
-    auto total = 0;
+using namespace std::string_view_literals;
 
-    for (auto i = 0; i < size; ++i)
+// write_full writes all of data, as a chunk's size has already promised it.
+net::coro::task<net::io::result> write_full(net::io::writer* out, std::span<const std::byte> data)
+{
+    std::size_t written = 0;
+
+    while (written < data.size())
     {
-        total *= 10;
-        total += 9;
+        auto res = co_await out->write(data.subspan(written));
+        written += res.count;
+        if (res.err) co_return {.count = written, .err = res.err};
     }
 
-    return total;
+    co_return {.count = written};
+}
+
+net::coro::task<net::io::result> write_full(net::io::writer* out, std::string_view data)
+{
+    co_return co_await write_full(out, std::as_bytes(std::span{data}));
+}
+
 }
 
 namespace net::http::http11
 {
 
-using namespace std::string_view_literals;
-
 coro::task<io::result> chunked_writer::write(std::span<const std::byte> data)
 {
-    std::array<char, 8>   chunk_size_buf{};
-    constexpr std::size_t max_chunk_size = max_decimal_for_length_digits(chunk_size_buf.size());
+    if (data.empty()) co_return {.count = 0};
 
-    std::size_t amount_written = 0;
+    // the size, in hex, and its line ending.
+    std::array<char, (std::numeric_limits<std::size_t>::digits / 4) + 2> size_line{};
 
-    while (amount_written < data.size())
-    {
-        std::size_t amount_to_write = std::min(max_chunk_size, data.size());
+    auto [end, _] = std::to_chars(size_line.data(), size_line.data() + size_line.size() - 2, data.size(), 16);
+    *end++        = '\r';
+    *end++        = '\n';
 
-        // write the chunk length
-        auto [ptr, ec] = std::to_chars(chunk_size_buf.begin(), chunk_size_buf.end(), amount_to_write);
+    auto res = co_await write_full(parent, std::string_view{size_line.data(), end});
+    if (res.err) co_return {.err = res.err};
 
-        auto end = static_cast<std::size_t>(ptr - chunk_size_buf.begin());
-        auto res = co_await parent->write(std::span{chunk_size_buf.data(), end});
-        if (res.err) co_return {.count = amount_written, .err = res.err};
+    res = co_await write_full(parent, data);
+    if (res.err) co_return res;
 
-        res = co_await parent->write("\r\n"sv);
-        if (res.err) co_return {.count = amount_written, .err = res.err};
+    auto count = res.count;
 
-        res = co_await parent->write(data.subspan(amount_written, amount_to_write));
-        amount_written += res.count;
-        if (res.err) co_return {.count = amount_written, .err = res.err};
+    res = co_await write_full(parent, "\r\n"sv);
+    if (res.err) co_return {.count = count, .err = res.err};
 
-        // end of chunk
-        res = co_await parent->write("\r\n"sv);
-        if (res.err) co_return {.count = amount_written, .err = res.err};
-    }
+    co_return {.count = count};
+}
 
-    co_return {.count = amount_written};
+coro::task<io::result> chunked_writer::finish()
+{
+    // the last chunk, and no trailers.
+    auto res = co_await write_full(parent, "0\r\n\r\n"sv);
+    co_return {.err = res.err};
 }
 
 }

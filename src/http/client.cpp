@@ -20,6 +20,9 @@
 namespace
 {
 
+// a server's response head can't use up all of the client's memory.
+constexpr std::size_t max_response_header_bytes = 1'024 * 1'024;
+
 // connection_reader reads a response from the connection it owns, so the connection lives as long as the response.
 //
 // NOTE: the socket is held in a base class, so that it's constructed before (and destroyed after) the buffered_reader
@@ -68,7 +71,8 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
     if (!res.has_value()) co_return std::unexpected(res.error());
 
     auto resp = co_await http11::response_decode(std::make_unique<connection_reader>(std::move(sock)),
-                                                 std::numeric_limits<std::size_t>::max());
+                                                 request.method,
+                                                 max_response_header_bytes);
     if (!resp.has_value()) co_return std::unexpected(resp.error());
 
     co_return std::move(*resp);

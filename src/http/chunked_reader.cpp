@@ -3,116 +3,145 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
 
 #include "coro/task.hpp"
+#include "http/headers.hpp"
 #include "io/io.hpp"
+#include "io/util.hpp"
+
+namespace
+{
+
+std::error_condition malformed() noexcept { return std::make_error_condition(std::errc::illegal_byte_sequence); }
+
+// truncated is for a body that the end of the stream cuts short: that's not the end of the body.
+std::error_condition truncated(std::error_condition err) noexcept
+{
+    if (err == net::io::status_condition::closed) return std::make_error_condition(std::errc::connection_aborted);
+    return err;
+}
+
+int hex_digit_value(char c) noexcept
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+}
 
 namespace net::http::http11
 {
 
 coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
 {
-    // TODO: Return the ACTUAL number of bytes read (chunk lengths, "\r\n" sequences, etc),
-    //       or just the bytes read INTO data?
-    //       (Currently returning the number of bytes read into data.)
-
     if (data.empty()) co_return {.count = 0};
 
     // don't read past the end of the body, into whatever follows it.
     if (done) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
 
-    std::size_t bytes_read = 0;
-
-    while (bytes_read < data.size())
+    if (chunk_remaining == 0)
     {
-        // new chunk
-        if (current_chunk_size == 0)
+        if (after_chunk)
         {
-            auto res = co_await get_next_chunk_size();
-            if (res.err) co_return {.count = bytes_read, .err = res.err};
-
-            // final chunk is size 0
-            if (current_chunk_size == 0)
-            {
-                res = co_await validate_end_of_chunk();
-                if (res.err) co_return {.count = bytes_read, .err = res.err};
-
-                done = true;
-                if (bytes_read == 0) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
-
-                break;
-            }
+            if (auto err = co_await read_crlf(); err) co_return {.err = err};
+            after_chunk = false;
         }
 
-        // plain read of current chunk
-        auto amount_to_read = std::min(data.size() - bytes_read, current_chunk_size);
-        auto res            = co_await parent->read(data.subspan(bytes_read, amount_to_read));
-        current_chunk_size -= res.count;
-        bytes_read += res.count;
-        if (res.err) co_return {.count = bytes_read, .err = res.err};
+        if (auto err = co_await read_chunk_size(); err) co_return {.err = err};
 
-        // end of chunk
-        if (current_chunk_size == 0)
+        // the last chunk is empty, and followed by the trailers.
+        if (chunk_remaining == 0)
         {
-            res = co_await validate_end_of_chunk();
-            if (res.err) co_return {.count = bytes_read, .err = res.err};
+            if (auto err = co_await read_trailers(); err) co_return {.err = err};
+
+            done = true;
+            co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
         }
     }
 
-    co_return {.count = bytes_read};
+    auto res = co_await parent->read(data.first(std::min(data.size(), chunk_remaining)));
+    chunk_remaining -= res.count;
+    if (chunk_remaining == 0) after_chunk = true;
+
+    if (res.err) co_return {.count = res.count, .err = truncated(res.err)};
+    co_return {.count = res.count};
 }
 
-coro::task<io::result> chunked_reader::get_next_chunk_size()
+coro::task<std::error_condition> chunked_reader::read_chunk_size()
 {
-    current_chunk_size = 0;
+    auto read = co_await io::read_terminated_line(parent, max_size_line);
+    if (read.has_error()) co_return truncated(read.to_error());
+    const auto& line = read.to_value();
+
+    // chunk-size = 1*HEXDIG
+    std::size_t size   = 0;
+    std::size_t digits = 0;
+    for (; digits < line.size(); ++digits)
+    {
+        auto value = hex_digit_value(line[digits]);
+        if (value < 0) break;
+
+        if (size > (std::numeric_limits<std::size_t>::max() >> 4U)) co_return malformed();
+        size = (size << 4U) | static_cast<std::size_t>(value);
+    }
+
+    if (digits == 0) co_return malformed();
+
+    // chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), which are skipped.
+    std::string_view rest{line};
+    rest.remove_prefix(digits);
+
+    // (whitespace is only allowed before a ';'.)
+    if (!rest.empty())
+    {
+        auto ext_start = rest.find_first_not_of(" \t");
+        if (ext_start == std::string_view::npos || rest[ext_start] != ';' || !is_valid_field_value(rest))
+            co_return malformed();
+    }
+
+    chunk_remaining = size;
+    co_return std::error_condition{};
+}
+
+coro::task<std::error_condition> chunked_reader::read_trailers()
+{
+    std::size_t remaining = max_trailers;
 
     while (true)
     {
-        char next = 0;
-        auto res  = co_await parent->read(next);
-        if (res.err) co_return res;
+        auto read = co_await io::read_terminated_line(parent, remaining);
+        if (read.has_error()) co_return truncated(read.to_error());
+        const auto& line = read.to_value();
+        remaining -= line.size() + 2;
 
-        if ('0' <= next && next <= '9')
-        {
-            current_chunk_size *= 10;
-            current_chunk_size += static_cast<std::size_t>(next - '0');
-        }
-        else if (next == '\r')
-        {
-            // end of size - next byte should be a '\n'
-            res = co_await parent->read(next);
-            if (res.err) co_return res;
+        if (line.empty()) co_return std::error_condition{};
 
-            // done
-            if (next == '\n') break;
-
-            // nope, invalid
-            co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
-        }
-        else
-        {
-            co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
-        }
+        // trailers aren't kept, but must be well-formed.
+        if (!parse_field_line(line).has_value()) co_return malformed();
     }
-
-    co_return {};
 }
 
-coro::task<io::result> chunked_reader::validate_end_of_chunk()
+coro::task<std::error_condition> chunked_reader::read_crlf()
 {
-    std::array<char, 2> end_of_chunk{};
+    constexpr std::array crlf{'\r', '\n'};
 
-    auto res = co_await parent->read(std::span{end_of_chunk});
-    if (res.err) co_return res;
-
-    if (end_of_chunk[0] != '\r' && end_of_chunk[1] != '\n')
+    for (char expect : crlf)
     {
-        co_return {.err = std::make_error_condition(std::errc::illegal_byte_sequence)};
+        char next = 0;
+        auto res  = co_await parent->read(next);
+        if (res.err) co_return truncated(res.err);
+        if (res.count == 0) co_return truncated(make_error_condition(io::status_condition::closed));
+        if (next != expect) co_return malformed();
     }
 
-    co_return {.count = 2};
+    co_return std::error_condition{};
 }
 
 }
