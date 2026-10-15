@@ -39,7 +39,7 @@ constexpr bool is_unreserved(char c) noexcept
     return is_alpha(c) || is_digit(c) || c == '-' || c == '.' || c == '_' || c == '~';
 }
 
-constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.find(c) != std::string_view::npos; }
+constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.contains(c); }
 
 constexpr bool is_pchar(char c) noexcept { return is_unreserved(c) || is_sub_delim(c) || c == ':' || c == '@'; }
 
@@ -191,7 +191,7 @@ bool parse_absolute_form(std::string_view target, request_target& out)
     auto authority     = rest.substr(0, authority_end);
 
     // userinfo isn't allowed in http(s) URIs (RFC 9110, section 4.2.4).
-    if (authority.find('@') != std::string_view::npos) return false;
+    if (authority.contains('@')) return false;
     if (!parse_authority(authority, false, out)) return false;
 
     out.kind = request_target::form::absolute;

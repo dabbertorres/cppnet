@@ -1,7 +1,9 @@
 #include "util/uuid.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <random>
 #include <ratio>
 #include <span>
@@ -13,17 +15,27 @@
 namespace net::util
 {
 
+namespace
+{
+
+    // fill_random fills data with random bytes.
+    void fill_random(std::span<std::byte> data)
+    {
+        std::random_device rd;
+
+        for (std::size_t i = 0; i < data.size(); i += sizeof(std::random_device::result_type))
+        {
+            const auto v = rd();
+            std::memcpy(data.data() + i, &v, std::min(sizeof(v), data.size() - i));
+        }
+    }
+
+}
+
 uuid uuid::generate_v4()
 {
-    std::random_device rd;
-
-    uuid  out{};
-    auto* ptr = reinterpret_cast<std::random_device::result_type*>(out.data.data());
-
-    for (auto i = 0u; i < out.data.size() / sizeof(std::random_device::result_type); ++i)
-    {
-        (*ptr++) = rd();
-    }
+    uuid out{};
+    fill_random(out.data);
 
     out.set_version(4);
     out.set_variant(8);
@@ -52,16 +64,7 @@ uuid uuid::generate_v7()
     out.data[6] = std::byte((seq.count() >> 8) & 0x0f);
     out.data[7] = std::byte(seq.count());
 
-    std::random_device rd;
-
-    auto* ptr = reinterpret_cast<std::random_device::result_type*>(out.data.data() + 8);
-
-    for (auto i = 8 / sizeof(std::random_device::result_type);
-         i < out.data.size() / sizeof(std::random_device::result_type);
-         ++i)
-    {
-        (*ptr++) = rd();
-    }
+    fill_random(std::span{out.data}.subspan(8));
 
     out.set_version(7);
     out.set_variant(8);
@@ -113,7 +116,7 @@ uuid uuid_parse(std::string_view sv)
         break;
 
     case 36 + 2: // {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
-        if (!sv.starts_with("{") || !sv.ends_with("}")) throw std::invalid_argument{"expected wrapped in '{}'"};
+        if (!sv.starts_with('{') || !sv.ends_with('}')) throw std::invalid_argument{"expected wrapped in '{}'"};
 
         sv = sv.substr(1, sv.length() - 2);
         break;

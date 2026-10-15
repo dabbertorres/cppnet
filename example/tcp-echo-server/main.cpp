@@ -72,7 +72,7 @@ int main()
     spdlog::set_default_logger(logger);
 
     // Block the signals before starting any threads (which inherit the mask), so that only sigwait() receives them.
-    sigset_t sig_set;
+    sigset_t sig_set{};
     sigemptyset(&sig_set);
     sigaddset(&sig_set, SIGINT);
     sigaddset(&sig_set, SIGTERM);
@@ -88,7 +88,7 @@ int main()
 
     auto run_thread = std::thread{[&] { scheduler.run(); }};
 
-    int sig;
+    int sig = 0;
     int ret = sigwait(&sig_set, &sig);
     if (ret != 0)
     {

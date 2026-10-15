@@ -41,7 +41,7 @@ TEST_CASE("does not go over max", "[util][resource_pool]")
     resource_pool<int> pool{1, 1};
 
     auto        res0 = pool.get();
-    std::thread waiting([res = std::move(res0)]() { std::this_thread::sleep_for(std::chrono::milliseconds(10)); });
+    std::thread waiting([res = std::move(res0)] { std::this_thread::sleep_for(std::chrono::milliseconds(10)); });
 
     CHECK_FALSE(pool.try_get().has_value());
 

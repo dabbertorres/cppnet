@@ -50,30 +50,30 @@ std::string sample(const std::string& text, std::string_view name)
 //       this has.
 TEST_CASE("process metrics are opt-in, and updated each record", "[instrument][prometheus][process]")
 {
-    CHECK(record().find("process_") == std::string::npos);
+    CHECK(!record().contains("process_"));
 
     register_process_metrics();
     register_process_metrics(); // again does nothing.
 
     auto before = record();
 
-    for (auto name : {"process_cpu_seconds_total",
-                      "process_open_fds",
-                      "process_max_fds",
-                      "process_virtual_memory_bytes",
-                      "process_virtual_memory_max_bytes",
-                      "process_resident_memory_bytes",
-                      "process_heap_bytes",
-                      "process_start_time_seconds",
-                      "process_threads"})
+    for (const auto* name : {"process_cpu_seconds_total",
+                             "process_open_fds",
+                             "process_max_fds",
+                             "process_virtual_memory_bytes",
+                             "process_virtual_memory_max_bytes",
+                             "process_resident_memory_bytes",
+                             "process_heap_bytes",
+                             "process_start_time_seconds",
+                             "process_threads"})
     {
         CAPTURE(name);
-        CHECK(before.find("# HELP "s + name + ' ') != std::string::npos);
+        CHECK(before.contains("# HELP "s + name + ' '));
         CHECK_FALSE(sample(before, name).empty());
     }
 
-    CHECK(before.find("# TYPE process_cpu_seconds_total counter\n") != std::string::npos);
-    CHECK(before.find("# TYPE process_open_fds gauge\n") != std::string::npos);
+    CHECK(before.contains("# TYPE process_cpu_seconds_total counter\n"));
+    CHECK(before.contains("# TYPE process_open_fds gauge\n"));
 
     // the next record sees two more open descriptors.
     std::array<int, 2> fds{};

@@ -54,10 +54,10 @@ std::string encoding::encode(std::span<const std::byte> data) const noexcept
     std::size_t blocks = data.size() / 3 * 3; // round down to a multiple of 3
     for (; in_i < blocks; in_i += 3, out_i += 4)
     {
-        encode_triplet(&out[out_i], &data.data()[in_i]);
+        encode_triplet(&out[out_i], &data[in_i]);
     }
 
-    auto wrote = encode_trailing(&out[out_i], &data.data()[in_i], data.size() - in_i);
+    auto wrote = encode_trailing(&out[out_i], &data[in_i], data.size() - in_i);
     if (padchar != 0)
     {
         for (auto i = out_i + wrote; i < out.size(); ++i)
@@ -82,7 +82,7 @@ std::optional<std::vector<std::byte>> encoding::decode(std::span<const char> dat
 
     for (std::size_t in_i = 0, out_i = 0; in_i < data.size(); in_i += 4, out_i += 3)
     {
-        auto valid = decode_triplet(&out[out_i], &data.data()[in_i], data.size() - in_i);
+        auto valid = decode_triplet(&out[out_i], &data[in_i], data.size() - in_i);
         if (!valid) return std::nullopt;
     }
 

@@ -62,7 +62,7 @@ public:
 
     // shutdown_write ends the outgoing side of the connection (the peer reads the end of the stream), while reads
     // carry on.
-    void shutdown_write() noexcept;
+    void shutdown_write() const noexcept;
 
 protected:
     static constexpr int invalid_fd = -1;

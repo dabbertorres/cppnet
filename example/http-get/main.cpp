@@ -31,11 +31,10 @@ namespace http = net::http;
 namespace
 {
 
-net::coro::task<bool> run_request(http::client& client, http::client_request& req);
-
+net::coro::task<bool> run_request(http::client& client, const http::client_request& req);
 }
 
-int main(int argc, char** argv)
+int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signature.
 {
     using namespace std::chrono_literals;
     using namespace std::string_view_literals;
@@ -99,7 +98,7 @@ int main(int argc, char** argv)
 namespace
 {
 
-net::coro::task<bool> run_request(http::client& client, http::client_request& req)
+net::coro::task<bool> run_request(http::client& client, const http::client_request& req)
 {
     auto get_result = co_await client.send(req);
     if (!get_result.has_value())

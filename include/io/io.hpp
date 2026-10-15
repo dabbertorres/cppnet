@@ -14,7 +14,7 @@ using handle = int;
 struct result
 {
     std::size_t          count{};
-    std::error_condition err;
+    std::error_condition err{};
 };
 
 enum class status_condition : std::uint8_t
@@ -25,7 +25,7 @@ enum class status_condition : std::uint8_t
     // TODO?
 };
 
-std::error_condition make_error_condition(status_condition);
+std::error_condition make_error_condition(status_condition /*code*/);
 
 const std::error_category& status_condition_category() noexcept;
 

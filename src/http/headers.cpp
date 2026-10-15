@@ -109,7 +109,7 @@ headers& headers::set(const std::string& key, std::initializer_list<std::string_
     value_type tmp;
     tmp.resize(vals.size());
 
-    std::transform(vals.begin(), vals.end(), tmp.begin(), [](std::string_view view) { return std::string(view); });
+    std::ranges::transform(vals, tmp.begin(), [](std::string_view view) { return std::string(view); });
 
     values[key] = tmp;
     return *this;
@@ -271,8 +271,8 @@ std::vector<std::string_view> headers::get_list(std::string_view key) const
             std::string key_v{key};
             std::string val_v{val};
 
-            std::for_each(key_v.begin(), key_v.end(), to_lower);
-            std::for_each(val_v.begin(), val_v.end(), to_lower);
+            std::ranges::for_each(key_v, to_lower);
+            std::ranges::for_each(val_v, to_lower);
 
             out.parameters.emplace(key_v, val_v);
         }
@@ -313,7 +313,7 @@ bool is_valid_field_name(std::string_view name) noexcept
     constexpr auto is_tchar = [](char c)
     {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-            || "!#$%&'*+-.^_`|~"sv.find(c) != std::string_view::npos;
+            || "!#$%&'*+-.^_`|~"sv.contains(c);
     };
 
     return !name.empty() && std::ranges::all_of(name, is_tchar);

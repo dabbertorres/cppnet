@@ -61,7 +61,7 @@ constexpr bool is_valid_zone(std::string_view zone) noexcept
     return true;
 }
 
-constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.find(c) != std::string_view::npos; }
+constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.contains(c); }
 constexpr bool is_scheme_char(char c) noexcept { return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.'; }
 
 // Characters that may appear unencoded in each part (RFC 3986).
@@ -78,7 +78,7 @@ constexpr bool is_fragment_char(char c) noexcept { return is_path_char(c) || c =
 constexpr bool is_forbidden_host_char(char c) noexcept
 {
     auto byte = static_cast<unsigned char>(c);
-    return byte <= 0x20 || byte == 0x7F || "#%/:<>?@[\\]^|"sv.find(c) != std::string_view::npos;
+    return byte <= 0x20 || byte == 0x7F || "#%/:<>?@[\\]^|"sv.contains(c);
 }
 
 template<typename Allowed>
@@ -211,8 +211,8 @@ url::parse_result parse_url(std::string_view input)
     auto rest = input.substr(pos);
 
     const bool has_authority = rest.starts_with("//"sv);
-    const bool starts_with_host
-        = !has_authority && out.scheme.empty() && !rest.empty() && "/?#"sv.find(rest.front()) == std::string_view::npos;
+    const bool starts_with_host =
+        !has_authority && out.scheme.empty() && !rest.empty() && !"/?#"sv.contains(rest.front());
 
     if (has_authority || starts_with_host)
     {
@@ -261,7 +261,7 @@ std::string url::encode(std::string_view str, std::string_view reserved) noexcep
                    [&](char c)
                    {
                        auto byte = static_cast<unsigned char>(c);
-                       return byte > 0x20 && byte < 0x7F && reserved.find(c) == std::string_view::npos;
+                       return byte > 0x20 && byte < 0x7F && !reserved.contains(c);
                    });
 
     return out;
@@ -363,7 +363,7 @@ std::string url::build() const noexcept
             out += '@';
         }
 
-        if (host.find(':') != std::string::npos)
+        if (host.contains(':'))
         {
             out += '[';
             out += host;

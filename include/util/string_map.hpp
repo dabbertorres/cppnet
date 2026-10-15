@@ -43,7 +43,7 @@ concept string_map_hasher = requires(T t, const String& s, StringView sv)
 template<typename String = std::string, typename StringView = std::string_view>
 struct default_string_map_hasher
 {
-    using hash_type      = typename std::hash<StringView>;
+    using hash_type      = std::hash<StringView>;
     using is_transparent = void;
 
     std::size_t operator()(const String& key) const noexcept { return hash_type{}(key); }

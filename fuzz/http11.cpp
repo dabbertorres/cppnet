@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <expected>
 #include <memory>
+#include <print>
 #include <span>
 #include <string>
 #include <string_view>
@@ -55,8 +56,7 @@ private:
 
 [[noreturn]] void fail(const char* what, std::string_view a, std::string_view b = {})
 {
-    std::fprintf(stderr, "PROPERTY FAILED: %s\n  [%.*s]\n  [%.*s]\n", what, int(a.size()), a.data(), int(b.size()),
-                 b.data());
+    std::println(stderr, "PROPERTY FAILED: {}\n  [{}]\n  [{}]", what, a, b);
     std::abort();
 }
 
@@ -86,7 +86,7 @@ std::string transcript(net::io::reader* conn)
             for (const auto& value : values)
             {
                 if (!net::http::is_valid_field_value(value)) fail("accepted an invalid field value", value);
-                out += name + ": " + value + "\n";
+                out.append(name).append(": ").append(value).append("\n");
             }
         }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,7 +12,7 @@
 namespace net
 {
 
-enum class url_parse_state
+enum class url_parse_state : std::uint8_t
 {
     scheme,
     authority,
@@ -74,9 +75,9 @@ public:
 
     // parse splits a URL as RFC 3986 does (with "//" before the authority), except that a URL with neither a scheme
     // nor "//", and not starting with '/', starts with its host (e.g. "example.com/path").
-    static parse_result parse(const char*) noexcept;
-    static parse_result parse(const std::string&) noexcept;
-    static parse_result parse(std::string_view) noexcept;
+    static parse_result parse(const char* /*s*/) noexcept;
+    static parse_result parse(const std::string& /*s*/) noexcept;
+    static parse_result parse(std::string_view /*s*/) noexcept;
 
     // build returns the URL, percent-encoding each part as needed.
     [[nodiscard]] std::string build() const noexcept;

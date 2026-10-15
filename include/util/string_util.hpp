@@ -19,7 +19,7 @@ template<typename String, typename CharT>
 class string_parts
 {
 public:
-    using size_type = typename String::size_type;
+    using size_type = String::size_type;
 
     class iterator
     {
@@ -34,7 +34,10 @@ public:
         constexpr iterator& operator++() noexcept
         {
             // after the last part (which ends at the end of the input, rather than at a separator), there are none.
-            if (end == parts->input.length()) begin = String::npos;
+            if (end == parts->input.length())
+            {
+                begin = String::npos;
+            }
             else
             {
                 begin = end + 1;
@@ -46,7 +49,7 @@ public:
 
         constexpr void operator++(int) noexcept { ++*this; }
 
-        friend constexpr bool operator==(const iterator& it, std::default_sentinel_t) noexcept
+        friend constexpr bool operator==(const iterator& it, std::default_sentinel_t /*unused*/) noexcept
         {
             return it.begin == String::npos;
         }
@@ -125,7 +128,7 @@ template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
-constexpr String trim_string(String str) noexcept
+constexpr String trim_string(const String& str) noexcept
 {
     using namespace std::literals::string_view_literals;
 

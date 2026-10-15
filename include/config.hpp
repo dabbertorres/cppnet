@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(__linux__)
+#ifdef __linux__
 
 #    define NET_HAS_EPOLL
 #    define NET_IS_LINUX

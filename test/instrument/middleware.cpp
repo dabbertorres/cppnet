@@ -284,7 +284,7 @@ TEST_CASE("handlers can continue the request's trace", "[instrument][middleware]
 
 TEST_CASE("the trace is removed from the request once it's handled", "[instrument][middleware][tracing]")
 {
-    const net::instrument::http_tracing handler{test_router(), [](opentelemetry::span&&) {}};
+    const net::instrument::http_tracing handler{test_router(), [](const opentelemetry::span&) {}};
 
     http::server_request req{
         .method  = http::request_method::GET,

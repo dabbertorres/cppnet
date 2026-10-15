@@ -37,7 +37,7 @@ std::string encode(const Metric& m)
 
 TEST_CASE("counter encodes", "[instrument][prometheus][counter][encode]")
 {
-    auto c = counter{"requests_total", "Requests served.", {{"code", "200"}}};
+    auto c = counter{"requests_total", "Requests served.", {{.key = "code", .val = "200"}}};
     c += 2.5;
     ++c;
 
@@ -65,6 +65,7 @@ TEST_CASE("counter increments from many threads aren't lost", "[instrument][prom
 
     {
         std::vector<std::jthread> workers;
+        workers.reserve(threads);
         for (std::size_t t = 0; t < threads; ++t)
         {
             workers.emplace_back(
@@ -104,7 +105,7 @@ TEST_CASE("metric labels are sorted", "[instrument][prometheus][metric]")
     auto c = counter{
         "name",
         "",
-        {{"b", "2"}, {"a", "1"}}
+        {{.key = "b", .val = "2"}, {.key = "a", .val = "1"}}
     };
     CHECK(c.labels
           == metric_labels{
@@ -118,7 +119,7 @@ TEST_CASE("derive_child adds labels", "[instrument][prometheus][metric]")
     auto parent = histogram{
         "latency",
         "Latency.",
-        {{"a", "1"}},
+        {{.key = "a", .val = "1"}},
         {0.5, 1.0}
     };
     parent.observe(0.1);
@@ -126,8 +127,8 @@ TEST_CASE("derive_child adds labels", "[instrument][prometheus][metric]")
     // a label it already has isn't replaced.
     auto child = derive_child(parent,
                               {
-                                  {"b",     "2"},
-                                  {"a", "other"}
+                                  {.key = "b",     .val = "2"},
+                                  {.key = "a", .val = "other"}
     });
 
     CHECK(child.name == "latency");
@@ -140,13 +141,13 @@ TEST_CASE("derive_child adds labels", "[instrument][prometheus][metric]")
     CHECK(child.buckets() == parent.buckets());
 
     // and it has nothing observed.
-    CHECK(encode(child).find(R"(latency_count{a="1",b="2"} 0)") != std::string::npos);
+    CHECK(encode(child).contains(R"(latency_count{a="1",b="2"} 0)"));
 
     auto c = derive_child(
         counter{
             "total"
     },
-        {{"x", "y"}});
+        {{.key = "x", .val = "y"}});
     CHECK(c.labels
           == metric_labels{
               {"x", "y"}

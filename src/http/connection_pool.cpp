@@ -31,7 +31,8 @@ namespace
 bool still_open(const net::tcp_socket& conn) noexcept
 {
     char byte = 0;
-    auto n    = ::recv(conn.native_handle(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): MSG_DONTWAIT, so it doesn't block.
+    auto n = ::recv(conn.native_handle(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     return n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
@@ -136,6 +137,7 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
     co_return lease{.conn = std::make_unique<tcp_socket>(std::move(*conn)), .key = key, .reused = false};
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): its members are moved from.
 void connection_pool::release(lease&& leased, bool reusable) noexcept
 {
     connections closing;

@@ -21,6 +21,7 @@
 #include "io/event_loop.hpp"
 #include "io/io.hpp"
 #include "io/poll.hpp"
+#include "util/defer.hpp"
 
 namespace
 {
@@ -248,25 +249,11 @@ void scheduler::run()
 {
     if (running.exchange(true, std::memory_order::acq_rel)) throw std::logic_error{"scheduler is already running"};
 
-    struct on_exit
-    {
-        explicit on_exit(std::atomic<bool>& running) noexcept
-            : running{running}
-        {}
-
-        on_exit(const on_exit&)            = delete;
-        on_exit& operator=(const on_exit&) = delete;
-        on_exit(on_exit&&)                 = delete;
-        on_exit& operator=(on_exit&&)      = delete;
-
-        ~on_exit()
-        {
-            running.store(false, std::memory_order::release);
-            running.notify_all();
-        }
-
-        std::atomic<bool>& running;
-    } reset_running{running};
+    util::defer on_exit{[this] noexcept
+                        {
+                            running.store(false, std::memory_order::release);
+                            running.notify_all();
+                        }};
 
     std::array<ready_event, 64> events{};
     completions                 done;
@@ -304,8 +291,8 @@ void scheduler::dispatch(std::span<const ready_event> events, completions& done)
         auto it = registrations.find(event.fd);
         if (it == registrations.end()) continue;
 
-        auto& reg   = it->second;
-        bool  fired = false;
+        const auto& reg   = it->second;
+        bool        fired = false;
 
         if (is_readable(event.ready) && reg.read != nullptr)
         {

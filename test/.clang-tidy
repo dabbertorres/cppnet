@@ -1,8 +1,10 @@
 # vim: ft=yaml
 
-# disable some checks triggered by Catch2 macros (e.g. it doesn't know REQUIRE(opt.has_value()) ends a failed test)
+# disable some checks triggered by Catch2 macros (e.g. it doesn't know REQUIRE(opt.has_value()) ends a failed test), and
+# capturing lambda coroutines, which in tests outlive the coroutines they start.
 Checks: >-
   -bugprone-unchecked-optional-access,
+  -cppcoreguidelines-avoid-capturing-lambda-coroutines,
   -cert-err58-cpp,
   -cppcoreguidelines-avoid-non-const-global-variables,
   -readability-function-cognitive-complexity,

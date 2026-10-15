@@ -1,6 +1,7 @@
 #include "pattern/pattern.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <queue>
 #include <stack>
 
@@ -32,14 +33,14 @@ bool is_operator(char c) noexcept
     }
 }
 
-bool is_operator(net::pattern::expr::string_view str) noexcept
+[[maybe_unused]] bool is_operator(net::pattern::expr::string_view str) noexcept
 {
     if (str.length() != 1) return false;
 
     return is_operator(str[0]);
 }
 
-enum class op
+enum class op : std::uint8_t
 {
     // by precedence, weakest -> strongest
 
@@ -131,7 +132,7 @@ expr expr::parse(string_view str)
     return ret;
 }
 
-void expr::parse(string_view str, std::vector<state>& states)
+void expr::parse(string_view str, [[maybe_unused]] std::vector<state>& states)
 {
     std::queue<string> output;
     std::stack<op>     operators;
@@ -219,11 +220,7 @@ void expr::parse(string_view str, std::vector<state>& states)
         operators.pop();
     }
 
-    while (!output.empty())
-    {
-        auto next = output.front();
-        output.pop();
-    }
+    // TODO: build states from output.
 }
 
 bool expr::match(string_view input) const noexcept

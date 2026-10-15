@@ -146,13 +146,14 @@ TEST_CASE("mixed digits", "[ipv6_addr][to_string]")
 TEST_CASE("parse rejects malformed addresses", "[ipv4_addr][ipv6_addr][parse]")
 {
     // too many parts used to be written before the start of the parsed values.
-    for (auto str : {"1.2.3.4.5", "1.2.3", "1.2..4", "1.2.3.4.", "1a.2.3.4", "1.2.3.256", "-1.2.3.4", ""})
+    for (const auto* str : {"1.2.3.4.5", "1.2.3", "1.2..4", "1.2.3.4.", "1a.2.3.4", "1.2.3.256", "-1.2.3.4", ""})
     {
         CAPTURE(str);
         CHECK_FALSE(ipv4_addr::parse(str).has_value());
     }
 
-    for (auto str : {"1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8g", "1:2:3:4:5:6:7:10000", "1:2:3:4:5:6::8"})
+    for (const auto* str :
+         {"1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8g", "1:2:3:4:5:6:7:10000", "1:2:3:4:5:6::8"})
     {
         CAPTURE(str);
         CHECK_FALSE(ipv6_addr::parse(str).has_value());

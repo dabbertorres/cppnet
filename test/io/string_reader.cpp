@@ -42,7 +42,7 @@ TEST_CASE("0-length read", "[io][string_reader]")
     auto res = test::sync_wait(reader.read(buf));
     REQUIRE_FALSE(res.err);
     REQUIRE(res.count == 0);
-    REQUIRE(buf == ""sv);
+    REQUIRE(buf.empty());
 }
 
 TEST_CASE("full-length read", "[io][string_reader]")

@@ -28,13 +28,13 @@ public:
     //
     // A write may be partial, but a write of a non-empty span writes at least one byte, or returns an error.
     virtual coro::task<result> write(std::span<const std::byte> data) = 0;
-    inline coro::task<result>  write(std::span<const char> data) { return write(std::as_bytes(data)); }
-    inline coro::task<result>  write(std::string_view data) { return write(std::span{data.data(), data.length()}); }
-    inline coro::task<result>  write(const std::string& data) { return write(std::span{data.data(), data.length()}); }
+    coro::task<result>         write(std::span<const char> data) { return write(std::as_bytes(data)); }
+    coro::task<result>         write(std::string_view data) { return write(std::span{data.data(), data.length()}); }
+    coro::task<result>         write(const std::string& data) { return write(std::span{data.data(), data.length()}); }
 
     // Single values are coroutines, so that the value lives in the coroutine frame until the write completes.
-    inline coro::task<result> write(std::byte data) { co_return co_await write(std::span{&data, 1}); }
-    inline coro::task<result> write(char data) { co_return co_await write(std::span{&data, 1}); }
+    coro::task<result> write(std::byte data) { co_return co_await write(std::span{&data, 1}); }
+    coro::task<result> write(char data) { co_return co_await write(std::span{&data, 1}); }
 
     [[nodiscard]] virtual int native_handle() const noexcept = 0;
 
@@ -42,7 +42,7 @@ protected:
     writer() = default;
 };
 
-inline coro::task<result> write_all(writer& out) { co_return {}; }
+inline coro::task<result> write_all(writer& /*out*/) { co_return {}; }
 
 template<typename... Writes>
 inline coro::task<result> write_all(writer& out, std::span<const std::byte> data, Writes&&... writes)

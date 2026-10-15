@@ -31,6 +31,11 @@ Style:
 Diagnostics:
   UnusedIncludes: Strict
   MissingIncludes: Strict
+  Includes:
+    # include-cleaner doesn't know <chrono> provides the duration literals (e.g. 5s), so it asks for libc++'s private
+    # header. Ignoring that header only affects what it can't map: e.g. std::chrono::seconds still needs <chrono>.
+    IgnoreHeader:
+    - __chrono/.*
   Suppress:
   - -Wpadded
 Completion:

@@ -101,7 +101,7 @@ constexpr span_flags& operator|=(span_flags& lhs, span_flags rhs) noexcept
     return lhs;
 }
 
-enum class span_kind
+enum class span_kind : std::uint8_t
 {
     unspecified = 0,
     internal    = 1,
@@ -136,7 +136,7 @@ struct link
 
 void to_json(nlohmann::json& j, const link& value);
 
-enum class status_code
+enum class status_code : std::uint8_t
 {
     unset = 0,
     ok    = 1,
@@ -151,6 +151,7 @@ struct status
 
 void to_json(nlohmann::json& j, const status& value);
 
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): its fields are in the order of OTLP's Span message.
 struct span
 {
     std::byte                version{};

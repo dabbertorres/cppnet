@@ -63,11 +63,11 @@ class scheduler
         poll_op                               op;
         std::optional<clock::time_point>      deadline;
         std::coroutine_handle<>               awaiting{nullptr};
-        std::error_condition                  result;
-        std::optional<timer_list::iterator>   timer;
+        std::error_condition                  result{};
+        std::optional<timer_list::iterator>   timer{};
         const std::atomic<std::uint64_t>*     word     = nullptr;
         std::uint64_t                         expected = 0;
-        std::optional<watched_list::iterator> watch;
+        std::optional<watched_list::iterator> watch{};
     };
 
     // registration holds the waiters for a handle: at most one per operation.

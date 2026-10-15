@@ -33,7 +33,7 @@ constexpr auto span_of(const char (&str)[N]) noexcept
 
 }
 
-using encoding = net::encoding::base64::encoding;
+using net::encoding::base64::encoding;
 
 TEST_CASE("encoded_size", "[encoding][base64]")
 {

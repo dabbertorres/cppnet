@@ -3,6 +3,7 @@
 #include <concepts> // IWYU pragma: keep
 #include <functional>
 #include <type_traits>
+#include <utility>
 
 namespace net::util
 {

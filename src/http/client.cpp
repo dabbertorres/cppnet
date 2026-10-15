@@ -104,8 +104,8 @@ private:
         // nothing is pipelined, so anything after the body is the server misbehaving.
         const bool reuse = complete && reusable && reader->buffered().empty();
 
-        body.reset();
-        reader.reset();
+        body   = nullptr;
+        reader = nullptr;
         pool->release(std::move(leased), reuse);
     }
 
@@ -120,7 +120,7 @@ private:
 // limit is a timeout from client_options, where 0 is no limit.
 std::optional<net::io::clock::duration> limit(std::chrono::milliseconds timeout) noexcept
 {
-    if (timeout <= timeout.zero()) return std::nullopt;
+    if (timeout <= std::chrono::milliseconds::zero()) return std::nullopt;
     return timeout;
 }
 

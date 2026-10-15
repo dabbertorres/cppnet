@@ -30,7 +30,7 @@ int udp_socket::open(std::string_view host, std::string_view port, protocol prot
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
-    ::addrinfo hints = {0};
+    ::addrinfo hints = {.ai_flags = 0};
 #pragma clang diagnostic pop
 
     if (host.empty()) hints.ai_flags = AI_PASSIVE;
@@ -55,7 +55,7 @@ int udp_socket::open(std::string_view host, std::string_view port, protocol prot
     // find first valid addr, and use it!
     int fd = -1;
 
-    for (::addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
+    for (const ::addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
         fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
         if (fd > -1) break;

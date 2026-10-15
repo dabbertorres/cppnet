@@ -218,7 +218,7 @@ std::expected<std::chrono::duration<double>, std::error_condition> process_cpu_s
 
 std::expected<std::size_t, std::error_condition> process_open_fds() noexcept
 {
-#if defined(NET_IS_LINUX)
+#ifdef NET_IS_LINUX
     DIR* dir = ::opendir("/proc/self/fd");
     if (dir == nullptr) return from_errno();
 
@@ -237,7 +237,7 @@ std::expected<std::size_t, std::error_condition> process_open_fds() noexcept
 
     ::closedir(dir);
     return count;
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     const auto pid = ::getpid();
 
     errno    = 0;
@@ -268,9 +268,9 @@ std::expected<std::size_t, std::error_condition> process_max_fds() noexcept { re
 
 std::expected<std::size_t, std::error_condition> process_virtual_memory() noexcept
 {
-#if defined(NET_IS_LINUX)
+#ifdef NET_IS_LINUX
     return statm_bytes(0);
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     return basic_task_info().transform([](const mach_task_basic_info& info)
                                        { return static_cast<std::size_t>(info.virtual_size); });
 #else
@@ -282,9 +282,9 @@ std::expected<std::size_t, std::error_condition> process_virtual_memory_max() no
 
 std::expected<std::size_t, std::error_condition> process_resident_memory() noexcept
 {
-#if defined(NET_IS_LINUX)
+#ifdef NET_IS_LINUX
     return statm_bytes(1);
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     return basic_task_info().transform([](const mach_task_basic_info& info)
                                        { return static_cast<std::size_t>(info.resident_size); });
 #else
@@ -298,7 +298,7 @@ std::expected<std::size_t, std::error_condition> process_heap() noexcept
     // the bytes allocated: from the main heap (arena), and with mmap (for large allocations).
     auto info = ::mallinfo2();
     return info.uordblks + info.hblkhd;
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     // every zone's (with no zone).
     malloc_statistics_t stats{};
     ::malloc_zone_statistics(nullptr, &stats);
@@ -310,7 +310,7 @@ std::expected<std::size_t, std::error_condition> process_heap() noexcept
 
 std::expected<time_point, std::error_condition> process_start_time() noexcept
 {
-#if defined(NET_IS_LINUX)
+#ifdef NET_IS_LINUX
     // starttime is in clock ticks since the system booted, and /proc/stat's btime is when that was, in Unix time.
     auto start_ticks = stat_field<unsigned long long>(22);
     if (!start_ticks) return std::unexpected{start_ticks.error()};
@@ -332,7 +332,7 @@ std::expected<time_point, std::error_condition> process_start_time() noexcept
 
     auto since_boot = std::chrono::duration<double>{static_cast<double>(*start_ticks) / static_cast<double>(ticks)};
     return time_point{std::chrono::seconds{*boot}} + std::chrono::duration_cast<time_point::duration>(since_boot);
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     return pid_info<proc_bsdinfo>(PROC_PIDTBSDINFO)
         .transform(
             [](const proc_bsdinfo& info)
@@ -348,9 +348,9 @@ std::expected<time_point, std::error_condition> process_start_time() noexcept
 
 std::expected<std::size_t, std::error_condition> process_threads() noexcept
 {
-#if defined(NET_IS_LINUX)
+#ifdef NET_IS_LINUX
     return stat_field<std::size_t>(20);
-#elif defined(NET_IS_OSX)
+#elifdef NET_IS_OSX
     return pid_info<proc_taskinfo>(PROC_PIDTASKINFO)
         .transform([](const proc_taskinfo& info) { return static_cast<std::size_t>(info.pti_threadnum); });
 #else
@@ -360,7 +360,7 @@ std::expected<std::size_t, std::error_condition> process_threads() noexcept
 
 std::expected<process_info, std::error_condition> process_usage() noexcept
 {
-#if defined(NET_IS_OSX)
+#ifdef NET_IS_OSX
     constexpr std::size_t max_rss_unit = 1; // bytes
 #else
     constexpr std::size_t max_rss_unit = 1024; // kilobytes

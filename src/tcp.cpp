@@ -80,7 +80,7 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
 
     std::error_condition last_err = std::make_error_condition(std::errc::host_unreachable);
 
-    for (auto* info = addresses->get(); info != nullptr; info = info->ai_next)
+    for (const auto* info = addresses->get(); info != nullptr; info = info->ai_next)
     {
         int fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
         if (fd == -1)
