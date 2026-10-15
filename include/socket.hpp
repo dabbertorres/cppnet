@@ -56,6 +56,10 @@ public:
 
     void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
 
+    // shutdown_write ends the outgoing side of the connection (the peer reads the end of the stream), while reads
+    // carry on.
+    void shutdown_write() noexcept;
+
 protected:
     static constexpr int invalid_fd = -1;
 

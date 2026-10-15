@@ -22,12 +22,21 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
 
+// request_decode decodes a request's head, and fails with:
+// - std::errc::invalid_argument if it's malformed (or ambiguous, e.g. two different Content-Lengths).
+// - std::errc::not_supported if it uses something that isn't implemented (e.g. an unknown method, or gzip transfer
+//   coding).
+// - std::errc::value_too_large if the head is longer than max_header_bytes.
+// - status_condition::closed if the connection ends first.
 task<request_decoder_result>
 request_decode(io::buffered_reader* reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
+// response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
+// HEAD requests have no body.
 task<response_decoder_result>
 response_decode(std::unique_ptr<io::buffered_reader> reader,
-                std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+                request_method                       method           = request_method::GET,
+                std::size_t                          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 }

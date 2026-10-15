@@ -244,4 +244,23 @@ std::expected<request_target, std::error_condition> parse_request_target(request
     }
 }
 
+std::expected<request_target, std::error_condition> parse_host(std::string_view value) noexcept
+{
+    try
+    {
+        request_target out;
+        out.kind = request_target::form::authority;
+
+        if (!parse_authority(value, false, out))
+            return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+
+        return out;
+    }
+    catch (...)
+    {
+        // only allocation can fail.
+        return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+    }
+}
+
 }

@@ -7,9 +7,28 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 #include "util/string_util.hpp"
+
+namespace
+{
+
+// trim_ows trims optional whitespace (spaces and tabs, RFC 9110 section 5.6.3) from both ends of str.
+std::string_view trim_ows(std::string_view str) noexcept
+{
+    constexpr auto ows = " \t";
+
+    auto start = str.find_first_not_of(ows);
+    if (start == std::string_view::npos) return {};
+
+    return str.substr(start, str.find_last_not_of(ows) - start + 1);
+}
+
+}
 
 namespace net::http
 {
@@ -164,15 +183,58 @@ headers& headers::set_content_type(const content_type& content_type)
     };
 }
 
+std::vector<std::string_view> headers::get_list(std::string_view key) const
+{
+    std::vector<std::string_view> out;
+
+    auto all = get_all(key);
+    if (!all.has_value()) return out;
+
+    for (std::string_view value : *all)
+    {
+        bool        quoted  = false;
+        std::size_t start   = 0;
+        const auto  element = [&](std::size_t end)
+        {
+            auto trimmed = trim_ows(value.substr(start, end - start));
+            if (!trimmed.empty()) out.push_back(trimmed);
+            start = end + 1;
+        };
+
+        for (std::size_t i = 0; i < value.size(); ++i)
+        {
+            if (quoted && value[i] == '\\')
+                ++i; // skip what's escaped
+            else if (value[i] == '"')
+                quoted = !quoted;
+            else if (!quoted && value[i] == ',')
+                element(i);
+        }
+
+        element(value.size());
+    }
+
+    return out;
+}
+
 [[nodiscard]] std::optional<std::size_t> headers::get_content_length() const
 {
-    auto maybe = get("Content-Length"sv);
-    if (!maybe.has_value()) return std::nullopt;
+    std::optional<std::size_t> length;
 
-    std::size_t length; // NOLINT(cppcoreguidelines-init-variables)
-    auto [_, err] = std::from_chars(maybe->begin(), maybe->end(), length);
+    for (auto value : get_list("Content-Length"sv))
+    {
+        // only digits: from_chars would also take a leading '-', and stop at the first non-digit.
+        if (!std::ranges::all_of(value, [](char c) { return c >= '0' && c <= '9'; })) return std::nullopt;
 
-    if (err != std::errc()) return std::nullopt;
+        std::size_t parsed = 0;
+        auto [ptr, err]    = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        if (err != std::errc() || ptr != value.data() + value.size()) return std::nullopt;
+
+        // repeated values must agree.
+        if (length.has_value() && *length != parsed) return std::nullopt;
+        length = parsed;
+    }
+
     return length;
 }
 
@@ -234,20 +296,8 @@ headers& headers::set_content_type(const content_type& content_type)
 
 [[nodiscard]] bool headers::is_chunked() const
 {
-    return get_transfer_encoding()
-        .transform(
-            [](auto range)
-            {
-                for (auto val : range)
-                {
-                    val = util::trim_string(val);
-
-                    if (util::equal_ignore_case(val, "chunked"s)) return true;
-                }
-
-                return false;
-            })
-        .value_or(false);
+    auto codings = get_list("Transfer-Encoding"sv);
+    return !codings.empty() && util::equal_ignore_case(codings.back(), "chunked"sv);
 }
 
 [[nodiscard]] headers::keys_iterator headers::begin() const { return values.begin(); }
@@ -256,5 +306,42 @@ headers& headers::set_content_type(const content_type& content_type)
 [[nodiscard]] bool headers::empty() const noexcept { return values.empty(); }
 
 [[nodiscard]] std::size_t headers::size() const noexcept { return values.size(); }
+
+bool is_valid_field_name(std::string_view name) noexcept
+{
+    constexpr auto is_tchar = [](char c)
+    {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || "!#$%&'*+-.^_`|~"sv.find(c) != std::string_view::npos;
+    };
+
+    return !name.empty() && std::ranges::all_of(name, is_tchar);
+}
+
+bool is_valid_field_value(std::string_view value) noexcept
+{
+    // anything but controls, other than tab: visible ASCII, space, and (obsolete, but allowed) bytes above ASCII.
+    return std::ranges::none_of(value,
+                                [](char c)
+                                {
+                                    auto byte = static_cast<unsigned char>(c);
+                                    return (byte < 0x20 && byte != '\t') || byte == 0x7F;
+                                });
+}
+
+std::optional<std::pair<std::string_view, std::string_view>> parse_field_line(std::string_view line) noexcept
+{
+    auto colon = line.find(':');
+    if (colon == std::string_view::npos) return std::nullopt;
+
+    // no whitespace is allowed before the colon (RFC 9112, section 5.1), which also rules out line folding.
+    auto name = line.substr(0, colon);
+    if (!is_valid_field_name(name)) return std::nullopt;
+
+    auto value = trim_ows(line.substr(colon + 1));
+    if (!is_valid_field_value(value)) return std::nullopt;
+
+    return std::pair{name, value};
+}
 
 }

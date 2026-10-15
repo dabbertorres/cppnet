@@ -25,6 +25,7 @@ request_decode(io::buffered_reader* reader,
 
 task<response_decoder_result>
 response_decode(std::unique_ptr<io::buffered_reader> reader,
-                std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+                request_method                       method           = request_method::GET,
+                std::size_t                          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 }

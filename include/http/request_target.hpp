@@ -49,4 +49,8 @@ struct request_target
 std::expected<request_target, std::error_condition> parse_request_target(request_method   method,
                                                                          std::string_view target) noexcept;
 
+// parse_host parses a Host header's value: "host[:port]", where the host may be an IPv6 address in brackets. Only the
+// result's host and port are set. It fails with std::errc::invalid_argument if the value is malformed.
+std::expected<request_target, std::error_condition> parse_host(std::string_view value) noexcept;
+
 }

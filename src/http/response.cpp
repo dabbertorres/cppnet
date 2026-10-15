@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -39,7 +40,8 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
     auto res = co_await encode(writer, *resp);
     if (!res.has_value())
     {
-        throw(res.error());
+        // e.g. a header that can't be written (one with a line break in it), which nothing was written for.
+        throw std::system_error{res.error().value(), res.error().category(), "failed to send response"};
     }
 
     co_return resp->body;
