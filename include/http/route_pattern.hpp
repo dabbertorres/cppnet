@@ -43,13 +43,24 @@ namespace detail
         return true;
     }
 
-    // has_segment is whether path (which ends with '/') has segment as a whole segment.
+    // segment_end is where the segment of path from start ends: at the next '/', or the end of path.
+    // NOTE: patterns are searched by hand, not with string_view's find and the like: GCC 16 fails to evaluate those at
+    //       compile time when the pattern is a template argument's (as static_router's are).
+    constexpr std::size_t segment_end(std::string_view path, std::size_t start) noexcept
+    {
+        while (start < path.size() && path[start] != '/') ++start;
+        return start;
+    }
+
+    // has_segment is whether path (which starts and ends with '/') has segment as a whole segment.
+    // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
     constexpr bool has_segment(std::string_view path, std::string_view segment) noexcept
     {
-        for (auto pos = path.find(segment); pos != std::string_view::npos; pos = path.find(segment, pos + 1))
+        for (std::size_t start = 1; start < path.size();)
         {
-            const auto after = pos + segment.size();
-            if (pos > 0 && path[pos - 1] == '/' && after < path.size() && path[after] == '/') return true;
+            const auto end = segment_end(path, start);
+            if (path.substr(start, end - start) == segment) return true;
+            start = end + 1;
         }
 
         return false;
@@ -63,12 +74,12 @@ namespace detail
 constexpr route_error check_route_pattern(std::string_view pattern) noexcept
 {
     if (!pattern.starts_with('/')) return route_error::no_leading_slash;
-    if (pattern.find_first_of("?#") != std::string_view::npos) return route_error::query_or_fragment;
+    for (const char c : pattern)
+        if (c == '?' || c == '#') return route_error::query_or_fragment;
 
     for (std::size_t start = 1; start <= pattern.size();)
     {
-        auto end = pattern.find('/', start);
-        if (end == std::string_view::npos) end = pattern.size();
+        const auto end = detail::segment_end(pattern, start);
 
         const auto segment = pattern.substr(start, end - start);
         const auto before  = pattern.substr(0, start); // up to the '/' before segment
