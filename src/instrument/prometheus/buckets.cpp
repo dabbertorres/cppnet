@@ -56,7 +56,8 @@ std::vector<double> exponential_buckets(double start, double factor, std::size_t
 {
     if (count < 2 || !(start > 0) || !std::isfinite(start) || !(factor > 1) || !std::isfinite(factor))
     {
-        throw std::invalid_argument{"exponential_buckets needs at least 2 buckets, a positive start, and a factor over 1"};
+        throw std::invalid_argument{
+            "exponential_buckets needs at least 2 buckets, a positive start, and a factor over 1"};
     }
 
     std::vector<double> buckets(count);

@@ -61,32 +61,31 @@ using metric_labels = std::vector<metric_label>;
 namespace detail
 {
 
-// add adds v to value, as one atomic step, and returns the result.
-// NOTE: rather than fetch_add, which not every standard library has for floating-point atomics yet.
-inline double add(std::atomic<double>& value, double v) noexcept
-{
-    auto current = value.load(std::memory_order_relaxed);
-    while (!value.compare_exchange_weak(current, current + v, std::memory_order_relaxed))
+    // add adds v to value, as one atomic step, and returns the result.
+    // NOTE: rather than fetch_add, which not every standard library has for floating-point atomics yet.
+    inline double add(std::atomic<double>& value, double v) noexcept
     {
+        auto current = value.load(std::memory_order_relaxed);
+        while (!value.compare_exchange_weak(current, current + v, std::memory_order_relaxed))
+        {}
+
+        return current + v;
     }
 
-    return current + v;
-}
+    // append_escaped appends text to out, escaping it for HELP text (backslashes and newlines) or, if label_value, for
+    // a label's value (also double quotes).
+    void append_escaped(std::string& out, std::string_view text, bool label_value);
 
-// append_escaped appends text to out, escaping it for HELP text (backslashes and newlines) or, if label_value, for a
-// label's value (also double quotes).
-void append_escaped(std::string& out, std::string_view text, bool label_value);
+    // write_text writes all of text, as a write may be partial.
+    coro::task<io::result> write_text(io::writer& out, std::string text);
 
-// write_text writes all of text, as a write may be partial.
-coro::task<io::result> write_text(io::writer& out, std::string text);
+    // validate_name throws std::invalid_argument if name isn't a valid metric name: [a-zA-Z_:][a-zA-Z0-9_:]*.
+    void validate_name(std::string_view name);
 
-// validate_name throws std::invalid_argument if name isn't a valid metric name: [a-zA-Z_:][a-zA-Z0-9_:]*.
-void validate_name(std::string_view name);
-
-// normalize_labels sorts labels by key (so that the same labels in another order are the same series), and throws
-// std::invalid_argument if a key isn't a valid label name ([a-zA-Z_][a-zA-Z0-9_]*, not starting with "__", which is
-// reserved), or is repeated.
-metric_labels normalize_labels(metric_labels labels);
+    // normalize_labels sorts labels by key (so that the same labels in another order are the same series), and throws
+    // std::invalid_argument if a key isn't a valid label name ([a-zA-Z_][a-zA-Z0-9_]*, not starting with "__", which is
+    // reserved), or is repeated.
+    metric_labels normalize_labels(metric_labels labels);
 
 }
 
@@ -210,8 +209,11 @@ struct base_metric
         }
         else
         {
-            static_assert(requires { { self->get() } -> std::convertible_to<double>; },
-                          "a metric needs an encode_own_samples, or a get() of its value");
+            static_assert(
+                requires {
+                    { self->get() } -> std::convertible_to<double>;
+                },
+                "a metric needs an encode_own_samples, or a get() of its value");
 
             // NOTE: no timestamp, as Prometheus then uses the time of the scrape. (The text format's are milliseconds
             //       since the Unix epoch, which last_update, from steady_clock, isn't.)

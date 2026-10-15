@@ -33,13 +33,13 @@ using metric = std::variant<counter, gauge, histogram>;
 namespace detail
 {
 
-template<typename T, typename Variant>
-struct is_alternative : std::false_type
-{};
+    template<typename T, typename Variant>
+    struct is_alternative : std::false_type
+    {};
 
-template<typename T, typename... Ts>
-struct is_alternative<T, std::variant<Ts...>> : std::bool_constant<(std::same_as<T, Ts> || ...)>
-{};
+    template<typename T, typename... Ts>
+    struct is_alternative<T, std::variant<Ts...>> : std::bool_constant<(std::same_as<T, Ts> || ...)>
+    {};
 
 }
 
