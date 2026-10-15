@@ -311,18 +311,6 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
     conn.close(false);
 }
 
-void server::serve_http11(tcp_socket conn) noexcept
-{
-    while (is_serving && conn.valid())
-    {}
-}
-
-void server::serve_http2(tcp_socket conn) noexcept
-{
-    while (is_serving && conn.valid())
-    {}
-}
-
 std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept
 {
     std::string_view upgrade_to;
