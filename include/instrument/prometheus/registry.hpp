@@ -4,12 +4,14 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
-#include <unordered_map>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -21,76 +23,72 @@
 #include "instrument/prometheus/metric.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
-#include "util/hash.hpp"
 #include "util/string_map.hpp"
-
-namespace std
-{
-
-template<typename T>
-struct hash<std::vector<T>>
-{
-    constexpr std::size_t operator()(const std::vector<T>& value) const
-    {
-        std::size_t h = std::hash<std::size_t>{}(value.size());
-        for (const auto& elem : value)
-        {
-            h = net::util::detail::hash_combine(h, std::hash<T>{}(elem));
-        }
-
-        return h;
-    }
-};
-
-}
 
 namespace net::instrument::prometheus
 {
 
 using metric = std::variant<counter, gauge, histogram>;
 
-template<typename T, typename V, typename S = std::make_index_sequence<std::variant_size_v<V>>, std::size_t... Is>
-concept variant_has = requires(V v, S)
-// clang-format off
+namespace detail
 {
-    (... || std::same_as<T, std::variant_alternative_t<Is, V>>);
-};
-// clang-format on
 
+template<typename T, typename Variant>
+struct is_alternative : std::false_type
+{};
+
+template<typename T, typename... Ts>
+struct is_alternative<T, std::variant<Ts...>> : std::bool_constant<(std::same_as<T, Ts> || ...)>
+{};
+
+}
+
+// variant_has is whether T is one of Variant's alternatives.
+template<typename T, typename Variant>
+concept variant_has = detail::is_alternative<T, Variant>::value;
+
+// registry holds the metrics that are recorded (e.g. for Prometheus to scrape). Its metrics are never removed, so
+// references to them stay valid.
+//
+// A metric's name is a metric family: metrics of the same name, but different labels, which must have the same type
+// and help.
 class registry
 {
 public:
+    // register_metric registers m, unless a metric of the same name and labels already is, and returns the registered
+    // metric. It throws std::invalid_argument if a metric of the same name has another type or help.
     template<variant_has<metric> T>
     static T& register_metric(T&& m)
     {
         auto* r = get();
 
         std::lock_guard lock{r->mutex};
-        return std::get<T>(
-            r->get_metric(m.name, m.labels)
-                .or_else([r, m = std::forward<T>(m)]()
-                         { return std::make_optional(r->register_metric(m.name, m.labels, std::move(m))); })
-                .value()
-                .get());
+        return std::get<T>(r->add(metric{std::move(m)}).get());
     }
 
+    // get_metric returns the metric of that type, name and labels, if it's registered.
     template<variant_has<metric> T>
     static std::optional<std::reference_wrapper<T>> get_metric(std::string_view name, const metric_labels& labels)
     {
         auto* r = get();
 
         std::shared_lock lock{r->mutex};
-        return r->get_metric(name, labels)
-            .transform([](metric_ref val) -> std::reference_wrapper<T> { return std::ref(std::get<T>(val.get())); });
+        auto             found = r->find(name, detail::normalize_labels(labels));
+        if (!found.has_value()) return std::nullopt;
+
+        T* m = std::get_if<T>(&found->get());
+        if (m == nullptr) return std::nullopt;
+        return std::ref(*m);
     }
 
-    // record writes every metric, in Prometheus' text format.
+    // record writes every metric, in Prometheus' text format, grouped by family (in the order they were registered).
     static coro::task<io::result> record(io::writer& writer);
 
 private:
-    using metric_ref       = std::reference_wrapper<metric>;
-    using submetric_lookup = std::unordered_map<metric_labels, metric_ref>;
-    using lookup_table     = util::string_map<submetric_lookup>;
+    using metric_ref = std::reference_wrapper<metric>;
+
+    // NOTE: ordered by labels, so a family's metrics are written in the same order each time.
+    using family = std::map<metric_labels, metric_ref>;
 
     registry() = default;
 
@@ -100,13 +98,14 @@ private:
     static std::once_flag            initialized;
     // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
-    metric_ref                register_metric(std::string_view name, const metric_labels& labels, metric&& m);
-    std::optional<metric_ref> get_metric(std::string_view name, const metric_labels& labels);
+    metric_ref                add(metric&& m);
+    std::optional<metric_ref> find(std::string_view name, const metric_labels& labels);
 
     std::shared_mutex  mutex;
     std::deque<metric> metrics;
 
-    lookup_table lookup;
+    util::string_map<family> families;
+    std::vector<std::string> family_order;
 };
 
 }

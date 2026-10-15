@@ -19,7 +19,7 @@ struct histogram : public base_metric<histogram>
     static constexpr metric_type type() noexcept { return metric_type::histogram; }
 
     // buckets are the buckets' upper bounds, which must be increasing (or std::invalid_argument is thrown). A +Inf
-    // bucket is added, if they don't end with one.
+    // bucket is added, if they don't end with one. The labels can't include "le", which the buckets use.
     histogram(std::string&&         name,
               std::string&&         help    = "",
               metric_labels&&       labels  = {},
@@ -38,6 +38,9 @@ struct histogram : public base_metric<histogram>
     // to the sum. It's safe to call from any number of threads at once.
     void observe(double v) noexcept;
 
+    // buckets returns the buckets' upper bounds, ending with +Inf.
+    [[nodiscard]] const std::vector<double>& buckets() const noexcept { return bounds; }
+
     // track returns a tracker, which observes how long it lived, in seconds.
     auto track() noexcept
     {
@@ -47,8 +50,7 @@ struct histogram : public base_metric<histogram>
 private:
     friend struct base_metric<histogram>;
 
-    void encode_self(std::string& out) const;
-    void on_derive(histogram& child);
+    void encode_own_samples(std::string& out) const;
 
     // NOTE: each bucket counts only the observations that belong in it, rather than also those in the buckets before
     //       it (as the output does), so an observation is one atomic increment, and the output adds them up: then its
