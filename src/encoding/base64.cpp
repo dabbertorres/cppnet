@@ -2,31 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
-#include <shared_mutex>
-#include <unordered_map>
-
-#include "util/hash.hpp"
-
-namespace std
-{
-
-template<>
-struct hash<net::encoding::base64::alphabet>
-{
-    std::size_t operator()(const net::encoding::base64::alphabet& alphabet) const noexcept
-    {
-        std::size_t h = std::hash<std::size_t>{}(alphabet.size());
-        for (const auto c : alphabet)
-        {
-            h = net::util::detail::hash_combine(h, c);
-        }
-
-        return h;
-    }
-};
-
-}
 
 namespace
 {
@@ -34,35 +9,16 @@ namespace
 using net::encoding::base64::alphabet;
 using net::encoding::base64::decode_map;
 
-// NOLINTBEGIN(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
-std::shared_mutex                        decoders_cache_mu;
-std::unordered_map<alphabet, decode_map> decoders_cache;
-// NOLINTEND(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
-
-decode_map build_decoder(const alphabet& alphabet)
+decode_map build_decoder(const alphabet& alphabet) noexcept
 {
-    // TODO: benchmark whether caching is actually worthwhile or not
-    //       or maybe just thread_local caches?
-
-    {
-        std::shared_lock read_lock{decoders_cache_mu};
-        if (auto it = decoders_cache.find(alphabet); it != decoders_cache.end()) return it->second;
-    }
-
-    std::lock_guard write_lock{decoders_cache_mu};
-
-    // double check the decode_map wasn't created by someone else while we were waiting
-    if (auto it = decoders_cache.find(alphabet); it != decoders_cache.end()) return it->second;
-
     decode_map out;
     out.fill(static_cast<std::byte>(0xff));
 
     for (std::size_t i = 0; i < alphabet.size(); ++i)
     {
-        out[static_cast<std::size_t>(alphabet[i])] = static_cast<std::byte>(i);
+        // NOTE: through unsigned char, as a char may be negative.
+        out[static_cast<unsigned char>(alphabet[i])] = static_cast<std::byte>(i);
     }
-
-    decoders_cache[alphabet] = out;
 
     return out;
 }
