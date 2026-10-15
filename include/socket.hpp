@@ -46,6 +46,13 @@ public:
     void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
     void set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept;
 
+    // Timeouts limit how long each wait of a read or write may be, i.e. how long it may go without the socket being
+    // ready (then failing with std::errc::timed_out), unlike a deadline, which limits them altogether. Both apply, if
+    // set. std::nullopt removes it.
+    void set_timeout(std::optional<io::clock::duration> timeout) noexcept;
+    void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept;
+    void set_write_timeout(std::optional<io::clock::duration> timeout) noexcept;
+
     coro::task<io::result> read(std::span<std::byte> data) noexcept override;
     coro::task<io::result> write(std::span<const std::byte> data) noexcept override;
 
@@ -75,6 +82,8 @@ private:
     int                                  fd;
     std::optional<io::clock::time_point> read_deadline;
     std::optional<io::clock::time_point> write_deadline;
+    std::optional<io::clock::duration>   read_timeout;
+    std::optional<io::clock::duration>   write_timeout;
 };
 
 }

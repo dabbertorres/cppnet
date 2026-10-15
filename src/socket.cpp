@@ -33,6 +33,16 @@
 namespace
 {
 
+// wait_deadline is when a wait must end by: the deadline, or the timeout from now, whichever is sooner.
+std::optional<net::io::clock::time_point> wait_deadline(std::optional<net::io::clock::time_point> deadline,
+                                                        std::optional<net::io::clock::duration>   timeout) noexcept
+{
+    if (!timeout) return deadline;
+
+    auto from_now = net::io::clock::now() + *timeout;
+    return deadline ? std::min(*deadline, from_now) : from_now;
+}
+
 std::string addr_name(const sockaddr_storage* addr)
 {
     std::array<char, INET6_ADDRSTRLEN> buf{};
@@ -104,6 +114,8 @@ socket::socket(socket&& other) noexcept
     , fd{std::exchange(other.fd, invalid_fd)}
     , read_deadline{std::exchange(other.read_deadline, std::nullopt)}
     , write_deadline{std::exchange(other.write_deadline, std::nullopt)}
+    , read_timeout{std::exchange(other.read_timeout, std::nullopt)}
+    , write_timeout{std::exchange(other.write_timeout, std::nullopt)}
 {}
 
 socket& socket::operator=(socket&& other) noexcept
@@ -116,6 +128,8 @@ socket& socket::operator=(socket&& other) noexcept
         fd             = std::exchange(other.fd, invalid_fd);
         read_deadline  = std::exchange(other.read_deadline, std::nullopt);
         write_deadline = std::exchange(other.write_deadline, std::nullopt);
+        read_timeout   = std::exchange(other.read_timeout, std::nullopt);
+        write_timeout  = std::exchange(other.write_timeout, std::nullopt);
     }
 
     return *this;
@@ -164,6 +178,16 @@ void socket::set_read_deadline(std::optional<io::clock::time_point> deadline) no
 
 void socket::set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept { write_deadline = deadline; }
 
+void socket::set_timeout(std::optional<io::clock::duration> timeout) noexcept
+{
+    read_timeout  = timeout;
+    write_timeout = timeout;
+}
+
+void socket::set_read_timeout(std::optional<io::clock::duration> timeout) noexcept { read_timeout = timeout; }
+
+void socket::set_write_timeout(std::optional<io::clock::duration> timeout) noexcept { write_timeout = timeout; }
+
 coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
     if (data.empty()) co_return {.count = 0};
@@ -183,7 +207,7 @@ coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
         if (err == EINTR) continue;
         if (err != EAGAIN && err != EWOULDBLOCK) co_return {.count = 0, .err = {err, std::generic_category()}};
 
-        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::read, read_deadline);
+        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::read, wait_deadline(read_deadline, read_timeout));
         if (wait_err) co_return {.count = 0, .err = wait_err};
     }
 }
@@ -216,7 +240,8 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
         if (err != EAGAIN && err != EWOULDBLOCK)
             co_return {.count = total_written, .err = {err, std::generic_category()}};
 
-        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::write, write_deadline);
+        auto wait_err =
+            co_await scheduler->wait_until(fd, io::poll_op::write, wait_deadline(write_deadline, write_timeout));
         if (wait_err) co_return {.count = total_written, .err = wait_err};
     }
 
