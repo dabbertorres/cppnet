@@ -1,6 +1,7 @@
 #include "socket.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -17,6 +18,7 @@
 #include <sys/signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -31,34 +33,32 @@
 namespace
 {
 
-std::string addr_name(sockaddr_storage* addr)
+std::string addr_name(const sockaddr_storage* addr)
 {
-    std::string ret;
-    void*       addr_type = nullptr;
+    std::array<char, INET6_ADDRSTRLEN> buf{};
+    const void*                        addr_bytes = nullptr;
+
     switch (addr->ss_family)
     {
-    case AF_INET:
-        ret.resize(INET_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in*>(addr)->sin_addr;
-        break;
+    case AF_INET: addr_bytes = &reinterpret_cast<const sockaddr_in*>(addr)->sin_addr; break;
+    case AF_INET6: addr_bytes = &reinterpret_cast<const sockaddr_in6*>(addr)->sin6_addr; break;
 
-    case AF_INET6:
-        ret.resize(INET6_ADDRSTRLEN);
-        addr_type = &reinterpret_cast<sockaddr_in6*>(addr)->sin6_addr;
-        break;
-
-    default:
-        [[unlikely]]
-#ifdef __cpp_lib_unreachable
-        std::unreachable()
-#endif
-            ;
+    // a Unix domain socket's path, which is empty if it isn't bound to one (e.g. from socketpair()).
+    case AF_UNIX:
+    {
+        // NOTE: sun_path needn't be null-terminated if it's full.
+        const auto& path = reinterpret_cast<const sockaddr_un*>(addr)->sun_path;
+        return {std::begin(path), std::ranges::find(path, '\0')};
     }
 
-    const char* ptr = inet_ntop(addr->ss_family, addr_type, ret.data(), static_cast<socklen_t>(ret.size()));
+    default: throw net::exception{"unsupported address family: " + std::to_string(addr->ss_family)};
+    }
+
+    const char* ptr = ::inet_ntop(addr->ss_family, addr_bytes, buf.data(), static_cast<socklen_t>(buf.size()));
     if (ptr == nullptr) throw net::system_error_from_errno(errno);
 
-    return ret;
+    // NOTE: only up to the terminating null: the buffer is sized for the longest address.
+    return ptr;
 }
 
 }
