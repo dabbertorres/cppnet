@@ -41,6 +41,7 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
     if (!res.has_value())
     {
         // e.g. a header that can't be written (one with a line break in it), which nothing was written for.
+        resp->status_code = status::NONE;
         throw std::system_error{res.error().value(), res.error().category(), "failed to send response"};
     }
 

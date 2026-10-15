@@ -97,7 +97,7 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-server::server(io::scheduler* scheduler, router&& handler, const server_config& cfg)
+server::server(io::scheduler* scheduler, request_handler handler, const server_config& cfg)
     : listener{scheduler, cfg.host, cfg.port, network::tcp}
     , is_serving{false}
     , handler{std::move(handler)}
@@ -252,7 +252,40 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
             else
             {
                 logger->trace("calling handler");
-                co_await handler(req, rw);
+
+                // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
+                bool failed = false;
+                try
+                {
+                    co_await handler(req, rw);
+                }
+                catch (const std::exception& ex)
+                {
+                    logger->error("handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
+                    failed = true;
+                }
+                catch (...)
+                {
+                    logger->error("handler for {} {} threw", method_string(req.method), req.target.path);
+                    failed = true;
+                }
+
+                if (failed)
+                {
+                    // whatever the handler sent of the response can't be finished, so the connection is closed.
+                    if (rw.status_code() == status::NONE)
+                    {
+                        resp.headers = {};
+                        resp.headers.set("Connection"sv, "close"sv);
+                        co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
+                    }
+
+                    co_await writer.flush();
+                    co_await linger_before_close(conn);
+                    break;
+                }
+
+                if (rw.status_code() == status::NONE) co_await rw.send(status::OK, 0);
             }
 
             logger->trace("flushing writer");

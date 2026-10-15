@@ -58,6 +58,9 @@ public:
 
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 
+    // local_port is the port the listener is bound to: e.g. the one chosen for it, if it was created with port "0".
+    [[nodiscard]] std::uint16_t local_port() const;
+
     // shutdown stops accepting connections. The socket is closed when the listener is destroyed.
     void shutdown() noexcept;
 
