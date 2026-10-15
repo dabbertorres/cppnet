@@ -163,6 +163,27 @@ TEST_CASE("multiple prefix and suffix", "[util][trim_string]")
     REQUIRE(actual == "foo"sv);
 }
 
+TEST_CASE("only whitespace", "[util][trim_string]")
+{
+    CHECK(net::util::trim_string(" \t\r\n "sv).empty());
+    CHECK(net::util::trim_string(std::string{"  "}).empty());
+}
+
+TEST_CASE("multi-byte characters aren't trimmed", "[util][trim_string]")
+{
+    // U+0100 and U+2000 in UTF-8: their bytes used to be taken for (part of) the Unicode whitespace.
+    CHECK(net::util::trim_string(" \xC4\x80 "sv) == "\xC4\x80"sv);
+    CHECK(net::util::trim_string("\xE2\x80\x80"sv) == "\xE2\x80\x80"sv);
+}
+
+TEST_CASE("less_ignore_case orders ignoring case", "[util][less_ignore_case]")
+{
+    CHECK(net::util::less_ignore_case("abc"sv, "ABD"sv));
+    CHECK_FALSE(net::util::less_ignore_case("ABD"sv, "abc"sv));
+    CHECK_FALSE(net::util::less_ignore_case("abc"sv, "ABC"sv));
+    CHECK(net::util::less_ignore_case("ab"sv, "ABC"sv));
+}
+
 TEST_CASE("multiple strings", "[util][join]")
 {
     constexpr auto expect = "foo,bar,baz"sv;
