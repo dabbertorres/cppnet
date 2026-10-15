@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include <catch.hpp>
@@ -13,9 +14,11 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 #include "io/string_reader.hpp"
+#include "io/string_writer.hpp"
 #include "string_makers.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
@@ -32,9 +35,7 @@ TEST_CASE("just a request line", "[http][1.1][request_decode]")
 
     REQUIRE(result.has_value());
 
-    auto route = net::url::parse("/some/resource"sv);
-    REQUIRE(route.has_value());
-    const auto expected_route = route.to_value();
+    const net::http::request_target expected_route{.path = "/some/resource"};
 
     auto& request = result.value();
 
@@ -42,7 +43,7 @@ TEST_CASE("just a request line", "[http][1.1][request_decode]")
     {
         CHECK(request.method == net::http::request_method::GET);
         CHECK(request.version == net::http::protocol_version{.major = 1, .minor = 1});
-        CHECK(request.uri == expected_route);
+        CHECK(request.target == expected_route);
         CHECK(request.headers.empty());
     }
 }
@@ -60,9 +61,7 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
 
     REQUIRE(result.has_value());
 
-    auto route = net::url::parse("/some/resource"sv);
-    REQUIRE(route.has_value());
-    const auto expected_route = route.to_value();
+    const net::http::request_target expected_route{.path = "/some/resource"};
 
     const net::http::headers expect_headers{
         { "Accept", {"application/json"}},
@@ -75,7 +74,7 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
     {
         CHECK(request.method == net::http::request_method::GET);
         CHECK(request.version == net::http::protocol_version{.major = 1, .minor = 1});
-        CHECK(request.uri == expected_route);
+        CHECK(request.target == expected_route);
         CHECK(request.headers == expect_headers);
     }
 }
@@ -96,9 +95,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
 
     REQUIRE(result.has_value());
 
-    auto route = net::url::parse("/some/resource"sv);
-    REQUIRE(route.has_value());
-    const auto expected_route = route.to_value();
+    const net::http::request_target expected_route{.path = "/some/resource"};
 
     const net::http::headers expect_headers{
         {        "Accept", {"application/json"}},
@@ -123,7 +120,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
     {
         CHECK(request.method == net::http::request_method::POST);
         CHECK(request.version == net::http::protocol_version{.major = 1, .minor = 1});
-        CHECK(request.uri == expected_route);
+        CHECK(request.target == expected_route);
         CHECK(request.headers == expect_headers);
         CHECK(body == "this is a request"sv);
     }
@@ -148,9 +145,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
 
     REQUIRE(result.has_value());
 
-    auto route = net::url::parse("/some/resource"sv);
-    REQUIRE(route.has_value());
-    const auto expected_route = route.to_value();
+    const net::http::request_target expected_route{.path = "/some/resource"};
 
     const net::http::headers expect_headers{
         {        "Accept", {"application/json"}},
@@ -175,7 +170,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
     {
         CHECK(request.method == net::http::request_method::POST);
         CHECK(request.version == net::http::protocol_version{.major = 1, .minor = 1});
-        CHECK(request.uri == expected_route);
+        CHECK(request.target == expected_route);
         CHECK(request.headers == expect_headers);
         CHECK(body
               == "this is a request\n"
@@ -215,7 +210,7 @@ TEST_CASE("chunked", "[http][1.1][request_decode]")
     auto next = test::sync_wait(net::http::http11::request_decode(&buf_reader));
     REQUIRE(next.has_value());
     CHECK(next->method == net::http::request_method::GET);
-    CHECK(next->uri.path == "/next"sv);
+    CHECK(next->target.path == "/next"sv);
 }
 
 TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
@@ -243,17 +238,63 @@ TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
     auto second = test::sync_wait(net::http::http11::request_decode(&buf_reader));
     REQUIRE(second.has_value());
     CHECK(second->method == net::http::request_method::GET);
-    CHECK(second->uri.path == "/second"sv);
+    CHECK(second->target.path == "/second"sv);
 }
 
 TEST_CASE("invalid percent-encoding in the target", "[http][1.1][request_decode]")
 {
-    // used to throw out of url::decode (which is noexcept), terminating the server.
+    // used to throw out of url::decode (which is noexcept), terminating the server. Now it's a malformed request.
     net::io::string_reader<char> content("GET /% HTTP/1.1\r\n"
                                          "\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
     auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
-    REQUIRE(result.has_value());
-    CHECK(result->uri.path == "/%"sv);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == std::errc::invalid_argument);
+}
+
+TEST_CASE("host comes from the target, if it has one", "[http][1.1][request_decode]")
+{
+    SECTION("origin-form")
+    {
+        net::io::string_reader<char> content("GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        net::io::buffered_reader     buf_reader(&content);
+
+        auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+        REQUIRE(result.has_value());
+        CHECK(result->host == "example.com");
+    }
+
+    SECTION("absolute-form")
+    {
+        net::io::string_reader<char> content("GET http://target.example/path HTTP/1.1\r\nHost: header.example\r\n\r\n");
+        net::io::buffered_reader     buf_reader(&content);
+
+        auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+        REQUIRE(result.has_value());
+        CHECK(result->host == "target.example");
+        CHECK(result->target.path == "/path");
+    }
+}
+
+TEST_CASE("requests are encoded in origin-form, with a Host header", "[http][1.1][request_encode]")
+{
+    auto parsed = net::url::parse("http://example.com:8080/a b");
+    REQUIRE(parsed.has_value());
+
+    net::http::client_request req{
+        .method  = net::http::request_method::GET,
+        .version = {.major = 1, .minor = 1},
+        .uri     = parsed.to_value(),
+    };
+
+    // nothing in the url can end the request line, and start a header.
+    req.uri.path += "\r\nX-Injected: yes";
+    req.uri.query["q"] = {"x&y=z"};
+
+    net::io::string_writer<char> out;
+    auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
+    REQUIRE(res.has_value());
+
+    CHECK(out.build() == "GET /a%20b%0D%0AX-Injected:%20yes?q=x%26y%3Dz HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
 }

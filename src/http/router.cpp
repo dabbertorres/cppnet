@@ -9,6 +9,7 @@
 #include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "url.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http
@@ -24,7 +25,7 @@ router& router::add(request_method method, std::string_view route, handler_func&
 
 coro::task<void> router::operator()(const server_request& req, response_writer& resp) const
 {
-    std::string_view route = req.uri.path;
+    std::string_view route = req.target.path;
 
     if (route.starts_with('/'))
     {
@@ -32,8 +33,12 @@ coro::task<void> router::operator()(const server_request& req, response_writer& 
     }
 
     auto* parent = this;
-    for (const auto part : util::split_string(route, '/'))
+
+    // The path is split before it's decoded, so an encoded '/' ("%2F") is part of a segment rather than separating two.
+    for (const auto encoded_part : util::split_string(route, '/'))
     {
+        const auto part = url::decode(encoded_part);
+
         auto iter = parent->children.find(part);
         if (iter != parent->children.end())
         {

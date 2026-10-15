@@ -20,6 +20,7 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
@@ -42,6 +43,7 @@ using net::http::headers;
 using net::http::parse_method;
 using net::http::parse_status;
 using net::http::protocol_version;
+using net::http::parse_request_target;
 using net::http::request_method;
 using net::http::server_request;
 using net::http::status;
@@ -137,16 +139,9 @@ task<std::error_condition> parse_request_line(buffered_reader* reader, server_re
     auto uri_end   = view.find(' ', uri_start);
     if (uri_end == std::string_view::npos) co_return std::make_error_condition(std::errc::illegal_byte_sequence);
 
-    auto uri = view.substr(uri_start, uri_end - uri_start);
-
-    // clang-format off
-    if (uri == "*")
-        req.uri.host = "*";
-    else
-        url::parse(uri)
-            .if_value([&](const url& u) { req.uri = u; })
-            .if_error([&](auto) { req.uri.path = "/"; });
-    // clang-format on
+    auto target = parse_request_target(req.method, view.substr(uri_start, uri_end - uri_start));
+    if (!target.has_value()) co_return target.error();
+    req.target = std::move(*target);
 
     auto res = parse_http_version(view.substr(uri_end + 1));
     if (res.has_error()) co_return res.to_error();
@@ -190,6 +185,12 @@ task<std::error_condition> parse_headers(buffered_reader* reader, std::size_t ma
     }
 
     co_return std::make_error_condition(std::errc::value_too_large);
+}
+
+bool is_default_port(std::string_view scheme, std::string_view port) noexcept
+{
+    return (port == "80"sv && (scheme.empty() || net::util::equal_ignore_case(scheme, "http"sv)))
+        || (port == "443"sv && net::util::equal_ignore_case(scheme, "https"sv));
 }
 
 task<std::error_condition> write_headers(net::io::writer& writer, const headers& headers) noexcept
@@ -239,8 +240,8 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     res = co_await writer->write(' ');
     if (res.err) co_return std::unexpected(res.err);
 
-    // TODO: don't build the uri before writing it
-    res = co_await writer->write(req.uri.build());
+    // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
+    res = co_await writer->write(origin_form(req.uri));
     if (res.err) co_return std::unexpected(res.err);
 
     res = co_await writer->write(" HTTP/"sv);
@@ -254,11 +255,11 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
         minor_version = 0;
     }
 
-    std::array<char, 4> version_buf{
+    // NOTE: unlike the status line, nothing follows the version.
+    std::array<char, 3> version_buf{
         static_cast<char>(major_version + '0'),
         '.',
         static_cast<char>(minor_version + '0'),
-        ' ',
     };
 
     res = co_await writer->write(version_buf);
@@ -266,6 +267,17 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
     res = co_await writer->write("\r\n"sv);
     if (res.err) co_return std::unexpected(res.err);
+
+    // HTTP/1.1 requires a Host header.
+    if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
+    {
+        auto host_line = "Host: " + req.uri.host;
+        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port)) host_line += ":" + req.uri.port;
+        host_line += "\r\n";
+
+        res = co_await writer->write(host_line);
+        if (res.err) co_return std::unexpected(res.err);
+    }
 
     res.err = co_await write_headers(*writer, req.headers);
     if (res.err) co_return std::unexpected(res.err);
@@ -318,7 +330,8 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
     err = co_await parse_headers(reader, max_header_bytes, req.headers);
     if (err) co_return std::unexpected(err);
 
-    if (req.uri.host.empty()) req.uri.host = req.headers.get("Host"sv).value_or(""sv);
+    // RFC 9112, section 3.2.2: a target with a host overrides the Host header.
+    req.host = !req.target.host.empty() ? req.target.host : std::string{req.headers.get("Host"sv).value_or(""sv)};
 
     if (req.headers.is_chunked())
     {
