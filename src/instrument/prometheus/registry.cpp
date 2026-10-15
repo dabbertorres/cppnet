@@ -1,5 +1,6 @@
 #include "instrument/prometheus/registry.hpp"
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -9,6 +10,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "instrument/prometheus/metric.hpp"
@@ -23,9 +25,27 @@ std::unique_ptr<registry> registry::instance;
 std::once_flag            registry::initialized;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
+void registry::add_collector(std::function<void()> collect)
+{
+    auto* r = get();
+
+    std::lock_guard lock{r->mutex};
+    r->collectors.push_back(std::move(collect));
+}
+
 coro::task<io::result> registry::record(io::writer& writer)
 {
     auto* r = get();
+
+    // NOTE: the collectors run without the lock: updating metrics doesn't need it, and they aren't held up by (or
+    //       holding up) a registration.
+    std::vector<std::function<void()>> collectors;
+    {
+        std::shared_lock lock{r->mutex};
+        collectors = r->collectors;
+    }
+
+    for (const auto& collect : collectors) collect();
 
     // NOTE: the text is built under the lock, and only written once it's released: a lock can't be held across a
     //       suspension, as the task may then resume on another thread.

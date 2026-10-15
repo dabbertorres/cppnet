@@ -81,6 +81,12 @@ public:
         return std::ref(*m);
     }
 
+    // add_collector adds a function that record calls each time, before writing the metrics, to update those whose
+    // values are kept elsewhere (e.g. by the OS, see register_process_metrics).
+    //
+    // NOTE: collectors may run at the same time (if records do), and mustn't register metrics or collectors.
+    static void add_collector(std::function<void()> collect);
+
     // record writes every metric, in Prometheus' text format, grouped by family (in the order they were registered).
     static coro::task<io::result> record(io::writer& writer);
 
@@ -106,6 +112,8 @@ private:
 
     util::string_map<family> families;
     std::vector<std::string> family_order;
+
+    std::vector<std::function<void()>> collectors;
 };
 
 }
