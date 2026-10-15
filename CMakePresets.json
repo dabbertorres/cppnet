@@ -50,7 +50,7 @@
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_CXX_FLAGS_INIT": "-Wall -Wextra -Wpedantic -fcolor-diagnostics",
-        "CMAKE_CXX_FLAGS_DEBUG_INIT": "-fsanitize=address,undefined"
+        "CMAKE_CXX_FLAGS_DEBUG_INIT": "-fsanitize=address,undefined -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE"
       }
     },
     {
