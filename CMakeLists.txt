@@ -61,3 +61,31 @@ if(BUILD_EXAMPLE)
     endif()
   endforeach()
 endif()
+
+# libFuzzer targets for the parsers (see fuzz/CMakeLists.txt): AUTO builds them with the tests, if the compiler supports
+# libFuzzer (LLVM's clang does; Apple's clang and GCC don't). ON requires them, and OFF skips them.
+set(BUILD_FUZZING "AUTO" CACHE STRING "Build the fuzz targets: AUTO, ON, or OFF")
+set_property(CACHE BUILD_FUZZING PROPERTY STRINGS AUTO ON OFF)
+
+if(BUILD_FUZZING STREQUAL "ON" OR (BUILD_FUZZING STREQUAL "AUTO" AND BUILD_TESTING))
+  include(CheckCXXSourceCompiles)
+
+  set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer")
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=fuzzer")
+  check_cxx_source_compiles(
+    "#include <cstddef>
+     #include <cstdint>
+     extern \"C\" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }"
+    NET_HAS_LIBFUZZER
+  )
+  unset(CMAKE_REQUIRED_FLAGS)
+  unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+  if(NET_HAS_LIBFUZZER)
+    add_subdirectory("fuzz/")
+  elseif(BUILD_FUZZING STREQUAL "ON")
+    message(FATAL_ERROR "BUILD_FUZZING is ON, but ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets")
+  else()
+    message(STATUS "Skipping the fuzz targets: ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets")
+  endif()
+endif()
