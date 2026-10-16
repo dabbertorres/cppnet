@@ -26,6 +26,7 @@
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/discard_writer.hpp"
+#include "io/flush_before_read.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -60,41 +61,6 @@ std::string_view current_date()
 
     return formatted;
 }
-
-// flush_then_read reads from a connection, first sending the responses written to it so far. So, a server holds its
-// responses until it has answered the requests it has already read: a batch of pipelined requests is answered with one
-// write, rather than one each, and a request that isn't pipelined is answered as the server waits for the next.
-//
-// NOTE: so a response to a pipelined request also waits for the requests read along with it to be handled.
-class flush_then_read final : public net::io::reader
-{
-public:
-    flush_then_read(net::io::reader* conn, net::io::buffered_writer* writer) noexcept
-        : conn{conn}
-        , writer{writer}
-    {}
-
-    net::coro::task<net::io::result> read(std::span<std::byte> data) override
-    {
-        if (writer->size() == 0) return conn->read(data);
-        return flush_and_read(data);
-    }
-
-    [[nodiscard]] int native_handle() const noexcept override { return conn->native_handle(); }
-
-private:
-    net::coro::task<net::io::result> flush_and_read(std::span<std::byte> data)
-    {
-        // the client can't be answered any more, which ends the connection as its closing would.
-        if (auto flushed = co_await writer->flush(); flushed.err)
-            co_return net::io::result{.err = make_error_condition(net::io::status_condition::closed)};
-
-        co_return co_await conn->read(data);
-    }
-
-    net::io::reader*          conn;
-    net::io::buffered_writer* writer;
-};
 
 // discard_body reads and drops the rest of body, returning whether it reached the end of it.
 net::coro::task<bool> discard_body(net::io::reader& body)
@@ -208,8 +174,9 @@ coro::task<> server::serve()
             logger->debug("accepted connection: {}", ex.what());
         }
 
-        // responses are written once each is finished, or a batch of them is (see flush_then_read), so there's nothing
-        // to gain from the kernel holding a write back until the last is acknowledged, and it can delay the response.
+        // responses are written once each is finished, or a batch of them is (see io::flush_before_read), so there's
+        // nothing to gain from the kernel holding a write back until the last is acknowledged, and it can delay the
+        // response.
         if (auto set = accepted->set_nodelay(); !set.has_value())
             logger->debug("failed to set TCP_NODELAY: {}", set.error().message());
 
@@ -224,7 +191,7 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
         // Kept for the whole connection: anything read past the end of one request (e.g. a pipelined request) belongs
         // to the next.
         io::buffered_writer writer{&conn, buffer_size};
-        flush_then_read     input{&conn, &writer};
+        io::flush_before_read input{&conn, &writer};
         io::buffered_reader reader{&input, buffer_size};
 
         // as are the request and response, so that their memory (e.g. for header values) is reused.
@@ -389,7 +356,7 @@ coro::task<server::serve_state> server::serve_request(tcp_socket&          conn,
         }
     }
 
-    // NOTE: the response is sent when the server next reads from the connection (see flush_then_read).
+    // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read).
 
     // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
     if (!co_await discard_body(*req.body))
