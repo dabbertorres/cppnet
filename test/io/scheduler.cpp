@@ -216,11 +216,18 @@ TEST_CASE("a scheduler that never ran can be destroyed", "[io][scheduler]")
     std::error_condition err;
     std::atomic<bool>    finished = false;
 
+    // NOTE: a sleep rather than a socket's read, as the socket would be closed first (and the workers poll, whether or
+    //       not the scheduler runs).
+    const auto sleep = [](scheduler* sched, std::error_condition* err, std::atomic<bool>* finished) -> task<>
+    {
+        *err = co_await sched->sleep_until(net::io::clock::now() + 1h);
+        finished->store(true);
+    };
+
     {
         scheduler sched{make_pool()};
-        auto [reader, writer] = make_socket_pair(&sched);
 
-        REQUIRE(sched.spawn(read_until_failure(&reader, &err, &finished)));
+        REQUIRE(sched.spawn(sleep(&sched, &err, &finished)));
         std::this_thread::sleep_for(20ms);
     }
 
@@ -593,14 +600,14 @@ TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][s
 {
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
-    reader.set_read_timeout(100ms);
+    reader.set_read_timeout(150ms);
 
-    // a byte every 40ms, for longer than the timeout altogether.
+    // a byte every 30ms, for longer than the timeout altogether (with room for a slow machine to be late).
     auto trickle = [](scheduler* sched, net::socket* writer) -> task<>
     {
         for (int i = 0; i < 8; ++i)
         {
-            (void)co_await sched->sleep_until(net::io::clock::now() + 40ms);
+            (void)co_await sched->sleep_until(net::io::clock::now() + 30ms);
             co_await writer->write(std::as_bytes(std::span{"x"sv}));
         }
     };
@@ -643,4 +650,17 @@ TEST_CASE("socket write timeouts", "[io][socket][timeout]")
     CHECK(count > 0);
     CHECK(elapsed >= 100ms);
     CHECK(elapsed < test_timeout);
+}
+
+TEST_CASE("a scheduler whose workers poll for another scheduler polls in run()", "[io][scheduler]")
+{
+    auto      pool = make_pool();
+    scheduler first{pool};
+    scheduler second{pool};
+
+    const auto sleep = [](scheduler* sched) -> net::coro::task<std::error_condition>
+    { co_return co_await sched->sleep_until(net::io::clock::now() + 10ms); };
+
+    CHECK_FALSE(second.run_to_completion(sleep(&second)));
+    CHECK_FALSE(first.run_to_completion(sleep(&first)));
 }

@@ -41,15 +41,16 @@ using clock = std::chrono::steady_clock;
 //
 // Lifecycle:
 // - spawn() starts tasks, which the scheduler owns until they finish.
-// - run() waits for and dispatches I/O on the calling thread, until the scheduler is stopped and its tasks have
-//   finished.
+// - The thread pool's idle workers wait for and dispatch I/O (see coro::thread_pool::poller), so a task readied by I/O
+//   continues on the worker that saw it. If the pool already polls for another scheduler, run() does it instead.
+// - run() blocks until the scheduler is stopped and its tasks have finished.
 // - request_stop() refuses new tasks, and cancels every pending (and future) wait (including wait_on() and
-//   sleep_until()) with std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still runs (e.g. to clean
-//   up), and reads/writes that don't need to wait still work.
+//   sleep_until()) with std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still
+//   runs (e.g. to clean up), and reads/writes that don't need to wait still work.
 // - shutdown() stops the scheduler, and blocks until its tasks have finished and run() has returned.
 //
 // A scheduler can't be restarted once stopped.
-class scheduler
+class scheduler : private coro::thread_pool::poller
 {
     struct waiter;
 
@@ -164,7 +165,7 @@ public:
     scheduler& operator=(scheduler&&) = delete;
 
     // Calls shutdown(): must not be destroyed from one of its own tasks.
-    ~scheduler() noexcept;
+    ~scheduler() noexcept override;
 
     // register_handle must be called before waiting on a handle, and deregister_handle before closing it.
     // deregister_handle cancels any waits on the handle.
@@ -339,6 +340,11 @@ private:
 
     void resume(const completions& done) noexcept;
 
+    // poll waits for I/O (if block, until some is ready, the next deadline, or wake() is called), and dispatches it,
+    // and the timers that expired, to done.
+    void poll(bool block, completions& done) noexcept override;
+    void wake() noexcept override;
+
     std::shared_ptr<coro::thread_pool> workers;
     std::unique_ptr<coro::thread_pool> blocking;
     std::shared_ptr<spdlog::logger>    logger;
@@ -360,6 +366,9 @@ private:
     std::atomic<bool> stopping = false;
 
     std::atomic<bool> running = false;
+
+    // workers_poll is whether the workers poll for I/O, rather than run().
+    bool workers_poll = false;
 
     // NOTE: declared last, so it's destroyed first: tasks use the rest of the scheduler until they finish.
     coro::async_scope scope;

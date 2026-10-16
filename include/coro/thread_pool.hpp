@@ -25,6 +25,29 @@ concept RangeOf = std::ranges::range<T> && std::is_same_v<V, std::ranges::range_
 class thread_pool
 {
 public:
+    // poller lets idle workers wait for I/O, rather than sleep (as Tokio's workers do): then a coroutine that I/O
+    // readies continues on the worker that saw it, rather than another thread waking one to resume it. One worker polls
+    // at a time, and a busy one polls (without blocking) every poll_interval jobs if no one else is.
+    class poller
+    {
+    public:
+        // poll waits for I/O (if block, until some is ready, or wake() is called), and adds the coroutines it readied
+        // to ready.
+        virtual void poll(bool block, std::vector<std::coroutine_handle<>>& ready) noexcept = 0;
+
+        // wake makes a poll() that's blocked return (or the next one, if none is).
+        virtual void wake() noexcept = 0;
+
+        virtual ~poller() = default;
+
+    protected:
+        poller()                         = default;
+        poller(const poller&)            = default;
+        poller(poller&&)                 = default;
+        poller& operator=(const poller&) = default;
+        poller& operator=(poller&&)      = default;
+    };
+
     class operation
     {
         friend class thread_pool;
@@ -53,6 +76,13 @@ public:
 
     ~thread_pool();
 
+    // attach makes idle workers wait for I/O with p (see poller), returning false if the pool is shutting down, or
+    // already has a poller.
+    bool attach(poller* p) noexcept;
+
+    // detach stops the workers polling with p, and waits for one that is to return.
+    void detach(poller* p) noexcept;
+
     // NOTE: arguments are taken by value, as the task does not start until after the caller's full expression ends.
     //       Use std::ref() to pass by reference.
     template<typename Func, typename... Args>
@@ -80,6 +110,7 @@ public:
     std::size_t resume(const R& handles) noexcept
     {
         std::size_t new_jobs = 0;
+        std::size_t woken    = 0;
 
         {
             std::scoped_lock lock{wait_mutex};
@@ -95,17 +126,11 @@ public:
                     ++new_jobs;
                 }
             }
+
+            woken = wake_locked(new_jobs);
         }
 
-        if (new_jobs >= threads.size())
-        {
-            wait.notify_all();
-        }
-        else
-        {
-            for (auto i = 0u; i < new_jobs; ++i) wait.notify_one();
-        }
-
+        notify(woken);
         return new_jobs;
     }
 
@@ -121,8 +146,20 @@ public:
     [[nodiscard]] bool        queue_empty() const noexcept;
 
 private:
+    // poll_interval is how many jobs a worker runs before polling (if no one else is), even if more are queued, so
+    // that I/O isn't held up by a queue that never empties. (Tokio's event_interval.)
+    static constexpr std::size_t poll_interval = 61;
+
     void worker();
     void schedule(std::coroutine_handle<> /*handle*/);
+
+    // poll_locked polls (with wait_mutex, which lock holds, released meanwhile), and queues what's readied.
+    void poll_locked(std::unique_lock<std::mutex>& lock, std::vector<std::coroutine_handle<>>& ready);
+
+    // wake_locked wakes workers for new_jobs: sleeping workers if there are any (returning how many to notify, once
+    // wait_mutex is released), or else the poller, if it's blocked. Must be called holding wait_mutex.
+    std::size_t wake_locked(std::size_t new_jobs) noexcept;
+    void        notify(std::size_t woken) noexcept;
 
     std::vector<std::thread>            threads;
     std::mutex                          wait_mutex;
@@ -130,6 +167,17 @@ private:
     std::deque<std::coroutine_handle<>> jobs;
     std::atomic<bool>                   running;
     std::atomic<std::size_t>            num_jobs; // queued AND currently executing
+
+    // Guarded by wait_mutex.
+    // - sleepers are the workers waiting on wait, less those already woken; wakeups are those woken that haven't
+    //   woken up yet (each takes one).
+    // - polling is whether a worker is polling, and poll_woken whether it has been woken (since it started).
+    std::size_t             sleepers   = 0;
+    std::size_t             wakeups    = 0;
+    poller*                 polls      = nullptr;
+    bool                    polling    = false;
+    bool                    poll_woken = false;
+    std::condition_variable polled; // notified when a poll ends, for detach()
 };
 
 }
