@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -99,6 +101,9 @@ enum class status : std::uint16_t
 };
 
 status parse_status(std::string_view str) noexcept;
+
+// format_date formats t as an HTTP date (RFC 9110, section 5.6.7), to the second: e.g. "Sun, 06 Nov 1994 08:49:37 GMT".
+std::string format_date(std::chrono::system_clock::time_point t);
 
 // reason_phrase is the status's reason phrase (RFC 9110, section 15), or empty for a status it doesn't know.
 constexpr std::string_view reason_phrase(status s) noexcept
