@@ -74,6 +74,8 @@ public:
 
     [[nodiscard]] operation schedule();
 
+    // resume queues handles to be resumed, all together (so, with one lock), returning how many it queued: none if
+    // the pool is shutting down.
     template<RangeOf<std::coroutine_handle<>> R>
     std::size_t resume(const R& handles) noexcept
     {
@@ -81,17 +83,19 @@ public:
 
         {
             std::scoped_lock lock{wait_mutex};
+            if (!running.load(std::memory_order::acquire)) return 0;
+
             for (const auto& handle : handles)
             {
                 if (handle != nullptr) [[likely]]
                 {
+                    // NOTE: counted before it's queued, as a worker may finish it as soon as the lock is released.
+                    num_jobs.fetch_add(1, std::memory_order::release);
                     jobs.emplace_back(handle);
                     ++new_jobs;
                 }
             }
         }
-
-        num_jobs.fetch_add(new_jobs, std::memory_order::release);
 
         if (new_jobs >= threads.size())
         {
