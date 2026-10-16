@@ -62,21 +62,41 @@ std::string_view current_date()
     return formatted;
 }
 
-// discard_body reads and drops the rest of body, returning whether it reached the end of it.
-net::coro::task<bool> discard_body(net::io::reader& body)
+// discard_rest finishes discard_body, once reading (which needed a coroutine) does, total having been read before it.
+net::coro::task<bool> discard_rest(net::io::reader&                 body,
+                                   std::span<std::byte>             scratch,
+                                   net::coro::task<net::io::result> reading,
+                                   std::size_t                      total)
 {
-    std::array<std::byte, 4'096> scratch{};
-    std::size_t                  total = 0;
+    auto res = co_await std::move(reading);
+    while (true)
+    {
+        total += res.count;
+        if (res.err) co_return res.err == net::io::status_condition::closed;
+        if (total > max_discard_bytes) co_return false;
 
+        res = co_await body.read(scratch);
+    }
+}
+
+// discard_body reads (into scratch) and drops the rest of body, returning whether it reached the end of it.
+net::coro::task<bool> discard_body(net::io::reader& body, std::span<std::byte> scratch)
+{
+    std::size_t total = 0;
+
+    // usually, there's none, or it's all buffered, so the reads don't wait: then there's no need for a coroutine (see
+    // net::coro::ready_task).
     while (total <= max_discard_bytes)
     {
-        auto res = co_await body.read(scratch);
-        total += res.count;
+        auto reading = body.read(scratch);
+        if (!reading.finished_without_coroutine()) return discard_rest(body, scratch, std::move(reading), total);
 
-        if (res.err) co_return res.err == net::io::status_condition::closed;
+        auto res = std::move(reading).result();
+        total += res.count;
+        if (res.err) return net::coro::ready_task<bool>(res.err == net::io::status_condition::closed);
     }
 
-    co_return false;
+    return net::coro::ready_task<bool>(false);
 }
 
 // linger_before_close reads (and drops) what the client is still sending, for a little while, after an error response.
@@ -184,28 +204,126 @@ coro::task<> server::serve()
     }
 }
 
+// connection_state is what's kept for a connection from one request to the next: anything read past the end of one
+// request (e.g. a pipelined request) belongs to the next; and the request, response and scratch buffer are reused, so
+// that their memory (e.g. for header values) is.
+struct server::connection_state
+{
+    explicit connection_state(tcp_socket* conn)
+        : writer{conn, buffer_size}
+        , input{conn, &writer}
+        , reader{&input, buffer_size}
+    {}
+
+    io::buffered_writer   writer;
+    io::flush_before_read input;
+    io::buffered_reader   reader;
+
+    server_request  req;
+    server_response resp;
+
+    // for reading what's left of a request's body, to drop it.
+    std::array<std::byte, 4'096> scratch{};
+};
+
 coro::task<> server::serve_connection(tcp_socket conn) noexcept
 {
     try
     {
-        // Kept for the whole connection: anything read past the end of one request (e.g. a pipelined request) belongs
-        // to the next.
-        io::buffered_writer writer{&conn, buffer_size};
-        io::flush_before_read input{&conn, &writer};
-        io::buffered_reader reader{&input, buffer_size};
+        connection_state state{&conn};
+        auto&            req  = state.req;
+        auto&            resp = state.resp;
 
-        // as are the request and response, so that their memory (e.g. for header values) is reused.
-        server_request  req;
-        server_response resp;
-
+        // NOTE: each request is served here, rather than by a coroutine of its own, which would allocate its frame for
+        //       each request (as one this large isn't elided). Only the rare ways a connection ends have their own.
         // NOTE: not conn.valid(), a syscall per request: a socket's pending error fails the next read or write anyway.
         while (is_serving.load(std::memory_order::acquire))
         {
-            auto state = co_await serve_request(conn, reader, writer, req, resp);
-            if (state == serve_state::close) break;
+            // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
+            set_head_deadline(conn);
+
+            // NOTE: HTTP/2 (parked) would be told apart here by its connection preface ("PRI * HTTP/2.0"), which
+            // HTTP/1.1 decoding rejects as not_supported, so it gets a 501 Not Implemented.
+            auto err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
+
+            conn.set_read_deadline(std::nullopt);
+
+            if (err)
+            {
+                co_await end_after_decode_error(conn, state, err);
+                break;
+            }
+
+            logger->trace("request {} {} as HTTP/{}.{}",
+                          method_string(req.method),
+                          req.target.path,
+                          req.version.major,
+                          req.version.minor);
+
+            // Only HTTP/1.x is implemented. In particular, http2::response_encode is a stub.
+            if (req.version.major != 1)
+            {
+                logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
+                co_await respond_and_close(conn, state, status::HTTP_VERSION_NOT_SUPPORTED);
+                break;
+            }
+
+            io::discard_writer no_body;
+            start_response(state, no_body);
+
+            response_writer rw{&state.writer, &resp, http11::response_encode};
+
+            if (auto upgrade_to = upgrade_to_protocol(req); !upgrade_to.empty())
+            {
+                logger->trace("upgrading to protocol: {}", upgrade_to);
+                resp.headers.set("Upgrade"sv, upgrade_to);
+                resp.headers.set("Connection"sv, "upgrade"sv);
+                co_await rw.send(status::SWITCHING_PROTOCOLS, 0);
+            }
+            else
+            {
+                // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
+                std::exception_ptr failure;
+                try
+                {
+                    co_await handler(req, rw);
+                }
+                catch (...)
+                {
+                    failure = std::current_exception();
+                }
+
+                if (failure)
+                {
+                    co_await end_after_handler_failure(conn, state, rw, failure);
+                    break;
+                }
+
+                if (rw.status_code() == status::NONE) co_await rw.send(status::OK, 0);
+
+                // the client would wait for the rest of the body, so it's told there's no more by closing the
+                // connection.
+                if (rw.body_remaining() > 0)
+                {
+                    logger->warn("handler for {} {} wrote {} bytes less than its Content-Length",
+                                 method_string(req.method),
+                                 req.target.path,
+                                 rw.body_remaining());
+                    break;
+                }
+            }
+
+            // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read).
+
+            // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
+            if (!co_await discard_body(*req.body, state.scratch))
+            {
+                logger->debug("closing connection rather than discarding the rest of the request body");
+                break;
+            }
         }
 
-        co_await writer.flush();
+        co_await state.writer.flush();
     }
     catch (const std::exception& ex)
     {
@@ -218,154 +336,93 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
     conn.close(false);
 }
 
-coro::task<server::serve_state> server::serve_request(tcp_socket&          conn,
-                                                      io::buffered_reader& reader,
-                                                      io::buffered_writer& writer,
-                                                      server_request&      req,
-                                                      server_response&     resp) noexcept
+void server::set_head_deadline(tcp_socket& conn) const
 {
-    logger->trace("decoding request");
-
-    // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
     if (header_read_timeout > std::chrono::seconds::zero())
         conn.set_read_deadline(io::clock::now() + header_read_timeout);
+}
 
-    // NOTE: HTTP/2 (parked) would be told apart here by its connection preface ("PRI * HTTP/2.0"), which HTTP/1.1
-    // decoding rejects as not_supported, so it gets a 501 Not Implemented.
-    auto err = co_await http11::request_decode(&reader, max_header_bytes, req);
-
-    conn.set_read_deadline(std::nullopt);
-
-    if (err)
-    {
-        if (err == io::status_condition::closed)
-        {
-            logger->debug("connection closed");
-        }
-        else if (err == std::errc::timed_out)
-        {
-            logger->debug("timed out waiting for request headers");
-        }
-        else
-        {
-            logger->debug("request decoding error: {} '{}'", err.value(), err.message());
-
-            // the rest of the connection can't be trusted to be where the next request starts, so close it.
-            resp.version     = {.major = 1, .minor = 1};
-            resp.status_code = status::NONE;
-            resp.body        = &writer;
-            resp.headers.clear();
-            resp.headers.set("Connection"sv, "close"sv);
-            resp.headers.set("Date"sv, current_date());
-
-            response_writer rw{&writer, &resp, http11::response_encode};
-            co_await rw.send(decode_error_status(err), 0);
-            co_await writer.flush();
-            co_await linger_before_close(conn);
-        }
-
-        co_return serve_state::close;
-    }
-
-    logger->trace("request decoded");
-
-    logger->trace("request {} {} as HTTP/{}.{}",
-                  method_string(req.method),
-                  req.target.path,
-                  req.version.major,
-                  req.version.minor);
-
-    // Only HTTP/1.x is implemented. In particular, http2::response_encode is a stub.
-    const bool supported = req.version.major == 1;
+void server::start_response(connection_state& state, io::discard_writer& no_body)
+{
+    auto& resp = state.resp;
 
     // A response to HEAD has the headers a GET would, but no body: what the handler writes as one is dropped.
-    io::discard_writer no_body;
-
-    resp.version     = supported ? req.version : protocol_version{.major = 1, .minor = 1};
+    resp.version     = state.req.version;
     resp.status_code = status::NONE;
-    resp.body        = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &writer;
+    resp.body        = state.req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &state.writer;
     resp.headers.clear();
     resp.headers.set("Date"sv, current_date());
+}
 
-    response_writer rw{&writer, &resp, http11::response_encode};
-
-    if (!supported)
+coro::task<> server::end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_condition err)
+{
+    if (err == io::status_condition::closed)
     {
-        logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
-        co_await rw.send(status::HTTP_VERSION_NOT_SUPPORTED, 0);
-        co_await writer.flush();
-        co_await linger_before_close(conn);
-        co_return serve_state::close;
+        logger->debug("connection closed");
+        co_return;
     }
 
-    if (auto upgrade_to = upgrade_to_protocol(req); !upgrade_to.empty())
+    if (err == std::errc::timed_out)
     {
-        logger->trace("upgrading to protocol: {}", upgrade_to);
-        resp.headers.set("Upgrade"sv, upgrade_to);
-        resp.headers.set("Connection"sv, "upgrade"sv);
-        co_await rw.send(status::SWITCHING_PROTOCOLS, 0);
-    }
-    else
-    {
-        logger->trace("calling handler");
-
-        // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
-        bool failed = false;
-        try
-        {
-            co_await handler(req, rw);
-        }
-        catch (const std::exception& ex)
-        {
-            logger->error("handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
-            failed = true;
-        }
-        catch (...)
-        {
-            logger->error("handler for {} {} threw", method_string(req.method), req.target.path);
-            failed = true;
-        }
-
-        if (failed)
-        {
-            // whatever the handler sent of the response can't be finished, so the connection is closed.
-            if (rw.status_code() == status::NONE)
-            {
-                resp.headers.clear();
-                resp.headers.set("Connection"sv, "close"sv);
-                resp.headers.set("Date"sv, current_date());
-                co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
-            }
-
-            co_await writer.flush();
-            co_await linger_before_close(conn);
-            co_return serve_state::close;
-        }
-
-        if (rw.status_code() == status::NONE) co_await rw.send(status::OK, 0);
-
-        // the client would wait for the rest of the body, so it's told there's no more by closing the connection.
-        if (rw.body_remaining() > 0)
-        {
-            logger->warn("handler for {} {} wrote {} bytes less than its Content-Length",
-                         method_string(req.method),
-                         req.target.path,
-                         rw.body_remaining());
-            co_await writer.flush();
-            co_return serve_state::close;
-        }
+        logger->debug("timed out waiting for request headers");
+        co_return;
     }
 
-    // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read).
+    logger->debug("request decoding error: {} '{}'", err.value(), err.message());
 
-    // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
-    if (!co_await discard_body(*req.body))
+    // the rest of the connection can't be trusted to be where the next request starts, so it's closed.
+    co_await respond_and_close(conn, state, decode_error_status(err));
+}
+
+coro::task<> server::end_after_handler_failure(tcp_socket&        conn,
+                                               connection_state&  state,
+                                               response_writer&   rw,
+                                               std::exception_ptr failure)
+{
+    const auto& req = state.req;
+
+    try
     {
-        logger->debug("closing connection rather than discarding the rest of the request body");
-        co_return serve_state::close;
+        std::rethrow_exception(failure);
+    }
+    catch (const std::exception& ex)
+    {
+        logger->error("handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
+    }
+    catch (...)
+    {
+        logger->error("handler for {} {} threw", method_string(req.method), req.target.path);
     }
 
-    co_return serve_state::keep_alive;
+    // whatever the handler sent of the response can't be finished, so the connection is closed.
+    if (rw.status_code() == status::NONE)
+    {
+        co_await respond_and_close(conn, state, status::INTERNAL_SERVER_ERROR);
+        co_return;
+    }
+
+    co_await state.writer.flush();
+    co_await linger_before_close(conn);
+}
+
+coro::task<> server::respond_and_close(tcp_socket& conn, connection_state& state, status code)
+{
+    auto& resp = state.resp;
+
+    // NOTE: the version is the request's, if it's one that's implemented.
+    if (state.req.version.major != 1) resp.version = {.major = 1, .minor = 1};
+    else resp.version = state.req.version;
+
+    resp.status_code = status::NONE;
+    resp.body        = &state.writer;
+    resp.headers.clear();
+    resp.headers.set("Connection"sv, "close"sv);
+    resp.headers.set("Date"sv, current_date());
+
+    response_writer rw{&state.writer, &resp, http11::response_encode};
+    co_await rw.send(code, 0);
+    co_await state.writer.flush();
+    co_await linger_before_close(conn);
 }
 
 std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept

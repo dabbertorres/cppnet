@@ -4,19 +4,24 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
+#include "http/http.hpp"
 #include "http/request.hpp"
+#include "http/response.hpp"
 #include "http/router.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
+#include "io/discard_writer.hpp"
 #include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
@@ -64,20 +69,28 @@ public:
     [[nodiscard]] std::uint16_t local_port() const { return listener.local_port(); }
 
 private:
-    enum class serve_state : std::uint8_t
-    {
-        keep_alive,
-        close,
-    };
+    // connection_state is what's kept for a connection from one request to the next (see server.cpp).
+    struct connection_state;
 
     coro::task<> serve_connection(tcp_socket conn) noexcept;
-    // serve_request serves the next request on conn, decoding it into req, and responding with resp: both are kept for
-    // the connection, so that their memory is reused for each request.
-    coro::task<serve_state> serve_request(tcp_socket&          conn,
-                                          io::buffered_reader& reader,
-                                          io::buffered_writer& writer,
-                                          server_request&      req,
-                                          server_response&     resp) noexcept;
+
+    // set_head_deadline sets how long conn may take to send the next request's head (see header_read_timeout).
+    void set_head_deadline(tcp_socket& conn) const;
+
+    // start_response readies the connection's response for the request it has just decoded, with no_body for its body
+    // if it's to a HEAD request.
+    static void start_response(connection_state& state, io::discard_writer& no_body);
+
+    // The ways a connection ends other than the client closing it, which close it.
+    coro::task<> end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_condition err);
+    coro::task<> end_after_handler_failure(tcp_socket&        conn,
+                                           connection_state&  state,
+                                           response_writer&   rw,
+                                           std::exception_ptr failure);
+
+    // respond_and_close sends a response of just code (closing the connection), and closes it.
+    coro::task<> respond_and_close(tcp_socket& conn, connection_state& state, status code);
+
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
 

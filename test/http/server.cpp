@@ -359,3 +359,63 @@ TEST_CASE("a response isn't held back waiting for the next request", "[http][ser
     CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
     CHECK(out.ends_with("\r\n\r\none"));
 }
+
+TEST_CASE("the server skips bodies handlers don't read, and closes connections it can't continue", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    const auto throws = [](const http::server_request& /*req*/, http::response_writer& /*resp*/) -> task<void>
+    {
+        throw std::runtime_error{"oops"};
+        co_return;
+    };
+
+    http::router router;
+    router.GET("/throws", throws);
+    router.GET("/:name", echo_name);
+    router.POST("/:name", echo_name);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    SECTION("a body the handler doesn't read is skipped, and the next request answered")
+    {
+        // the second request has no Host, so the server answers it with a 400, and closes the connection.
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "POST /first HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\nabcdef"
+                                                    "GET /second HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                    "GET / HTTP/1.1\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+        CHECK(out.find("\r\n\r\nfirst") < out.find("\r\n\r\nsecond"));
+        CHECK(out.contains("HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    SECTION("an HTTP version that isn't implemented gets a 505")
+    {
+        auto out = sched.run_to_completion(exchange(&sched, server.local_port(), "GET /a HTTP/2.0\r\nHost: x\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(out.starts_with("HTTP/1.1 505 HTTP Version Not Supported\r\n"));
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+    }
+
+    SECTION("a handler that throws gets a 500, and the connection closed")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "GET /throws HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                    "GET /never HTTP/1.1\r\nHost: x\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(out.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+        CHECK_FALSE(out.contains("never"));
+    }
+}
