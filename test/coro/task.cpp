@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -187,4 +188,22 @@ TEST_CASE("operation tasks", "[coro][task][operation]")
         CHECK_FALSE(op.started);
         CHECK(op.try_claim());
     }
+}
+
+TEST_CASE("an empty task can't be awaited, or give a result", "[coro][task]")
+{
+    net::coro::task<int> empty;
+    CHECK_FALSE(empty.valid());
+    CHECK_FALSE(empty.resume());
+    CHECK_THROWS_AS(std::move(empty).result(), std::logic_error);
+
+    // nor one moved from.
+    auto moved_from = [] -> net::coro::task<int> { co_return 1; }();
+    auto moved_to   = std::move(moved_from);
+
+    const auto await_it = [](net::coro::task<int>* t) -> net::coro::task<int> { co_return co_await std::move(*t); };
+    // NOLINTNEXTLINE(bugprone-use-after-move): what's left of it is what's checked.
+    CHECK_THROWS_AS(test::sync_wait(await_it(&moved_from)), std::logic_error);
+    const int value = test::sync_wait(std::move(moved_to));
+    CHECK(value == 1);
 }

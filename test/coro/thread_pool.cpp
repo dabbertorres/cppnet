@@ -1,8 +1,10 @@
 #include "coro/thread_pool.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
+#include <latch>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -248,4 +250,51 @@ TEST_CASE("a worker polls now and then, even if the queue doesn't empty", "[coro
     pool.shutdown();
 
     CHECK(poller.non_blocking() > 0);
+}
+
+namespace
+{
+
+// stuck_after_poll is readied by poller, and then doesn't suspend until unstuck (as a coroutine that blocks wouldn't).
+net::coro::task<> stuck_after_poll(test_poller* poller, std::latch* running, std::binary_semaphore* unstick)
+{
+    co_await readied_by{poller};
+    running->count_down();
+    unstick->acquire();
+}
+
+}
+
+TEST_CASE("a worker that's stuck running a coroutine doesn't hold up polling", "[coro][thread_pool][poller]")
+{
+    thread_pool pool{3};
+    test_poller poller;
+    REQUIRE(pool.attach(&poller));
+
+    // the worker that polled runs the first coroutine it readied, which gets stuck.
+    std::latch            running{1};
+    std::binary_semaphore unstick{0};
+    auto                  first = stuck_after_poll(&poller, &running, &unstick);
+    first.get_handle().resume();
+    running.wait();
+
+    // so another (asleep, until it checks) must poll, to ready the next.
+    std::thread::id       ran_on;
+    std::binary_semaphore done{0};
+    auto                  second = wait_for_poller(&poller, &ran_on, &done);
+
+    const auto start = std::chrono::steady_clock::now();
+    second.get_handle().resume();
+    const bool ran     = done.try_acquire_for(std::chrono::seconds{2});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // NOTE: before checking, so a failure doesn't leave a worker stuck.
+    unstick.release();
+    if (!ran) done.acquire();
+
+    CHECK(ran);
+    CHECK(elapsed < std::chrono::milliseconds{500});
+
+    pool.detach(&poller);
+    pool.shutdown();
 }

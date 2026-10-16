@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -916,4 +917,27 @@ TEST_CASE("a malformed request line fails without waiting for the rest of the he
 
     auto err = test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req));
     CHECK(err == std::errc::invalid_argument);
+}
+
+TEST_CASE("a request gets one final response, after any interim ones", "[http][1.1][response_writer]")
+{
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 1},
+        .body    = &out
+    };
+    net::http::response_writer rw{&out, &resp, net::http::http11::response_encode};
+
+    CHECK_FALSE(rw.sent());
+
+    // interim responses don't count.
+    (void)test::sync_wait(rw.send(net::http::status::CONTINUE, 0));
+    CHECK_FALSE(rw.sent());
+
+    (void)test::sync_wait(rw.send(net::http::status::OK, 0));
+    CHECK(rw.sent());
+
+    CHECK_THROWS_AS(test::sync_wait(rw.send(net::http::status::NOT_FOUND, 0)), std::logic_error);
+    CHECK(out.build().contains("HTTP/1.1 200 OK"));
+    CHECK_FALSE(out.build().contains("404"));
 }

@@ -168,3 +168,16 @@ TEST_CASE("moved-from headers are empty", "[http][headers]")
     });
     // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
 }
+
+TEST_CASE("has_token finds an element of a list-based field", "[http][headers][get_list]")
+{
+    net::http::headers fields;
+    fields.add("Connection"sv, "Keep-Alive, \"close\""sv).add("Connection"sv, "upgrade"sv);
+
+    CHECK(fields.has_token("connection"sv, "keep-alive"sv));
+    CHECK(fields.has_token("Connection"sv, "UPGRADE"sv));
+
+    // a quoted string is one element, not the token inside it.
+    CHECK_FALSE(fields.has_token("Connection"sv, "close"sv));
+    CHECK_FALSE(fields.has_token("Transfer-Encoding"sv, "chunked"sv));
+}

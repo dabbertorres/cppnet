@@ -6,14 +6,17 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
+#include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -38,7 +41,14 @@ struct server_config
     std::size_t max_header_bytes = 8'192;
     // How long to wait for a request's headers, from when the server starts waiting for them, so it includes waiting
     // for the next request on a kept-alive connection. The connection is closed once it passes. 0 disables it.
-    std::chrono::seconds            header_read_timeout     = 5s;
+    std::chrono::seconds header_read_timeout = 5s;
+    // How long reading a request's body (by the handler, or skipping what it didn't read), and writing a response, may
+    // each go without progress. The connection is closed once either passes. 0 disables them.
+    std::chrono::seconds body_read_timeout = 60s;
+    std::chrono::seconds write_timeout     = 60s;
+    // The most connections served at once: once that many are open, the server waits for one to close before
+    // accepting another. 0 doesn't limit them.
+    std::size_t                     max_connections         = 0;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
 };
@@ -57,12 +67,18 @@ public:
     server(const server&)            = delete;
     server& operator=(const server&) = delete;
 
-    server(server&&) noexcept;
-    server& operator=(server&&) noexcept;
+    server(server&&)            = delete;
+    server& operator=(server&&) = delete;
 
+    // Closes the server, and blocks until serve() and the connections have finished: so it must not be destroyed
+    // from one of the scheduler's tasks, which might be one of them (or one a worker it needs is running).
     ~server();
 
-    void         close();
+    // close stops accepting connections, and ends the open ones: those waiting for a request close, and the others
+    // once their response is sent (reads of a request's body find its end).
+    void close();
+
+    // serve accepts and serves connections, until the server is closed (or the scheduler stopped).
     coro::task<> serve();
 
     // local_port is the port the server listens on: e.g. the one chosen for it, if it was configured with port "0".
@@ -72,7 +88,11 @@ private:
     // connection_state is what's kept for a connection from one request to the next (see server.cpp).
     struct connection_state;
 
-    coro::task<> serve_connection(tcp_socket conn) noexcept;
+    // room_for_connection waits until fewer than max_connections are open, returning false if the scheduler stops.
+    coro::task<bool> room_for_connection();
+
+    // serve_connection serves conn's requests, holding a lease on running (so the server isn't destroyed meanwhile).
+    coro::task<> serve_connection(tcp_socket conn, coro::async_scope::lease held) noexcept;
 
     // set_head_deadline sets how long conn may take to send the next request's head (see header_read_timeout).
     void set_head_deadline(tcp_socket& conn) const;
@@ -91,9 +111,6 @@ private:
     // respond_and_close sends a response of just code (closing the connection), and closes it.
     coro::task<> respond_and_close(tcp_socket& conn, connection_state& state, status code);
 
-    std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
-    bool             is_protocol_supported(std::string_view protocol) const noexcept;
-
     net::listener                   listener;
     std::atomic_bool                is_serving;
     request_handler                 handler;
@@ -102,7 +119,20 @@ private:
 
     std::size_t          max_header_bytes;
     std::chrono::seconds header_read_timeout;
+    std::chrono::seconds body_read_timeout;
+    std::chrono::seconds write_timeout;
+    std::size_t          max_connections;
     std::uint16_t        max_pending_connections;
+
+    // open_connections counts the connections being served, for max_connections (waited on, with the scheduler).
+    std::atomic<std::uint64_t> open_connections = 0;
+
+    // connections are the sockets being served, for close() to end. Each removes itself before closing its socket.
+    std::mutex                      connections_mu;
+    std::unordered_set<tcp_socket*> connections;
+
+    // running counts serve() and the connections (which are the scheduler's tasks), for the destructor to wait for.
+    coro::async_scope running;
 };
 
 }

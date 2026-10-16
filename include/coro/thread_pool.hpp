@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -150,6 +151,11 @@ private:
     // that I/O isn't held up by a queue that never empties. (Tokio's event_interval.)
     static constexpr std::size_t poll_interval = 61;
 
+    // watchdog_interval is how often the standby (see worker()) checks that someone's polling: so how long a coroutine
+    // that doesn't suspend can hold up I/O, when other workers are asleep. (Go's sysmon checks at most this often, once
+    // idle.)
+    static constexpr std::chrono::milliseconds watchdog_interval{10};
+
     void worker();
     void schedule(std::coroutine_handle<> /*handle*/);
 
@@ -177,6 +183,7 @@ private:
     poller*                 polls      = nullptr;
     bool                    polling    = false;
     bool                    poll_woken = false;
+    bool                    standby    = false; // whether a sleeping worker is the standby (see worker())
     std::condition_variable polled; // notified when a poll ends, for detach()
 };
 

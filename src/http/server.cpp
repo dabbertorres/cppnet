@@ -1,5 +1,6 @@
 #include "http/server.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -32,11 +33,13 @@
 #include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+#include "util/string_util.hpp"
 
 namespace
 {
 
 using namespace std::chrono_literals;
+using namespace std::string_view_literals;
 
 // The most of an unread request body to read and discard, rather than closing the connection.
 constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
@@ -122,6 +125,16 @@ net::coro::task<> linger_before_close(net::tcp_socket& conn) noexcept
     }
 }
 
+// has_close is whether fields say the connection closes after this message.
+bool has_close(const net::http::headers& fields) { return fields.has_token("Connection"sv, "close"sv); }
+
+// response_version is the version of a response to a request of version: the highest the server implements, which the
+// client does too (RFC 9110, section 2.5).
+net::http::protocol_version response_version(net::http::protocol_version version) noexcept
+{
+    return {.major = 1, .minor = version.major == 1 && version.minor == 0 ? 0U : 1U};
+}
+
 // decode_error_status is the response to a request that couldn't be decoded.
 net::http::status decode_error_status(std::error_condition err) noexcept
 {
@@ -147,22 +160,45 @@ server::server(io::scheduler* scheduler, request_handler handler, const server_c
     , scheduler{scheduler}
     , max_header_bytes{cfg.max_header_bytes}
     , header_read_timeout{cfg.header_read_timeout}
+    , body_read_timeout{cfg.body_read_timeout}
+    , write_timeout{cfg.write_timeout}
+    , max_connections{cfg.max_connections}
     , max_pending_connections{cfg.max_pending_connections}
 {}
 
-server::~server() { close(); }
+server::~server()
+{
+    close();
+
+    // serve() and the connections use the server until they finish.
+    running.close();
+    running.join_blocking();
+}
 
 void server::close()
 {
-    if (is_serving.exchange(false, std::memory_order::acq_rel))
+    if (!is_serving.exchange(false, std::memory_order::acq_rel)) return;
+
+    listener.shutdown();
+
     {
-        listener.shutdown();
-        logger->flush();
+        // NOTE: a connection checks is_serving under the lock before adding itself, so it either sees it's false, or
+        //       is ended here.
+        std::scoped_lock lock{connections_mu};
+        for (const auto* conn : connections) conn->shutdown_read();
     }
+
+    // serve() may be waiting for a connection to close (see max_connections).
+    scheduler->notify_all(open_connections);
+    logger->flush();
 }
 
 coro::task<> server::serve()
 {
+    // the server waits for this to finish before it's destroyed.
+    auto held = running.acquire();
+    if (!held) co_return;
+
     if (is_serving.exchange(true, std::memory_order::acq_rel))
     {
         throw exception{"already serving"};
@@ -170,8 +206,12 @@ coro::task<> server::serve()
 
     listener.listen(max_pending_connections);
 
+    auto backoff = io::clock::duration::zero();
+
     while (is_serving.load(std::memory_order::acquire))
     {
+        if (!co_await room_for_connection()) co_return;
+
         logger->trace("waiting for connection");
 
         auto accepted = co_await listener.accept();
@@ -180,9 +220,16 @@ coro::task<> server::serve()
             // the server was closed, or the scheduler stopped.
             if (accepted.error() == std::errc::operation_canceled) co_return;
 
+            // e.g. too many open files: trying again straight away would fail again (and on Linux, which leaves the
+            // connection queued, straight away), so it waits a little longer each time.
+            backoff = std::min<io::clock::duration>(backoff == io::clock::duration::zero() ? 5ms : backoff * 2, 1s);
             logger->error("failed to accept connection: {}", accepted.error().message());
+
+            if (co_await scheduler->sleep_until(io::clock::now() + backoff)) co_return;
             continue;
         }
+
+        backoff = io::clock::duration::zero();
 
         try
         {
@@ -200,8 +247,31 @@ coro::task<> server::serve()
         if (auto set = accepted->set_nodelay(); !set.has_value())
             logger->debug("failed to set TCP_NODELAY: {}", set.error().message());
 
-        if (!scheduler->spawn(serve_connection(std::move(*accepted)))) co_return;
+        auto conn_held = running.acquire();
+        if (!conn_held) co_return;
+
+        open_connections.fetch_add(1, std::memory_order::acq_rel);
+        if (!scheduler->spawn(serve_connection(std::move(*accepted), std::move(conn_held))))
+        {
+            // the task was destroyed without running (as the scheduler is stopping).
+            open_connections.fetch_sub(1, std::memory_order::acq_rel);
+            co_return;
+        }
     }
+}
+
+coro::task<bool> server::room_for_connection()
+{
+    while (max_connections != 0 && is_serving.load(std::memory_order::acquire))
+    {
+        const auto open = open_connections.load(std::memory_order::acquire);
+        if (open < max_connections) co_return true;
+
+        // the scheduler's being stopped.
+        if (co_await scheduler->wait_on(open_connections, open)) co_return false;
+    }
+
+    co_return true;
 }
 
 // connection_state is what's kept for a connection from one request to the next: anything read past the end of one
@@ -226,10 +296,19 @@ struct server::connection_state
     std::array<std::byte, 4'096> scratch{};
 };
 
-coro::task<> server::serve_connection(tcp_socket conn) noexcept
+coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease /*held*/) noexcept
 {
     try
     {
+        {
+            std::scoped_lock lock{connections_mu};
+            if (is_serving.load(std::memory_order::acquire)) connections.insert(&conn);
+        }
+
+        // NOTE: per wait, so a slow (or stuck) client can't hold the connection for ever.
+        if (body_read_timeout > std::chrono::seconds::zero()) conn.set_read_timeout(body_read_timeout);
+        if (write_timeout > std::chrono::seconds::zero()) conn.set_write_timeout(write_timeout);
+
         connection_state state{&conn};
         auto&            req  = state.req;
         auto&            resp = state.resp;
@@ -273,44 +352,34 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
 
             response_writer rw{&state.writer, &resp, http11::response_encode};
 
-            if (auto upgrade_to = upgrade_to_protocol(req); !upgrade_to.empty())
+            // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
+            std::exception_ptr failure;
+            try
             {
-                logger->trace("upgrading to protocol: {}", upgrade_to);
-                resp.headers.set("Upgrade"sv, upgrade_to);
-                resp.headers.set("Connection"sv, "upgrade"sv);
-                co_await rw.send(status::SWITCHING_PROTOCOLS, 0);
+                co_await handler(req, rw);
             }
-            else
+            catch (...)
             {
-                // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
-                std::exception_ptr failure;
-                try
-                {
-                    co_await handler(req, rw);
-                }
-                catch (...)
-                {
-                    failure = std::current_exception();
-                }
+                failure = std::current_exception();
+            }
 
-                if (failure)
-                {
-                    co_await end_after_handler_failure(conn, state, rw, failure);
-                    break;
-                }
+            if (failure)
+            {
+                co_await end_after_handler_failure(conn, state, rw, failure);
+                break;
+            }
 
-                if (rw.status_code() == status::NONE) co_await rw.send(status::OK, 0);
+            if (!rw.sent()) co_await rw.send(status::OK, 0);
 
-                // the client would wait for the rest of the body, so it's told there's no more by closing the
-                // connection.
-                if (rw.body_remaining() > 0)
-                {
-                    logger->warn("handler for {} {} wrote {} bytes less than its Content-Length",
-                                 method_string(req.method),
-                                 req.target.path,
-                                 rw.body_remaining());
-                    break;
-                }
+            // the client would wait for the rest of the body, so it's told there's no more by closing the connection.
+            // NOTE: not for HEAD, whose body isn't sent.
+            if (req.method != request_method::HEAD && rw.body_remaining() > 0)
+            {
+                logger->warn("handler for {} {} wrote {} bytes less than its Content-Length",
+                             method_string(req.method),
+                             req.target.path,
+                             rw.body_remaining());
+                break;
             }
 
             // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read).
@@ -321,6 +390,9 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
                 logger->debug("closing connection rather than discarding the rest of the request body");
                 break;
             }
+
+            // the client, or the handler, asked for the connection to close after this response.
+            if (has_close(resp.headers)) break;
         }
 
         co_await state.writer.flush();
@@ -332,8 +404,17 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
 
     logger->trace("connection closing");
 
+    {
+        std::scoped_lock lock{connections_mu};
+        connections.erase(&conn);
+    }
+
     // The kernel still sends anything already written, without lingering here.
     conn.close(false);
+
+    // serve() may be waiting for a connection to close (see max_connections).
+    open_connections.fetch_sub(1, std::memory_order::acq_rel);
+    scheduler->notify_one(open_connections);
 }
 
 void server::set_head_deadline(tcp_socket& conn) const
@@ -344,14 +425,22 @@ void server::set_head_deadline(tcp_socket& conn) const
 
 void server::start_response(connection_state& state, io::discard_writer& no_body)
 {
-    auto& resp = state.resp;
+    const auto& req  = state.req;
+    auto&       resp = state.resp;
 
     // A response to HEAD has the headers a GET would, but no body: what the handler writes as one is dropped.
-    resp.version     = state.req.version;
+    resp.version     = response_version(req.version);
     resp.status_code = status::NONE;
-    resp.body        = state.req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &state.writer;
+    resp.body        = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &state.writer;
     resp.headers.clear();
     resp.headers.set("Date"sv, current_date());
+
+    // HTTP/1.1 connections persist unless either end says they close, and HTTP/1.0's close unless the client says they
+    // persist (RFC 9112, section 9.3): the response says which, if it isn't the default.
+    const bool http10 = req.version.minor == 0;
+    if (has_close(req.headers) || (http10 && !req.headers.has_token("Connection"sv, "keep-alive"sv)))
+        resp.headers.set("Connection"sv, "close"sv);
+    else if (http10) resp.headers.set("Connection"sv, "keep-alive"sv);
 }
 
 coro::task<> server::end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_condition err)
@@ -409,9 +498,7 @@ coro::task<> server::respond_and_close(tcp_socket& conn, connection_state& state
 {
     auto& resp = state.resp;
 
-    // NOTE: the version is the request's, if it's one that's implemented.
-    if (state.req.version.major != 1) resp.version = {.major = 1, .minor = 1};
-    else resp.version = state.req.version;
+    resp.version = response_version(state.req.version);
 
     resp.status_code = status::NONE;
     resp.body        = &state.writer;
@@ -425,20 +512,4 @@ coro::task<> server::respond_and_close(tcp_socket& conn, connection_state& state
     co_await linger_before_close(conn);
 }
 
-std::string_view server::upgrade_to_protocol(const server_request& req) const noexcept
-{
-    std::string_view upgrade_to;
-    for (auto protocol : req.headers.get_list("Upgrade"sv))
-    {
-        if (is_protocol_supported(protocol))
-        {
-            upgrade_to = protocol;
-            break;
-        }
-    }
-
-    return upgrade_to;
-}
-
-bool server::is_protocol_supported(std::string_view protocol) const noexcept { return protocol == "HTTP/1.1"; }
 }

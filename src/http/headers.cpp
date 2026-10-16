@@ -244,19 +244,42 @@ headers& headers::set_content_type(const content_type& content_type)
 std::vector<std::string_view> headers::get_list(std::string_view key) const
 {
     std::vector<std::string_view> out;
+    for_each_element(key,
+                     [&](std::string_view element)
+                     {
+                         out.push_back(element);
+                         return true;
+                     });
+    return out;
+}
 
-    auto all = get_all(key);
-    if (!all.has_value()) return out;
+bool headers::has_token(std::string_view key, std::string_view token) const
+{
+    bool found = false;
+    for_each_element(key,
+                     [&](std::string_view element)
+                     {
+                         found = util::equal_ignore_case(element, token);
+                         return !found;
+                     });
+    return found;
+}
 
-    for (std::string_view value : *all)
+template<typename F>
+void headers::for_each_element(std::string_view key, F visit) const
+{
+    const auto* field = find(key);
+    if (field == nullptr) return;
+
+    for (std::string_view value : field->second)
     {
         bool        quoted  = false;
         std::size_t start   = 0;
         const auto  element = [&](std::size_t end)
         {
             auto trimmed = trim_ows(value.substr(start, end - start));
-            if (!trimmed.empty()) out.push_back(trimmed);
-            start = end + 1;
+            start        = end + 1;
+            return trimmed.empty() || visit(trimmed);
         };
 
         for (std::size_t i = 0; i < value.size(); ++i)
@@ -265,14 +288,11 @@ std::vector<std::string_view> headers::get_list(std::string_view key) const
                 ++i; // skip what's escaped
             else if (value[i] == '"')
                 quoted = !quoted;
-            else if (!quoted && value[i] == ',')
-                element(i);
+            else if (!quoted && value[i] == ',' && !element(i)) return;
         }
 
-        element(value.size());
+        if (!element(value.size())) return;
     }
-
-    return out;
 }
 
 [[nodiscard]] std::optional<std::size_t> headers::get_content_length() const

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -48,6 +49,10 @@ headers& response_writer::headers() noexcept { return resp->headers; }
 
 coro::task<io::writer*> response_writer::send(status status_code, std::size_t content_length)
 {
+    // a second final response would be read as the response to the next request (by a proxy reusing the connection,
+    // possibly another client's).
+    if (final_sent) throw std::logic_error{"the response was already sent"};
+
     // 1xx and 204 responses have no content, and mustn't say how long it is; nor need a 304, whose length would have
     // to be the 200's (RFC 9110, section 8.6).
     const bool has_content =
@@ -62,7 +67,7 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
     // usually, the head fits in the connection's buffer: then there's no need for a coroutine (see coro::ready_task).
     auto encoding = encode(writer, *resp);
     if (encoding.finished_without_coroutine())
-        return coro::ready_task<io::writer*>(sent(std::move(encoding).result(), body_length));
+        return coro::ready_task<io::writer*>(take_encoding(std::move(encoding).result(), body_length));
 
     return finish_send(std::move(encoding), body_length);
 }
@@ -70,10 +75,10 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
 coro::task<io::writer*> response_writer::finish_send(coro::task<response_encoder_result> encoding,
                                                      std::size_t                         body_length)
 {
-    co_return sent(co_await std::move(encoding), body_length);
+    co_return take_encoding(co_await std::move(encoding), body_length);
 }
 
-io::writer* response_writer::sent(const response_encoder_result& res, std::size_t body_length)
+io::writer* response_writer::take_encoding(const response_encoder_result& res, std::size_t body_length)
 {
     if (!res.has_value())
     {
@@ -81,6 +86,8 @@ io::writer* response_writer::sent(const response_encoder_result& res, std::size_
         resp->status_code = status::NONE;
         throw std::system_error{res.error().value(), res.error().category(), "failed to send response"};
     }
+
+    if (!status_is_information(resp->status_code)) final_sent = true;
 
     body = io::limit_writer{resp->body, body_length};
     return &body;
