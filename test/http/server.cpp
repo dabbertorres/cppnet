@@ -180,6 +180,33 @@ TEST_CASE("responses to HEAD requests have no body", "[http][server]")
     CHECK(out.ends_with("\r\n\r\nhello"));
 }
 
+TEST_CASE("the server sends the date", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/", [](const http::server_request&, http::response_writer&) -> task<void> { co_return; });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // for a handler's response, and for the server's own (here, to a request it can't decode).
+    auto out = sched.run_to_completion(exchange(&sched,
+                                                server.local_port(),
+                                                "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                "GET / HTTP/1.1\r\n\r\n"));
+    CAPTURE(out);
+
+    CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 1);
+    CHECK(count(out, "HTTP/1.1 400 Bad Request\r\n") == 1);
+    CHECK(count(out, "\r\nDate: ") == 2);
+    CHECK(count(out, " GMT\r\n") == 2);
+}
+
 TEST_CASE("a response's body is as long as its Content-Length", "[http][server]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};

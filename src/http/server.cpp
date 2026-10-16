@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -38,6 +39,23 @@ using namespace std::chrono_literals;
 
 // The most of an unread request body to read and discard, rather than closing the connection.
 constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
+
+// current_date is the Date header's value for a response sent now (RFC 9110, section 6.6.1: a server with a clock
+// sends one). It's formatted at most once a second, on each thread.
+std::string current_date()
+{
+    thread_local std::chrono::sys_seconds formatted_at{};
+    thread_local std::string              formatted;
+
+    const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+    if (now != formatted_at)
+    {
+        formatted    = net::http::format_date(now);
+        formatted_at = now;
+    }
+
+    return formatted;
+}
 
 // discard_body reads and drops the rest of body, returning whether it reached the end of it.
 net::coro::task<bool> discard_body(net::io::reader& body)
@@ -218,6 +236,7 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
                 .body    = &writer
             };
             resp.headers.set("Connection"sv, "close"sv);
+            resp.headers.set("Date"sv, current_date());
 
             response_writer rw{&writer, &resp, http11::response_encode};
             co_await rw.send(decode_error_status(err), 0);
@@ -248,6 +267,7 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
         .headers = {},
         .body    = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &writer,
     };
+    resp.headers.set("Date"sv, current_date());
 
     response_writer rw{&writer, &resp, http11::response_encode};
 
@@ -295,6 +315,7 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
             {
                 resp.headers = {};
                 resp.headers.set("Connection"sv, "close"sv);
+                resp.headers.set("Date"sv, current_date());
                 co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
             }
 

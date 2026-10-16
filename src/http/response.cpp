@@ -1,8 +1,11 @@
 #include "http/response.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <string>
 #include <string_view>
 #include <system_error>
 
@@ -15,6 +18,12 @@ namespace net::http
 {
 
 using namespace std::string_view_literals;
+
+std::string format_date(std::chrono::system_clock::time_point t)
+{
+    // NOTE: std::format's day and month names are the C locale's (the L option would use another), as HTTP's are.
+    return std::format("{:%a, %d %b %Y %H:%M:%S} GMT", std::chrono::floor<std::chrono::seconds>(t));
+}
 
 status parse_status(std::string_view str) noexcept
 {
