@@ -893,3 +893,27 @@ TEST_CASE("a response head that doesn't fit in the writer's buffer is still writ
     REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
     CHECK(out.build() == want);
 }
+
+TEST_CASE("a field line longer than the reader's buffer is still decoded", "[http][1.1][request_decode]")
+{
+    const std::string value(200, 'v');
+    const std::string input = "GET / HTTP/1.1\r\nHost: a\r\nX-Long: " + value + "\r\n\r\n";
+
+    net::io::string_reader<char> content(input);
+    net::io::buffered_reader     reader(&content, 32);
+    net::http::server_request    req;
+
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    CHECK(req.headers.get("X-Long"sv) == value);
+}
+
+TEST_CASE("a malformed request line fails without waiting for the rest of the head", "[http][1.1][request_decode]")
+{
+    // the head never ends: had decoding waited for it, it would fail with closed, at the end of the input.
+    net::io::string_reader<char> content("NOT A REQUEST\r\nHost: a\r\n");
+    net::io::buffered_reader     reader(&content, 8);
+    net::http::server_request    req;
+
+    auto err = test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req));
+    CHECK(err == std::errc::invalid_argument);
+}

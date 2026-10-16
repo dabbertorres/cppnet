@@ -16,7 +16,11 @@ class discard_writer final : public writer
 public:
     using writer::write;
 
-    coro::task<result> write(std::span<const std::byte> data) override { co_return {.count = data.size()}; }
+    // NOTE: without a coroutine (see coro::ready_task), as it never waits.
+    coro::task<result> write(std::span<const std::byte> data) override
+    {
+        return coro::ready_task<result>(result{.count = data.size()});
+    }
 
     [[nodiscard]] int native_handle() const noexcept override { return -1; }
 };
