@@ -96,25 +96,41 @@ TEST_CASE("process start time", "[instrument][system]")
 
 TEST_CASE("process threads", "[instrument][system]")
 {
-    auto before = system_stats::process_threads();
-    REQUIRE(before.has_value());
-    CHECK(*before >= 1);
+    // NOTE: a thread is started (and finished) first, as a sanitizer's runtime may start one of its own along with the
+    //       first (ThreadSanitizer does).
+    {
+        std::jthread warm_up{[] {}};
+    }
 
-    std::latch started{1};
-    std::latch done{1};
+    // started counts the threads before and while running one more.
+    const auto started = []
+    {
+        auto before = system_stats::process_threads();
+        REQUIRE(before.has_value());
+        CHECK(*before >= 1);
 
-    std::jthread thread{[&]
-                        {
-                            started.count_down();
-                            done.wait();
-                        }};
-    started.wait();
+        std::latch running{1};
+        std::latch done{1};
 
-    auto during = system_stats::process_threads();
-    done.count_down();
+        std::jthread thread{[&]
+                            {
+                                running.count_down();
+                                done.wait();
+                            }};
+        running.wait();
 
-    REQUIRE(during.has_value());
-    CHECK(*during == *before + 1);
+        auto during = system_stats::process_threads();
+        done.count_down();
+
+        REQUIRE(during.has_value());
+        return static_cast<std::ptrdiff_t>(*during) - static_cast<std::ptrdiff_t>(*before);
+    };
+
+    // NOTE: tried a few times, as threads that earlier tests started may still be finishing, meanwhile.
+    std::ptrdiff_t counted = 0;
+    for (int attempt = 0; attempt < 10 && counted != 1; ++attempt) counted = started();
+
+    CHECK(counted == 1);
 }
 
 TEST_CASE("process usage", "[instrument][system]")
