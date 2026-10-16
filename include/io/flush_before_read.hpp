@@ -38,7 +38,10 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return conn->native_handle(); }
 
 private:
-    coro::task<result> flush_and_read(std::span<std::byte> data);
+    // flush_and_read finishes read(), once flushing (which needed a coroutine) does.
+    coro::task<result> flush_and_read(coro::task<result> flushing, std::span<std::byte> data);
+
+    static result closed() noexcept;
 
     reader*          conn;
     buffered_writer* writer;

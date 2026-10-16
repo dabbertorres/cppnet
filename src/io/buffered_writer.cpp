@@ -5,6 +5,7 @@
 #include <iterator>
 #include <span>
 #include <system_error>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -81,25 +82,47 @@ std::span<std::byte> buffered_writer::prepare(std::size_t size)
 coro::task<result> buffered_writer::flush()
 {
     std::size_t total = 0;
-    result      res;
 
+    // usually, the writes don't wait (e.g. a socket with room for it all): then there's no need for a coroutine (see
+    // coro::ready_task).
     while (total < buf.size())
+    {
+        auto writing = impl->write(std::span{buf}.subspan(total));
+        if (!writing.finished_without_coroutine()) return flush_after(std::move(writing), total);
+
+        auto res = std::move(writing).result();
+        total += res.count;
+
+        if (res.err || res.count == 0) return coro::ready_task<result>(flushed(total, res));
+    }
+
+    return coro::ready_task<result>(flushed(total, {}));
+}
+
+coro::task<result> buffered_writer::flush_after(coro::task<result> writing, std::size_t total)
+{
+    result res = co_await std::move(writing);
+    total += res.count;
+
+    while (!res.err && res.count != 0 && total < buf.size())
     {
         res = co_await impl->write(std::span{buf}.subspan(total));
         total += res.count;
-
-        if (res.err) break;
-        if (res.count == 0)
-        {
-            res.err = make_error_condition(status_condition::error);
-            break;
-        }
     }
 
+    co_return flushed(total, res);
+}
+
+result buffered_writer::flushed(std::size_t total, const result& last) noexcept
+{
     // drop what was written, keeping anything that wasn't for a later flush.
     buf.erase(buf.begin(), std::next(buf.begin(), static_cast<std::ptrdiff_t>(total)));
 
-    co_return result{.count = total, .err = res.err};
+    // a write that made no progress without reporting why would otherwise leave the rest unwritten, unreported.
+    if (!last.err && last.count == 0 && !buf.empty())
+        return result{.count = total, .err = make_error_condition(status_condition::error)};
+
+    return result{.count = total, .err = last.err};
 }
 
 std::size_t buffered_writer::capacity() const noexcept { return buf.capacity(); }
