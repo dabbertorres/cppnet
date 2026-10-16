@@ -57,6 +57,48 @@ class scheduler : private coro::thread_pool::poller
     using timer_list   = std::multimap<clock::time_point, waiter*>;
     using watched_list = std::multimap<const std::atomic<std::uint64_t>*, waiter*>;
 
+    // timer_queue holds waiters' deadlines in order. It keeps the nodes of (a few of) the timers removed, for the next
+    // ones added, so adding one doesn't allocate each time: e.g. for each read with a deadline.
+    class timer_queue
+    {
+    public:
+        using iterator = timer_list::iterator;
+
+        iterator add(clock::time_point deadline, waiter* state)
+        {
+            if (spares.empty())
+            {
+                // NOTE: reserved once, so that remove() doesn't allocate.
+                if (spares.capacity() == 0) spares.reserve(max_spares);
+                return timers.emplace(deadline, state);
+            }
+
+            auto node = std::move(spares.back());
+            spares.pop_back();
+            node.key()    = deadline;
+            node.mapped() = state;
+            return timers.insert(std::move(node));
+        }
+
+        void remove(iterator it) noexcept
+        {
+            auto node = timers.extract(it);
+            if (spares.size() < spares.capacity()) spares.push_back(std::move(node));
+        }
+
+        [[nodiscard]] bool     empty() const noexcept { return timers.empty(); }
+        [[nodiscard]] iterator begin() noexcept { return timers.begin(); }
+
+        // earliest is the earliest deadline: there must be one.
+        [[nodiscard]] clock::time_point earliest() const noexcept { return timers.begin()->first; }
+
+    private:
+        static constexpr std::size_t max_spares = 16;
+
+        timer_list                         timers;
+        std::vector<timer_list::node_type> spares;
+    };
+
     // waiter is a pending wait, owned by the suspended coroutine's wait_operation. It's one of:
     // - a wait for a handle (op is read or write).
     // - a wait for a notification about word (op is none, and word is set).
@@ -94,7 +136,7 @@ class scheduler : private coro::thread_pool::poller
     {
         std::mutex                               mu;
         std::unordered_map<handle, registration> registrations;
-        timer_list                               timers;
+        timer_queue                              timers;
 
         // earliest is the earliest of the timers' deadlines (as clock::rep), for run() to read without the lock.
         std::atomic<clock::rep> earliest = std::numeric_limits<clock::rep>::max();
@@ -103,7 +145,7 @@ class scheduler : private coro::thread_pool::poller
         void update_earliest() noexcept
         {
             earliest.store(timers.empty() ? std::numeric_limits<clock::rep>::max()
-                                          : timers.begin()->first.time_since_epoch().count());
+                                          : timers.earliest().time_since_epoch().count());
         }
     };
 
@@ -356,7 +398,7 @@ private:
     // timers_mu guards the timers of waits that aren't for handles (sleeps, and waits for notifications), and the
     // waits for notifications (watched).
     mutable std::mutex timers_mu;
-    timer_list         timers;
+    timer_queue        timers;
     watched_list       watched;
 
     // sleeping_until is the deadline run() is waiting for (as clock::rep), so that a wait with an earlier one
