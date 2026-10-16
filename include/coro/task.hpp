@@ -4,6 +4,7 @@
 #include <coroutine> // IWYU pragma: export (coroutines need it, wherever they use these)
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -15,7 +16,8 @@ namespace net::coro
 template<typename T>
 class promise;
 
-// task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it finishes.
+// task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it
+// finishes.
 //
 // How co_await hands over to a task (and back), and why:
 //
@@ -38,6 +40,11 @@ class promise;
 // finishes straight away (e.g. 12 -> 18ns with Clang, 49 -> 60ns with GCC, on x86-64 Linux, where allocating the
 // task's frame is most of the rest). That's small next to I/O (a recv() is microseconds), but bench/coro/task.cpp
 // measures both ways, to check again later.
+//
+// A task may also be made already finished, with its result (ready_task()), without a coroutine: calling a coroutine
+// allocates its frame (before it even starts), so a function that can often finish without waiting (e.g. a read of
+// what's already buffered) returns one of those, and only calls a coroutine when it must wait. Awaiting it just takes
+// the result.
 template<typename T = void>
 class [[nodiscard]] task
 {
@@ -45,13 +52,23 @@ public:
     using promise_type = promise<T>;
     using value_t      = T;
 
+    // ready_type holds a ready task's result: a pointer for a reference, and nothing for void.
+    using ready_type = std::conditional_t<std::is_void_v<T>,
+                                          std::monostate,
+                                          std::conditional_t<std::is_reference_v<T>,
+                                                             std::add_pointer_t<std::remove_reference_t<T>>,
+                                                             std::remove_const_t<T>>>;
+
+    // NOTE: the awaiter holds the handle (and a ready task's result), rather than the task: then the compiler can see
+    //       that the handle doesn't escape, and may allocate the coroutine's frame in the awaiting coroutine's (HALO).
     struct awaitable_base
     {
-        explicit constexpr awaitable_base(std::coroutine_handle<promise_type> handle) noexcept
+        constexpr awaitable_base(std::coroutine_handle<promise_type> handle, std::optional<ready_type> ready) noexcept
             : handle{handle}
+            , ready{std::move(ready)}
         {}
 
-        [[nodiscard]] bool await_ready() const noexcept { return !handle || handle.done(); }
+        [[nodiscard]] bool await_ready() const noexcept { return ready.has_value() || !handle || handle.done(); }
 
         // await_suspend starts the task, and only suspends the awaiting coroutine if the task suspended (see task's
         // comment, for why not symmetric transfer).
@@ -70,6 +87,7 @@ public:
         }
 
         std::coroutine_handle<promise_type> handle{nullptr};
+        std::optional<ready_type>           ready;
     };
 
     constexpr task() noexcept
@@ -85,6 +103,7 @@ public:
 
     constexpr task(task&& other) noexcept
         : handle{std::exchange(other.handle, nullptr)}
+        , ready{std::exchange(other.ready, std::nullopt)}
     {}
 
     // NOTE: handle is tested with operator bool rather than compared to nullptr. A comparison looks up operator== in
@@ -98,6 +117,7 @@ public:
             if (handle) handle.destroy();
 
             handle = std::exchange(other.handle, nullptr);
+            ready  = std::exchange(other.ready, std::nullopt);
         }
 
         return *this;
@@ -108,33 +128,46 @@ public:
         if (handle) handle.destroy();
     }
 
-    auto operator co_await() const& noexcept
+    auto operator co_await() & noexcept
     {
         struct awaitable : public awaitable_base
         {
-            auto await_resume() { return this->handle.promise().result(); }
+            T await_resume()
+            {
+                if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
+                return this->handle.promise().result();
+            }
         };
 
-        return awaitable{awaitable_base{handle}};
+        return awaitable{
+            awaitable_base{handle, ready}
+        };
     }
 
-    auto operator co_await() const&& noexcept
+    auto operator co_await() && noexcept
     {
         struct awaitable : public awaitable_base
         {
-            auto await_resume() { return std::move(this->handle.promise()).result(); }
+            T await_resume()
+            {
+                if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
+                return std::move(this->handle.promise()).result();
+            }
         };
 
-        return awaitable{awaitable_base{handle}};
+        return awaitable{
+            awaitable_base{handle, std::move(ready)}
+        };
     }
 
     [[nodiscard]] bool resume() const noexcept
     {
+        if (ready.has_value()) return false;
         if (!handle.done()) handle.resume();
         return !handle.done();
     }
 
-    [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(handle); }
+    [[nodiscard]] bool valid() const noexcept { return ready.has_value() || static_cast<bool>(handle); }
 
     bool destroy()
     {
@@ -148,17 +181,60 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool is_ready() const noexcept { return !handle || handle.done(); }
+    [[nodiscard]] bool is_ready() const noexcept { return ready.has_value() || !handle || handle.done(); }
 
+    // finished_without_coroutine is whether this is a ready task (see ready_task()): its result can be taken with
+    // result() right away.
+    [[nodiscard]] bool finished_without_coroutine() const noexcept { return ready.has_value(); }
+
+    // result is the finished task's result (rethrowing its exception, if it threw).
+    T result() &&
+    {
+        if (ready.has_value()) return from_ready(std::move(*ready));
+        return std::move(handle.promise()).result();
+    }
+
+    // get_handle is the coroutine's handle: null for a ready task, which has none.
     [[nodiscard]] std::coroutine_handle<promise_type> get_handle() noexcept { return handle; }
 
     [[nodiscard]] promise_type&       get_promise() & { return handle.promise(); }
     [[nodiscard]] const promise_type& get_promise() const& { return handle.promise(); }
     [[nodiscard]] promise_type&&      get_promise() && { return std::move(handle.promise()); }
 
+    template<typename U, typename... Args>
+    friend task<U> ready_task(Args&&... args);
+
 private:
+    // from_ready is the result a ready task holds.
+    static T from_ready(ready_type value)
+    {
+        if constexpr (std::is_void_v<T>) return;
+        else if constexpr (std::is_reference_v<T>) return static_cast<T>(*value);
+        else return std::move(value);
+    }
+
     std::coroutine_handle<promise_type> handle;
+    std::optional<ready_type>           ready;
 };
+
+// ready_task makes a task that has already finished, with its result made of args (none, for task<void>), without a
+// coroutine (see task).
+template<typename T = void, typename... Args>
+task<T> ready_task(Args&&... args)
+{
+    task<T> out;
+    if constexpr (std::is_reference_v<T>)
+    {
+        static_assert(sizeof...(Args) == 1, "a reference is made of one argument");
+        T ref = (std::forward<Args>(args), ...);
+        out.ready.emplace(std::addressof(ref));
+    }
+    else
+    {
+        out.ready.emplace(std::forward<Args>(args)...);
+    }
+    return out;
+}
 
 class promise_base
 {
@@ -211,7 +287,9 @@ class promise final : public promise_base
 {
 public:
     static constexpr bool is_reference = std::is_reference_v<T>;
-    using stored_type = std::conditional_t<is_reference, std::remove_reference_t<T>, std::remove_const_t<T>>;
+    // NOTE: a reference is stored as a pointer.
+    using stored_type =
+        std::conditional_t<is_reference, std::add_pointer_t<std::remove_reference_t<T>>, std::remove_const_t<T>>;
 
     promise() noexcept                 = default;
     promise(const promise&)            = delete;

@@ -75,6 +75,9 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
 
 private:
+    // read_more reads what's buffered, and then more.
+    coro::task<result> read_more(std::span<std::byte> data);
+
     coro::task<void> fill();
 
     // what's buffered is buf[start, end): consuming it moves start, rather than what's left, which is only moved to the

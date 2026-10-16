@@ -38,6 +38,9 @@ public:
     void reset();
 
 private:
+    // write_through writes what doesn't fit in the buffer, flushing it first.
+    coro::task<result> write_through(std::span<const std::byte> data);
+
     writer*                impl;
     std::vector<std::byte> buf;
 };

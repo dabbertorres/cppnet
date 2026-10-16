@@ -75,6 +75,18 @@ protected:
     }
 
 private:
+    // try_read reads, unless it would have to wait (then returning nothing).
+    [[nodiscard]] std::optional<io::result> try_read(std::span<std::byte> data) const noexcept;
+
+    // try_write writes from data[written], counting what it writes in written, unless it would have to wait for the
+    // rest (then returning nothing).
+    [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte> data,
+                                                      std::size_t&               written) const noexcept;
+
+    // read_waiting and write_waiting wait for the socket to be ready, then read or write, as often as it takes.
+    coro::task<io::result> read_waiting(std::span<std::byte> data) noexcept;
+    coro::task<io::result> write_waiting(std::span<const std::byte> data, std::size_t written) noexcept;
+
     io::scheduler*                       scheduler;
     int                                  fd;
     std::optional<io::clock::time_point> read_deadline;

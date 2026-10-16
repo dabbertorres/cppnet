@@ -185,64 +185,104 @@ void socket::set_read_timeout(std::optional<io::clock::duration> timeout) noexce
 
 void socket::set_write_timeout(std::optional<io::clock::duration> timeout) noexcept { write_timeout = timeout; }
 
+// NOTE: read and write try the socket first, without a coroutine (see coro::ready_task), and only call one if they
+//       have to wait for it.
+
 coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
-    if (data.empty()) co_return {.count = 0};
+    if (data.empty()) return coro::ready_task<io::result>(io::result{.count = 0});
     if (fd == invalid_fd || scheduler == nullptr)
-        co_return {.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)};
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)});
 
-    while (true)
-    {
-        const auto num = ::recv(fd, data.data(), data.size(), 0);
-
-        if (num > 0) co_return {.count = static_cast<std::size_t>(num)};
-
-        // the other end closed the connection
-        if (num == 0) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
-
-        auto err = errno;
-        if (err == EINTR) continue;
-        if (err != EAGAIN && err != EWOULDBLOCK) co_return {.count = 0, .err = {err, std::generic_category()}};
-
-        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::read, wait_deadline(read_deadline, read_timeout));
-        if (wait_err) co_return {.count = 0, .err = wait_err};
-    }
+    if (auto res = try_read(data); res.has_value()) return coro::ready_task<io::result>(*res);
+    return read_waiting(data);
 }
 
 coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 {
     if (fd == invalid_fd || scheduler == nullptr)
-        co_return {.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)};
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)});
 
+    std::size_t written = 0;
+    if (auto res = try_write(data, written); res.has_value()) return coro::ready_task<io::result>(*res);
+    return write_waiting(data, written);
+}
+
+std::optional<io::result> socket::try_read(std::span<std::byte> data) const noexcept
+{
+    while (true)
+    {
+        const auto num = ::recv(fd, data.data(), data.size(), 0);
+
+        if (num > 0) return io::result{.count = static_cast<std::size_t>(num)};
+
+        // the other end closed the connection
+        if (num == 0) return io::result{.count = 0, .err = make_error_condition(io::status_condition::closed)};
+
+        auto err = errno;
+        if (err == EINTR) continue;
+        if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
+        return io::result{
+            .count = 0,
+            .err   = {err, std::generic_category()}
+        };
+    }
+}
+
+std::optional<io::result> socket::try_write(std::span<const std::byte> data, std::size_t& written) const noexcept
+{
 #ifdef MSG_NOSIGNAL
     constexpr int flags = MSG_NOSIGNAL; // don't raise SIGPIPE when writing to a closed socket.
 #else
     constexpr int flags = 0;
 #endif
 
-    std::size_t total_written = 0;
-
-    while (total_written < data.size())
+    while (written < data.size())
     {
-        const auto num = ::send(fd, data.data() + total_written, data.size() - total_written, flags);
+        const auto num = ::send(fd, data.data() + written, data.size() - written, flags);
 
         if (num >= 0)
         {
-            total_written += static_cast<std::size_t>(num);
+            written += static_cast<std::size_t>(num);
             continue;
         }
 
         auto err = errno;
         if (err == EINTR) continue;
-        if (err != EAGAIN && err != EWOULDBLOCK)
-            co_return {.count = total_written, .err = {err, std::generic_category()}};
-
-        auto wait_err =
-            co_await scheduler->wait_until(fd, io::poll_op::write, wait_deadline(write_deadline, write_timeout));
-        if (wait_err) co_return {.count = total_written, .err = wait_err};
+        if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
+        return io::result{
+            .count = written,
+            .err   = {err, std::generic_category()}
+        };
     }
 
-    co_return {.count = total_written};
+    return io::result{.count = written};
+}
+
+coro::task<io::result> socket::read_waiting(std::span<std::byte> data) noexcept
+{
+    while (true)
+    {
+        auto wait_err =
+            co_await scheduler->wait_until(fd, io::poll_op::read, wait_deadline(read_deadline, read_timeout));
+        if (wait_err) co_return {.count = 0, .err = wait_err};
+
+        if (auto res = try_read(data); res.has_value()) co_return *res;
+    }
+}
+
+coro::task<io::result> socket::write_waiting(std::span<const std::byte> data, std::size_t written) noexcept
+{
+    while (true)
+    {
+        auto wait_err =
+            co_await scheduler->wait_until(fd, io::poll_op::write, wait_deadline(write_deadline, write_timeout));
+        if (wait_err) co_return {.count = written, .err = wait_err};
+
+        if (auto res = try_write(data, written); res.has_value()) co_return *res;
+    }
 }
 
 void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept

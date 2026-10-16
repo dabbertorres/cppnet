@@ -21,17 +21,20 @@ buffered_reader::buffered_reader(reader* impl, std::size_t bufsize)
 
 coro::task<result> buffered_reader::read(std::span<std::byte> data)
 {
-    if (data.empty()) co_return result{.count = 0};
-
-    // easy way out
+    // usually, it's all buffered: then there's no need for a coroutine (see coro::ready_task).
     if (data.size() <= size())
     {
         std::ranges::copy(buffered().first(data.size()), data.begin());
         consume(data.size());
 
-        co_return result{.count = data.size()};
+        return coro::ready_task<result>(result{.count = data.size()});
     }
 
+    return read_more(data);
+}
+
+coro::task<result> buffered_reader::read_more(std::span<std::byte> data)
+{
     // Note that we always (try to) read from the inner reader in capacity() increments.
 
     // copy over what we can...

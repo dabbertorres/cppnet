@@ -35,6 +35,8 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
+    coro::task<result> count_after(coro::task<result> inner);
+
     std::unique_ptr<reader> owned    = nullptr;
     reader*                 parent   = nullptr;
     std::size_t             limit    = 0;
