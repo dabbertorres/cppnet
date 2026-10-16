@@ -154,7 +154,7 @@ bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) 
     const auto deadline = state.deadline;
     if (deadline)
     {
-        state.timer = sh.timers.emplace(*deadline, &state);
+        state.timer = sh.timers.add(*deadline, &state);
         sh.update_earliest();
     }
 
@@ -200,7 +200,7 @@ bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) n
     state.awaiting = awaiting;
 
     const auto deadline = state.deadline;
-    if (deadline) state.timer = timers.emplace(*deadline, &state);
+    if (deadline) state.timer = timers.add(*deadline, &state);
 
     lock.unlock();
 
@@ -218,7 +218,7 @@ void scheduler::complete_handle_wait(shard&               sh,
 
     if (state->timer)
     {
-        sh.timers.erase(*state->timer);
+        sh.timers.remove(*state->timer);
         state->timer.reset();
         sh.update_earliest();
     }
@@ -236,7 +236,7 @@ void scheduler::complete_other(waiter* state, std::error_condition result, compl
 
     if (state->timer)
     {
-        timers.erase(*state->timer);
+        timers.remove(*state->timer);
         state->timer.reset();
     }
 
@@ -351,7 +351,7 @@ void scheduler::expire_timers(completions& done) noexcept
         if (sh.earliest.load() > now.time_since_epoch().count()) continue;
 
         std::scoped_lock lock{sh.mu};
-        while (!sh.timers.empty() && sh.timers.begin()->first <= now)
+        while (!sh.timers.empty() && sh.timers.earliest() <= now)
         {
             const auto* state = sh.timers.begin()->second;
 
@@ -359,7 +359,7 @@ void scheduler::expire_timers(completions& done) noexcept
             auto it = sh.registrations.find(state->fd);
             if (it == sh.registrations.end())
             {
-                sh.timers.erase(sh.timers.begin());
+                sh.timers.remove(sh.timers.begin());
                 sh.update_earliest();
                 continue;
             }
@@ -369,7 +369,7 @@ void scheduler::expire_timers(completions& done) noexcept
     }
 
     std::scoped_lock lock{timers_mu};
-    while (!timers.empty() && timers.begin()->first <= now)
+    while (!timers.empty() && timers.earliest() <= now)
     {
         auto* state = timers.begin()->second;
 
@@ -384,7 +384,7 @@ clock::rep scheduler::next_deadline() const noexcept
     for (const auto& sh : shards) next = std::min(next, sh.earliest.load());
 
     std::scoped_lock lock{timers_mu};
-    if (!timers.empty()) next = std::min(next, timers.begin()->first.time_since_epoch().count());
+    if (!timers.empty()) next = std::min(next, timers.earliest().time_since_epoch().count());
     return next;
 }
 
