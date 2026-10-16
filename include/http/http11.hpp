@@ -30,11 +30,15 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
 
+// max_fields is the most field lines a message's head may have (as hyper's default): headers are looked up by going
+// through them, so a head of many tiny fields would otherwise take time quadratic in their number to decode.
+constexpr std::size_t max_fields = 100;
+
 // request_decode decodes a request's head, and fails with:
 // - std::errc::invalid_argument if it's malformed (or ambiguous, e.g. two different Content-Lengths).
 // - std::errc::not_supported if it uses something that isn't implemented (e.g. an unknown method, or gzip transfer
 //   coding).
-// - std::errc::value_too_large if the head is longer than max_header_bytes.
+// - std::errc::value_too_large if the head is longer than max_header_bytes, or has more than max_fields field lines.
 // - status_condition::closed if the connection ends first.
 task<request_decoder_result>
 request_decode(io::buffered_reader* reader,

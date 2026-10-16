@@ -58,6 +58,19 @@ public:
 
     constexpr void push_back(T value) { emplace_back(std::move(value)); }
 
+    // erase removes the element at pos, moving those after it back one, and returns where the next one now is.
+    constexpr iterator erase(const_iterator pos)
+    {
+        const auto index = static_cast<std::ptrdiff_t>(pos - begin());
+        if (spilled()) return spill.erase(spill.begin() + index) - spill.begin() + data();
+
+        std::ranges::move(held.begin() + index + 1,
+                          held.begin() + static_cast<std::ptrdiff_t>(count),
+                          held.begin() + index);
+        held[--count] = T{};
+        return begin() + index;
+    }
+
     // clear removes the elements, keeping any memory it allocated (and so, using it).
     constexpr void clear() noexcept
     {

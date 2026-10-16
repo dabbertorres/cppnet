@@ -70,3 +70,36 @@ TEST_CASE("copies compare equal", "[util][small_vector]")
     c.push_back(1);
     CHECK_FALSE(a == c);
 }
+
+TEST_CASE("erase moves the rest back", "[util][small_vector]")
+{
+    SECTION("held in itself")
+    {
+        small_vector<std::string, 4> v;
+        v.push_back("a");
+        v.push_back("b");
+        v.push_back("c");
+
+        auto* next = v.erase(v.begin() + 1);
+        CHECK(*next == "c");
+        CHECK(v.size() == 2);
+        CHECK(v.back() == "c");
+
+        // what was the last element's place is empty again.
+        v.push_back("d");
+        CHECK(v[2] == "d");
+    }
+
+    SECTION("on the heap")
+    {
+        small_vector<std::string, 1> v;
+        v.push_back("a");
+        v.push_back("b");
+        v.push_back("c");
+
+        auto* next = v.erase(v.begin());
+        CHECK(*next == "b");
+        CHECK(v.size() == 2);
+        CHECK(v.front() == "b");
+    }
+}
