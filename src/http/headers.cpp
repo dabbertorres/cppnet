@@ -29,6 +29,14 @@ std::string_view trim_ows(std::string_view str) noexcept
     return str.substr(start, str.find_last_not_of(ows) - start + 1);
 }
 
+// find_field finds key's field in fields (const or not), or returns null.
+auto* find_field(auto& fields, std::string_view key) noexcept
+{
+    auto* it = std::ranges::find_if(fields,
+                                    [&](const auto& field)
+                                    { return net::util::equal_ignore_case(std::string_view{field.first}, key); });
+    return it != fields.end() ? it : nullptr;
+}
 }
 
 namespace net::http
@@ -37,102 +45,101 @@ namespace net::http
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
-std::size_t headers::keyhash::operator()(const std::string& key) const noexcept
+headers::headers(std::initializer_list<std::pair<std::string, std::vector<std::string>>> init)
 {
-    return operator()(static_cast<std::string_view>(key));
-}
-
-std::size_t headers::keyhash::operator()(std::string_view key) const noexcept
-{
-    // variant of Fowler-Noll-Vo
-
-    std::size_t result = 2'166'136'261;
-
-    for (auto c : key)
+    for (const auto& [key, vals] : init)
     {
-        result = (result * 16'777'619) ^ static_cast<std::size_t>(std::tolower(c));
+        for (const auto& val : vals) add(key, val);
     }
-
-    return result;
 }
 
-bool headers::keyequal::operator()(const std::string& lhs, const std::string& rhs) const noexcept
+const headers::field_type* headers::find(std::string_view key) const noexcept { return find_field(fields, key); }
+
+headers::values_type& headers::values_of(std::string_view key)
 {
-    return net::util::equal_ignore_case(lhs, rhs);
+    if (auto* field = find_field(fields, key); field != nullptr) return field->second;
+    return fields.emplace_back(std::string{key}, values_type{}).second;
 }
 
-bool headers::keyequal::operator()(std::string_view lhs, const std::string& rhs) const noexcept
+headers::values_type& headers::assign(std::string_view key)
 {
-    return net::util::equal_ignore_case(lhs, static_cast<std::string_view>(rhs));
+    auto& vals = values_of(key);
+    vals.clear();
+    return vals;
 }
 
-bool headers::keyequal::operator()(const std::string& lhs, std::string_view rhs) const noexcept
-{
-    return net::util::equal_ignore_case(static_cast<std::string_view>(lhs), rhs);
-}
-
-headers::headers(std::initializer_list<map_type::value_type> init)
-    : values(init)
-{}
-
-headers& headers::set(const std::string& key, std::string val)
-{
-    values.insert_or_assign(key, std::vector{std::move(val)});
-    return *this;
-}
+headers& headers::set(const std::string& key, std::string val) { return set(std::string_view{key}, std::move(val)); }
 
 headers& headers::set(const std::string& key, std::initializer_list<std::string> vals)
 {
-    values.insert_or_assign(key, vals);
-    return *this;
+    return set(std::string_view{key}, vals);
 }
 
-headers& headers::add(const std::string& key, std::string val)
+headers& headers::set(const std::string& key, std::vector<std::string>&& vals)
 {
-    values[key].push_back(std::move(val));
-    return *this;
+    return set(std::string_view{key}, std::move(vals));
 }
 
-headers& headers::set(std::string_view key, std::string val) { return set(std::string(key), std::move(val)); }
+headers& headers::add(const std::string& key, std::string val) { return add(std::string_view{key}, std::move(val)); }
+
+headers& headers::set(std::string_view key, std::string val)
+{
+    assign(key).push_back(std::move(val));
+    return *this;
+}
 
 headers& headers::set(std::string_view key, std::initializer_list<std::string> vals)
 {
-    return set(std::string(key), vals);
+    auto& out = assign(key);
+    for (const auto& val : vals) out.push_back(val);
+    return *this;
 }
 
-headers& headers::add(std::string_view key, std::string val) { return add(std::string(key), std::move(val)); }
+headers& headers::set(std::string_view key, std::vector<std::string>&& vals)
+{
+    auto& out   = assign(key);
+    auto  taken = std::move(vals);
+    for (auto& val : taken) out.push_back(std::move(val));
+    return *this;
+}
 
-headers& headers::set(const std::string& key, std::string_view val) { return set(key, std::string(val)); }
+headers& headers::add(std::string_view key, std::string val)
+{
+    values_of(key).push_back(std::move(val));
+    return *this;
+}
+
+headers& headers::set(const std::string& key, std::string_view val) { return set(std::string_view{key}, val); }
 
 headers& headers::set(const std::string& key, std::initializer_list<std::string_view> vals)
 {
-    value_type tmp;
-    tmp.resize(vals.size());
-
-    std::ranges::transform(vals, tmp.begin(), [](std::string_view view) { return std::string(view); });
-
-    values[key] = tmp;
-    return *this;
+    return set(std::string_view{key}, vals);
 }
 
-headers& headers::add(const std::string& key, std::string_view val)
+headers& headers::add(const std::string& key, std::string_view val) { return add(std::string_view{key}, val); }
+
+headers& headers::set(std::string_view key, std::string_view val)
 {
-    values[key].emplace_back(val);
+    assign(key).emplace_back(val);
     return *this;
 }
-
-headers& headers::set(std::string_view key, std::string_view val) { return set(std::string(key), std::string(val)); }
 
 headers& headers::set(std::string_view key, std::initializer_list<std::string_view> vals)
 {
-    return set(std::string(key), vals);
+    auto& out = assign(key);
+    for (auto val : vals) out.emplace_back(val);
+    return *this;
 }
 
-headers& headers::add(std::string_view key, std::string_view val) { return add(std::string(key), val); }
+headers& headers::add(std::string_view key, std::string_view val)
+{
+    values_of(key).emplace_back(val);
+    return *this;
+}
 
 headers& headers::remove(std::string_view key)
 {
-    values.erase(key);
+    if (const auto* field = find(key); field != nullptr) fields.erase(field);
     return *this;
 }
 
@@ -154,22 +161,15 @@ headers& headers::set_content_type(const content_type& content_type)
 
 [[nodiscard]] std::optional<std::string_view> headers::get(const std::string& key) const
 {
-    auto iter = values.find(key);
-    if (iter == values.end()) return std::nullopt;
-    if (iter->second.empty()) return std::nullopt;
-
-    std::string_view view = iter->second.front();
-    return {view};
+    return get(std::string_view{key});
 }
 
 [[nodiscard]] std::optional<std::string_view> headers::get(std::string_view key) const
 {
-    auto iter = values.find(key);
-    if (iter == values.end()) return std::nullopt;
-    if (iter->second.empty()) return std::nullopt;
+    const auto* field = find(key);
+    if (field == nullptr || field->second.empty()) return std::nullopt;
 
-    std::string_view view = iter->second.front();
-    return {view};
+    return std::string_view{field->second.front()};
 }
 
 [[nodiscard]] std::optional<std::string_view> headers::operator[](const std::string& key) const { return get(key); }
@@ -182,12 +182,10 @@ headers& headers::set_content_type(const content_type& content_type)
 
 [[nodiscard]] std::optional<headers::values_range> headers::get_all(std::string_view key) const
 {
-    auto iter = values.find(key);
-    if (iter == values.end()) return std::nullopt;
+    const auto* field = find(key);
+    if (field == nullptr) return std::nullopt;
 
-    return {
-        {iter->second.begin(), iter->second.end()}
-    };
+    return values_range{field->second.begin(), field->second.end()};
 }
 
 std::vector<std::string_view> headers::get_list(std::string_view key) const
@@ -307,12 +305,23 @@ std::vector<std::string_view> headers::get_list(std::string_view key) const
     return !codings.empty() && util::equal_ignore_case(codings.back(), "chunked"sv);
 }
 
-[[nodiscard]] headers::keys_iterator headers::begin() const { return values.begin(); }
-[[nodiscard]] headers::keys_iterator headers::end() const { return values.end(); }
+[[nodiscard]] headers::keys_iterator headers::begin() const { return fields.begin(); }
+[[nodiscard]] headers::keys_iterator headers::end() const { return fields.end(); }
 
-[[nodiscard]] bool headers::empty() const noexcept { return values.empty(); }
+[[nodiscard]] bool headers::empty() const noexcept { return fields.empty(); }
 
-[[nodiscard]] std::size_t headers::size() const noexcept { return values.size(); }
+[[nodiscard]] std::size_t headers::size() const noexcept { return fields.size(); }
+
+bool operator==(const headers& lhs, const headers& rhs) noexcept
+{
+    return lhs.size() == rhs.size()
+        && std::ranges::all_of(lhs,
+                               [&](const auto& field)
+                               {
+                                   const auto* other = rhs.find(field.first);
+                                   return other != nullptr && other->second == field.second;
+                               });
+}
 
 bool is_valid_field_name(std::string_view name) noexcept
 {

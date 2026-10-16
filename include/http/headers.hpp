@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "util/string_map.hpp"
+#include "util/small_vector.hpp"
 
 namespace net::http
 {
@@ -26,37 +26,19 @@ struct content_type
     }
 };
 
+// headers are a message's fields: each name's values, one per field line, in the order they were received or set.
+// Names are compared ignoring case.
+//
+// NOTE: a message has a few fields, so they're kept in order (each name once), and looked up by going through them:
+//       that, and holding the first few (and the first value of each) in itself, saves allocating for each one.
 class headers
 {
-private:
-    struct keyhash
-    {
-        using is_transparent   = void;
-        using string_type      = std::string;
-        using string_view_type = std::string_view;
-
-        std::size_t operator()(const std::string& key) const noexcept;
-        std::size_t operator()(std::string_view key) const noexcept;
-    };
-
-    struct keyequal
-    {
-        using is_transparent   = void;
-        using string_type      = std::string;
-        using string_view_type = std::string_view;
-
-        bool operator()(const std::string& lhs, const std::string& rhs) const noexcept;
-        bool operator()(std::string_view lhs, const std::string& rhs) const noexcept;
-        bool operator()(const std::string& lhs, std::string_view rhs) const noexcept;
-    };
-
-    using value_type = std::vector<std::string>;
-    using key_type   = std::string;
-    using map_type   = util::string_map<value_type, std::string, std::string_view, keyhash, keyequal>;
-
 public:
-    using value_iterator = value_type::const_iterator;
-    using keys_iterator  = map_type::const_iterator;
+    using values_type = util::small_vector<std::string, 1>;
+    using field_type  = std::pair<std::string, values_type>;
+
+    using value_iterator = values_type::const_iterator;
+    using keys_iterator  = const field_type*;
 
     struct values_range
     {
@@ -74,7 +56,7 @@ public:
     };
 
     headers() = default;
-    headers(std::initializer_list<map_type::value_type> init);
+    headers(std::initializer_list<std::pair<std::string, std::vector<std::string>>> init);
 
     headers& set(const std::string& key, std::string val);
     headers& set(const std::string& key, std::initializer_list<std::string> vals);
@@ -100,6 +82,8 @@ public:
     headers& set_content_length(std::size_t length);
     headers& set_content_type(const content_type& content_type);
 
+    // NOTE: the views get() and get_all() return are only valid until the headers are next changed (as a vector's
+    //       elements' are), as the fields are held in order, rather than one by one.
     [[nodiscard]] std::optional<std::string_view> get(const std::string& key) const;
     [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const;
     [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
@@ -132,10 +116,19 @@ public:
     [[nodiscard]] bool        empty() const noexcept;
     [[nodiscard]] std::size_t size() const noexcept;
 
-    friend bool operator==(const headers& lhs, const headers& rhs) noexcept = default;
+    // headers are equal if they have the same values for each name, in the same order, whatever order the names are in.
+    friend bool operator==(const headers& lhs, const headers& rhs) noexcept;
 
 private:
-    map_type values;
+    [[nodiscard]] const field_type* find(std::string_view key) const noexcept;
+
+    // values_of returns key's values, adding key if it has none.
+    values_type& values_of(std::string_view key);
+
+    // assign returns key's values, emptied, adding key if it has none.
+    values_type& assign(std::string_view key);
+
+    util::small_vector<field_type, 8> fields;
 };
 
 // is_valid_field_name checks that name is a token (RFC 9110, section 5.1).

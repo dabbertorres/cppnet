@@ -106,12 +106,21 @@ constexpr string_parts<String, CharT> split_string(String input, CharT sep, type
     return {std::move(input), sep, start};
 }
 
+// to_lower_ascii lowercases c if it's an ASCII letter. Unlike std::tolower, it doesn't depend on the locale (or call
+// into the C library), as the case-insensitive names that protocols have (e.g. HTTP's field names) are ASCII.
+template<typename CharT>
+constexpr CharT to_lower_ascii(CharT c) noexcept
+{
+    return c >= 'A' && c <= 'Z' ? static_cast<CharT>(c - 'A' + 'a') : c;
+}
+
+// equal_ignore_case compares lhs and rhs, ignoring the case of ASCII letters.
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
          typename String = std::basic_string_view<CharT, Traits>>
 constexpr bool equal_ignore_case(String lhs, String rhs) noexcept
 {
-    constexpr auto compare = [](unsigned char l, unsigned char r) { return std::tolower(l) == std::tolower(r); };
+    constexpr auto compare = [](CharT l, CharT r) { return to_lower_ascii(l) == to_lower_ascii(r); };
     return std::equal(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
 }
 
@@ -120,7 +129,7 @@ template<typename CharT  = char,
          typename String = std::basic_string_view<CharT, Traits>>
 constexpr bool less_ignore_case(String lhs, String rhs) noexcept
 {
-    constexpr auto compare = [](unsigned char l, unsigned char r) { return std::tolower(l) < std::tolower(r); };
+    constexpr auto compare = [](CharT l, CharT r) { return to_lower_ascii(l) < to_lower_ascii(r); };
     return std::lexicographical_compare(std::begin(lhs), std::end(lhs), std::begin(rhs), std::end(rhs), compare);
 }
 

@@ -59,16 +59,40 @@ std::error_condition invalid() noexcept { return std::make_error_condition(std::
 constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 
 // head_reader reads the lines of a message's head (its start line and fields), which are limited in size altogether.
+//
+// A line is usually all buffered already, so it's taken from the buffer as it is (buffered_line()): only one that isn't
+// is read (read_line()), with a coroutine, and copied.
 struct head_reader
 {
     buffered_reader* reader;
     std::size_t      remaining;
+    std::string      line{}; // the last line read_line() read
 
-    task<net::io::readline_result> next_line() noexcept
+    // buffered_line takes the next line (without its CRLF) from what's buffered, if it's all there, and within the
+    // limit. It views the reader's buffer, so it's only valid until the reader next reads.
+    std::optional<std::string_view> buffered_line() noexcept
     {
-        auto line = co_await net::io::read_terminated_line(reader, remaining);
-        if (line.has_value()) remaining -= line.to_value().size() + 2;
-        co_return line;
+        const auto       buffered = reader->buffered();
+        std::string_view chars{reinterpret_cast<const char*>(buffered.data()), std::min(buffered.size(), remaining)};
+
+        const auto end = chars.find("\r\n"sv);
+        if (end == std::string_view::npos) return std::nullopt;
+
+        reader->consume(end + 2);
+        remaining -= end + 2;
+        chars.remove_suffix(chars.size() - end);
+        return chars;
+    }
+
+    // read_line reads the next line (without its CRLF) into line.
+    task<std::error_condition> read_line() noexcept
+    {
+        auto read = co_await net::io::read_terminated_line(reader, remaining);
+        if (read.has_error()) co_return read.to_error();
+
+        line = std::move(read.to_value());
+        remaining -= line.size() + 2;
+        co_return std::error_condition{};
     }
 };
 
@@ -134,13 +158,19 @@ std::error_condition parse_request_line(std::string_view line, server_request& r
 // parse_fields reads field lines up to the empty line that ends them.
 task<std::error_condition> parse_fields(head_reader& head, headers& fields) noexcept
 {
-    while (true)
+    for (std::size_t count = 0;; ++count)
     {
-        auto line = co_await head.next_line();
-        if (line.has_error()) co_return line.to_error();
-        if (line.to_value().empty()) co_return std::error_condition{};
+        auto line = head.buffered_line();
+        if (!line.has_value())
+        {
+            if (auto err = co_await head.read_line(); err) co_return err;
+            line = head.line;
+        }
 
-        auto field = net::http::parse_field_line(line.to_value());
+        if (line->empty()) co_return std::error_condition{};
+        if (count == net::http::http11::max_fields) co_return std::make_error_condition(std::errc::value_too_large);
+
+        auto field = net::http::parse_field_line(*line);
         if (!field.has_value()) co_return invalid();
 
         // NOTE: each line is kept whole: splitting on commas would break fields that aren't lists (e.g. User-Agent).
@@ -374,6 +404,10 @@ task<std::error_condition> write_full(net::io::writer& out, std::span<const std:
     co_return std::error_condition{};
 }
 
+// max_start_line_overhead is enough for a request or status line, apart from the request's target: e.g. the method,
+// version, status code and reason phrase, and the line's end and the head's.
+constexpr std::size_t max_start_line_overhead = 128;
+
 // body_buffer is how much of a body is read at a time.
 constexpr std::size_t body_buffer = std::size_t{16} * 1'024;
 
@@ -440,25 +474,27 @@ bool is_default_port(std::string_view scheme, std::string_view port) noexcept
         || (port == "443"sv && net::util::equal_ignore_case(scheme, "https"sv));
 }
 
-task<std::error_condition> write_headers(net::io::writer& writer, const headers& headers) noexcept
+// fields_size is how long append_fields makes the field lines for fields.
+std::size_t fields_size(const headers& fields) noexcept
 {
-    // one line per value: joining them with commas would change fields that aren't lists (e.g. Set-Cookie).
-    for (const auto& [name, values] : headers)
+    std::size_t size = 0;
+    for (const auto& [name, values] : fields)
     {
-        for (const auto& value : values)
-        {
-            const std::array<std::string_view, 4> parts{name, ": "sv, value, "\r\n"sv};
-            for (auto part : parts)
-            {
-                auto res = co_await writer.write(part);
-                if (res.err) co_return res.err;
-            }
-        }
+        for (const auto& value : values) size += name.size() + value.size() + 4;
     }
 
-    co_return std::error_condition{};
+    return size;
 }
 
+// append_fields appends a field line for each of the values in fields: joining a field's values with commas would
+// change fields that aren't lists (e.g. Set-Cookie).
+void append_fields(std::string& out, const headers& fields)
+{
+    for (const auto& [name, values] : fields)
+    {
+        for (const auto& value : values) out.append(name).append(": "sv).append(value).append("\r\n"sv);
+    }
+}
 }
 
 namespace net::http::http11
@@ -490,56 +526,39 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     // NOTE: can't fail, having been checked.
     const auto framing = *frame_request(req);
 
-    auto res = co_await writer->write(method_string(req.method));
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write(' ');
-    if (res.err) co_return std::unexpected(res.err);
-
+    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
     // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
-    res = co_await writer->write(req.uri.origin_form());
-    if (res.err) co_return std::unexpected(res.err);
+    const auto target = req.uri.origin_form();
 
-    res = co_await writer->write(" HTTP/"sv);
-    if (res.err) co_return std::unexpected(res.err);
+    std::string head;
+    head.reserve(max_start_line_overhead + target.size() + req.uri.host.size() + req.uri.port.size()
+                 + framing.field.size() + fields_size(req.headers));
 
     // NOTE: unlike the status line, nothing follows the version.
-    const auto          version = effective_version(req);
-    std::array<char, 3> version_buf{
-        static_cast<char>(version.major + '0'),
-        '.',
-        static_cast<char>(version.minor + '0'),
-    };
-
-    res = co_await writer->write(version_buf);
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return std::unexpected(res.err);
+    const auto version = effective_version(req);
+    head.append(method_string(req.method))
+        .append(" "sv)
+        .append(target)
+        .append(" HTTP/"sv)
+        .append({static_cast<char>(version.major + '0'), '.', static_cast<char>(version.minor + '0')})
+        .append("\r\n"sv);
 
     // HTTP/1.1 requires a Host header.
     if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
     {
         // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
-        auto host_line = req.uri.host.contains(':') ? "Host: [" + req.uri.host + "]" : "Host: " + req.uri.host;
-        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port)) host_line += ":" + req.uri.port;
-        host_line += "\r\n";
-
-        res = co_await writer->write(host_line);
-        if (res.err) co_return std::unexpected(res.err);
+        const bool bracketed = req.uri.host.contains(':');
+        head.append(bracketed ? "Host: ["sv : "Host: "sv).append(req.uri.host).append(bracketed ? "]"sv : ""sv);
+        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port))
+            head.append(":"sv).append(req.uri.port);
+        head.append("\r\n"sv);
     }
 
-    if (!framing.field.empty())
-    {
-        res = co_await writer->write(framing.field);
-        if (res.err) co_return std::unexpected(res.err);
-    }
+    head.append(framing.field);
+    append_fields(head, req.headers);
+    head.append("\r\n"sv);
 
-    res.err = co_await write_headers(*writer, req.headers);
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return std::unexpected(res.err);
+    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
 
     try
     {
@@ -582,37 +601,24 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
     const auto code = static_cast<std::uint16_t>(resp.status_code);
     if (code < 100 || code > 599) co_return std::unexpected(invalid());
 
-    auto res = co_await writer->write("HTTP/"sv);
-    if (res.err) co_return std::unexpected(res.err);
+    std::array<char, 3> status_buf{};
+    std::to_chars(status_buf.begin(), status_buf.end(), code);
 
-    std::array<char, 4> version_buf{
-        static_cast<char>(resp.version.major + '0'),
-        '.',
-        static_cast<char>(resp.version.minor + '0'),
-        ' ',
-    };
+    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
+    std::string head;
+    head.reserve(max_start_line_overhead + fields_size(resp.headers));
 
-    res = co_await writer->write(version_buf);
-    if (res.err) co_return std::unexpected(res.err);
+    head.append("HTTP/"sv)
+        .append({static_cast<char>(resp.version.major + '0'), '.', static_cast<char>(resp.version.minor + '0'), ' '})
+        .append(std::string_view{status_buf.data(), status_buf.size()})
+        .append(" "sv)
+        .append(reason_phrase(resp.status_code))
+        .append("\r\n"sv);
 
-    std::array<char, 4> status_buf{};
-    std::to_chars(status_buf.begin(), status_buf.begin() + 3, code);
-    status_buf[3] = ' ';
+    append_fields(head, resp.headers);
+    head.append("\r\n"sv);
 
-    res = co_await writer->write(status_buf);
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write(reason_phrase(resp.status_code));
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return std::unexpected(res.err);
-
-    res.err = co_await write_headers(*writer, resp.headers);
-    if (res.err) co_return std::unexpected(res.err);
-
-    res = co_await writer->write("\r\n"sv);
-    if (res.err) co_return std::unexpected(res.err);
+    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
 
     co_return writer;
 }
@@ -624,13 +630,21 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
         server_request req;
         head_reader    head{.reader = reader, .remaining = max_header_bytes};
 
-        auto line = co_await head.next_line();
-
         // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
-        if (line.has_value() && line.to_value().empty()) line = co_await head.next_line();
-        if (line.has_error()) co_return std::unexpected(line.to_error());
+        std::string_view line;
+        for (int tries = 0; tries < 2 && line.empty(); ++tries)
+        {
+            if (auto buffered = head.buffered_line(); buffered.has_value())
+            {
+                line = *buffered;
+                continue;
+            }
 
-        if (auto err = parse_request_line(line.to_value(), req); err) co_return std::unexpected(err);
+            if (auto err = co_await head.read_line(); err) co_return std::unexpected(err);
+            line = head.line;
+        }
+
+        if (auto err = parse_request_line(line, req); err) co_return std::unexpected(err);
         if (auto err = co_await parse_fields(head, req.headers); err) co_return std::unexpected(err);
         if (auto err = parse_host_header(req); err) co_return std::unexpected(err);
 
@@ -660,10 +674,14 @@ response_decode(io::buffered_reader* reader, request_method method, std::size_t 
         {
             resp.headers = {};
 
-            auto line = co_await head.next_line();
-            if (line.has_error()) co_return std::unexpected(line.to_error());
+            auto line = head.buffered_line();
+            if (!line.has_value())
+            {
+                if (auto err = co_await head.read_line(); err) co_return std::unexpected(err);
+                line = head.line;
+            }
 
-            if (auto err = parse_status_line(line.to_value(), resp); err) co_return std::unexpected(err);
+            if (auto err = parse_status_line(*line, resp); err) co_return std::unexpected(err);
             if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
         } while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
 

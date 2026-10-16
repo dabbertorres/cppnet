@@ -450,6 +450,16 @@ TEST_CASE("the head of a request is limited in size", "[http][1.1][request_decod
     CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\n\r\n", 64).has_value());
 }
 
+TEST_CASE("a request has at most max_fields field lines", "[http][1.1][request_decode][strict]")
+{
+    // Host, then the rest.
+    std::string head = "GET / HTTP/1.1\r\nHost: a\r\n";
+    for (std::size_t i = 1; i < net::http::http11::max_fields; ++i) head += "X-" + std::to_string(i) + ": y\r\n";
+
+    CHECK(decode(head + "\r\n").has_value());
+    CHECK(decode(head + "X-Last: y\r\n\r\n").error() == std::errc::value_too_large);
+}
+
 TEST_CASE("status lines", "[http][1.1][response_encode]")
 {
     struct test_case

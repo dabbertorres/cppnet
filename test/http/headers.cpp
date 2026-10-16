@@ -66,3 +66,44 @@ TEST_CASE("remove a field", "[http][headers]")
     // removing a field that isn't there does nothing.
     fields.remove("Content-Length"sv);
 }
+
+TEST_CASE("fields keep their order, and names ignore case", "[http][headers]")
+{
+    net::http::headers fields;
+    fields.set("Content-Type"sv, "text/plain"sv).add("set-cookie"sv, "a=1"sv).add("Set-Cookie"sv, "b=2"sv);
+    fields.set("X-Last"sv, "1"sv);
+
+    std::vector<std::string_view> names;
+    for (const auto& [name, values] : fields) names.emplace_back(name);
+    CHECK(names == std::vector{"Content-Type"sv, "set-cookie"sv, "X-Last"sv});
+
+    CHECK(fields.get("content-type"sv) == "text/plain"sv);
+    CHECK(fields.get_list("SET-COOKIE"sv) == std::vector{"a=1"sv, "b=2"sv});
+
+    // set replaces every value.
+    fields.set("SET-cookie"sv, "c=3"sv);
+    CHECK(fields.get_list("Set-Cookie"sv) == std::vector{"c=3"sv});
+
+    fields.remove("content-TYPE"sv);
+    CHECK_FALSE(fields.get("Content-Type"sv).has_value());
+    CHECK(fields.size() == 2);
+}
+
+TEST_CASE("headers are equal whatever order their names are in", "[http][headers]")
+{
+    const net::http::headers a{
+        {"A",      {"1"}},
+        {"B", {"2", "3"}},
+    };
+    const net::http::headers b{
+        {"b", {"2", "3"}},
+        {"a",      {"1"}},
+    };
+    const net::http::headers c{
+        {"A",      {"1"}},
+        {"B", {"3", "2"}},
+    };
+
+    CHECK(a == b);
+    CHECK_FALSE(a == c); // a name's values are in order.
+}

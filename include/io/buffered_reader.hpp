@@ -53,7 +53,8 @@ public:
         return std::span{buf}.subspan(start, end - start);
     }
 
-    // consume drops the first count bytes of what's buffered, as if they had been read.
+    // consume drops the first count bytes of what's buffered, as if they had been read. It doesn't move what's left, so
+    // a view of what was buffered stays valid until the next read.
     void consume(std::size_t count) noexcept;
 
     [[nodiscard]] std::size_t capacity() const noexcept { return buf.size(); }
