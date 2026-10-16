@@ -45,6 +45,12 @@ private:
     // write_through writes what doesn't fit in the buffer, flushing it first.
     coro::task<result> write_through(std::span<const std::byte> data);
 
+    // flush_after finishes flush(), once writing (which needed a coroutine) does, having written total before it.
+    coro::task<result> flush_after(coro::task<result> writing, std::size_t total);
+
+    // flushed drops the total written from the buffer, and returns flush()'s result, given the last write's.
+    result flushed(std::size_t total, const result& last) noexcept;
+
     writer*                impl;
     std::vector<std::byte> buf;
 };
