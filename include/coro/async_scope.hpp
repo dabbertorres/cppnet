@@ -5,6 +5,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "coro/task.hpp"
@@ -44,6 +45,52 @@ public:
         async_scope* scope;
     };
 
+    // lease counts as one of the scope's tasks while it's held (until it's destroyed, or released): for work that uses
+    // what owns the scope, without being one of its tasks (e.g. being another scope's), which joining the scope must
+    // still wait for. A lease taken from a closed scope is empty, and holds nothing.
+    class lease
+    {
+    public:
+        lease() noexcept = default;
+
+        lease(const lease&)            = delete;
+        lease& operator=(const lease&) = delete;
+
+        lease(lease&& other) noexcept
+            : scope{std::exchange(other.scope, nullptr)}
+        {}
+
+        lease& operator=(lease&& other) noexcept
+        {
+            if (this != &other)
+            {
+                release();
+                scope = std::exchange(other.scope, nullptr);
+            }
+
+            return *this;
+        }
+
+        ~lease() { release(); }
+
+        [[nodiscard]] explicit operator bool() const noexcept { return scope != nullptr; }
+
+        // release releases the lease. NOTE: the scope may be destroyed as soon as it has.
+        void release() noexcept
+        {
+            if (auto* held = std::exchange(scope, nullptr)) held->finish();
+        }
+
+    private:
+        friend class async_scope;
+
+        explicit lease(async_scope* scope) noexcept
+            : scope{scope}
+        {}
+
+        async_scope* scope = nullptr;
+    };
+
     // By default, an exception that escapes a spawned task calls std::terminate().
     explicit async_scope(exception_handler on_exception = {}, drained_handler on_drained = {});
 
@@ -59,7 +106,10 @@ public:
     // is destroyed without being run, and false is returned.
     bool spawn(task<> task);
 
-    // close stops the scope from accepting new tasks. Tasks already in it are unaffected.
+    // acquire takes a lease on the scope (see lease): an empty one if the scope is closed.
+    [[nodiscard]] lease acquire() noexcept;
+
+    // close stops the scope from accepting new tasks (and leases). Tasks already in it are unaffected.
     void close() noexcept;
 
     [[nodiscard]] bool        closed() const noexcept;

@@ -110,6 +110,10 @@ public:
     // field lines: each value is split on the commas that aren't in a quoted string, and empty elements are skipped.
     [[nodiscard]] std::vector<std::string_view> get_list(std::string_view key) const;
 
+    // has_token is whether a list-based field has the element token (ignoring case), e.g. "close" in "Connection:
+    // close", without allocating for the list.
+    [[nodiscard]] bool has_token(std::string_view key, std::string_view token) const;
+
     // getters for well-known common headers
 
     // get_content_length returns the Content-Length, if it's present and valid: a decimal number, which every value of
@@ -135,6 +139,10 @@ public:
 private:
     [[nodiscard]] const field_type* find(std::string_view key) const noexcept;
     [[nodiscard]] field_type*       find(std::string_view key) noexcept;
+
+    // for_each_element calls visit with each element of a list-based field (see get_list), until it returns false.
+    template<typename F>
+    void for_each_element(std::string_view key, F visit) const;
 
     // add_field adds key, with no values, reusing a removed field's memory if there is one. Its values must then be
     // set (with set_one, or after clearing them), as they may still be the removed field's.

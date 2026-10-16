@@ -151,12 +151,32 @@ void thread_pool::worker()
         }
 
         ++sleepers;
-        wait.wait(lock, [this] { return wakeups > 0 || !running.load(std::memory_order::acquire); });
+
+        const auto woken     = [this] { return wakeups > 0 || !running.load(std::memory_order::acquire); };
+        bool       timed_out = false;
+
+        // One sleeping worker (the standby) wakes now and then, to check that someone's polling: no one is while the
+        // worker that last polled runs a coroutine that doesn't suspend (e.g. one that blocks), even with others
+        // asleep.
+        if (polls != nullptr && !standby)
+        {
+            standby   = true;
+            timed_out = !wait.wait_for(lock, watchdog_interval, woken);
+            standby   = false;
+        }
+        else
+        {
+            wait.wait(lock, woken);
+        }
 
         // NOTE: either this was woken, and takes a wakeup (perhaps another's, which then waits on, still counted), or
-        //       the pool is shutting down.
+        //       the pool is shutting down, or it's the standby, and timed out.
         if (wakeups > 0) --wakeups;
         else --sleepers;
+
+        // no one's polling, so this does (as it loops round), and another sleeping worker becomes the standby, in case
+        // this gets stuck too. NOTE: only then, so the standby only costs a wakeup each interval.
+        if (timed_out && polls != nullptr && !polling && wake_locked(1) > 0) wait.notify_one();
     }
 
     while (num_jobs.load(std::memory_order::acquire) > 0)

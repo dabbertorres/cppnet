@@ -58,6 +58,15 @@ bool async_scope::spawn(task<> task)
     return true;
 }
 
+async_scope::lease async_scope::acquire() noexcept
+{
+    std::scoped_lock lock{mu};
+    if (is_closed) return lease{};
+
+    ++count;
+    return lease{this};
+}
+
 async_scope::detached async_scope::run(async_scope* scope, task<> task)
 {
     {

@@ -362,7 +362,13 @@ void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcep
             .l_onoff  = 1,
             .l_linger = static_cast<int>(graceful_timeout.count()),
         };
+
+#ifdef SO_LINGER_SEC
+        // Apple's SO_LINGER is in clock ticks; SO_LINGER_SEC is in seconds.
+        set_option(fd, SO_LINGER_SEC, &linger);
+#else
         set_option(fd, SO_LINGER, &linger);
+#endif
     }
 
     // deregister first: it cancels any waits, and epoll needs the handle to still be open.
@@ -377,4 +383,8 @@ void socket::shutdown_write() const noexcept
     if (fd != invalid_fd) ::shutdown(fd, SHUT_WR);
 }
 
+void socket::shutdown_read() const noexcept
+{
+    if (fd != invalid_fd) ::shutdown(fd, SHUT_RD);
+}
 }

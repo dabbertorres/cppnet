@@ -13,9 +13,16 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <arpa/inet.h>
 #include <catch2/catch_test_macros.hpp>
+#include <netinet/in.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
@@ -418,4 +425,302 @@ TEST_CASE("the server skips bodies handlers don't read, and closes connections i
         CHECK(out.contains("\r\nConnection: close\r\n"));
         CHECK_FALSE(out.contains("never"));
     }
+}
+
+TEST_CASE("the server follows the request's version and Connection header", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    // a HEAD handler that says how long the GET's body is, as it should, without writing it.
+    const auto head = [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+    { co_await resp.send(http::status::OK, 5); };
+
+    http::router router;
+    router.HEAD("/h", head);
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // NOTE: a request without a Host ends a connection that the server keeps open, with a 400 (see the pipelining
+    //       tests).
+    constexpr auto end = "GET / HTTP/1.1\r\n\r\n"sv;
+
+    SECTION("Connection: close closes it after the response")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                                                    "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 1);
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+        CHECK(out.ends_with("\r\n\r\na"));
+    }
+
+    SECTION("HTTP/1.0 closes it")
+    {
+        auto out = sched.run_to_completion(
+            exchange(&sched, server.local_port(), "GET /a HTTP/1.0\r\n\r\nGET /b HTTP/1.0\r\n\r\n"));
+        CAPTURE(out);
+
+        CHECK(out.starts_with("HTTP/1.0 200 OK\r\n"));
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+        CHECK(count(out, "200 OK") == 1);
+    }
+
+    SECTION("HTTP/1.0 keeps it, if the client asks")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "GET /a HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+                                                    "GET /b HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+                                                        + std::string{end}));
+        CAPTURE(out);
+
+        CHECK(count(out, "HTTP/1.0 200 OK\r\n") == 2);
+        CHECK(out.contains("\r\nConnection: keep-alive\r\n"));
+    }
+
+    SECTION("an Upgrade is ignored: the request is handled as usual")
+    {
+        auto out = sched.run_to_completion(
+            exchange(&sched,
+                     server.local_port(),
+                     "GET /a HTTP/1.1\r\nHost: x\r\nUpgrade: HTTP/1.1\r\nConnection: upgrade\r\n\r\n"
+                     "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+                         + std::string{end}));
+        CAPTURE(out);
+
+        CHECK_FALSE(out.contains("101"));
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+        CHECK(out.find("\r\n\r\na") < out.find("\r\n\r\nb"));
+    }
+
+    SECTION("a HEAD response's Content-Length is the GET's, without a body")
+    {
+        auto out = sched.run_to_completion(exchange(&sched,
+                                                    server.local_port(),
+                                                    "HEAD /h HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                    "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                        + std::string{end}));
+        CAPTURE(out);
+
+        CHECK(out.contains("\r\nContent-Length: 5\r\n"));
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+        CHECK(out.contains("\r\n\r\nb"));
+    }
+
+    SECTION("a response's version is the highest the server implements")
+    {
+        auto out = sched.run_to_completion(
+            exchange(&sched, server.local_port(), "GET /a HTTP/1.9\r\nHost: x\r\n\r\n" + std::string{end}));
+        CAPTURE(out);
+
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK_FALSE(out.contains("HTTP/1.9"));
+    }
+}
+
+namespace
+{
+
+// blocking_client is a plain, blocking connection to the server, for tests that need a client on its own thread (e.g.
+// one that doesn't read).
+class blocking_client
+{
+public:
+    explicit blocking_client(std::uint16_t port)
+        : fd{::socket(AF_INET, SOCK_STREAM, 0)}
+    {
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
+        REQUIRE(::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        set_receive_timeout(5s);
+    }
+
+    blocking_client(const blocking_client&)            = delete;
+    blocking_client& operator=(const blocking_client&) = delete;
+    blocking_client(blocking_client&&)                 = delete;
+    blocking_client& operator=(blocking_client&&)      = delete;
+
+    ~blocking_client() { close(); }
+
+    void close() noexcept
+    {
+        if (fd != -1) ::close(std::exchange(fd, -1));
+    }
+
+    // set_receive_timeout limits how long a read waits (then reading nothing).
+    void set_receive_timeout(std::chrono::milliseconds timeout) const
+    {
+        timeval tv{.tv_sec  = static_cast<decltype(timeval::tv_sec)>(timeout.count() / 1'000),
+                   .tv_usec = static_cast<decltype(timeval::tv_usec)>((timeout.count() % 1'000) * 1'000)};
+        REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+    }
+
+    void send(std::string_view data) const
+    {
+        REQUIRE(::send(fd, data.data(), data.size(), 0) == static_cast<ssize_t>(data.size()));
+    }
+
+    // read_some reads what's there, or waits for some (up to the receive timeout): nothing if none came, or the
+    // server closed the connection.
+    [[nodiscard]] std::string read_some() const
+    {
+        std::array<char, 4'096> buf{};
+        auto                    n = ::recv(fd, buf.data(), buf.size(), 0);
+        return n > 0 ? std::string(buf.data(), static_cast<std::size_t>(n)) : std::string{};
+    }
+
+    // read_to_end reads until the server closes the connection (or a read times out), returning what it read.
+    [[nodiscard]] std::string read_to_end() const
+    {
+        std::string out;
+        while (true)
+        {
+            auto chunk = read_some();
+            if (chunk.empty()) return out;
+            out += chunk;
+        }
+    }
+
+private:
+    int fd;
+};
+
+// running_scheduler runs a scheduler on its own thread, for tests that use blocking clients.
+struct running_scheduler
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    std::thread        runner{[this] { sched.run(); }};
+
+    running_scheduler()                                    = default;
+    running_scheduler(const running_scheduler&)            = delete;
+    running_scheduler& operator=(const running_scheduler&) = delete;
+    running_scheduler(running_scheduler&&)                 = delete;
+    running_scheduler& operator=(running_scheduler&&)      = delete;
+
+    ~running_scheduler()
+    {
+        sched.shutdown();
+        runner.join();
+    }
+};
+
+}
+
+TEST_CASE("a server can be destroyed while the scheduler runs", "[http][server][lifetime]")
+{
+    running_scheduler running;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    auto server = std::make_unique<http::server>(&running.sched,
+                                                 std::move(router),
+                                                 http::server_config{.host = "127.0.0.1", .port = "0"});
+    REQUIRE(running.sched.spawn(server->serve()));
+
+    // one connection waits for its next request, after one.
+    blocking_client idle{server->local_port()};
+    idle.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(idle.read_some().ends_with("\r\n\r\na"));
+
+    // it ends the connections, and waits for them (and serve()) to finish.
+    auto start = std::chrono::steady_clock::now();
+    server.reset();
+    CHECK(std::chrono::steady_clock::now() - start < 2s);
+
+    CHECK(idle.read_to_end().empty());
+}
+
+TEST_CASE("the server closes connections that make no progress", "[http][server][timeout]")
+{
+    running_scheduler running;
+
+    // a handler with a long body.
+    const std::string long_body(std::size_t{64} * 1'024 * 1'024, 'x');
+    const auto        lots = [&](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+    {
+        auto* body = co_await resp.send(http::status::OK, long_body.size());
+        co_await net::io::write_all(*body, long_body);
+    };
+
+    http::router router;
+    router.GET("/lots", lots);
+    router.POST("/:name", echo_name);
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .body_read_timeout = 1s, .write_timeout = 1s}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    SECTION("a body that doesn't come")
+    {
+        blocking_client conn{server.local_port()};
+        conn.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n");
+
+        auto start = std::chrono::steady_clock::now();
+        auto out   = conn.read_to_end();
+        CAPTURE(out);
+
+        // the server answers (the handler doesn't read the body), then gives up skipping the rest of it.
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(std::chrono::steady_clock::now() - start >= 1s);
+        CHECK(std::chrono::steady_clock::now() - start < 4s);
+    }
+
+    SECTION("a client that doesn't read the response")
+    {
+        blocking_client conn{server.local_port()};
+        conn.send("GET /lots HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        // had the server waited, the client would get all of it now.
+        std::this_thread::sleep_for(3s);
+        auto out = conn.read_to_end();
+
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.size() < long_body.size());
+    }
+}
+
+TEST_CASE("the server serves at most max_connections at once", "[http][server][limits]")
+{
+    running_scheduler running;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .max_connections = 1}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client first{server.local_port()};
+    first.send("GET /first HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(first.read_some().ends_with("\r\n\r\nfirst"));
+
+    // the second connects (the kernel accepts it), but isn't served while the first is open.
+    blocking_client second{server.local_port()};
+    second.send("GET /second HTTP/1.1\r\nHost: x\r\n\r\n");
+    second.set_receive_timeout(300ms);
+    CHECK(second.read_some().empty());
+
+    first.close();
+    second.set_receive_timeout(5s);
+    CHECK(second.read_some().ends_with("\r\n\r\nsecond"));
 }

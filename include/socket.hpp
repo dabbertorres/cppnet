@@ -62,11 +62,19 @@ public:
 
     [[nodiscard]] io::handle native_handle() const noexcept override { return fd; }
 
-    void close(bool graceful = true, std::chrono::seconds graceful_timeout = 5s) noexcept;
+    // close closes the socket, cancelling any reads and writes waiting for it. The kernel still sends what's been
+    // written, after it's closed. If graceful, close waits (up to graceful_timeout) for that to be acknowledged:
+    // NOTE: blocking the calling thread, even though the socket is non-blocking (as Linux's close() does), so not
+    //       on one of the scheduler's workers. The destructor doesn't.
+    void close(bool graceful = false, std::chrono::seconds graceful_timeout = 5s) noexcept;
 
     // shutdown_write ends the outgoing side of the connection (the peer reads the end of the stream), while reads
     // carry on.
     void shutdown_write() const noexcept;
+
+    // shutdown_read ends the incoming side of the connection: reads (including one waiting) find the end of the
+    // stream, while writes carry on. It may be called from another thread than the one reading.
+    void shutdown_read() const noexcept;
 
 protected:
     static constexpr int invalid_fd = -1;

@@ -189,6 +189,7 @@ public:
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
                 if (this->op != nullptr) return this->op->result();
+                if (!this->handle) throw std::logic_error{"awaited an empty task"};
                 return this->handle.promise().result();
             }
         };
@@ -207,6 +208,7 @@ public:
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
                 if (this->op != nullptr) return this->op->result();
+                if (!this->handle) throw std::logic_error{"awaited an empty task"};
                 return std::move(this->handle.promise()).result();
             }
         };
@@ -219,7 +221,7 @@ public:
 
     [[nodiscard]] bool resume() const noexcept
     {
-        if (ready.has_value() || op != nullptr) return false;
+        if (ready.has_value() || op != nullptr || !handle) return false;
         if (!handle.done()) handle.resume();
         return !handle.done();
     }
@@ -255,6 +257,7 @@ public:
     T result() &&
     {
         if (ready.has_value()) return from_ready(std::move(*ready));
+        if (!handle) throw std::logic_error{"result() of a task without one (empty, moved from, or an operation)"};
         return std::move(handle.promise()).result();
     }
 
