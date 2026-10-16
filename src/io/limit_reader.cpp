@@ -13,18 +13,24 @@ namespace net::io
 coro::task<result> limit_reader::read(std::span<std::byte> data)
 {
     if (progress >= limit)
+        return coro::ready_task<result>(result{.count = 0, .err = make_error_condition(status_condition::closed)});
+
+    // the reader often finishes without a coroutine (e.g. a buffered one, with enough buffered): then so can this.
+    auto inner = parent->read(data.first(std::min(data.size(), limit - progress)));
+    if (inner.finished_without_coroutine())
     {
-        co_return {
-            .count = 0,
-            .err   = make_error_condition(status_condition::closed),
-        };
+        auto res = std::move(inner).result();
+        progress += res.count;
+        return coro::ready_task<result>(res);
     }
 
-    const std::size_t read_amount = std::min(data.size(), limit - progress);
+    return count_after(std::move(inner));
+}
 
-    auto res = co_await parent->read(data.subspan(0, read_amount));
+coro::task<result> limit_reader::count_after(coro::task<result> inner)
+{
+    auto res = co_await std::move(inner);
     progress += res.count;
     co_return res;
 }
-
 }

@@ -33,6 +33,11 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return out != nullptr ? out->native_handle() : -1; }
 
 private:
+    // finish counts what a write of amount bytes (of wanted) wrote.
+    result finish(result res, std::size_t amount, std::size_t wanted) noexcept;
+
+    coro::task<result> finish_after(coro::task<result> inner, std::size_t amount, std::size_t wanted);
+
     writer*     out  = nullptr;
     std::size_t left = 0;
 };

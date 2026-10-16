@@ -22,8 +22,18 @@ buffered_writer::buffered_writer(writer* underlying, std::size_t bufsize)
 
 coro::task<result> buffered_writer::write(std::span<const std::byte> data)
 {
-    if (data.empty()) co_return result{.count = 0};
+    // usually, it fits in the buffer: then there's no need for a coroutine (see coro::ready_task).
+    if (data.size() <= buf.capacity() - buf.size())
+    {
+        buf.insert(buf.end(), data.begin(), data.end());
+        return coro::ready_task<result>(result{.count = data.size()});
+    }
 
+    return write_through(data);
+}
+
+coro::task<result> buffered_writer::write_through(std::span<const std::byte> data)
+{
     // fill up the buffer as much as possible first...
     auto available = std::min(buf.capacity() - buf.size(), data.size());
     buf.insert(buf.end(), data.begin(), std::next(data.begin(), static_cast<std::ptrdiff_t>(available)));
