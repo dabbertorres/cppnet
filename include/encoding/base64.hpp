@@ -2,9 +2,12 @@
 
 #include <array>
 #include <cstddef>
-#include <optional>
+#include <cstdint>
+#include <expected>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace net::encoding::base64
@@ -50,12 +53,24 @@ public:
     explicit encoding(alphabet alphabet = standard_alphabet(), char padchar = '=') noexcept;
 
     [[nodiscard]] std::size_t encoded_size(std::size_t input_size) const noexcept;
+
+    // decoded_size is the most input_size characters decode to (fewer if they end with padding).
     [[nodiscard]] std::size_t decoded_size(std::size_t input_size) const noexcept;
 
     [[nodiscard]] std::string encode(std::span<const std::byte> data) const noexcept;
 
-    // returns an empty optional if the input data is invalid/corrupt.
-    [[nodiscard]] std::optional<std::vector<std::byte>> decode(std::span<const char> data) const noexcept;
+    // decode decodes data, which must be as encode makes it, failing with invalid_argument if it isn't (RFC 4648):
+    // - only characters of the alphabet, so no whitespace.
+    // - with padding (if the encoding has a padchar): a multiple of 4 characters, with at most two padchars, at the
+    //   end. Without: no padchars, and not one more than a multiple of 4.
+    // - the bits of the last character that aren't part of a byte are zero, so that data is the only encoding of
+    //   what it decodes to.
+    [[nodiscard]] std::expected<std::vector<std::byte>, std::error_condition> decode(std::string_view data) const;
+
+    // decode_to decodes data (as decode does) into out, returning how many bytes it wrote. It fails with
+    // value_too_large if they don't fit: decoded_size(data.size()) always do.
+    [[nodiscard]] std::expected<std::size_t, std::error_condition> decode_to(std::string_view     data,
+                                                                             std::span<std::byte> out) const noexcept;
 
 private:
     void encode_triplet(char* out, const std::byte* data) const noexcept;
@@ -63,8 +78,8 @@ private:
     // returns the number of characters written to out.
     std::size_t encode_trailing(char* out, const std::byte* data, std::size_t remaining) const noexcept;
 
-    // returns false if the input data is invalid/corrupt.
-    bool decode_triplet(std::byte* out, const char* data, std::size_t remaining) const noexcept;
+    // value is the 6 bits c encodes, or 0xff if it isn't in the alphabet.
+    [[nodiscard]] std::uint8_t value(char c) const noexcept;
 
     alphabet   encoder;
     decode_map decoder;
