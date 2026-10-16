@@ -6,6 +6,7 @@
 #include <span>
 #include <system_error>
 #include <tuple>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -129,9 +130,9 @@ void buffered_reader::consume(std::size_t count) noexcept
 
 std::error_condition buffered_reader::error() const { return err; }
 
-coro::task<void> buffered_reader::fill()
+coro::task<std::error_condition> buffered_reader::fill()
 {
-    if (size() == capacity()) co_return;
+    if (size() == capacity()) return coro::ready_task<std::error_condition>();
 
     // make as much room as there can be.
     if (start != 0)
@@ -141,11 +142,26 @@ coro::task<void> buffered_reader::fill()
         start = 0;
     }
 
-    auto res = co_await impl->read(std::span{buf}.subspan(end));
+    // usually, the read doesn't wait (e.g. the data's there): then there's no need for a coroutine (see
+    // coro::ready_task).
+    auto reading = impl->read(std::span{buf}.subspan(end));
+    if (reading.finished_without_coroutine())
+        return coro::ready_task<std::error_condition>(filled(std::move(reading).result()));
+
+    return fill_after(std::move(reading));
+}
+
+coro::task<std::error_condition> buffered_reader::fill_after(coro::task<result> reading)
+{
+    co_return filled(co_await std::move(reading));
+}
+
+std::error_condition buffered_reader::filled(const result& res) noexcept
+{
     end += res.count;
 
     // a reader that makes no progress without reporting why would otherwise leave callers waiting forever.
     err = res.count == 0 && !res.err ? make_error_condition(status_condition::error) : res.err;
+    return err;
 }
-
 }

@@ -580,6 +580,31 @@ task<net::http::response_encoder_result> write_status_head(net::io::writer*     
     }
 }
 
+// head_state is how far decoding a request's head has got.
+struct head_state
+{
+    bool        started     = false; // whether the request line has been parsed
+    int         empty_lines = 0;
+    std::size_t fields      = 0;
+};
+
+// take_head_line parses the next line of a request's head, returning whether it was the last (the empty line after the
+// fields).
+std::expected<bool, std::error_condition> take_head_line(std::string_view line, head_state& state, server_request& req)
+{
+    if (!state.started)
+    {
+        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
+        if (line.empty() && ++state.empty_lines < 2) return false;
+
+        if (auto err = parse_request_line(line, req); err) return std::unexpected(err);
+        state.started = true;
+        return false;
+    }
+
+    return add_field_line(line, state.fields++, req.headers);
+}
+
 // head_is_buffered is whether the reader's buffer holds a whole head (up to the empty line that ends it), within
 // max_header_bytes: then decoding it doesn't need to read.
 bool head_is_buffered(const buffered_reader* reader, std::size_t max_header_bytes) noexcept
@@ -599,34 +624,17 @@ decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_re
     try
     {
         head_reader head{.reader = reader, .remaining = max_header_bytes};
+        head_state  state;
 
-        // NOTE: the lines are all buffered, so buffered_line() only fails if the head ends in a way it can't.
-        const auto next_line = [&] -> std::expected<std::string_view, std::error_condition>
+        while (true)
         {
+            // NOTE: the lines are all buffered, so buffered_line() only fails if the head ends in a way it can't.
             auto line = head.buffered_line();
-            if (!line.has_value()) return std::unexpected(invalid());
-            return *line;
-        };
+            if (!line.has_value()) return invalid();
 
-        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
-        std::string_view line;
-        for (int tries = 0; tries < 2 && line.empty(); ++tries)
-        {
-            auto next = next_line();
-            if (!next.has_value()) return next.error();
-            line = *next;
-        }
-
-        if (auto err = parse_request_line(line, req); err) return err;
-
-        for (std::size_t count = 0;; ++count)
-        {
-            auto next = next_line();
-            if (!next.has_value()) return next.error();
-
-            auto added = add_field_line(*next, count, req.headers);
-            if (!added.has_value()) return added.error();
-            if (*added) break;
+            auto last = take_head_line(*line, state, req);
+            if (!last.has_value()) return last.error();
+            if (*last) break;
         }
 
         if (auto err = parse_host_header(req); err) return err;
@@ -638,32 +646,47 @@ decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_re
     }
 }
 
-// decode_reading decodes a request whose head isn't all buffered yet, reading the rest.
+// decode_reading decodes a request whose head isn't all buffered yet, reading the rest. Each line is still parsed as it
+// comes (so a malformed one fails without waiting for the rest), from the reader's buffer: it's refilled until the line
+// is all there, rather than the line read into a string, unless the buffer can't hold it.
 task<std::error_condition>
 decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     try
     {
         head_reader head{.reader = reader, .remaining = max_header_bytes};
+        head_state  state;
 
-        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
-        std::string_view line;
-        for (int tries = 0; tries < 2 && line.empty(); ++tries)
+        while (true)
         {
+            std::string_view line;
             if (auto buffered = head.buffered_line(); buffered.has_value())
             {
                 line = *buffered;
+            }
+            else if (reader->size() >= head.remaining)
+            {
+                // the head's longer than it may be.
+                co_return std::make_error_condition(std::errc::value_too_large);
+            }
+            else if (reader->size() == reader->capacity())
+            {
+                // the line's longer than the buffer.
+                if (auto err = co_await head.read_line(); err) co_return err;
+                line = head.line;
+            }
+            else
+            {
+                if (auto err = co_await reader->fill(); err) co_return err;
                 continue;
             }
 
-            if (auto err = co_await head.read_line(); err) co_return err;
-            line = head.line;
+            auto last = take_head_line(line, state, req);
+            if (!last.has_value()) co_return last.error();
+            if (*last) break;
         }
 
-        if (auto err = parse_request_line(line, req); err) co_return err;
-        if (auto err = co_await parse_fields(head, req.headers); err) co_return err;
         if (auto err = parse_host_header(req); err) co_return err;
-
         co_return set_request_body(reader, req);
     }
     catch (const std::bad_alloc&)
