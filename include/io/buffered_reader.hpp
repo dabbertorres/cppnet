@@ -48,13 +48,16 @@ public:
     // buffered returns what's buffered, without reading any more. Unlike read(), looking through it doesn't need a
     // coroutine per byte: when reads complete without suspending, each co_await can deepen the stack (where symmetric
     // transfer isn't a tail call, e.g. GCC without optimizations).
-    [[nodiscard]] std::span<const std::byte> buffered() const noexcept { return buf; }
+    [[nodiscard]] std::span<const std::byte> buffered() const noexcept
+    {
+        return std::span{buf}.subspan(start, end - start);
+    }
 
     // consume drops the first count bytes of what's buffered, as if they had been read.
     void consume(std::size_t count) noexcept;
 
-    [[nodiscard]] std::size_t capacity() const noexcept { return buf.capacity(); }
-    [[nodiscard]] std::size_t size() const noexcept { return buf.size(); }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf.size(); }
+    [[nodiscard]] std::size_t size() const noexcept { return end - start; }
 
     // reset clears the buffer, and if other is not null, switches to it.
     // If other is null, the current reader is kept.
@@ -73,8 +76,12 @@ public:
 private:
     coro::task<void> fill();
 
+    // what's buffered is buf[start, end): consuming it moves start, rather than what's left, which is only moved to the
+    // front of buf to make room for more.
     reader*                impl;
     std::vector<std::byte> buf;
+    std::size_t            start = 0;
+    std::size_t            end   = 0;
     std::error_condition   err;
 };
 

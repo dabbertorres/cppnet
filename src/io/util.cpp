@@ -1,5 +1,6 @@
 #include "io/util.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <span>
@@ -41,19 +42,18 @@ read_line(buffered_reader* reader, std::size_t max_length, std::string_view end_
             break;
         }
 
-        std::size_t taken = 0;
-        while (taken < available.size() && !line.ends_with(end_of_line))
-        {
-            if (line.size() == max_length)
-            {
-                reader->consume(taken);
-                co_return std::make_error_condition(std::errc::value_too_large);
-            }
+        // up to the end of the line, if it's buffered (possibly only the last of end_of_line, the rest being taken
+        // already), or else all of it.
+        const std::string_view chars{reinterpret_cast<const char*>(available.data()), available.size()};
 
-            line += static_cast<char>(available[taken++]);
-        }
+        auto taken = chars.find(end_of_line.back());
+        taken      = taken == std::string_view::npos ? chars.size() : taken + 1;
 
-        reader->consume(taken);
+        const auto room = max_length - line.size();
+        line.append(chars.substr(0, std::min(taken, room)));
+        reader->consume(std::min(taken, room));
+
+        if (taken > room) co_return std::make_error_condition(std::errc::value_too_large);
     }
 
     if (line.ends_with(end_of_line)) line.resize(line.size() - end_of_line.size());

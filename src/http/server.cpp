@@ -40,6 +40,9 @@ using namespace std::chrono_literals;
 // The most of an unread request body to read and discard, rather than closing the connection.
 constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
 
+// How much a connection reads, and writes, at once.
+constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
+
 // current_date is the Date header's value for a response sent now (RFC 9110, section 6.6.1: a server with a clock
 // sends one). It's formatted at most once a second, on each thread.
 std::string current_date()
@@ -56,6 +59,41 @@ std::string current_date()
 
     return formatted;
 }
+
+// flush_then_read reads from a connection, first sending the responses written to it so far. So, a server holds its
+// responses until it has answered the requests it has already read: a batch of pipelined requests is answered with one
+// write, rather than one each, and a request that isn't pipelined is answered as the server waits for the next.
+//
+// NOTE: so a response to a pipelined request also waits for the requests read along with it to be handled.
+class flush_then_read final : public net::io::reader
+{
+public:
+    flush_then_read(net::io::reader* conn, net::io::buffered_writer* writer) noexcept
+        : conn{conn}
+        , writer{writer}
+    {}
+
+    net::coro::task<net::io::result> read(std::span<std::byte> data) override
+    {
+        if (writer->size() == 0) return conn->read(data);
+        return flush_and_read(data);
+    }
+
+    [[nodiscard]] int native_handle() const noexcept override { return conn->native_handle(); }
+
+private:
+    net::coro::task<net::io::result> flush_and_read(std::span<std::byte> data)
+    {
+        // the client can't be answered any more, which ends the connection as its closing would.
+        if (auto flushed = co_await writer->flush(); flushed.err)
+            co_return net::io::result{.err = make_error_condition(net::io::status_condition::closed)};
+
+        co_return co_await conn->read(data);
+    }
+
+    net::io::reader*          conn;
+    net::io::buffered_writer* writer;
+};
 
 // discard_body reads and drops the rest of body, returning whether it reached the end of it.
 net::coro::task<bool> discard_body(net::io::reader& body)
@@ -169,6 +207,11 @@ coro::task<> server::serve()
             logger->debug("accepted connection: {}", ex.what());
         }
 
+        // responses are written once each is finished, or a batch of them is (see flush_then_read), so there's nothing
+        // to gain from the kernel holding a write back until the last is acknowledged, and it can delay the response.
+        if (auto set = accepted->set_nodelay(); !set.has_value())
+            logger->debug("failed to set TCP_NODELAY: {}", set.error().message());
+
         if (!scheduler->spawn(serve_connection(std::move(*accepted)))) co_return;
     }
 }
@@ -179,14 +222,18 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
     {
         // Kept for the whole connection: anything read past the end of one request (e.g. a pipelined request) belongs
         // to the next.
-        io::buffered_reader reader{&conn};
-        io::buffered_writer writer{&conn};
+        io::buffered_writer writer{&conn, buffer_size};
+        flush_then_read     input{&conn, &writer};
+        io::buffered_reader reader{&input, buffer_size};
 
-        while (is_serving.load(std::memory_order::acquire) && conn.valid())
+        // NOTE: not conn.valid(), a syscall per request: a socket's pending error fails the next read or write anyway.
+        while (is_serving.load(std::memory_order::acquire))
         {
             auto state = co_await serve_request(conn, reader, writer);
             if (state == serve_state::close) break;
         }
+
+        co_await writer.flush();
     }
     catch (const std::exception& ex)
     {
@@ -338,9 +385,7 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
         }
     }
 
-    logger->trace("flushing writer");
-    co_await writer.flush();
-    logger->trace("response sent");
+    // NOTE: the response is sent when the server next reads from the connection (see flush_then_read).
 
     // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
     if (!co_await discard_body(*req.body))

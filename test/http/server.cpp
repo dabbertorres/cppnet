@@ -267,3 +267,95 @@ TEST_CASE("a response's body is as long as its Content-Length", "[http][server]"
         CHECK(out.ends_with("\r\n\r\nok"));
     }
 }
+
+namespace
+{
+
+// echo_name responds with the route's :name.
+task<void> echo_name(const http::server_request& req, http::response_writer& resp)
+{
+    const auto name = req.path_value("name");
+    auto*      body = co_await resp.send(http::status::OK, name.size());
+    co_await net::io::write_all(*body, name);
+}
+
+}
+
+TEST_CASE("pipelined requests are answered in order", "[http][server][pipelining]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // the last request has no Host, so the server answers it with a 400, and closes the connection.
+    auto out = sched.run_to_completion(exchange(&sched,
+                                                server.local_port(),
+                                                "GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                "GET /second HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                "GET /third HTTP/1.1\r\nHost: x\r\n\r\n"
+                                                "GET / HTTP/1.1\r\n\r\n"));
+    CAPTURE(out);
+
+    CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 3);
+
+    const auto first  = out.find("\r\n\r\nfirst");
+    const auto second = out.find("\r\n\r\nsecond");
+    const auto third  = out.find("\r\n\r\nthird");
+    const auto last   = out.find("HTTP/1.1 400 Bad Request\r\n");
+    CHECK(first < second);
+    CHECK(second < third);
+    CHECK(third < last);
+    CHECK(last != std::string::npos);
+}
+
+TEST_CASE("a response isn't held back waiting for the next request", "[http][server][pipelining]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // the server holds a response until it reads from the connection again (to answer pipelined requests together),
+    // so it must send it as it waits for the next request.
+    const auto exchange_one = [&] -> task<std::string>
+    {
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return "error: " + conn.error().message();
+        conn->set_read_timeout(2s);
+
+        auto res = co_await net::io::write_all(*conn, "GET /one HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+        if (res.err) co_return "error: " + res.err.message();
+
+        std::string                out;
+        std::array<std::byte, 256> buf{};
+        while (!out.ends_with("\r\n\r\none"))
+        {
+            auto read = co_await conn->read(buf);
+            out.append(reinterpret_cast<const char*>(buf.data()), read.count);
+            if (read.err) co_return out + "error: " + read.err.message();
+        }
+
+        co_return out;
+    };
+
+    auto out = sched.run_to_completion(exchange_one());
+    CAPTURE(out);
+
+    CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(out.ends_with("\r\n\r\none"));
+}
