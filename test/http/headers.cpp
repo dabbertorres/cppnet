@@ -1,7 +1,9 @@
 #include "http/headers.hpp"
 
 #include <optional>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -106,4 +108,63 @@ TEST_CASE("headers are equal whatever order their names are in", "[http][headers
 
     CHECK(a == b);
     CHECK_FALSE(a == c); // a name's values are in order.
+}
+
+TEST_CASE("cleared and removed fields are gone, and their memory is reused", "[http][headers][clear]")
+{
+    const std::string long_value(100, 'a');
+
+    net::http::headers fields;
+    fields.set("Accept"sv, std::string_view{long_value}).add("X-Many"sv, "1"sv).add("X-Many"sv, "2"sv);
+
+    fields.clear();
+    CHECK(fields.empty());
+    CHECK_FALSE(fields.get("Accept"sv).has_value());
+    CHECK(fields.begin() == fields.end());
+
+    // the fields added next take the cleared ones' places, with nothing left of their values.
+    fields.add("Host"sv, "example.com"sv).set("X-Many"sv, "3"sv);
+    CHECK(fields
+          == net::http::headers{
+              {  "Host", {"example.com"}},
+              {"X-Many",           {"3"}}
+    });
+
+    const auto* reused = fields.get("Host"sv)->data();
+    fields.remove("Host"sv);
+    CHECK(fields
+          == net::http::headers{
+              {"X-Many", {"3"}}
+    });
+
+    // a value that fits in the removed field's memory is put there.
+    fields.add("Accept"sv, "text/plain"sv);
+    CHECK(fields.get("Accept"sv)->data() == reused);
+    CHECK(fields
+          == net::http::headers{
+              {"X-Many",          {"3"}},
+              {"Accept", {"text/plain"}}
+    });
+}
+
+TEST_CASE("moved-from headers are empty", "[http][headers]")
+{
+    net::http::headers fields{
+        {"Host", {"a"}}
+    };
+    net::http::headers moved{std::move(fields)};
+
+    CHECK(moved
+          == net::http::headers{
+              {"Host", {"a"}}
+    });
+    // NOLINTBEGIN(bugprone-use-after-move,clang-analyzer-cplusplus.Move): what's left is checked.
+    CHECK(fields.empty());
+
+    fields.add("X"sv, "y"sv);
+    CHECK(fields
+          == net::http::headers{
+              {"X", {"y"}}
+    });
+    // NOLINTEND(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
 }

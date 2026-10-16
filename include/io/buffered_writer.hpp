@@ -29,6 +29,10 @@ public:
 
     [[nodiscard]] std::span<const std::byte> view() const noexcept;
 
+    // prepare adds size bytes to the buffer, for the caller to write in place (e.g. formatting into it, rather than
+    // into a string to write), and returns them; or returns none if they don't fit. They're written by the next flush.
+    [[nodiscard]] std::span<std::byte> prepare(std::size_t size);
+
     // reset clears the buffer, and if other is not null, switches to it.
     // If other is null, the current writer is kept.
     // This allows re-use of the buffer's memory with other writers.

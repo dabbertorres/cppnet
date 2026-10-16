@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/limit_reader.hpp"
 #include "io/reader.hpp"
@@ -147,12 +149,23 @@ std::error_condition parse_request_line(std::string_view line, server_request& r
         return std::make_error_condition(std::errc::not_supported);
 
     req.version = *version;
+    return parse_request_target(req.method, target, req.target);
+}
 
-    auto parsed = parse_request_target(req.method, target);
-    if (!parsed.has_value()) return parsed.error();
-    req.target = std::move(*parsed);
+// add_field_line adds a field line to fields, returning whether it was the empty line that ends them. count is how many
+// came before it.
+std::expected<bool, std::error_condition> add_field_line(std::string_view line, std::size_t count, headers& fields)
+{
+    if (line.empty()) return true;
+    if (count == net::http::http11::max_fields)
+        return std::unexpected(std::make_error_condition(std::errc::value_too_large));
 
-    return {};
+    auto field = net::http::parse_field_line(line);
+    if (!field.has_value()) return std::unexpected(invalid());
+
+    // NOTE: each line is kept whole: splitting on commas would break fields that aren't lists (e.g. User-Agent).
+    fields.add(field->first, field->second);
+    return false;
 }
 
 // parse_fields reads field lines up to the empty line that ends them.
@@ -167,14 +180,9 @@ task<std::error_condition> parse_fields(head_reader& head, headers& fields) noex
             line = head.line;
         }
 
-        if (line->empty()) co_return std::error_condition{};
-        if (count == net::http::http11::max_fields) co_return std::make_error_condition(std::errc::value_too_large);
-
-        auto field = net::http::parse_field_line(*line);
-        if (!field.has_value()) co_return invalid();
-
-        // NOTE: each line is kept whole: splitting on commas would break fields that aren't lists (e.g. User-Agent).
-        fields.add(field->first, field->second);
+        auto added = add_field_line(*line, count, fields);
+        if (!added.has_value()) co_return added.error();
+        if (*added) co_return std::error_condition{};
     }
 }
 
@@ -193,7 +201,7 @@ std::error_condition parse_host_header(server_request& req)
     // HTTP/1.1 requires exactly one, and HTTP/1.0 doesn't know it, but mustn't repeat it either.
     if (lines > 1 || (lines == 0 && req.version.major == 1 && req.version.minor >= 1)) return invalid();
 
-    std::string host;
+    req.host.clear();
     if (lines == 1)
     {
         auto value = req.headers.get("Host"sv).value_or(""sv);
@@ -203,48 +211,59 @@ std::error_condition parse_host_header(server_request& req)
         {
             auto parsed = net::http::parse_host(value);
             if (!parsed.has_value()) return invalid();
-            host = std::move(parsed->host);
+            req.host.assign(parsed->host);
         }
     }
 
     // a target with a host overrides the Host header (RFC 9112, section 3.2.2).
-    req.host = !req.target.host.empty() ? req.target.host : std::move(host);
+    if (!req.target.host.empty()) req.host.assign(req.target.host);
     return {};
 }
 
-// make_request_body decides how long the request's body is (RFC 9112, section 6.3), and wraps the reader to read only
-// that much. The rules are strict where requests are ambiguous, as an ambiguity between this server and anything in
-// front of it is what request smuggling exploits.
-std::expected<std::unique_ptr<net::io::reader>, std::error_condition> make_request_body(buffered_reader*      reader,
-                                                                                        const server_request& req)
+// reuse_or_make sets body to a T made from args, reusing body's memory if it's already one.
+template<typename T, typename... Args>
+void reuse_or_make(std::unique_ptr<net::io::reader>& body, Args&&... args)
+{
+    const auto* existing = body.get();
+    if (existing != nullptr && typeid(*existing) == typeid(T))
+        *static_cast<T*>(body.get()) = T(std::forward<Args>(args)...);
+    else body = std::make_unique<T>(std::forward<Args>(args)...);
+}
+
+// set_request_body decides how long the request's body is (RFC 9112, section 6.3), and sets its body to read only that
+// much of reader. The rules are strict where requests are ambiguous, as an ambiguity between this server and anything
+// in front of it is what request smuggling exploits.
+std::error_condition set_request_body(buffered_reader* reader, server_request& req)
 {
     if (req.headers.get_all("Transfer-Encoding"sv).has_value())
     {
         // HTTP/1.0 has no transfer codings, and a length from both would be ambiguous.
         const bool http10 = req.version.major == 1 && req.version.minor == 0;
-        if (http10 || req.headers.get_all("Content-Length"sv).has_value()) return std::unexpected(invalid());
+        if (http10 || req.headers.get_all("Content-Length"sv).has_value()) return invalid();
 
         // chunked must be last, and only applied once (RFC 9112, section 6.1).
         auto codings  = req.headers.get_list("Transfer-Encoding"sv);
         auto chunked  = [](std::string_view coding) { return net::util::equal_ignore_case(coding, "chunked"sv); };
         auto how_many = std::ranges::count_if(codings, chunked);
-        if (codings.empty() || !chunked(codings.back()) || how_many > 1) return std::unexpected(invalid());
+        if (codings.empty() || !chunked(codings.back()) || how_many > 1) return invalid();
 
         // and nothing else is implemented.
-        if (codings.size() > 1) return std::unexpected(std::make_error_condition(std::errc::not_supported));
+        if (codings.size() > 1) return std::make_error_condition(std::errc::not_supported);
 
-        return std::make_unique<net::http::http11::chunked_reader>(reader);
+        reuse_or_make<net::http::http11::chunked_reader>(req.body, reader);
+        return {};
     }
 
+    std::size_t length = 0;
     if (req.headers.get_all("Content-Length"sv).has_value())
     {
-        auto length = req.headers.get_content_length();
-        if (!length.has_value()) return std::unexpected(invalid());
-
-        return std::make_unique<net::io::limit_reader>(static_cast<net::io::reader*>(reader), *length);
+        auto parsed = req.headers.get_content_length();
+        if (!parsed.has_value()) return invalid();
+        length = *parsed;
     }
 
-    return std::make_unique<net::io::limit_reader>(static_cast<net::io::reader*>(reader), 0);
+    reuse_or_make<net::io::limit_reader>(req.body, static_cast<net::io::reader*>(reader), length);
+    return {};
 }
 
 // response_framing is how a response's body ends (RFC 9112, section 6.3).
@@ -486,13 +505,170 @@ std::size_t fields_size(const headers& fields) noexcept
     return size;
 }
 
+// span_appender appends to a span, as std::string::append does to a string: the span must be long enough.
+struct span_appender
+{
+    std::span<std::byte> out;
+    std::size_t          size = 0;
+
+    span_appender& append(std::string_view str) noexcept
+    {
+        std::ranges::copy(std::as_bytes(std::span{str}), out.subspan(size).begin());
+        size += str.size();
+        return *this;
+    }
+};
+
 // append_fields appends a field line for each of the values in fields: joining a field's values with commas would
 // change fields that aren't lists (e.g. Set-Cookie).
-void append_fields(std::string& out, const headers& fields)
+void append_fields(auto& out, const headers& fields)
 {
     for (const auto& [name, values] : fields)
     {
         for (const auto& value : values) out.append(name).append(": "sv).append(value).append("\r\n"sv);
+    }
+}
+
+// status_line_size is how long append_status_head makes the status line (with its CRLF).
+std::size_t status_line_size(const net::http::server_response& resp) noexcept
+{
+    // "HTTP/1.1 200 " and the reason, then CRLF.
+    return 13 + net::http::reason_phrase(resp.status_code).size() + 2;
+}
+
+// append_status_head appends a response's head: its status line, field lines, and the empty line after them. The status
+// code must be from 100 to 599.
+void append_status_head(auto& out, const net::http::server_response& resp)
+{
+    std::array<char, 3> code{};
+    std::to_chars(code.begin(), code.end(), static_cast<std::uint16_t>(resp.status_code));
+
+    const std::array<char, 4> version{static_cast<char>(resp.version.major + '0'),
+                                      '.',
+                                      static_cast<char>(resp.version.minor + '0'),
+                                      ' '};
+
+    out.append("HTTP/"sv)
+        .append(std::string_view{version.data(), version.size()})
+        .append(std::string_view{code.data(), code.size()})
+        .append(" "sv)
+        .append(net::http::reason_phrase(resp.status_code))
+        .append("\r\n"sv);
+
+    append_fields(out, resp.headers);
+    out.append("\r\n"sv);
+}
+
+// write_status_head writes a response's head that didn't fit in the writer's buffer (see response_encode).
+task<net::http::response_encoder_result> write_status_head(net::io::writer*                  writer,
+                                                           const net::http::server_response& resp) noexcept
+{
+    try
+    {
+        // NOTE: written all at once, rather than a write (and so, a coroutine) for each part of it.
+        std::string head;
+        head.reserve(status_line_size(resp) + fields_size(resp.headers) + 2);
+        append_status_head(head, resp);
+
+        if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err)
+            co_return std::unexpected(err);
+        co_return writer;
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+    }
+}
+
+// head_is_buffered is whether the reader's buffer holds a whole head (up to the empty line that ends it), within
+// max_header_bytes: then decoding it doesn't need to read.
+bool head_is_buffered(const buffered_reader* reader, std::size_t max_header_bytes) noexcept
+{
+    const auto       buffered = reader->buffered();
+    std::string_view chars{reinterpret_cast<const char*>(buffered.data()), std::min(buffered.size(), max_header_bytes)};
+
+    // NOTE: every line ends with CRLF (see head_reader), so this is the end of a line and then an empty line: the
+    //       first empty line after the request line is at or before it (and one before the request line is skipped).
+    return chars.contains("\r\n\r\n"sv);
+}
+
+// decode_buffered decodes a request whose head is buffered (see head_is_buffered), without a coroutine.
+std::error_condition
+decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+{
+    try
+    {
+        head_reader head{.reader = reader, .remaining = max_header_bytes};
+
+        // NOTE: the lines are all buffered, so buffered_line() only fails if the head ends in a way it can't.
+        const auto next_line = [&] -> std::expected<std::string_view, std::error_condition>
+        {
+            auto line = head.buffered_line();
+            if (!line.has_value()) return std::unexpected(invalid());
+            return *line;
+        };
+
+        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
+        std::string_view line;
+        for (int tries = 0; tries < 2 && line.empty(); ++tries)
+        {
+            auto next = next_line();
+            if (!next.has_value()) return next.error();
+            line = *next;
+        }
+
+        if (auto err = parse_request_line(line, req); err) return err;
+
+        for (std::size_t count = 0;; ++count)
+        {
+            auto next = next_line();
+            if (!next.has_value()) return next.error();
+
+            auto added = add_field_line(*next, count, req.headers);
+            if (!added.has_value()) return added.error();
+            if (*added) break;
+        }
+
+        if (auto err = parse_host_header(req); err) return err;
+        return set_request_body(reader, req);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return std::make_error_condition(std::errc::not_enough_memory);
+    }
+}
+
+// decode_reading decodes a request whose head isn't all buffered yet, reading the rest.
+task<std::error_condition>
+decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+{
+    try
+    {
+        head_reader head{.reader = reader, .remaining = max_header_bytes};
+
+        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
+        std::string_view line;
+        for (int tries = 0; tries < 2 && line.empty(); ++tries)
+        {
+            if (auto buffered = head.buffered_line(); buffered.has_value())
+            {
+                line = *buffered;
+                continue;
+            }
+
+            if (auto err = co_await head.read_line(); err) co_return err;
+            line = head.line;
+        }
+
+        if (auto err = parse_request_line(line, req); err) co_return err;
+        if (auto err = co_await parse_fields(head, req.headers); err) co_return err;
+        if (auto err = parse_host_header(req); err) co_return err;
+
+        co_return set_request_body(reader, req);
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::make_error_condition(std::errc::not_enough_memory);
     }
 }
 }
@@ -595,32 +771,35 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept
 {
-    if (!valid_fields(resp.headers)) co_return std::unexpected(invalid());
+    using result = response_encoder_result;
+
+    if (!valid_fields(resp.headers)) return coro::ready_task<result>(std::unexpected(invalid()));
 
     // a status code is three digits, from 100 to 599 (RFC 9110, section 15).
     const auto code = static_cast<std::uint16_t>(resp.status_code);
-    if (code < 100 || code > 599) co_return std::unexpected(invalid());
+    if (code < 100 || code > 599) return coro::ready_task<result>(std::unexpected(invalid()));
 
-    std::array<char, 3> status_buf{};
-    std::to_chars(status_buf.begin(), status_buf.end(), code);
+    // usually, it's a connection's buffered writer, with room for the head: then it's formatted straight into the
+    // buffer, without a coroutine (see coro::ready_task).
+    if (auto* buffered = dynamic_cast<io::buffered_writer*>(writer); buffered != nullptr)
+    {
+        try
+        {
+            const auto size = status_line_size(resp) + fields_size(resp.headers) + 2;
+            if (auto out = buffered->prepare(size); !out.empty())
+            {
+                span_appender appender{.out = out};
+                append_status_head(appender, resp);
+                return coro::ready_task<result>(writer);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            return coro::ready_task<result>(std::unexpected(std::make_error_condition(std::errc::not_enough_memory)));
+        }
+    }
 
-    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
-    std::string head;
-    head.reserve(max_start_line_overhead + fields_size(resp.headers));
-
-    head.append("HTTP/"sv)
-        .append({static_cast<char>(resp.version.major + '0'), '.', static_cast<char>(resp.version.minor + '0'), ' '})
-        .append(std::string_view{status_buf.data(), status_buf.size()})
-        .append(" "sv)
-        .append(reason_phrase(resp.status_code))
-        .append("\r\n"sv);
-
-    append_fields(head, resp.headers);
-    head.append("\r\n"sv);
-
-    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
-
-    co_return writer;
+    return write_status_head(writer, resp);
 }
 
 task<request_decoder_result> request_decode(io::buffered_reader* reader, std::size_t max_header_bytes) noexcept
@@ -628,36 +807,25 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
     try
     {
         server_request req;
-        head_reader    head{.reader = reader, .remaining = max_header_bytes};
-
-        // an empty line before the request line is ignored (RFC 9112, section 2.2), e.g. a CRLF after a POST's body.
-        std::string_view line;
-        for (int tries = 0; tries < 2 && line.empty(); ++tries)
-        {
-            if (auto buffered = head.buffered_line(); buffered.has_value())
-            {
-                line = *buffered;
-                continue;
-            }
-
-            if (auto err = co_await head.read_line(); err) co_return std::unexpected(err);
-            line = head.line;
-        }
-
-        if (auto err = parse_request_line(line, req); err) co_return std::unexpected(err);
-        if (auto err = co_await parse_fields(head, req.headers); err) co_return std::unexpected(err);
-        if (auto err = parse_host_header(req); err) co_return std::unexpected(err);
-
-        auto body = make_request_body(reader, req);
-        if (!body.has_value()) co_return std::unexpected(body.error());
-        req.body = std::move(*body);
-
+        if (auto err = co_await request_decode(reader, max_header_bytes, req); err) co_return std::unexpected(err);
         co_return req;
     }
     catch (const std::bad_alloc&)
     {
         co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
     }
+}
+
+task<std::error_condition>
+request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+{
+    req.clear();
+
+    // e.g. for pipelined requests, which are read together.
+    if (head_is_buffered(reader, max_header_bytes))
+        return coro::ready_task<std::error_condition>(decode_buffered(reader, max_header_bytes, req));
+
+    return decode_reading(reader, max_header_bytes, req);
 }
 
 coro::task<response_decoder_result>

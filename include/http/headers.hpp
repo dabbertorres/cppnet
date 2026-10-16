@@ -30,7 +30,9 @@ struct content_type
 // Names are compared ignoring case.
 //
 // NOTE: a message has a few fields, so they're kept in order (each name once), and looked up by going through them:
-//       that, and holding the first few (and the first value of each) in itself, saves allocating for each one.
+//       that, and holding the first few (and the first value of each) in itself, saves allocating for each one. Fields
+//       removed (or cleared) are kept for their memory, which fields added later reuse: so headers reused for each
+//       message on a connection (see clear()) needn't allocate for values that are too long to hold in themselves.
 class headers
 {
 public:
@@ -58,6 +60,14 @@ public:
     headers() = default;
     headers(std::initializer_list<std::pair<std::string, std::vector<std::string>>> init);
 
+    headers(const headers&)            = default;
+    headers& operator=(const headers&) = default;
+
+    headers(headers&& other) noexcept;
+    headers& operator=(headers&& other) noexcept;
+
+    ~headers() = default;
+
     headers& set(const std::string& key, std::string val);
     headers& set(const std::string& key, std::initializer_list<std::string> vals);
     headers& set(const std::string& key, std::vector<std::string>&& vals);
@@ -78,6 +88,9 @@ public:
 
     // remove removes key's values, if it has any.
     headers& remove(std::string_view key);
+
+    // clear removes every field, keeping their memory for the fields added next.
+    void clear() noexcept;
 
     headers& set_content_length(std::size_t length);
     headers& set_content_type(const content_type& content_type);
@@ -121,14 +134,22 @@ public:
 
 private:
     [[nodiscard]] const field_type* find(std::string_view key) const noexcept;
+    [[nodiscard]] field_type*       find(std::string_view key) noexcept;
 
-    // values_of returns key's values, adding key if it has none.
-    values_type& values_of(std::string_view key);
+    // add_field adds key, with no values, reusing a removed field's memory if there is one. Its values must then be
+    // set (with set_one, or after clearing them), as they may still be the removed field's.
+    field_type& add_field(std::string_view key);
 
     // assign returns key's values, emptied, adding key if it has none.
     values_type& assign(std::string_view key);
 
+    // set_one sets key's value to val, reusing the memory of its first value (or a removed field's).
+    template<typename V>
+    headers& set_one(std::string_view key, V&& val);
+
+    // fields holds the fields (the first used), and then those removed, kept for their memory.
     util::small_vector<field_type, 8> fields;
+    std::size_t                       used = 0;
 };
 
 // is_valid_field_name checks that name is a token (RFC 9110, section 5.1).

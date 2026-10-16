@@ -61,6 +61,9 @@ public:
         return true;
     }
 
+    // clear removes every value.
+    void clear() noexcept { values.clear(); }
+
     [[nodiscard]] std::size_t size() const noexcept { return values.size(); }
     [[nodiscard]] bool        empty() const noexcept { return values.empty(); }
 

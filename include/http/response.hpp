@@ -258,7 +258,11 @@ public:
 
     // send sends the response's status and headers, with a Content-Length of content_length (except for statuses
     // that have no content: 1xx, 204 and 304), and returns the writer for its body. Writing more than content_length
-    // fails with std::errc::value_too_large; writing less leaves the server to close the connection.
+    // fails with std::errc::value_too_large; writing less leaves the server to close the connection. It throws
+    // std::system_error if the response can't be sent (e.g. a header has a line break in it).
+    //
+    // NOTE: when the encoder finishes without a coroutine (e.g. the head fits in the connection's buffer), so does
+    //       send(), which then throws when it's called, rather than when it's awaited.
     coro::task<io::writer*> send(status status_code, std::size_t content_length);
 
     // body_remaining is how much of the body the handler has yet to write.
@@ -268,6 +272,12 @@ public:
     [[nodiscard]] status status_code() const noexcept { return resp->status_code; }
 
 private:
+    // finish_send finishes sending the response, once encoding (which needed a coroutine) does.
+    coro::task<io::writer*> finish_send(coro::task<response_encoder_result> encoding, std::size_t body_length);
+
+    // sent takes the encoder's result, returning the body's writer, or throwing if it failed.
+    io::writer* sent(const response_encoder_result& res, std::size_t body_length);
+
     io::writer*      writer;
     server_response* resp;
     response_encoder encode;

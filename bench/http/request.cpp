@@ -97,24 +97,24 @@ task<void> serve(const Router& router, std::string_view input, net::io::writer& 
 
     const std::string date(date_bytes, 'x');
 
+    // kept for the connection, as the server does.
+    http::server_request  req;
+    http::server_response resp;
+
     while (true)
     {
         auto at = allocations;
 
-        auto decoded = co_await http::http11::request_decode(&reader, 8'192);
-        if (!decoded.has_value()) break;
+        if (auto err = co_await http::http11::request_decode(&reader, 8'192, req); err) break;
 
         counted.decode += allocations - at;
         at = allocations;
 
-        auto& req = *decoded;
-
-        http::server_response resp{
-            .version = req.version,
-            .headers = {},
-            .body    = &writer,
-        };
-        resp.headers.set("Date"sv, std::string{date});
+        resp.version     = req.version;
+        resp.status_code = http::status::NONE;
+        resp.body        = &writer;
+        resp.headers.clear();
+        resp.headers.set("Date"sv, std::string_view{date});
 
         http::response_writer rw{&writer, &resp, http::http11::response_encode};
 

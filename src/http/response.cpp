@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -55,7 +56,25 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
     resp->status_code = status_code;
     if (has_content) resp->headers.set_content_length(content_length);
     else resp->headers.remove("Content-Length"sv);
-    auto res = co_await encode(writer, *resp);
+
+    const auto body_length = has_content ? content_length : 0;
+
+    // usually, the head fits in the connection's buffer: then there's no need for a coroutine (see coro::ready_task).
+    auto encoding = encode(writer, *resp);
+    if (encoding.finished_without_coroutine())
+        return coro::ready_task<io::writer*>(sent(std::move(encoding).result(), body_length));
+
+    return finish_send(std::move(encoding), body_length);
+}
+
+coro::task<io::writer*> response_writer::finish_send(coro::task<response_encoder_result> encoding,
+                                                     std::size_t                         body_length)
+{
+    co_return sent(co_await std::move(encoding), body_length);
+}
+
+io::writer* response_writer::sent(const response_encoder_result& res, std::size_t body_length)
+{
     if (!res.has_value())
     {
         // e.g. a header that can't be written (one with a line break in it), which nothing was written for.
@@ -63,8 +82,7 @@ coro::task<io::writer*> response_writer::send(status status_code, std::size_t co
         throw std::system_error{res.error().value(), res.error().category(), "failed to send response"};
     }
 
-    body = io::limit_writer{resp->body, has_content ? content_length : 0};
-    co_return &body;
+    body = io::limit_writer{resp->body, body_length};
+    return &body;
 }
-
 }

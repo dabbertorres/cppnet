@@ -1,5 +1,7 @@
 #include "http/http11.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -22,6 +24,7 @@
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
@@ -795,4 +798,98 @@ TEST_CASE("encoded request bodies decode", "[http][1.1][request_encode][body]")
     REQUIRE(decoded.has_value());
     CHECK(decoded->headers.is_chunked() == !with_length);
     CHECK(read_body(*decoded->body) == content);
+}
+
+TEST_CASE("requests decoded into one request don't keep anything of the last", "[http][1.1][request_decode][reuse]")
+{
+    // the first has a chunked body, a query, and a field the second doesn't; the second a length; the third nothing.
+    net::io::string_reader<char> content("POST /a?x=1 HTTP/1.1\r\n"
+                                         "Host: first\r\n"
+                                         "X-Only-First: yes\r\n"
+                                         "Transfer-Encoding: chunked\r\n"
+                                         "\r\n"
+                                         "3\r\nabc\r\n0\r\n\r\n"
+                                         "PUT http://second:8080/b HTTP/1.1\r\n"
+                                         "Host: ignored\r\n"
+                                         "Content-Length: 2\r\n"
+                                         "\r\n"
+                                         "de"
+                                         "GET /c HTTP/1.0\r\n"
+                                         "\r\n");
+
+    // NOTE: a small buffer, so that some heads are decoded as they're read, and others from the buffer.
+    auto buffer_size = GENERATE(std::size_t{16}, std::size_t{4'096});
+    CAPTURE(buffer_size);
+
+    net::io::buffered_reader  reader(&content, buffer_size);
+    net::http::server_request req;
+
+    // body reads the request's body to its end.
+    const auto body = [&]
+    {
+        std::string out;
+        while (true)
+        {
+            std::array<char, 8> chunk{};
+            auto                res = test::sync_wait(req.body->read(std::as_writable_bytes(std::span{chunk})));
+            out.append(chunk.data(), res.count);
+            if (res.err)
+            {
+                CHECK(res.err == net::io::status_condition::closed);
+                return out;
+            }
+        }
+    };
+
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    CHECK(req.method == net::http::request_method::POST);
+    CHECK(req.target.path == "/a");
+    CHECK(req.target.query == "x=1");
+    CHECK(req.host == "first");
+    CHECK(req.headers.get("X-Only-First"sv) == "yes");
+    CHECK(body() == "abc");
+
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    CHECK(req.method == net::http::request_method::PUT);
+    CHECK(req.target.path == "/b");
+    CHECK(req.target.query.empty());
+    CHECK(req.target.port == "8080");
+    CHECK(req.host == "second");
+    CHECK(req.headers
+          == net::http::headers{
+              {          "Host", {"ignored"}},
+              {"Content-Length",       {"2"}}
+    });
+    CHECK(body() == "de");
+
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    CHECK(req.method == net::http::request_method::GET);
+    CHECK(req.version == net::http::protocol_version{.major = 1, .minor = 0});
+    CHECK(req.target == net::http::request_target{.path = "/c"});
+    CHECK(req.host.empty());
+    CHECK(req.headers.empty());
+    CHECK(body().empty());
+}
+
+TEST_CASE("a response head that doesn't fit in the writer's buffer is still written", "[http][1.1][response_encode]")
+{
+    net::http::server_response resp{
+        .version     = {.major = 1, .minor = 1},
+        .status_code = net::http::status::OK,
+    };
+    resp.headers.set("X-Long"sv, std::string(200, 'x'));
+
+    const auto want = "HTTP/1.1 200 OK\r\nX-Long: " + std::string(200, 'x') + "\r\n\r\n";
+
+    // with room for it, and without.
+    auto buffer_size = GENERATE(std::size_t{64}, std::size_t{4'096});
+    CAPTURE(buffer_size);
+
+    net::io::string_writer<char> out;
+    net::io::buffered_writer     writer{&out, buffer_size};
+
+    auto res = test::sync_wait(net::http::http11::response_encode(&writer, resp));
+    REQUIRE(res.has_value());
+    REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
+    CHECK(out.build() == want);
 }
