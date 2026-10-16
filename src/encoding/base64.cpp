@@ -1,8 +1,12 @@
 #include "encoding/base64.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <span>
+#include <string_view>
+#include <system_error>
+#include <vector>
 
 namespace
 {
@@ -70,24 +74,75 @@ std::string encoding::encode(std::span<const std::byte> data) const noexcept
     return out;
 }
 
-std::optional<std::vector<std::byte>> encoding::decode(std::span<const char> data) const noexcept
+std::expected<std::vector<std::byte>, std::error_condition> encoding::decode(std::string_view data) const
 {
-    auto out_size = decoded_size(data.size());
+    std::vector<std::byte> out(decoded_size(data.size()));
+
+    auto wrote = decode_to(data, out);
+    if (!wrote) return std::unexpected{wrote.error()};
+
+    out.resize(*wrote);
+    return out;
+}
+
+std::expected<std::size_t, std::error_condition> encoding::decode_to(std::string_view     data,
+                                                                     std::span<std::byte> out) const noexcept
+{
+    const auto invalid = std::unexpected{std::make_error_condition(std::errc::invalid_argument)};
+
     if (padchar != 0)
     {
-        auto might_have_padding = data.last(2);
-        out_size -= static_cast<std::size_t>(std::count(might_have_padding.begin(), might_have_padding.end(), padchar));
+        if (data.size() % 4 != 0) return invalid;
+
+        // at most two: a third would be where a character has to be (and fails to decode, below).
+        if (data.ends_with(padchar)) data.remove_suffix(1);
+        if (data.ends_with(padchar)) data.remove_suffix(1);
     }
 
-    std::vector<std::byte> out(out_size);
+    // the characters after the last whole group of 4: one can't be (it's only 6 bits of a byte).
+    const auto tail = data.size() % 4;
+    if (tail == 1) return invalid;
 
-    for (std::size_t in_i = 0, out_i = 0; in_i < data.size(); in_i += 4, out_i += 3)
+    const auto groups = data.size() / 4;
+    const auto size   = (groups * 3) + (tail == 0 ? 0 : tail - 1);
+    if (out.size() < size) return std::unexpected{std::make_error_condition(std::errc::value_too_large)};
+
+    for (std::size_t i = 0; i < groups; ++i)
     {
-        auto valid = decode_triplet(&out[out_i], &data[in_i], data.size() - in_i);
-        if (!valid) return std::nullopt;
+        const auto a = value(data[(i * 4) + 0]);
+        const auto b = value(data[(i * 4) + 1]);
+        const auto c = value(data[(i * 4) + 2]);
+        const auto d = value(data[(i * 4) + 3]);
+
+        // NOTE: values are at most 0x3f, so any of the top two bits means one wasn't in the alphabet.
+        if (((a | b | c | d) & 0xc0) != 0) return invalid;
+
+        const std::uint32_t combined =
+            (std::uint32_t{a} << 18) | (std::uint32_t{b} << 12) | (std::uint32_t{c} << 6) | d;
+
+        out[(i * 3) + 0] = static_cast<std::byte>(combined >> 16);
+        out[(i * 3) + 1] = static_cast<std::byte>(combined >> 8);
+        out[(i * 3) + 2] = static_cast<std::byte>(combined);
     }
 
-    return out;
+    if (tail != 0)
+    {
+        const auto a = value(data[(groups * 4) + 0]);
+        const auto b = value(data[(groups * 4) + 1]);
+        const auto c = tail == 3 ? value(data[(groups * 4) + 2]) : std::uint8_t{0};
+        if (((a | b | c) & 0xc0) != 0) return invalid;
+
+        const std::uint32_t combined = (std::uint32_t{a} << 18) | (std::uint32_t{b} << 12) | (std::uint32_t{c} << 6);
+
+        // the bits after the last whole byte must be zero: 4 of them after 1 byte, 2 after 2.
+        const std::uint32_t unused = tail == 2 ? 0x00'ffff : 0x00'00ff;
+        if ((combined & unused) != 0) return invalid;
+
+        out[(groups * 3) + 0] = static_cast<std::byte>(combined >> 16);
+        if (tail == 3) out[(groups * 3) + 1] = static_cast<std::byte>(combined >> 8);
+    }
+
+    return size;
 }
 
 void encoding::encode_triplet(char* out, const std::byte* data) const noexcept
@@ -131,51 +186,10 @@ std::size_t encoding::encode_trailing(char* out, const std::byte* data, std::siz
     }
 }
 
-bool encoding::decode_triplet(std::byte* out, const char* data, std::size_t remaining) const noexcept
+std::uint8_t encoding::value(char c) const noexcept
 {
-    std::array<std::byte, 4> buf{};
-    std::size_t              buflen = 0;
-
-    std::size_t lookahead = std::min(remaining, 4ul);
-    std::size_t i         = 0u;
-    for (; i < lookahead; ++i)
-    {
-        auto in  = data[i];
-        auto dec = decoder[static_cast<std::size_t>(in)];
-        if (dec == static_cast<std::byte>(0xff))
-        {
-            // padding/done
-            if (padchar != 0)
-            {
-                while (i < lookahead && in == padchar)
-                {
-                    ++i;
-                    in = data[i];
-                }
-            }
-
-            break;
-        }
-
-        buf[i] = dec;
-        ++buflen;
-    }
-
-    // trailing garbage or invalid character
-    if (i < lookahead) return false;
-
-    // clang-format off
-        std::uint32_t combined = (static_cast<std::uint32_t>(buf[0]) << 18)
-                               | (static_cast<std::uint32_t>(buf[1]) << 12)
-                               | (static_cast<std::uint32_t>(buf[2]) << 6)
-                               | (static_cast<std::uint32_t>(buf[3]) << 0);
-    // clang-format on
-
-    if (buflen >= 4) out[2] = static_cast<std::byte>(combined >> 0);
-    if (buflen >= 3) out[1] = static_cast<std::byte>(combined >> 8);
-    if (buflen >= 2) out[0] = static_cast<std::byte>(combined >> 16);
-
-    return true;
+    // NOTE: through unsigned char, as a char may be negative.
+    return static_cast<std::uint8_t>(decoder[static_cast<unsigned char>(c)]);
 }
 
 }

@@ -17,6 +17,7 @@ function(add_fuzzer name)
 endfunction()
 
 add_fuzzer(fuzz_url url.cpp "${PROJECT_SOURCE_DIR}/src/url.cpp")
+add_fuzzer(fuzz_base64 base64.cpp "${PROJECT_SOURCE_DIR}/src/encoding/base64.cpp")
 add_fuzzer(
   fuzz_request_target
   request_target.cpp
