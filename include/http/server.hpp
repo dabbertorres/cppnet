@@ -71,8 +71,13 @@ private:
     };
 
     coro::task<> serve_connection(tcp_socket conn) noexcept;
-    coro::task<serve_state>
-                     serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffered_writer& writer) noexcept;
+    // serve_request serves the next request on conn, decoding it into req, and responding with resp: both are kept for
+    // the connection, so that their memory is reused for each request.
+    coro::task<serve_state> serve_request(tcp_socket&          conn,
+                                          io::buffered_reader& reader,
+                                          io::buffered_writer& writer,
+                                          server_request&      req,
+                                          server_response&     resp) noexcept;
     std::string_view upgrade_to_protocol(const server_request& req) const noexcept;
     bool             is_protocol_supported(std::string_view protocol) const noexcept;
 

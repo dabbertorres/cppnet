@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -29,13 +30,33 @@ std::string_view trim_ows(std::string_view str) noexcept
     return str.substr(start, str.find_last_not_of(ows) - start + 1);
 }
 
-// find_field finds key's field in fields (const or not), or returns null.
-auto* find_field(auto& fields, std::string_view key) noexcept
+// find_field finds key's field in the first used of fields (const or not), or returns null.
+auto* find_field(auto& fields, std::size_t used, std::string_view key) noexcept
 {
-    auto* it = std::ranges::find_if(fields,
-                                    [&](const auto& field)
-                                    { return net::util::equal_ignore_case(std::string_view{field.first}, key); });
-    return it != fields.end() ? it : nullptr;
+    auto* first = fields.data();
+    auto* last  = first + used;
+    auto* it    = std::find_if(first,
+                               last,
+                               [&](const auto& field)
+                               { return net::util::equal_ignore_case(std::string_view{field.first}, key); });
+    return it != last ? it : nullptr;
+}
+
+// set_values makes vals just val, reusing the memory of the first value.
+template<typename V>
+void set_values(auto& vals, V&& val)
+{
+    if (vals.empty())
+    {
+        vals.emplace_back(std::forward<V>(val));
+        return;
+    }
+
+    if constexpr (std::is_same_v<std::remove_cvref_t<V>, std::string> && !std::is_lvalue_reference_v<V>)
+        vals.front() = std::forward<V>(val);
+    else vals.front().assign(val);
+
+    while (vals.size() > 1) vals.erase(vals.end() - 1);
 }
 }
 
@@ -53,19 +74,50 @@ headers::headers(std::initializer_list<std::pair<std::string, std::vector<std::s
     }
 }
 
-const headers::field_type* headers::find(std::string_view key) const noexcept { return find_field(fields, key); }
+headers::headers(headers&& other) noexcept
+    : fields{std::move(other.fields)}
+    , used{std::exchange(other.used, 0)}
+{}
 
-headers::values_type& headers::values_of(std::string_view key)
+headers& headers::operator=(headers&& other) noexcept
 {
-    if (auto* field = find_field(fields, key); field != nullptr) return field->second;
-    return fields.emplace_back(std::string{key}, values_type{}).second;
+    fields = std::move(other.fields);
+    used   = std::exchange(other.used, 0);
+    return *this;
+}
+
+const headers::field_type* headers::find(std::string_view key) const noexcept { return find_field(fields, used, key); }
+
+headers::field_type* headers::find(std::string_view key) noexcept { return find_field(fields, used, key); }
+
+headers::field_type& headers::add_field(std::string_view key)
+{
+    if (used < fields.size())
+    {
+        auto& field = fields[used++];
+        field.first.assign(key);
+        return field;
+    }
+
+    auto& field = fields.emplace_back(std::string{key}, values_type{});
+    ++used;
+    return field;
 }
 
 headers::values_type& headers::assign(std::string_view key)
 {
-    auto& vals = values_of(key);
+    auto* field = find(key);
+    auto& vals  = field != nullptr ? field->second : add_field(key).second;
     vals.clear();
     return vals;
+}
+
+template<typename V>
+headers& headers::set_one(std::string_view key, V&& val)
+{
+    auto* field = find(key);
+    set_values(field != nullptr ? field->second : add_field(key).second, std::forward<V>(val));
+    return *this;
 }
 
 headers& headers::set(const std::string& key, std::string val) { return set(std::string_view{key}, std::move(val)); }
@@ -82,11 +134,7 @@ headers& headers::set(const std::string& key, std::vector<std::string>&& vals)
 
 headers& headers::add(const std::string& key, std::string val) { return add(std::string_view{key}, std::move(val)); }
 
-headers& headers::set(std::string_view key, std::string val)
-{
-    assign(key).push_back(std::move(val));
-    return *this;
-}
+headers& headers::set(std::string_view key, std::string val) { return set_one(key, std::move(val)); }
 
 headers& headers::set(std::string_view key, std::initializer_list<std::string> vals)
 {
@@ -105,7 +153,8 @@ headers& headers::set(std::string_view key, std::vector<std::string>&& vals)
 
 headers& headers::add(std::string_view key, std::string val)
 {
-    values_of(key).push_back(std::move(val));
+    if (auto* field = find(key); field != nullptr) field->second.push_back(std::move(val));
+    else set_values(add_field(key).second, std::move(val));
     return *this;
 }
 
@@ -118,11 +167,7 @@ headers& headers::set(const std::string& key, std::initializer_list<std::string_
 
 headers& headers::add(const std::string& key, std::string_view val) { return add(std::string_view{key}, val); }
 
-headers& headers::set(std::string_view key, std::string_view val)
-{
-    assign(key).emplace_back(val);
-    return *this;
-}
+headers& headers::set(std::string_view key, std::string_view val) { return set_one(key, val); }
 
 headers& headers::set(std::string_view key, std::initializer_list<std::string_view> vals)
 {
@@ -133,15 +178,23 @@ headers& headers::set(std::string_view key, std::initializer_list<std::string_vi
 
 headers& headers::add(std::string_view key, std::string_view val)
 {
-    values_of(key).emplace_back(val);
+    if (auto* field = find(key); field != nullptr) field->second.emplace_back(val);
+    else set_values(add_field(key).second, val);
     return *this;
 }
 
 headers& headers::remove(std::string_view key)
 {
-    if (const auto* field = find(key); field != nullptr) fields.erase(field);
+    auto* field = find(key);
+    if (field == nullptr) return *this;
+
+    // moved after the fields, keeping its memory.
+    std::rotate(field, field + 1, fields.data() + used);
+    --used;
     return *this;
 }
+
+void headers::clear() noexcept { used = 0; }
 
 headers& headers::set_content_length(std::size_t length) { return set("Content-Length"sv, std::to_string(length)); }
 
@@ -305,12 +358,12 @@ std::vector<std::string_view> headers::get_list(std::string_view key) const
     return !codings.empty() && util::equal_ignore_case(codings.back(), "chunked"sv);
 }
 
-[[nodiscard]] headers::keys_iterator headers::begin() const { return fields.begin(); }
-[[nodiscard]] headers::keys_iterator headers::end() const { return fields.end(); }
+[[nodiscard]] headers::keys_iterator headers::begin() const { return fields.data(); }
+[[nodiscard]] headers::keys_iterator headers::end() const { return fields.data() + used; }
 
-[[nodiscard]] bool headers::empty() const noexcept { return fields.empty(); }
+[[nodiscard]] bool headers::empty() const noexcept { return used == 0; }
 
-[[nodiscard]] std::size_t headers::size() const noexcept { return fields.size(); }
+[[nodiscard]] std::size_t headers::size() const noexcept { return used; }
 
 bool operator==(const headers& lhs, const headers& rhs) noexcept
 {

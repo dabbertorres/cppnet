@@ -172,7 +172,13 @@ bool parse_path_and_query(std::string_view rest, request_target& out)
 
     if (!is_valid(path, is_path_char)) return false;
 
-    out.path = path.empty() ? "/" : remove_dot_segments(path);
+    // a dot segment has a dot, perhaps encoded: without one, the path is kept as it is (without allocating for it).
+    const bool may_have_dots = path.contains('.') || path.contains("%2e"sv) || path.contains("%2E"sv);
+
+    if (path.empty()) out.path.assign("/"sv);
+    else if (!may_have_dots) out.path.assign(path);
+    else out.path = remove_dot_segments(path);
+
     return true;
 }
 
@@ -208,12 +214,25 @@ url::query_values request_target::query_values() const { return url::parse_query
 std::expected<request_target, std::error_condition> parse_request_target(request_method   method,
                                                                          std::string_view target) noexcept
 {
-    const auto invalid = std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    request_target out;
+    if (auto err = parse_request_target(method, target, out); err) return std::unexpected(err);
+    return out;
+}
+
+std::error_condition parse_request_target(request_method method, std::string_view target, request_target& out) noexcept
+{
+    const auto invalid = std::make_error_condition(std::errc::invalid_argument);
 
     try
     {
-        request_target out;
-        bool           ok = false;
+        // NOTE: emptied, rather than replaced, to keep their memory.
+        out.kind = request_target::form::origin;
+        out.path.assign("/"sv);
+        out.query.clear();
+        out.host.clear();
+        out.port.clear();
+
+        bool ok = false;
 
         if (method == request_method::CONNECT)
         {
@@ -235,12 +254,12 @@ std::expected<request_target, std::error_condition> parse_request_target(request
         }
 
         if (!ok) return invalid;
-        return out;
+        return {};
     }
     catch (...)
     {
         // only allocation can fail.
-        return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        return std::make_error_condition(std::errc::not_enough_memory);
     }
 }
 

@@ -44,6 +44,12 @@ task<request_decoder_result>
 request_decode(io::buffered_reader* reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
+// request_decode decodes a request's head into req, as the other does, reusing req's memory (e.g. for each request on
+// a connection): its strings, fields, and body (if it's the reader the body needs). If it fails, req is left part-way
+// decoded.
+task<std::error_condition>
+request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept;
+
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
 // HEAD requests have no body. The body owns reader.
 task<response_decoder_result>

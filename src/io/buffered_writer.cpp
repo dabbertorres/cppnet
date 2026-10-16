@@ -69,6 +69,15 @@ coro::task<result> buffered_writer::write_through(std::span<const std::byte> dat
 
 int buffered_writer::native_handle() const noexcept { return impl->native_handle(); }
 
+std::span<std::byte> buffered_writer::prepare(std::size_t size)
+{
+    if (size > buf.capacity() - buf.size()) return {};
+
+    const auto start = buf.size();
+    buf.resize(start + size);
+    return std::span{buf}.subspan(start);
+}
+
 coro::task<result> buffered_writer::flush()
 {
     std::size_t total = 0;

@@ -139,6 +139,23 @@ struct server_request
     // add_path_value adds the parameter name, for encoded, which it decodes if need be. encoded must be part of
     // target.path, after any added before it, and name must outlive the request (e.g. being the router's).
     void add_path_value(std::string_view name, std::string_view encoded);
+
+    // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces).
+    void clear() noexcept
+    {
+        method  = request_method::NONE;
+        version = {};
+        target.path.clear();
+        target.query.clear();
+        target.host.clear();
+        target.port.clear();
+        headers.clear();
+        host.clear();
+        route = {};
+        path_values.clear();
+        path_value_storage.clear();
+        extensions.clear();
+    }
 };
 
 using request_decoder_result = std::expected<server_request, std::error_condition>;

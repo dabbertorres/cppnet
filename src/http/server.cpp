@@ -44,8 +44,9 @@ constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
 constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
 
 // current_date is the Date header's value for a response sent now (RFC 9110, section 6.6.1: a server with a clock
-// sends one). It's formatted at most once a second, on each thread.
-std::string current_date()
+// sends one). It's formatted at most once a second, on each thread, so the view is only valid until the thread next
+// calls it (e.g. after a co_await, which may continue on another).
+std::string_view current_date()
 {
     thread_local std::chrono::sys_seconds formatted_at{};
     thread_local std::string              formatted;
@@ -226,10 +227,14 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
         flush_then_read     input{&conn, &writer};
         io::buffered_reader reader{&input, buffer_size};
 
+        // as are the request and response, so that their memory (e.g. for header values) is reused.
+        server_request  req;
+        server_response resp;
+
         // NOTE: not conn.valid(), a syscall per request: a socket's pending error fails the next read or write anyway.
         while (is_serving.load(std::memory_order::acquire))
         {
-            auto state = co_await serve_request(conn, reader, writer);
+            auto state = co_await serve_request(conn, reader, writer, req, resp);
             if (state == serve_state::close) break;
         }
 
@@ -246,8 +251,11 @@ coro::task<> server::serve_connection(tcp_socket conn) noexcept
     conn.close(false);
 }
 
-coro::task<server::serve_state>
-server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffered_writer& writer) noexcept
+coro::task<server::serve_state> server::serve_request(tcp_socket&          conn,
+                                                      io::buffered_reader& reader,
+                                                      io::buffered_writer& writer,
+                                                      server_request&      req,
+                                                      server_response&     resp) noexcept
 {
     logger->trace("decoding request");
 
@@ -257,13 +265,12 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
 
     // NOTE: HTTP/2 (parked) would be told apart here by its connection preface ("PRI * HTTP/2.0"), which HTTP/1.1
     // decoding rejects as not_supported, so it gets a 501 Not Implemented.
-    auto req_result = co_await http11::request_decode(&reader, max_header_bytes);
+    auto err = co_await http11::request_decode(&reader, max_header_bytes, req);
 
     conn.set_read_deadline(std::nullopt);
 
-    if (!req_result.has_value())
+    if (err)
     {
-        auto err = req_result.error();
         if (err == io::status_condition::closed)
         {
             logger->debug("connection closed");
@@ -277,11 +284,10 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
             logger->debug("request decoding error: {} '{}'", err.value(), err.message());
 
             // the rest of the connection can't be trusted to be where the next request starts, so close it.
-            server_response resp{
-                .version = {.major = 1, .minor = 1},
-                .headers = {},
-                .body    = &writer
-            };
+            resp.version     = {.major = 1, .minor = 1};
+            resp.status_code = status::NONE;
+            resp.body        = &writer;
+            resp.headers.clear();
             resp.headers.set("Connection"sv, "close"sv);
             resp.headers.set("Date"sv, current_date());
 
@@ -296,7 +302,6 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
 
     logger->trace("request decoded");
 
-    auto& req = req_result.value();
     logger->trace("request {} {} as HTTP/{}.{}",
                   method_string(req.method),
                   req.target.path,
@@ -309,11 +314,10 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
     // A response to HEAD has the headers a GET would, but no body: what the handler writes as one is dropped.
     io::discard_writer no_body;
 
-    server_response resp{
-        .version = supported ? req.version : protocol_version{.major = 1, .minor = 1},
-        .headers = {},
-        .body    = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &writer,
-    };
+    resp.version     = supported ? req.version : protocol_version{.major = 1, .minor = 1};
+    resp.status_code = status::NONE;
+    resp.body        = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &writer;
+    resp.headers.clear();
     resp.headers.set("Date"sv, current_date());
 
     response_writer rw{&writer, &resp, http11::response_encode};
@@ -360,7 +364,7 @@ server::serve_request(tcp_socket& conn, io::buffered_reader& reader, io::buffere
             // whatever the handler sent of the response can't be finished, so the connection is closed.
             if (rw.status_code() == status::NONE)
             {
-                resp.headers = {};
+                resp.headers.clear();
                 resp.headers.set("Connection"sv, "close"sv);
                 resp.headers.set("Date"sv, current_date());
                 co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
