@@ -11,7 +11,7 @@
 
 #include <pthread.h>
 
-#include <nlohmann/json.hpp>
+#include <glaze/glaze.hpp>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
@@ -22,6 +22,18 @@
 #include "http/static_router.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
+
+// message is the JSON test's object, which glaze serializes by reflection (as serde does Rust's structs).
+// NOTE: not in the anonymous namespace: glaze's reflection needs it to have linkage.
+namespace tfb
+{
+
+struct message // NOLINT(misc-use-internal-linkage): see above.
+{
+    std::string_view message;
+};
+
+}
 
 namespace
 {
@@ -44,11 +56,12 @@ task<void> plaintext(const http::server_request& /*req*/, http::response_writer&
 task<void> json(const http::server_request& /*req*/, http::response_writer& resp)
 {
     // NOTE: serialized for each request, as the benchmark requires.
-    const auto body =
-        nlohmann::json{
-            {"message", "Hello, World!"}
+    std::string body;
+    if (glz::write_json(tfb::message{.message = "Hello, World!"}, body))
+    {
+        co_await resp.send(http::status::INTERNAL_SERVER_ERROR, 0);
+        co_return;
     }
-            .dump();
 
     resp.headers().set("Server"sv, "cppnet"sv).set("Content-Type"sv, "application/json"sv);
     auto* out = co_await resp.send(http::status::OK, body.size());

@@ -4,14 +4,17 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <variant>
 #include <vector>
 
-#include <nlohmann/json_fwd.hpp>
-
+// These are OTLP's types, which to_json writes as OTLP/JSON (proto3's JSON mapping, e.g. "traceId" as hex), and
+// from_json reads the export services' responses from.
 namespace net::instrument::opentelemetry
 {
 
@@ -25,14 +28,14 @@ struct key_value_list
     std::vector<key_value> values;
 };
 
-void to_json(nlohmann::json& j, const key_value_list& value);
+[[nodiscard]] std::string to_json(const key_value_list& value);
 
 struct array_value
 {
     std::vector<any_value> values;
 };
 
-void to_json(nlohmann::json& j, const array_value& value);
+[[nodiscard]] std::string to_json(const array_value& value);
 
 struct any_value
 {
@@ -51,7 +54,7 @@ struct any_value
     value_t value;
 };
 
-void to_json(nlohmann::json& j, const any_value& value);
+[[nodiscard]] std::string to_json(const any_value& value);
 
 struct key_value
 {
@@ -59,7 +62,7 @@ struct key_value
     any_value   value;
 };
 
-void to_json(nlohmann::json& j, const key_value& value);
+[[nodiscard]] std::string to_json(const key_value& value);
 
 struct resource
 {
@@ -67,7 +70,7 @@ struct resource
     std::uint32_t          dropped_attributes_count{};
 };
 
-void to_json(nlohmann::json& j, const resource& value);
+[[nodiscard]] std::string to_json(const resource& value);
 
 using trace_id_t = std::array<std::byte, 16>;
 using span_id_t  = std::array<std::byte, 8>;
@@ -122,7 +125,7 @@ struct event
     std::uint32_t          dropped_attributes_count{};
 };
 
-void to_json(nlohmann::json& j, const event& value);
+[[nodiscard]] std::string to_json(const event& value);
 
 struct link
 {
@@ -134,7 +137,7 @@ struct link
     span_flags             flags{};
 };
 
-void to_json(nlohmann::json& j, const link& value);
+[[nodiscard]] std::string to_json(const link& value);
 
 enum class status_code : std::uint8_t
 {
@@ -149,7 +152,7 @@ struct status
     status_code code{};
 };
 
-void to_json(nlohmann::json& j, const status& value);
+[[nodiscard]] std::string to_json(const status& value);
 
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding): its fields are in the order of OTLP's Span message.
 struct span
@@ -173,7 +176,7 @@ struct span
     struct status            status;
 };
 
-void to_json(nlohmann::json& j, const span& value);
+[[nodiscard]] std::string to_json(const span& value);
 
 struct instrumentation_scope
 {
@@ -183,7 +186,7 @@ struct instrumentation_scope
     std::uint32_t          dropped_attributes_count{};
 };
 
-void to_json(nlohmann::json& j, const instrumentation_scope& value);
+[[nodiscard]] std::string to_json(const instrumentation_scope& value);
 
 struct scope_spans
 {
@@ -192,7 +195,7 @@ struct scope_spans
     std::string           schema_url;
 };
 
-void to_json(nlohmann::json& j, const scope_spans& value);
+[[nodiscard]] std::string to_json(const scope_spans& value);
 
 struct resource_spans
 {
@@ -201,7 +204,7 @@ struct resource_spans
     std::string                     schema_url;
 };
 
-void to_json(nlohmann::json& j, const resource_spans& value);
+[[nodiscard]] std::string to_json(const resource_spans& value);
 
 enum class data_point_flags : std::uint8_t
 {
@@ -238,7 +241,7 @@ struct exemplar
     trace_id_t                         trace_id{};
 };
 
-void to_json(nlohmann::json& j, const exemplar& value);
+[[nodiscard]] std::string to_json(const exemplar& value);
 
 struct number_data_point
 {
@@ -250,14 +253,14 @@ struct number_data_point
     data_point_flags                   flags{};
 };
 
-void to_json(nlohmann::json& j, const number_data_point& value);
+[[nodiscard]] std::string to_json(const number_data_point& value);
 
 struct gauge
 {
     std::vector<number_data_point> data_points;
 };
 
-void to_json(nlohmann::json& j, const gauge& value);
+[[nodiscard]] std::string to_json(const gauge& value);
 
 enum class aggregation_temporality : std::uint8_t
 {
@@ -275,7 +278,7 @@ struct sum
     bool is_monotonic{};
 };
 
-void to_json(nlohmann::json& j, const sum& value);
+[[nodiscard]] std::string to_json(const sum& value);
 
 struct histogram
 {
@@ -300,8 +303,8 @@ struct histogram
     };
 };
 
-void to_json(nlohmann::json& j, const histogram::data_point& value);
-void to_json(nlohmann::json& j, const histogram& value);
+[[nodiscard]] std::string to_json(const histogram::data_point& value);
+[[nodiscard]] std::string to_json(const histogram& value);
 
 struct exponential_histogram
 {
@@ -335,9 +338,9 @@ struct exponential_histogram
     };
 };
 
-void to_json(nlohmann::json& j, const exponential_histogram::data_point::buckets& value);
-void to_json(nlohmann::json& j, const exponential_histogram::data_point& value);
-void to_json(nlohmann::json& j, const exponential_histogram& value);
+[[nodiscard]] std::string to_json(const exponential_histogram::data_point::buckets& value);
+[[nodiscard]] std::string to_json(const exponential_histogram::data_point& value);
+[[nodiscard]] std::string to_json(const exponential_histogram& value);
 
 struct summary
 {
@@ -361,9 +364,9 @@ struct summary
     std::vector<data_point> data_points;
 };
 
-void to_json(nlohmann::json& j, const summary::data_point::value_at_quantile& value);
-void to_json(nlohmann::json& j, const summary::data_point& value);
-void to_json(nlohmann::json& j, const summary& value);
+[[nodiscard]] std::string to_json(const summary::data_point::value_at_quantile& value);
+[[nodiscard]] std::string to_json(const summary::data_point& value);
+[[nodiscard]] std::string to_json(const summary& value);
 
 struct metric
 {
@@ -384,7 +387,7 @@ struct metric
     std::vector<key_value> metadata;
 };
 
-void to_json(nlohmann::json& j, const metric& value);
+[[nodiscard]] std::string to_json(const metric& value);
 
 struct scope_metrics
 {
@@ -393,7 +396,7 @@ struct scope_metrics
     std::string           schema_url;
 };
 
-void to_json(nlohmann::json& j, const scope_metrics& value);
+[[nodiscard]] std::string to_json(const scope_metrics& value);
 
 struct resource_metrics
 {
@@ -402,14 +405,14 @@ struct resource_metrics
     std::string                       schema_url;
 };
 
-void to_json(nlohmann::json& j, const resource_metrics& value);
+[[nodiscard]] std::string to_json(const resource_metrics& value);
 
 struct export_trace_service_request
 {
     std::vector<struct resource_spans> resource_spans;
 };
 
-void to_json(nlohmann::json& j, const export_trace_service_request& value);
+[[nodiscard]] std::string to_json(const export_trace_service_request& value);
 
 struct export_trace_partial_success
 {
@@ -417,21 +420,19 @@ struct export_trace_partial_success
     std::string  error_message;
 };
 
-void from_json(const nlohmann::json& j, export_trace_partial_success& value);
 
 struct export_trace_service_response
 {
     std::optional<export_trace_partial_success> partial_success;
 };
 
-void from_json(const nlohmann::json& j, export_trace_service_response& value);
 
 struct export_metrics_service_request
 {
     std::vector<struct resource_metrics> resource_metrics;
 };
 
-void to_json(nlohmann::json& j, const export_metrics_service_request& value);
+[[nodiscard]] std::string to_json(const export_metrics_service_request& value);
 
 struct export_metrics_partial_success
 {
@@ -439,13 +440,22 @@ struct export_metrics_partial_success
     std::string  error_message;
 };
 
-void from_json(const nlohmann::json& j, export_metrics_partial_success& value);
 
 struct export_metrics_service_response
 {
     std::optional<export_metrics_partial_success> partial_success;
 };
 
-void from_json(const nlohmann::json& j, export_metrics_service_response& value);
+// from_json reads an export service's response (export_trace_service_response or export_metrics_service_response),
+// failing with std::errc::invalid_argument if it isn't one.
+template<typename T>
+[[nodiscard]] std::expected<T, std::error_condition> from_json(std::string_view json);
 
+template<>
+std::expected<export_trace_service_response, std::error_condition>
+from_json<export_trace_service_response>(std::string_view json);
+
+template<>
+std::expected<export_metrics_service_response, std::error_condition>
+from_json<export_metrics_service_response>(std::string_view json);
 }
