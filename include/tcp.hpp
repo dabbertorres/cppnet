@@ -46,6 +46,10 @@ public:
     {
         return connect(scheduler, std::move(host), std::move(port), connect_options{});
     }
+
+    // set_nodelay turns Nagle's algorithm off (TCP_NODELAY), so a small write is sent right away, rather than when what
+    // was sent before is acknowledged.
+    [[nodiscard]] std::expected<void, std::error_condition> set_nodelay(bool nodelay = true) const noexcept;
 };
 
 }

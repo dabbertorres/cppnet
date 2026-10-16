@@ -10,6 +10,9 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
 #include "coro/task.hpp"
 #include "exception.hpp"
 #include "io/poll.hpp"
@@ -67,6 +70,14 @@ tcp_socket::tcp_socket(io::scheduler* scheduler) noexcept
 tcp_socket::tcp_socket(io::scheduler* scheduler, int fd)
     : socket{scheduler, fd}
 {}
+
+std::expected<void, std::error_condition> tcp_socket::set_nodelay(bool nodelay) const noexcept
+{
+    const int value = nodelay ? 1 : 0;
+    if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) == -1)
+        return std::unexpected(std::error_condition{errno, std::generic_category()});
+    return {};
+}
 
 coro::task<std::expected<tcp_socket, std::error_condition>>
 tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options)

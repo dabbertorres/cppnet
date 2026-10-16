@@ -16,43 +16,35 @@ namespace net::io
 
 buffered_reader::buffered_reader(reader* impl, std::size_t bufsize)
     : impl{impl}
-    , buf{bufsize}
-{
-    buf.resize(0);
-}
+    , buf(bufsize)
+{}
 
 coro::task<result> buffered_reader::read(std::span<std::byte> data)
 {
     if (data.empty()) co_return result{.count = 0};
 
     // easy way out
-    if (data.size() <= buf.size())
+    if (data.size() <= size())
     {
-        std::copy_n(buf.begin(), data.size(), data.begin());
+        std::ranges::copy(buffered().first(data.size()), data.begin());
         consume(data.size());
 
         co_return result{.count = data.size()};
     }
 
-    // Note that we always (try to) read from the inner reader in buf.capacity() increments.
+    // Note that we always (try to) read from the inner reader in capacity() increments.
 
-    std::size_t total = 0;
-
-    if (!buf.empty())
-    {
-        // copy over what we can...
-
-        std::copy_n(buf.begin(), buf.size(), data.begin());
-        total += buf.size();
-        buf.resize(0);
-    }
+    // copy over what we can...
+    std::size_t total = size();
+    std::ranges::copy(buffered(), data.begin());
+    consume(total);
 
     // At this point, the buffer is empty. As long as length - total is larger
     // than the buffer capacity, we can skip a copy and read straight to data.
 
-    while (data.size() - total > buf.capacity())
+    while (data.size() - total > capacity())
     {
-        auto res = co_await impl->read(data.subspan(total, buf.capacity()));
+        auto res = co_await impl->read(data.subspan(total, capacity()));
         total += res.count;
 
         if (res.err) co_return result{.count = total, .err = res.err};
@@ -67,8 +59,8 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
 
         // regardless of error, give the user what we can
 
-        auto available = std::min(leftover, buf.size());
-        std::copy_n(buf.begin(), available, data.subspan(total).begin());
+        auto available = std::min(leftover, size());
+        std::ranges::copy(buffered().first(available), data.subspan(total).begin());
 
         total += available;
         consume(available);
@@ -82,20 +74,22 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
 
 coro::task<buffered_reader::read_until_result> buffered_reader::read_until(std::span<const std::byte> delim) noexcept
 {
+    const auto data = std::span{buf}.subspan(start, size());
+
     // do we already have an instance of delim in the buffer?
     auto searcher    = std::boyer_moore_searcher{delim.begin(), delim.end()};
-    auto delim_begin = std::search(buf.begin(), buf.end(), searcher);
-    if (delim_begin != buf.end())
+    auto delim_begin = std::search(data.begin(), data.end(), searcher);
+    if (delim_begin != data.end())
     {
         co_return {
-            .data      = {buf.begin(), delim_begin},
+            .data      = {data.begin(), delim_begin},
             .is_prefix = false,
             .err       = err,
         };
     }
 
     co_return {
-        .data      = {buf.begin(), buf.end()},
+        .data      = data,
         .is_prefix = true,
         .err       = {},
     };
@@ -105,39 +99,47 @@ coro::task<buffered_reader::read_until_result> buffered_reader::read_until(std::
 {
     using result_t = std::tuple<std::byte, bool>;
 
-    if (!buf.empty()) co_return result_t{buf.front(), true};
-    co_await fill();
+    if (size() == 0) co_await fill();
 
-    if (buf.empty()) co_return result_t{static_cast<std::byte>(0), false};
-    co_return result_t{buf.front(), true};
+    if (size() == 0) co_return result_t{static_cast<std::byte>(0), false};
+    co_return result_t{buf[start], true};
 }
 
 void buffered_reader::reset(reader* other)
 {
     if (other != nullptr) impl = other;
-    buf.resize(0);
+    reset();
     err.clear();
 }
 
-void buffered_reader::reset() { buf.resize(0); }
+void buffered_reader::reset()
+{
+    start = 0;
+    end   = 0;
+}
 
 void buffered_reader::consume(std::size_t count) noexcept
 {
-    // NOTE: erase shifts what's left to the front, keeping the capacity.
-    buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(std::min(count, buf.size())));
+    start += std::min(count, size());
+    if (start == end) reset();
 }
 
 std::error_condition buffered_reader::error() const { return err; }
 
 coro::task<void> buffered_reader::fill()
 {
-    if (buf.size() == buf.capacity()) co_return;
+    if (size() == capacity()) co_return;
 
-    auto start     = buf.size();
-    auto read_more = buf.capacity() - start;
-    buf.resize(buf.capacity());
-    auto res = co_await impl->read(std::span{buf.data() + start, read_more});
-    buf.resize(start + res.count);
+    // make as much room as there can be.
+    if (start != 0)
+    {
+        std::ranges::copy(buffered(), buf.begin());
+        end -= start;
+        start = 0;
+    }
+
+    auto res = co_await impl->read(std::span{buf}.subspan(end));
+    end += res.count;
 
     // a reader that makes no progress without reporting why would otherwise leave callers waiting forever.
     err = res.count == 0 && !res.err ? make_error_condition(status_condition::error) : res.err;
