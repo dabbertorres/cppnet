@@ -28,17 +28,6 @@
 namespace
 {
 
-std::uint32_t to_epoll_events(net::io::poll_op op) noexcept
-{
-    // EPOLLONESHOT disables the handle once it has been reported, until it is armed again. It's also set when no
-    // operations are wanted, as otherwise EPOLLHUP and EPOLLERR (which can't be masked) would be reported over and
-    // over.
-    std::uint32_t events = EPOLLONESHOT;
-    if (net::io::is_readable(op)) events |= EPOLLIN | EPOLLRDHUP;
-    if (net::io::is_writable(op)) events |= EPOLLOUT;
-    return events;
-}
-
 net::io::poll_op from_epoll_events(std::uint32_t events) noexcept
 {
     using net::io::poll_op;
@@ -88,7 +77,8 @@ epoll_loop::~epoll_loop() noexcept
 // NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
 void epoll_loop::add(handle fd)
 {
-    epoll_event ev{.events = to_epoll_events(poll_op::none), .data = {.fd = fd}};
+    // EPOLLET reports the handle when it becomes ready (edge-triggered), rather than for as long as it is.
+    epoll_event ev{.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT | EPOLLET, .data = {.fd = fd}};
     if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1 && errno != EEXIST)
         throw system_error_from_errno(errno, "failed to add handle to epoll");
 }
@@ -97,13 +87,6 @@ void epoll_loop::remove(handle fd) noexcept
 {
     // NOTE: fails if the handle is already closed, which removes it anyway.
     ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-}
-
-// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
-void epoll_loop::arm(handle fd, poll_op op)
-{
-    epoll_event ev{.events = to_epoll_events(op), .data = {.fd = fd}};
-    if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) throw system_error_from_errno(errno, "failed to arm handle");
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.

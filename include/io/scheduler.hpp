@@ -1,11 +1,14 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,18 +67,46 @@ class scheduler
         std::optional<clock::time_point>      deadline;
         std::coroutine_handle<>               awaiting{nullptr};
         std::error_condition                  result{};
-        std::optional<timer_list::iterator>   timer{};
+        std::optional<timer_list::iterator>   timer{}; // guarded by its shard's lock, or (if not a handle's) timers_mu
         const std::atomic<std::uint64_t>*     word     = nullptr;
         std::uint64_t                         expected = 0;
         std::optional<watched_list::iterator> watch{};
     };
 
-    // registration holds the waiters for a handle: at most one per operation.
+    // direction is a handle's state for one operation: the waiter, if any, and whether the handle became ready (since
+    // the last wait) when nothing was waiting.
+    struct direction
+    {
+        waiter* waiting = nullptr;
+        bool    ready   = false;
+    };
+
     struct registration
     {
-        waiter* read  = nullptr;
-        waiter* write = nullptr;
+        direction read;
+        direction write;
     };
+
+    // shard holds some of the handles' registrations (by fd), and their waiters' timers, so that waits on different
+    // handles rarely share a lock.
+    struct alignas(64) shard
+    {
+        std::mutex                               mu;
+        std::unordered_map<handle, registration> registrations;
+        timer_list                               timers;
+
+        // earliest is the earliest of the timers' deadlines (as clock::rep), for run() to read without the lock.
+        std::atomic<clock::rep> earliest = std::numeric_limits<clock::rep>::max();
+
+        // Must be called holding mu, once timers changes.
+        void update_earliest() noexcept
+        {
+            earliest.store(timers.empty() ? std::numeric_limits<clock::rep>::max()
+                                          : timers.begin()->first.time_since_epoch().count());
+        }
+    };
+
+    static constexpr std::size_t shard_count = 64;
 
 public:
     // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
@@ -285,13 +316,26 @@ private:
     using completions = std::vector<std::coroutine_handle<>>;
 
     bool suspend(waiter& state, std::coroutine_handle<> awaiting) noexcept;
+    bool suspend_handle(waiter& state, std::coroutine_handle<> awaiting) noexcept;
+    bool suspend_other(waiter& state, std::coroutine_handle<> awaiting) noexcept;
 
-    // Must be called while holding mu.
-    void complete(waiter* state, std::error_condition result, completions& done) noexcept;
-    void rearm(handle fd, const registration& reg, completions& done) noexcept;
+    shard& shard_for(handle fd) noexcept { return shards[static_cast<std::size_t>(fd) % shard_count]; }
+
+    // complete_handle_wait completes a handle's waiter, which slot (in sh) holds. Must be called holding sh's lock.
+    void complete_handle_wait(shard& sh, direction& slot, std::error_condition result, completions& done) noexcept;
+
+    // complete_other completes a waiter that isn't for a handle. Must be called holding timers_mu.
+    void complete_other(waiter* state, std::error_condition result, completions& done) noexcept;
+
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
     void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;
     void expire_timers(completions& done) noexcept;
+
+    // next_deadline is the earliest deadline of any wait (as clock::rep): the most run() may wait for.
+    [[nodiscard]] clock::rep next_deadline() const noexcept;
+
+    // note_deadline interrupts run() if it's waiting for a later deadline than this new one.
+    void note_deadline(clock::time_point deadline) noexcept;
 
     void resume(const completions& done) noexcept;
 
@@ -300,11 +344,20 @@ private:
     std::shared_ptr<spdlog::logger>    logger;
     detail::event_loop                 loop;
 
-    mutable std::mutex                       mu;
-    std::unordered_map<handle, registration> registrations;
-    timer_list                               timers;
-    watched_list                             watched;
-    bool                                     stopping = false;
+    // Lock order: a shard's mu, then timers_mu.
+    std::array<shard, shard_count> shards;
+
+    // timers_mu guards the timers of waits that aren't for handles (sleeps, and waits for notifications), and the
+    // waits for notifications (watched).
+    mutable std::mutex timers_mu;
+    timer_list         timers;
+    watched_list       watched;
+
+    // sleeping_until is the deadline run() is waiting for (as clock::rep), so that a wait with an earlier one
+    // interrupts it (see run()).
+    std::atomic<clock::rep> sleeping_until = std::numeric_limits<clock::rep>::max();
+
+    std::atomic<bool> stopping = false;
 
     std::atomic<bool> running = false;
 

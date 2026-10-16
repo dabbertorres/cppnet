@@ -22,7 +22,8 @@ struct ready_event;
 namespace net::io::detail
 {
 
-// epoll_loop implements EventLoop with epoll: one level-triggered, one-shot registration per handle.
+// epoll_loop implements EventLoop with epoll: one edge-triggered (EPOLLET) registration per handle, for reads and
+// writes.
 class epoll_loop
 {
 public:
@@ -38,7 +39,6 @@ public:
 
     void add(handle fd);
     void remove(handle fd) noexcept;
-    void arm(handle fd, poll_op op);
 
     std::size_t wait(std::span<ready_event> events, std::optional<std::chrono::nanoseconds> timeout);
 

@@ -62,11 +62,11 @@ namespace net::io
 
 // EventLoop is the OS-specific part of the scheduler: it reports when handles are ready, and nothing else.
 //
-// - add/remove start and stop tracking a handle.
-// - arm requests a single notification for the given operations (replacing any earlier request for the handle). Once
-//   a handle has been reported ready, it must be armed again for further notifications. poll_op::none disarms it.
-// - wait blocks until at least one handle is ready, the timeout passes, or interrupt() is called (from any thread),
-//   and returns how many events were written. It may return spurious events (and 0 events).
+// - add/remove start and stop tracking a handle, for reads and writes.
+// - wait blocks until at least one handle has become ready, the timeout passes, or interrupt() is called (from any
+//   thread), and returns how many events were written. Handles are edge-triggered: one is reported when it becomes
+//   ready (e.g. data arrives), not again for as long as it stays ready, so a caller must try its read or write (until
+//   it would block) before waiting. It may return spurious events (and 0 events).
 //
 // All but wait() may be called concurrently with wait().
 // clang-format off
@@ -77,11 +77,10 @@ concept EventLoop = std::is_default_constructible_v<T>
     && !std::is_move_constructible_v<T>
     && !std::is_move_assignable_v<T>
     && std::is_destructible_v<T>
-    && requires(T& t, handle fd, poll_op op, std::span<ready_event> events, std::optional<std::chrono::nanoseconds> timeout)
+    && requires(T& t, handle fd, std::span<ready_event> events, std::optional<std::chrono::nanoseconds> timeout)
     {
         { t.add(fd) } -> std::same_as<void>;
         { t.remove(fd) } noexcept -> std::same_as<void>;
-        { t.arm(fd, op) } -> std::same_as<void>;
         { t.wait(events, timeout) } -> std::same_as<std::size_t>;
         { t.interrupt() } noexcept -> std::same_as<void>;
     };
