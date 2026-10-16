@@ -65,34 +65,33 @@ kqueue_loop::kqueue_loop()
 
 kqueue_loop::~kqueue_loop() noexcept { ::close(descriptor); }
 
-void kqueue_loop::add(handle /*fd*/)
+// NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
+void kqueue_loop::add(handle fd)
 {
-    // nothing to do: filters are added as they are armed.
+    // EV_CLEAR reports each filter when it becomes ready (edge-triggered), rather than for as long as it is.
+    change(fd, EV_ADD | EV_CLEAR);
 }
 
 void kqueue_loop::remove(handle fd) noexcept
 {
     try
     {
-        arm(fd, poll_op::none);
+        change(fd, EV_DELETE);
     }
     catch (...) // NOLINT(bugprone-empty-catch): closing the handle removes its filters anyway.
     {}
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): modifies the kernel object.
-void kqueue_loop::arm(handle fd, poll_op op)
+void kqueue_loop::change(handle fd, std::uint16_t flags)
 {
     const auto ident = static_cast<std::uintptr_t>(fd);
 
     // EV_RECEIPT reports the result of each change, rather than failing the whole call, so that deleting a filter
-    // that isn't there (which also happens once a one-shot filter has fired) can be ignored.
-    const auto flags_for = [](bool wanted) -> std::uint16_t
-    { return EV_RECEIPT | (wanted ? (EV_ADD | EV_ONESHOT) : EV_DELETE); };
-
+    // that isn't there can be ignored.
     std::array changes{
-        make_kevent(ident, EVFILT_READ, flags_for(is_readable(op))),
-        make_kevent(ident, EVFILT_WRITE, flags_for(is_writable(op))),
+        make_kevent(ident, EVFILT_READ, EV_RECEIPT | flags),
+        make_kevent(ident, EVFILT_WRITE, EV_RECEIPT | flags),
     };
     std::array<struct kevent, changes.size()> receipts{};
 

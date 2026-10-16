@@ -6,6 +6,7 @@
 
 #    include <chrono>
 #    include <cstddef>
+#    include <cstdint>
 #    include <optional>
 #    include <span>
 
@@ -22,7 +23,7 @@ struct ready_event;
 namespace net::io::detail
 {
 
-// kqueue_loop implements EventLoop with kqueue: one-shot, level-triggered read and write filters per handle.
+// kqueue_loop implements EventLoop with kqueue: edge-triggered (EV_CLEAR) read and write filters per handle.
 class kqueue_loop
 {
 public:
@@ -38,13 +39,15 @@ public:
 
     void add(handle fd);
     void remove(handle fd) noexcept;
-    void arm(handle fd, poll_op op);
 
     std::size_t wait(std::span<ready_event> events, std::optional<std::chrono::nanoseconds> timeout);
 
     void interrupt() noexcept;
 
 private:
+    // change applies flags (e.g. EV_ADD) to both of the handle's filters.
+    void change(handle fd, std::uint16_t flags);
+
     int descriptor;
 };
 

@@ -6,6 +6,7 @@
 #include <compare>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,14 +31,6 @@ net::coro::task<> start_on(net::coro::thread_pool* workers, net::coro::task<> ta
 {
     co_await workers->schedule();
     co_await task;
-}
-
-net::io::poll_op interest(const auto& reg) noexcept
-{
-    auto op = net::io::poll_op::none;
-    if (reg.read != nullptr) op = op | net::io::poll_op::read;
-    if (reg.write != nullptr) op = op | net::io::poll_op::write;
-    return op;
 }
 
 }
@@ -71,12 +64,14 @@ scheduler::~scheduler() noexcept { shutdown(); }
 
 void scheduler::register_handle(handle fd)
 {
-    std::scoped_lock lock{mu};
+    auto&            sh = shard_for(fd);
+    std::scoped_lock lock{sh.mu};
 
-    if (registrations.contains(fd)) return;
+    if (sh.registrations.contains(fd)) return;
 
+    // NOTE: under the shard's lock, so that an event for the handle (which may come straight away) finds it.
     loop.add(fd);
-    registrations.emplace(fd, registration{});
+    sh.registrations.emplace(fd, registration{});
 }
 
 void scheduler::deregister_handle(handle fd) noexcept
@@ -84,16 +79,17 @@ void scheduler::deregister_handle(handle fd) noexcept
     completions done;
 
     {
-        std::scoped_lock lock{mu};
+        auto&            sh = shard_for(fd);
+        std::scoped_lock lock{sh.mu};
 
-        auto it = registrations.find(fd);
-        if (it == registrations.end()) return;
+        auto it = sh.registrations.find(fd);
+        if (it == sh.registrations.end()) return;
 
         auto canceled = std::make_error_condition(std::errc::operation_canceled);
-        if (it->second.read != nullptr) complete(it->second.read, canceled, done);
-        if (it->second.write != nullptr) complete(it->second.write, canceled, done);
+        if (it->second.read.waiting != nullptr) complete_handle_wait(sh, it->second.read, canceled, done);
+        if (it->second.write.waiting != nullptr) complete_handle_wait(sh, it->second.write, canceled, done);
 
-        registrations.erase(it);
+        sh.registrations.erase(it);
         loop.remove(fd);
     }
 
@@ -104,80 +100,55 @@ bool scheduler::spawn(coro::task<> task) { return scope.spawn(start_on(workers.g
 
 bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcept
 {
-    std::unique_lock lock{mu};
+    if (state.op == poll_op::none) return suspend_other(state, awaiting);
+    if (state.op != poll_op::read && state.op != poll_op::write)
+    {
+        state.result = std::make_error_condition(std::errc::invalid_argument);
+        return false;
+    }
 
+    return suspend_handle(state, awaiting);
+}
+
+bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) noexcept
+{
     const auto fail = [&](std::errc err)
     {
         state.result = std::make_error_condition(err);
         return false; // don't suspend
     };
 
-    if (stopping) return fail(std::errc::operation_canceled);
+    auto&            sh = shard_for(state.fd);
+    std::unique_lock lock{sh.mu};
 
-    // a wait for a notification, or a sleep.
-    if (state.op == poll_op::none)
-    {
-        if (state.word != nullptr && state.word->load(std::memory_order::acquire) != state.expected)
-        {
-            // the notification already came.
-            state.result = {};
-            return false;
-        }
+    // NOTE: read under the shard's lock: request_stop() sets it before going through the shards, so either this sees
+    //       it, or request_stop() sees this wait.
+    if (stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
 
-        if (state.word == nullptr && !state.deadline) return fail(std::errc::invalid_argument);
-
-        if (state.deadline && *state.deadline <= clock::now())
-        {
-            // a sleep that's over isn't an error.
-            if (state.word == nullptr) return false;
-            return fail(std::errc::timed_out);
-        }
-
-        if (state.word != nullptr) state.watch = watched.emplace(state.word, &state);
-        state.awaiting = awaiting;
-
-        bool earliest = false;
-        if (state.deadline)
-        {
-            state.timer = timers.emplace(*state.deadline, &state);
-            earliest    = *state.timer == timers.begin();
-        }
-
-        lock.unlock();
-
-        if (earliest) loop.interrupt();
-        return true;
-    }
-
-    if (state.op != poll_op::read && state.op != poll_op::write) return fail(std::errc::invalid_argument);
-
-    auto it = registrations.find(state.fd);
-    if (it == registrations.end()) return fail(std::errc::bad_file_descriptor);
+    auto it = sh.registrations.find(state.fd);
+    if (it == sh.registrations.end()) return fail(std::errc::bad_file_descriptor);
 
     if (state.deadline && *state.deadline <= clock::now()) return fail(std::errc::timed_out);
 
-    auto& reg  = it->second;
-    auto& slot = state.op == poll_op::read ? reg.read : reg.write;
-    if (slot != nullptr) return fail(std::errc::device_or_resource_busy);
+    auto& slot = state.op == poll_op::read ? it->second.read : it->second.write;
+    if (slot.waiting != nullptr) return fail(std::errc::device_or_resource_busy);
 
-    try
+    // The handle became ready since the caller last found it wasn't (e.g. a read got EAGAIN), so it can try again
+    // straight away: as handles are only reported when they become ready, waiting would miss it.
+    if (std::exchange(slot.ready, false))
     {
-        loop.arm(state.fd, interest(reg) | state.op);
-    }
-    catch (const std::system_error& err)
-    {
-        state.result = err.code().default_error_condition();
+        state.result = {};
         return false;
     }
 
-    slot           = &state;
+    slot.waiting   = &state;
     state.awaiting = awaiting;
 
-    bool earliest = false;
-    if (state.deadline)
+    const auto deadline = state.deadline;
+    if (deadline)
     {
-        state.timer = timers.emplace(*state.deadline, &state);
-        earliest    = *state.timer == timers.begin();
+        state.timer = sh.timers.emplace(*deadline, &state);
+        sh.update_earliest();
     }
 
     // Once unlocked, the wait may complete and the coroutine resume (on another thread) at any moment: state must not
@@ -185,23 +156,71 @@ bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcep
     lock.unlock();
 
     // run() may be waiting for a later deadline (or none at all).
-    if (earliest) loop.interrupt();
+    if (deadline) note_deadline(*deadline);
 
     return true;
 }
 
-void scheduler::complete(waiter* state, std::error_condition result, completions& done) noexcept
+bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) noexcept
 {
-    if (state->op != poll_op::none)
+    const auto fail = [&](std::errc err)
     {
-        auto it = registrations.find(state->fd);
-        if (it != registrations.end())
-        {
-            auto& slot = state->op == poll_op::read ? it->second.read : it->second.write;
-            if (slot == state) slot = nullptr;
-        }
+        state.result = std::make_error_condition(err);
+        return false; // don't suspend
+    };
+
+    std::unique_lock lock{timers_mu};
+
+    if (stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
+
+    if (state.word != nullptr && state.word->load(std::memory_order::acquire) != state.expected)
+    {
+        // the notification already came.
+        state.result = {};
+        return false;
     }
 
+    if (state.word == nullptr && !state.deadline) return fail(std::errc::invalid_argument);
+
+    if (state.deadline && *state.deadline <= clock::now())
+    {
+        // a sleep that's over isn't an error.
+        if (state.word == nullptr) return false;
+        return fail(std::errc::timed_out);
+    }
+
+    if (state.word != nullptr) state.watch = watched.emplace(state.word, &state);
+    state.awaiting = awaiting;
+
+    const auto deadline = state.deadline;
+    if (deadline) state.timer = timers.emplace(*deadline, &state);
+
+    lock.unlock();
+
+    if (deadline) note_deadline(*deadline);
+    return true;
+}
+
+void scheduler::complete_handle_wait(shard&               sh,
+                                     direction&           slot,
+                                     std::error_condition result,
+                                     completions&         done) noexcept
+{
+    auto* state   = std::exchange(slot.waiting, nullptr);
+    state->result = result;
+
+    if (state->timer)
+    {
+        sh.timers.erase(*state->timer);
+        state->timer.reset();
+        sh.update_earliest();
+    }
+
+    done.push_back(state->awaiting);
+}
+
+void scheduler::complete_other(waiter* state, std::error_condition result, completions& done) noexcept
+{
     if (state->watch)
     {
         watched.erase(*state->watch);
@@ -216,21 +235,6 @@ void scheduler::complete(waiter* state, std::error_condition result, completions
 
     state->result = result;
     done.push_back(state->awaiting);
-}
-
-void scheduler::rearm(handle fd, const registration& reg, completions& done) noexcept
-{
-    try
-    {
-        loop.arm(fd, interest(reg));
-    }
-    catch (const std::system_error& err)
-    {
-        // nothing would wake the remaining waiters, so fail them instead.
-        auto result = err.code().default_error_condition();
-        if (reg.read != nullptr) complete(reg.read, result, done);
-        if (reg.write != nullptr) complete(reg.write, result, done);
-    }
 }
 
 void scheduler::resume(const completions& done) noexcept
@@ -255,32 +259,29 @@ void scheduler::run()
     std::size_t                 num_ready = 0;
     completions                 done;
 
-    // NOTE: the lock is taken once a turn, as the workers take it for each wait: e.g. for each request on a connection
-    // that isn't pipelining them.
     while (true)
     {
-        std::optional<clock::time_point> next_deadline;
-        bool                             finished = false;
+        dispatch(std::span{events}.first(num_ready), done);
+        expire_timers(done);
 
-        {
-            std::scoped_lock lock{mu};
-            dispatch(std::span{events}.first(num_ready), done);
-            expire_timers(done);
+        // NOTE: the scope interrupts the loop once it has drained after being closed.
+        const bool finished = stopping.load(std::memory_order::acquire) && scope.empty();
 
-            // NOTE: the scope interrupts the loop once it has drained after being closed.
-            finished = stopping && scope.empty();
-
-            if (!timers.empty()) next_deadline = timers.begin()->first;
-        }
+        // A wait with an earlier deadline, from after next_deadline() looked, interrupts the loop: either it's in time
+        // for the second look, or it sees what sleeping_until was set to in between (as both use sequential
+        // consistency), and is earlier (see note_deadline()).
+        auto next = next_deadline();
+        sleeping_until.store(next);
+        next = std::min(next, next_deadline());
 
         resume(done);
         done.clear();
 
         if (finished) return;
 
-        // NOTE: a wait with an earlier deadline, from since the lock was released, interrupts the loop.
         std::optional<clock::duration> timeout;
-        if (next_deadline) timeout = std::max(*next_deadline - clock::now(), clock::duration::zero());
+        if (next != std::numeric_limits<clock::rep>::max())
+            timeout = std::max(clock::time_point{clock::duration{next}} - clock::now(), clock::duration::zero());
 
         num_ready = loop.wait(events, timeout);
     }
@@ -290,72 +291,101 @@ void scheduler::dispatch(std::span<const ready_event> events, completions& done)
 {
     for (const auto& event : events)
     {
-        auto it = registrations.find(event.fd);
-        if (it == registrations.end()) continue;
+        auto&            sh = shard_for(event.fd);
+        std::scoped_lock lock{sh.mu};
 
-        const auto& reg   = it->second;
-        bool        fired = false;
+        auto it = sh.registrations.find(event.fd);
+        if (it == sh.registrations.end()) continue;
 
-        if (is_readable(event.ready) && reg.read != nullptr)
+        // a waiter continues; otherwise, the next wait doesn't need to (see suspend_handle). Spurious events (e.g. for
+        // a handle closed since, whose number was reused) only make a caller try its read or write once more.
+        const auto ready = [&](direction& slot)
         {
-            complete(reg.read, {}, done);
-            fired = true;
-        }
+            if (slot.waiting != nullptr) complete_handle_wait(sh, slot, {}, done);
+            else slot.ready = true;
+        };
 
-        if (is_writable(event.ready) && reg.write != nullptr)
-        {
-            complete(reg.write, {}, done);
-            fired = true;
-        }
-
-        // The handle is disarmed once reported, so if another operation is still waiting, arm it again.
-        // (Spurious events, with nothing waiting, are ignored: whatever is waiting has armed it since.)
-        if (fired && interest(reg) != poll_op::none) rearm(event.fd, reg, done);
+        if (is_readable(event.ready)) ready(it->second.read);
+        if (is_writable(event.ready)) ready(it->second.write);
     }
 }
 
 void scheduler::expire_timers(completions& done) noexcept
 {
-    auto now       = clock::now();
-    auto timed_out = std::make_error_condition(std::errc::timed_out);
+    const auto now       = clock::now();
+    const auto timed_out = std::make_error_condition(std::errc::timed_out);
 
+    for (auto& sh : shards)
+    {
+        if (sh.earliest.load() > now.time_since_epoch().count()) continue;
+
+        std::scoped_lock lock{sh.mu};
+        while (!sh.timers.empty() && sh.timers.begin()->first <= now)
+        {
+            const auto* state = sh.timers.begin()->second;
+
+            // NOTE: a waiter with a timer is always in its handle's slot, as both change under this lock.
+            auto it = sh.registrations.find(state->fd);
+            if (it == sh.registrations.end())
+            {
+                sh.timers.erase(sh.timers.begin());
+                sh.update_earliest();
+                continue;
+            }
+
+            complete_handle_wait(sh, state->op == poll_op::read ? it->second.read : it->second.write, timed_out, done);
+        }
+    }
+
+    std::scoped_lock lock{timers_mu};
     while (!timers.empty() && timers.begin()->first <= now)
     {
         auto* state = timers.begin()->second;
-        auto  fd    = state->fd;
-        auto  op    = state->op;
 
         // a sleep that's over isn't an error.
-        const bool sleep = op == poll_op::none && state->word == nullptr;
-        complete(state, sleep ? std::error_condition{} : timed_out, done);
-
-        // stop watching for the operation that timed out.
-        if (op != poll_op::none)
-        {
-            if (auto it = registrations.find(fd); it != registrations.end()) rearm(fd, it->second, done);
-        }
+        complete_other(state, state->word == nullptr ? std::error_condition{} : timed_out, done);
     }
+}
+
+clock::rep scheduler::next_deadline() const noexcept
+{
+    auto next = std::numeric_limits<clock::rep>::max();
+    for (const auto& sh : shards) next = std::min(next, sh.earliest.load());
+
+    std::scoped_lock lock{timers_mu};
+    if (!timers.empty()) next = std::min(next, timers.begin()->first.time_since_epoch().count());
+    return next;
+}
+
+void scheduler::note_deadline(clock::time_point deadline) noexcept
+{
+    if (deadline.time_since_epoch().count() < sleeping_until.load()) loop.interrupt();
 }
 
 void scheduler::request_stop() noexcept
 {
+    if (stopping.exchange(true, std::memory_order::acq_rel)) return;
+
     completions done;
+    auto        canceled = std::make_error_condition(std::errc::operation_canceled);
+
+    for (auto& sh : shards)
+    {
+        std::scoped_lock lock{sh.mu};
+
+        for (auto& [fd, reg] : sh.registrations)
+        {
+            if (reg.read.waiting != nullptr) complete_handle_wait(sh, reg.read, canceled, done);
+            if (reg.write.waiting != nullptr) complete_handle_wait(sh, reg.write, canceled, done);
+        }
+    }
 
     {
-        std::scoped_lock lock{mu};
-        if (std::exchange(stopping, true)) return;
-
-        auto canceled = std::make_error_condition(std::errc::operation_canceled);
-
-        for (auto& [fd, reg] : registrations)
-        {
-            if (reg.read != nullptr) complete(reg.read, canceled, done);
-            if (reg.write != nullptr) complete(reg.write, canceled, done);
-        }
+        std::scoped_lock lock{timers_mu};
 
         // then waits for notifications, and (all that's left with a timer) sleeps.
-        while (!watched.empty()) complete(watched.begin()->second, canceled, done);
-        while (!timers.empty()) complete(timers.begin()->second, canceled, done);
+        while (!watched.empty()) complete_other(watched.begin()->second, canceled, done);
+        while (!timers.empty()) complete_other(timers.begin()->second, canceled, done);
     }
 
     scope.close();
@@ -374,7 +404,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
     completions done;
 
     {
-        std::scoped_lock lock{mu};
+        std::scoped_lock lock{timers_mu};
 
         // NOTE: equal keys are kept in the order they were inserted, and lower_bound finds the first (find needn't).
         while (true)
@@ -382,7 +412,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
             auto it = watched.lower_bound(&word);
             if (it == watched.end() || it->first != &word) break;
 
-            complete(it->second, {}, done);
+            complete_other(it->second, {}, done);
             if (!all) break;
         }
     }
@@ -390,11 +420,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
     resume(done);
 }
 
-bool scheduler::stop_requested() const noexcept
-{
-    std::scoped_lock lock{mu};
-    return stopping;
-}
+bool scheduler::stop_requested() const noexcept { return stopping.load(std::memory_order::acquire); }
 
 void scheduler::shutdown() noexcept
 {

@@ -58,6 +58,29 @@ resolve(const std::string& host, const std::string& port, net::protocol proto) n
 
 std::error_condition from_errno(int err) noexcept { return {err, std::generic_category()}; }
 
+// wait_connected waits for a connection that's in progress to be established, returning the error if it fails.
+//
+// The connection is established (or failed) once the socket is writable. The socket may be reported ready before then
+// (e.g. as Linux reports a socket that isn't connected yet as hung up, when it's registered), so that's checked, and it
+// waits again if it's still connecting.
+net::coro::task<std::error_condition>
+wait_connected(net::io::scheduler* scheduler, int fd, net::io::clock::time_point deadline)
+{
+    while (true)
+    {
+        if (auto err = co_await scheduler->wait_until(fd, net::io::poll_op::write, deadline); err) co_return err;
+
+        int       sock_err = 0;
+        socklen_t size     = sizeof(sock_err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &size) == -1) sock_err = errno;
+        if (sock_err != 0) co_return from_errno(sock_err);
+
+        sockaddr_storage peer{};
+        socklen_t        peer_size = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size) == 0) co_return std::error_condition{};
+        if (errno != ENOTCONN) co_return from_errno(errno);
+    }
+}
 }
 
 namespace net
@@ -118,27 +141,16 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
             continue;
         }
 
-        // the connection is established (or failed) once the socket is writable.
-        auto wait_err = co_await scheduler->wait_until(fd, io::poll_op::write, deadline);
-        if (wait_err)
-        {
-            conn.close(false);
+        auto result = co_await wait_connected(scheduler, fd, deadline);
+        if (!result) co_return conn;
 
-            // a timeout is for all of the addresses together, so there's no time left to try the rest.
-            if (wait_err == std::errc::timed_out || wait_err == std::errc::operation_canceled)
-                co_return std::unexpected(wait_err);
-
-            last_err = wait_err;
-            continue;
-        }
-
-        int       sock_err = 0;
-        socklen_t size     = sizeof(sock_err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &size) == -1) sock_err = errno;
-        if (sock_err == 0) co_return conn;
-
-        last_err = from_errno(sock_err);
         conn.close(false);
+
+        // a timeout is for all of the addresses together, so there's no time left to try the rest.
+        if (result == std::errc::timed_out || result == std::errc::operation_canceled)
+            co_return std::unexpected(result);
+
+        last_err = result;
     }
 
     co_return std::unexpected(last_err);
