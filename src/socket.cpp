@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <coroutine>
 #include <cstddef>
 #include <iterator>
 #include <optional>
@@ -185,18 +186,23 @@ void socket::set_read_timeout(std::optional<io::clock::duration> timeout) noexce
 
 void socket::set_write_timeout(std::optional<io::clock::duration> timeout) noexcept { write_timeout = timeout; }
 
-// NOTE: read and write try the socket first, without a coroutine (see coro::ready_task), and only call one if they
-//       have to wait for it.
+// NOTE: read and write try the socket first, without a coroutine (see coro::ready_task), and only wait for it (also
+//       without one: see read_operation) if they have to.
 
 coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
-    if (data.empty()) return coro::ready_task<io::result>(io::result{.count = 0});
     if (fd == invalid_fd || scheduler == nullptr)
         return coro::ready_task<io::result>(
             io::result{.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)});
 
     if (auto res = try_read(data); res.has_value()) return coro::ready_task<io::result>(*res);
-    return read_waiting(data);
+
+    // the scheduler reads, once the socket's ready (see read_operation).
+    if (!reading.claim(data))
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_condition(std::errc::device_or_resource_busy)});
+
+    return coro::operation_task(reading);
 }
 
 coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
@@ -207,7 +213,89 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 
     std::size_t written = 0;
     if (auto res = try_write(data, written); res.has_value()) return coro::ready_task<io::result>(*res);
-    return write_waiting(data, written);
+
+    // the scheduler writes the rest, once the socket's ready (see write_operation).
+    if (!writing.claim(data, written))
+        return coro::ready_task<io::result>(
+            io::result{.count = written, .err = std::make_error_condition(std::errc::device_or_resource_busy)});
+
+    return coro::operation_task(writing);
+}
+
+bool socket::read_operation::claim(std::span<std::byte> into) noexcept
+{
+    if (!try_claim()) return false;
+
+    data     = into;
+    deadline = wait_deadline(sock->read_deadline, sock->read_timeout);
+    res      = {};
+    return true;
+}
+
+bool socket::read_operation::start(std::coroutine_handle<> awaiting) noexcept
+{
+    return begin(*sock->scheduler, sock->fd, io::poll_op::read, deadline, awaiting);
+}
+
+bool socket::read_operation::perform() noexcept
+{
+    auto read = sock->try_read(data);
+    if (!read.has_value()) return false;
+
+    res = *read;
+    return true;
+}
+
+io::result socket::read_operation::result() noexcept
+{
+    auto out = error() ? io::result{.count = 0, .err = error()} : res;
+    release();
+    return out;
+}
+
+bool socket::write_operation::claim(std::span<const std::byte> from, std::size_t already) noexcept
+{
+    if (!try_claim()) return false;
+
+    data     = from;
+    written  = already;
+    timeout  = sock->write_timeout;
+    deadline = wait_deadline(sock->write_deadline, timeout);
+    res      = {};
+    return true;
+}
+
+bool socket::write_operation::start(std::coroutine_handle<> awaiting) noexcept
+{
+    return begin(*sock->scheduler, sock->fd, io::poll_op::write, deadline, awaiting);
+}
+
+bool socket::write_operation::perform() noexcept
+{
+    const auto before = written;
+
+    auto wrote = sock->try_write(data, written);
+    if (wrote.has_value())
+    {
+        res = *wrote;
+        return true;
+    }
+
+    // a timeout limits how long it goes without progress, so it starts again as it makes some.
+    if (written != before && timeout)
+    {
+        deadline = wait_deadline(sock->write_deadline, timeout);
+        set_deadline(deadline);
+    }
+
+    return false;
+}
+
+io::result socket::write_operation::result() noexcept
+{
+    auto out = error() ? io::result{.count = written, .err = error()} : res;
+    release();
+    return out;
 }
 
 std::optional<io::result> socket::try_read(std::span<std::byte> data) const noexcept
@@ -261,29 +349,7 @@ std::optional<io::result> socket::try_write(std::span<const std::byte> data, std
     return io::result{.count = written};
 }
 
-coro::task<io::result> socket::read_waiting(std::span<std::byte> data) noexcept
-{
-    while (true)
-    {
-        auto wait_err =
-            co_await scheduler->wait_until(fd, io::poll_op::read, wait_deadline(read_deadline, read_timeout));
-        if (wait_err) co_return {.count = 0, .err = wait_err};
 
-        if (auto res = try_read(data); res.has_value()) co_return *res;
-    }
-}
-
-coro::task<io::result> socket::write_waiting(std::span<const std::byte> data, std::size_t written) noexcept
-{
-    while (true)
-    {
-        auto wait_err =
-            co_await scheduler->wait_until(fd, io::poll_op::write, wait_deadline(write_deadline, write_timeout));
-        if (wait_err) co_return {.count = written, .err = wait_err};
-
-        if (auto res = try_write(data, written); res.has_value()) co_return *res;
-    }
-}
 
 void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept
 {

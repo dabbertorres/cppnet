@@ -1,11 +1,15 @@
 #pragma once
 
 #include <chrono>
+#include <coroutine>
+#include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 
 #include <sys/socket.h>
 
+#include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -43,9 +47,9 @@ public:
     void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
     void set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept;
 
-    // Timeouts limit how long each wait of a read or write may be, i.e. how long it may go without the socket being
-    // ready (then failing with std::errc::timed_out), unlike a deadline, which limits them altogether. Both apply, if
-    // set. std::nullopt removes it.
+    // Timeouts limit how long a read or write may go without progress, waiting for the socket to be ready (then failing
+    // with std::errc::timed_out), unlike a deadline, which limits them altogether. Both apply, if set. std::nullopt
+    // removes it.
     void set_timeout(std::optional<io::clock::duration> timeout) noexcept;
     void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept;
     void set_write_timeout(std::optional<io::clock::duration> timeout) noexcept;
@@ -75,6 +79,59 @@ protected:
     }
 
 private:
+    // read_operation and write_operation read and write once the socket's ready, which the scheduler does (see
+    // io::scheduler::handle_operation), for read() and write() to return as a task when their first try would have to
+    // wait, rather than a coroutine that waits and tries again in turn. A socket has one of each, as only one task may
+    // wait to read it (and one to write it) at a time: claim() fails while one is.
+    class read_operation final
+        : public coro::operation<io::result>
+        , public io::scheduler::handle_operation
+    {
+    public:
+        explicit read_operation(socket* sock) noexcept
+            : sock{sock}
+        {}
+
+        // claim readies it to read into into, returning false if it's already in use.
+        [[nodiscard]] bool claim(std::span<std::byte> into) noexcept;
+
+        bool       start(std::coroutine_handle<> awaiting) noexcept override;
+        io::result result() noexcept override;
+        bool       perform() noexcept override;
+
+    private:
+        socket*                              sock;
+        std::span<std::byte>                 data;
+        std::optional<io::clock::time_point> deadline;
+        io::result                           res;
+    };
+
+    class write_operation final
+        : public coro::operation<io::result>
+        , public io::scheduler::handle_operation
+    {
+    public:
+        explicit write_operation(socket* sock) noexcept
+            : sock{sock}
+        {}
+
+        // claim readies it to write the rest of from, after the already written, returning false if it's already in
+        // use.
+        [[nodiscard]] bool claim(std::span<const std::byte> from, std::size_t already) noexcept;
+
+        bool       start(std::coroutine_handle<> awaiting) noexcept override;
+        io::result result() noexcept override;
+        bool       perform() noexcept override;
+
+    private:
+        socket*                              sock;
+        std::span<const std::byte>           data;
+        std::size_t                          written = 0;
+        std::optional<io::clock::time_point> deadline;
+        std::optional<io::clock::duration>   timeout;
+        io::result                           res;
+    };
+
     // try_read reads, unless it would have to wait (then returning nothing).
     [[nodiscard]] std::optional<io::result> try_read(std::span<std::byte> data) const noexcept;
 
@@ -83,16 +140,16 @@ private:
     [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte> data,
                                                       std::size_t&               written) const noexcept;
 
-    // read_waiting and write_waiting wait for the socket to be ready, then read or write, as often as it takes.
-    coro::task<io::result> read_waiting(std::span<std::byte> data) noexcept;
-    coro::task<io::result> write_waiting(std::span<const std::byte> data, std::size_t written) noexcept;
-
     io::scheduler*                       scheduler;
     int                                  fd;
     std::optional<io::clock::time_point> read_deadline;
     std::optional<io::clock::time_point> write_deadline;
     std::optional<io::clock::duration>   read_timeout;
     std::optional<io::clock::duration>   write_timeout;
+
+    // NOTE: not moved with the socket: one mustn't be moved while a read or write waits for it.
+    read_operation  reading{this};
+    write_operation writing{this};
 };
 
 }
