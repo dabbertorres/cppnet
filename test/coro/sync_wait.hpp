@@ -16,6 +16,10 @@ namespace test
 template<typename T>
 T sync_wait(net::coro::task<T>&& task)
 {
+    // an operation (see net::coro::operation_task) needs something to finish it, e.g. the scheduler.
+    if (!task.finished_without_coroutine() && !task.get_handle())
+        throw std::logic_error{"sync_wait: only synchronous tasks are supported, not operations"};
+
     if (auto handle = task.get_handle())
     {
         handle.resume();

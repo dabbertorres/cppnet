@@ -664,3 +664,52 @@ TEST_CASE("a scheduler whose workers poll for another scheduler polls in run()",
     CHECK_FALSE(second.run_to_completion(sleep(&second)));
     CHECK_FALSE(first.run_to_completion(sleep(&first)));
 }
+
+TEST_CASE("socket write timeouts limit each wait, rather than the whole write", "[io][socket][timeout]")
+{
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+    writer.set_write_timeout(100ms);
+
+    constexpr std::size_t total = std::size_t{16} * 1'024 * 1'024;
+
+    // more than the socket's buffers hold, so the write has to wait for the reader several times.
+    auto write_all_of_it = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
+    {
+        std::vector<std::byte> lots(total);
+        auto                   res = co_await writer->write(lots);
+        co_return std::pair{res.count, res.err};
+    };
+
+    // reads a little at a time: so the write makes progress well within the timeout, but takes longer altogether. It
+    // stops once the write has, if that's first (e.g. as it timed out).
+    std::size_t       read          = 0;
+    std::atomic<bool> write_stopped = false;
+    std::thread       slow_reader{[&, fd = reader.native_handle()]
+                                  {
+                                std::vector<char> buf(std::size_t{256} * 1'024);
+                                while (read < total && !write_stopped.load())
+                                {
+                                    std::this_thread::sleep_for(10ms);
+
+                                    // NOTE: the socket's non-blocking, so this may find nothing yet.
+                                    auto got = ::recv(fd, buf.data(), buf.size(), 0);
+                                    if (got > 0) read += static_cast<std::size_t>(got);
+                                    else if (got == 0) break;
+                                }
+                                  }};
+
+    auto start        = net::io::clock::now();
+    auto [count, err] = sched.run_to_completion(write_all_of_it(&writer));
+    auto elapsed      = net::io::clock::now() - start;
+
+    write_stopped = true;
+    slow_reader.join();
+
+    CHECK_FALSE(err);
+    CHECK(count == total);
+    CHECK(read == total);
+
+    // or the test shows nothing: the timeout would have ended a write limited altogether.
+    CHECK(elapsed > 100ms);
+}

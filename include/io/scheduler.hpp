@@ -52,6 +52,10 @@ using clock = std::chrono::steady_clock;
 // A scheduler can't be restarted once stopped.
 class scheduler : private coro::thread_pool::poller
 {
+public:
+    class handle_operation;
+
+private:
     struct waiter;
 
     using timer_list   = std::multimap<clock::time_point, waiter*>;
@@ -114,6 +118,9 @@ class scheduler : private coro::thread_pool::poller
         const std::atomic<std::uint64_t>*     word     = nullptr;
         std::uint64_t                         expected = 0;
         std::optional<watched_list::iterator> watch{};
+
+        // operation, for a wait for a handle, is what to perform once the handle's ready (see handle_operation).
+        handle_operation* operation = nullptr;
     };
 
     // direction is a handle's state for one operation: the waiter, if any, and whether the handle became ready (since
@@ -152,6 +159,48 @@ class scheduler : private coro::thread_pool::poller
     static constexpr std::size_t shard_count = 64;
 
 public:
+    // handle_operation is an operation on a handle (e.g. a socket's recv()) that the scheduler performs once the
+    // handle's ready, rather than resuming the waiting coroutine to try it again: so that coroutine is only resumed
+    // once it's finished, and needn't be one of its own that tries and waits in turn (see socket's reads and writes).
+    class handle_operation
+    {
+    public:
+        handle_operation(const handle_operation&)                = delete;
+        handle_operation(handle_operation&&) noexcept            = delete;
+        handle_operation& operator=(const handle_operation&)     = delete;
+        handle_operation& operator=(handle_operation&&) noexcept = delete;
+
+        // perform tries the operation, returning whether it's finished (successfully or not): false if it would have
+        // to wait (e.g. recv() failed with EAGAIN), when the scheduler waits for the handle to be ready again. It's
+        // called with the scheduler's lock for the handle held, so it mustn't block, or use the scheduler.
+        virtual bool perform() noexcept = 0;
+
+    protected:
+        handle_operation() noexcept = default;
+        ~handle_operation()         = default;
+
+        // begin waits for fd to be ready for op (read or write), until deadline, and then performs this (as often as it
+        // takes) and resumes awaiting. It returns whether awaiting must suspend: false if the wait failed straight away
+        // (see error()), or the handle was ready, and this has been performed already.
+        bool begin(scheduler&                       sched,
+                   handle                           fd,
+                   poll_op                          op,
+                   std::optional<clock::time_point> deadline,
+                   std::coroutine_handle<>          awaiting) noexcept;
+
+        // error is why the wait ended without this finishing, if it did: e.g. std::errc::timed_out, or
+        // std::errc::operation_canceled if the scheduler was stopped, or the handle deregistered.
+        [[nodiscard]] std::error_condition error() const noexcept { return state.result; }
+
+        // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress.
+        void set_deadline(std::optional<clock::time_point> deadline) noexcept { state.deadline = deadline; }
+
+    private:
+        friend class scheduler;
+
+        waiter state{};
+    };
+
     // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
     // - std::errc::timed_out if the deadline passed first.
     // - std::errc::operation_canceled if the scheduler was stopped, or the handle deregistered.
@@ -363,6 +412,13 @@ private:
     bool suspend_other(waiter& state, std::coroutine_handle<> awaiting) noexcept;
 
     shard& shard_for(handle fd) noexcept { return shards[static_cast<std::size_t>(fd) % shard_count]; }
+
+    // ready_for completes the waiter that slot (in sh) holds, now its handle's ready, or performs its operation, which
+    // may keep it waiting (see handle_operation). Must be called holding sh's lock.
+    void ready_for(shard& sh, direction& slot, completions& done) noexcept;
+
+    // retime replaces the timer of a waiter (whose handle is in sh) for its deadline. Must be called holding sh's lock.
+    void retime(shard& sh, waiter& state) noexcept;
 
     // complete_handle_wait completes a handle's waiter, which slot (in sh) holds. Must be called holding sh's lock.
     void complete_handle_wait(shard& sh, direction& slot, std::error_condition result, completions& done) noexcept;

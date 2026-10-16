@@ -1,10 +1,12 @@
 #include "coro/task.hpp"
 
+#include <coroutine>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -105,5 +107,84 @@ TEST_CASE("ready tasks have their result without a coroutine", "[coro][task][rea
 
         // a coroutine's task isn't.
         CHECK_FALSE(one().finished_without_coroutine());
+    }
+}
+
+namespace
+{
+
+// test_operation finishes with value when it's started, or later, when finish() is called.
+class test_operation final : public net::coro::operation<int>
+{
+public:
+    bool start(std::coroutine_handle<> awaiting) noexcept override
+    {
+        started = true;
+        if (finish_at_start) return false;
+
+        waiting = awaiting;
+        return true;
+    }
+
+    int result() override
+    {
+        release();
+        return value;
+    }
+
+    void finish() const { waiting.resume(); }
+
+    bool                    finish_at_start = true;
+    bool                    started         = false;
+    int                     value           = 0;
+    std::coroutine_handle<> waiting{nullptr};
+};
+
+}
+
+TEST_CASE("operation tasks", "[coro][task][operation]")
+{
+    test_operation op;
+
+    const auto await_it = [&] -> net::coro::task<int> { co_return co_await net::coro::operation_task(op); };
+
+    SECTION("one that finishes straight away")
+    {
+        op.value = 5;
+        REQUIRE(op.try_claim());
+
+        CHECK(test::sync_wait(await_it()) == 5);
+
+        // taking the result released it.
+        CHECK(op.try_claim());
+    }
+
+    SECTION("one that finishes later")
+    {
+        op.finish_at_start = false;
+        op.value           = 6;
+        REQUIRE(op.try_claim());
+
+        auto awaiting = await_it();
+        awaiting.get_handle().resume();
+        CHECK_FALSE(awaiting.is_ready());
+
+        op.finish();
+        REQUIRE(awaiting.is_ready());
+        const int value = std::move(awaiting).result();
+        CHECK(value == 6);
+    }
+
+    SECTION("one that's claimed can't be again until it's released, e.g. as its task is never awaited")
+    {
+        REQUIRE(op.try_claim());
+
+        {
+            auto never_awaited = net::coro::operation_task(op);
+            CHECK_FALSE(op.try_claim());
+        }
+
+        CHECK_FALSE(op.started);
+        CHECK(op.try_claim());
     }
 }

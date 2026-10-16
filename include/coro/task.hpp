@@ -16,6 +16,43 @@ namespace net::coro
 template<typename T>
 class promise;
 
+// operation is something a task can await without a coroutine (see operation_task()): e.g. a socket's read that has to
+// wait for data, which the scheduler performs once the socket's ready, and then resumes the awaiting coroutine. Its
+// state lives elsewhere (e.g. in the socket), as the task only points to it, so one is reused: whatever makes a task of
+// it claims it first (try_claim()), and it's released once its result is taken, or if the task is destroyed without
+// being awaited.
+template<typename T>
+class operation
+{
+public:
+    operation(const operation&)                = delete;
+    operation(operation&&) noexcept            = delete;
+    operation& operator=(const operation&)     = delete;
+    operation& operator=(operation&&) noexcept = delete;
+
+    // start starts the operation, for awaiting to be resumed once it's finished, and returns whether awaiting must
+    // suspend: false if it finished straight away (then awaiting isn't resumed by it).
+    virtual bool start(std::coroutine_handle<> awaiting) noexcept = 0;
+
+    // result is the finished operation's result. It must release() the operation, once it no longer needs its state.
+    virtual T result() = 0;
+
+    // try_claim claims the operation, for a task, returning false if one already has it.
+    [[nodiscard]] bool try_claim() noexcept { return !claimed.exchange(true, std::memory_order::acq_rel); }
+
+    // release releases the operation, for the next task to claim.
+    // NOTE: not virtual, so that the compiler can see what a task's destructor does (or it doesn't elide the frames of
+    //       coroutines that are awaited directly, as it can't tell that the handle doesn't escape).
+    void release() noexcept { claimed.store(false, std::memory_order::release); }
+
+protected:
+    operation() noexcept = default;
+    ~operation()         = default;
+
+private:
+    std::atomic<bool> claimed = false;
+};
+
 // task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it
 // finishes.
 //
@@ -45,6 +82,9 @@ class promise;
 // allocates its frame (before it even starts), so a function that can often finish without waiting (e.g. a read of
 // what's already buffered) returns one of those, and only calls a coroutine when it must wait. Awaiting it just takes
 // the result.
+//
+// And a task may be an operation (operation_task()), which it starts when it's awaited, and takes the result of when
+// it's finished, again without a coroutine: e.g. a socket's read that has to wait, which the scheduler performs.
 template<typename T = void>
 class [[nodiscard]] task
 {
@@ -63,17 +103,25 @@ public:
     //       that the handle doesn't escape, and may allocate the coroutine's frame in the awaiting coroutine's (HALO).
     struct awaitable_base
     {
-        constexpr awaitable_base(std::coroutine_handle<promise_type> handle, std::optional<ready_type> ready) noexcept
+        constexpr awaitable_base(std::coroutine_handle<promise_type> handle,
+                                 std::optional<ready_type>           ready,
+                                 operation<T>*                       op) noexcept
             : handle{handle}
             , ready{std::move(ready)}
+            , op{op}
         {}
 
-        [[nodiscard]] bool await_ready() const noexcept { return ready.has_value() || !handle || handle.done(); }
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return ready.has_value() || (op == nullptr && (!handle || handle.done()));
+        }
 
         // await_suspend starts the task, and only suspends the awaiting coroutine if the task suspended (see task's
         // comment, for why not symmetric transfer).
         bool await_suspend(std::coroutine_handle<> continuation) noexcept
         {
+            if (op != nullptr) return op->start(continuation);
+
             auto& promise = handle.promise();
             promise.set_continuation(continuation);
 
@@ -88,6 +136,7 @@ public:
 
         std::coroutine_handle<promise_type> handle{nullptr};
         std::optional<ready_type>           ready;
+        operation<T>*                       op = nullptr;
     };
 
     constexpr task() noexcept
@@ -104,6 +153,7 @@ public:
     constexpr task(task&& other) noexcept
         : handle{std::exchange(other.handle, nullptr)}
         , ready{std::exchange(other.ready, std::nullopt)}
+        , op{std::exchange(other.op, nullptr)}
     {}
 
     // NOTE: handle is tested with operator bool rather than compared to nullptr. A comparison looks up operator== in
@@ -115,9 +165,11 @@ public:
         if (std::addressof(other) != this)
         {
             if (handle) handle.destroy();
+            if (op != nullptr) op->release();
 
             handle = std::exchange(other.handle, nullptr);
             ready  = std::exchange(other.ready, std::nullopt);
+            op     = std::exchange(other.op, nullptr);
         }
 
         return *this;
@@ -126,6 +178,7 @@ public:
     ~task()
     {
         if (handle) handle.destroy();
+        if (op != nullptr) op->release(); // never awaited
     }
 
     auto operator co_await() & noexcept
@@ -135,12 +188,14 @@ public:
             T await_resume()
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
+                if (this->op != nullptr) return this->op->result();
                 return this->handle.promise().result();
             }
         };
 
+        // NOTE: the operation is the awaiter's now, so the task doesn't release it (a task is only awaited once).
         return awaitable{
-            awaitable_base{handle, ready}
+            awaitable_base{handle, ready, std::exchange(op, nullptr)}
         };
     }
 
@@ -151,23 +206,28 @@ public:
             T await_resume()
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
+                if (this->op != nullptr) return this->op->result();
                 return std::move(this->handle.promise()).result();
             }
         };
 
+        // NOTE: the operation is the awaiter's now, so the task doesn't release it (a task is only awaited once).
         return awaitable{
-            awaitable_base{handle, std::move(ready)}
+            awaitable_base{handle, std::move(ready), std::exchange(op, nullptr)}
         };
     }
 
     [[nodiscard]] bool resume() const noexcept
     {
-        if (ready.has_value()) return false;
+        if (ready.has_value() || op != nullptr) return false;
         if (!handle.done()) handle.resume();
         return !handle.done();
     }
 
-    [[nodiscard]] bool valid() const noexcept { return ready.has_value() || static_cast<bool>(handle); }
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return ready.has_value() || op != nullptr || static_cast<bool>(handle);
+    }
 
     bool destroy()
     {
@@ -181,13 +241,17 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool is_ready() const noexcept { return ready.has_value() || !handle || handle.done(); }
+    [[nodiscard]] bool is_ready() const noexcept
+    {
+        return ready.has_value() || (op == nullptr && (!handle || handle.done()));
+    }
 
     // finished_without_coroutine is whether this is a ready task (see ready_task()): its result can be taken with
     // result() right away.
     [[nodiscard]] bool finished_without_coroutine() const noexcept { return ready.has_value(); }
 
-    // result is the finished task's result (rethrowing its exception, if it threw).
+    // result is the finished task's result (rethrowing its exception, if it threw): not an operation's, which is
+    // awaited for its result.
     T result() &&
     {
         if (ready.has_value()) return from_ready(std::move(*ready));
@@ -204,6 +268,9 @@ public:
     template<typename U, typename... Args>
     friend task<U> ready_task(Args&&... args);
 
+    template<typename U>
+    friend task<U> operation_task(operation<U>& op) noexcept;
+
 private:
     // from_ready is the result a ready task holds.
     static T from_ready(ready_type value)
@@ -215,7 +282,18 @@ private:
 
     std::coroutine_handle<promise_type> handle;
     std::optional<ready_type>           ready;
+    operation<T>*                       op = nullptr;
 };
+
+// operation_task makes a task of op (which must be claimed for it: see operation), which it starts when it's awaited.
+// op must outlive it.
+template<typename T>
+task<T> operation_task(operation<T>& op) noexcept
+{
+    task<T> out;
+    out.op = std::addressof(op);
+    return out;
+}
 
 // ready_task makes a task that has already finished, with its result made of args (none, for task<void>), without a
 // coroutine (see task).

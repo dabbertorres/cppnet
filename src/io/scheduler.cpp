@@ -141,8 +141,9 @@ bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) 
     if (slot.waiting != nullptr) return fail(std::errc::device_or_resource_busy);
 
     // The handle became ready since the caller last found it wasn't (e.g. a read got EAGAIN), so it can try again
-    // straight away: as handles are only reported when they become ready, waiting would miss it.
-    if (std::exchange(slot.ready, false))
+    // straight away: as handles are only reported when they become ready, waiting would miss it. An operation is tried
+    // here, and waits if it would still have to (e.g. the event was spurious).
+    if (std::exchange(slot.ready, false) && (state.operation == nullptr || state.operation->perform()))
     {
         state.result = {};
         return false;
@@ -330,15 +331,60 @@ void scheduler::dispatch(std::span<const ready_event> events, completions& done)
 
         // a waiter continues; otherwise, the next wait doesn't need to (see suspend_handle). Spurious events (e.g. for
         // a handle closed since, whose number was reused) only make a caller try its read or write once more.
-        const auto ready = [&](direction& slot)
-        {
-            if (slot.waiting != nullptr) complete_handle_wait(sh, slot, {}, done);
-            else slot.ready = true;
-        };
-
-        if (is_readable(event.ready)) ready(it->second.read);
-        if (is_writable(event.ready)) ready(it->second.write);
+        if (is_readable(event.ready)) ready_for(sh, it->second.read, done);
+        if (is_writable(event.ready)) ready_for(sh, it->second.write, done);
     }
+}
+
+void scheduler::ready_for(shard& sh, direction& slot, completions& done) noexcept
+{
+    auto* state = slot.waiting;
+    if (state == nullptr)
+    {
+        slot.ready = true;
+        return;
+    }
+
+    if (state->operation != nullptr)
+    {
+        const auto deadline = state->deadline;
+        if (!state->operation->perform())
+        {
+            // it would have to wait again (e.g. a write that wrote some, but not all): so it does, until its deadline,
+            // which it may have moved.
+            if (state->deadline != deadline) retime(sh, *state);
+            return;
+        }
+    }
+
+    complete_handle_wait(sh, slot, {}, done);
+}
+
+void scheduler::retime(shard& sh, waiter& state) noexcept
+{
+    if (state.timer)
+    {
+        sh.timers.remove(*state.timer);
+        state.timer.reset();
+    }
+
+    if (state.deadline)
+    {
+        state.timer = sh.timers.add(*state.deadline, &state);
+        note_deadline(*state.deadline);
+    }
+
+    sh.update_earliest();
+}
+
+bool scheduler::handle_operation::begin(scheduler&                       sched,
+                                        handle                           fd,
+                                        poll_op                          op,
+                                        std::optional<clock::time_point> deadline,
+                                        std::coroutine_handle<>          awaiting) noexcept
+{
+    state = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
+    return sched.suspend(state, awaiting);
 }
 
 void scheduler::expire_timers(completions& done) noexcept
