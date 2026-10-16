@@ -1,10 +1,13 @@
 #include "coro/thread_pool.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <coroutine>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace net::coro
 {
@@ -59,6 +62,8 @@ void thread_pool::shutdown() noexcept
         // forever.
         std::scoped_lock lock{wait_mutex};
         if (!running.exchange(false, std::memory_order::acq_rel)) return;
+
+        if (polling && polls != nullptr) polls->wake();
     }
 
     wait.notify_all();
@@ -66,6 +71,37 @@ void thread_pool::shutdown() noexcept
     for (auto& thread : threads)
     {
         if (thread.joinable()) thread.join();
+    }
+}
+
+bool thread_pool::attach(poller* p) noexcept
+{
+    std::size_t woken = 0;
+
+    {
+        std::scoped_lock lock{wait_mutex};
+        if (!running.load(std::memory_order::acquire) || polls != nullptr) return false;
+
+        polls = p;
+
+        // a sleeping worker can poll now.
+        woken = wake_locked(1);
+    }
+
+    notify(woken);
+    return true;
+}
+
+void thread_pool::detach(poller* p) noexcept
+{
+    std::unique_lock lock{wait_mutex};
+    if (polls != p) return;
+
+    polls = nullptr;
+    while (polling)
+    {
+        p->wake();
+        polled.wait(lock);
     }
 }
 
@@ -84,25 +120,47 @@ bool thread_pool::queue_empty() const noexcept { return queue_size() == 0; }
 
 void thread_pool::worker()
 {
+    std::vector<std::coroutine_handle<>> ready;
+    std::size_t                          since_poll = 0;
+
+    std::unique_lock lock{wait_mutex};
+
     while (running.load(std::memory_order::acquire))
     {
-        std::unique_lock lock{wait_mutex};
-        wait.wait(lock, [this] { return !jobs.empty() || !running.load(std::memory_order::acquire); });
+        // runs the next job, unless it's time to poll (and no one else is).
+        const bool can_poll = polls != nullptr && !polling;
+        if (!jobs.empty() && (since_poll < poll_interval || !can_poll))
+        {
+            auto handle = jobs.front();
+            jobs.pop_front();
+            lock.unlock();
 
-        if (jobs.empty()) continue;
+            handle.resume();
+            num_jobs.fetch_sub(1, std::memory_order::release);
+            ++since_poll;
 
-        auto handle = jobs.front();
-        jobs.pop_front();
-        lock.unlock();
+            lock.lock();
+            continue;
+        }
 
-        handle.resume();
-        num_jobs.fetch_sub(1, std::memory_order::release);
+        if (can_poll)
+        {
+            poll_locked(lock, ready);
+            since_poll = 0;
+            continue;
+        }
+
+        ++sleepers;
+        wait.wait(lock, [this] { return wakeups > 0 || !running.load(std::memory_order::acquire); });
+
+        // NOTE: either this was woken, and takes a wakeup (perhaps another's, which then waits on, still counted), or
+        //       the pool is shutting down.
+        if (wakeups > 0) --wakeups;
+        else --sleepers;
     }
 
     while (num_jobs.load(std::memory_order::acquire) > 0)
     {
-        std::unique_lock lock{wait_mutex};
-
         if (jobs.empty()) break;
 
         auto handle = jobs.front();
@@ -111,20 +169,89 @@ void thread_pool::worker()
 
         handle.resume();
         num_jobs.fetch_sub(1, std::memory_order::release);
+
+        lock.lock();
     }
+}
+
+void thread_pool::poll_locked(std::unique_lock<std::mutex>& lock, std::vector<std::coroutine_handle<>>& ready)
+{
+    auto* p = polls;
+
+    // only blocks if there's nothing else to do: otherwise, it's polling as the queue hasn't emptied for a while.
+    const bool block = jobs.empty();
+
+    polling    = true;
+    poll_woken = false;
+    lock.unlock();
+
+    p->poll(block, ready);
+
+    lock.lock();
+    polling = false;
+    if (polls != p) polled.notify_all(); // detached meanwhile
+
+    for (auto handle : ready)
+    {
+        num_jobs.fetch_add(1, std::memory_order::release);
+        jobs.emplace_back(handle);
+    }
+
+    // This worker runs the first of them, so the rest are for others. NOTE: as with Tokio, no one else is woken to poll
+    // while this one runs it (which would cost a wakeup per poll): a worker polls once it's idle, so a coroutine that
+    // doesn't suspend for a while (e.g. blocks) holds up I/O if the other workers are asleep.
+    std::size_t woken = ready.size() <= 1 ? 0 : wake_locked(ready.size() - 1);
+    ready.clear();
+
+    if (woken > 0)
+    {
+        lock.unlock();
+        notify(woken);
+        lock.lock();
+    }
+}
+
+std::size_t thread_pool::wake_locked(std::size_t new_jobs) noexcept
+{
+    const auto woken = std::min(new_jobs, sleepers);
+    sleepers -= woken;
+    wakeups += woken;
+
+    // a worker blocked polling is idle too.
+    if (woken < new_jobs && polling && !poll_woken && polls != nullptr)
+    {
+        poll_woken = true;
+        polls->wake();
+    }
+
+    return woken;
+}
+
+void thread_pool::notify(std::size_t woken) noexcept
+{
+    if (woken >= threads.size())
+    {
+        wait.notify_all();
+        return;
+    }
+
+    for (std::size_t i = 0; i < woken; ++i) wait.notify_one();
 }
 
 void thread_pool::schedule(std::coroutine_handle<> handle)
 {
     if (handle == nullptr) return;
 
-    num_jobs.fetch_add(1, std::memory_order::release);
+    std::size_t woken = 0;
 
     {
         std::scoped_lock lock{wait_mutex};
+        num_jobs.fetch_add(1, std::memory_order::release);
         jobs.emplace_back(handle);
-        wait.notify_one();
+        woken = wake_locked(1);
     }
+
+    notify(woken);
 }
 
 }

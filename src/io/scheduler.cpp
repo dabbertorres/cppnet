@@ -58,9 +58,16 @@ scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shar
                 }
             },
             [this] { loop.interrupt(); }}
-{}
+{
+    // NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer): once every member is, as workers may poll at once.
+    workers_poll = this->workers->attach(this);
+}
 
-scheduler::~scheduler() noexcept { shutdown(); }
+scheduler::~scheduler() noexcept
+{
+    shutdown();
+    if (workers_poll) workers->detach(this);
+}
 
 void scheduler::register_handle(handle fd)
 {
@@ -255,18 +262,32 @@ void scheduler::run()
                             running.notify_all();
                         }};
 
-    std::array<ready_event, 64> events{};
-    std::size_t                 num_ready = 0;
-    completions                 done;
+    if (workers_poll)
+    {
+        stopping.wait(false, std::memory_order::acquire);
+        scope.join_blocking();
+        return;
+    }
 
+    completions done;
     while (true)
     {
-        dispatch(std::span{events}.first(num_ready), done);
-        expire_timers(done);
-
         // NOTE: the scope interrupts the loop once it has drained after being closed.
-        const bool finished = stopping.load(std::memory_order::acquire) && scope.empty();
+        if (stopping.load(std::memory_order::acquire) && scope.empty()) return;
 
+        poll(true, done);
+        resume(done);
+        done.clear();
+    }
+}
+
+void scheduler::poll(bool block, completions& done) noexcept
+{
+    std::array<ready_event, 64>    events{};
+    std::optional<clock::duration> timeout = clock::duration::zero();
+
+    if (block)
+    {
         // A wait with an earlier deadline, from after next_deadline() looked, interrupts the loop: either it's in time
         // for the second look, or it sees what sleeping_until was set to in between (as both use sequential
         // consistency), and is earlier (see note_deadline()).
@@ -274,18 +295,28 @@ void scheduler::run()
         sleeping_until.store(next);
         next = std::min(next, next_deadline());
 
-        resume(done);
-        done.clear();
-
-        if (finished) return;
-
-        std::optional<clock::duration> timeout;
+        timeout.reset();
         if (next != std::numeric_limits<clock::rep>::max())
             timeout = std::max(clock::time_point{clock::duration{next}} - clock::now(), clock::duration::zero());
+    }
 
+    std::size_t num_ready = 0;
+    try
+    {
         num_ready = loop.wait(events, timeout);
     }
+    catch (const std::exception& err)
+    {
+        logger->error("failed to wait for I/O: {}", err.what());
+    }
+
+    if (block) sleeping_until.store(std::numeric_limits<clock::rep>::max());
+
+    dispatch(std::span{events}.first(num_ready), done);
+    expire_timers(done);
 }
+
+void scheduler::wake() noexcept { loop.interrupt(); }
 
 void scheduler::dispatch(std::span<const ready_event> events, completions& done) noexcept
 {
@@ -365,6 +396,7 @@ void scheduler::note_deadline(clock::time_point deadline) noexcept
 void scheduler::request_stop() noexcept
 {
     if (stopping.exchange(true, std::memory_order::acq_rel)) return;
+    stopping.notify_all(); // for run()
 
     completions done;
     auto        canceled = std::make_error_condition(std::errc::operation_canceled);
