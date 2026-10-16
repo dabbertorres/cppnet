@@ -20,4 +20,4 @@ target_link_libraries(bench_request PRIVATE net)
 
 # TechEmpower's plaintext and JSON tests: bench/web/run.sh runs it, and other servers, under wrk.
 add_benchmark(bench_web web/cppnet/main.cpp)
-target_link_libraries(bench_web PRIVATE net nlohmann_json::nlohmann_json)
+target_link_libraries(bench_web PRIVATE net glaze::glaze)
