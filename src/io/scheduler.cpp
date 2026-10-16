@@ -235,14 +235,10 @@ void scheduler::rearm(handle fd, const registration& reg, completions& done) noe
 
 void scheduler::resume(const completions& done) noexcept
 {
-    for (auto awaiting : done)
-    {
-        if (!workers->resume(awaiting))
-        {
-            logger->warn("thread pool is not running; resuming task on the current thread");
-            awaiting.resume();
-        }
-    }
+    if (done.empty() || workers->resume(done) != 0) return;
+
+    logger->warn("thread pool is not running; resuming tasks on the current thread");
+    for (auto awaiting : done) awaiting.resume();
 }
 
 void scheduler::run()
@@ -256,31 +252,37 @@ void scheduler::run()
                         }};
 
     std::array<ready_event, 64> events{};
+    std::size_t                 num_ready = 0;
     completions                 done;
 
+    // NOTE: the lock is taken once a turn, as the workers take it for each wait: e.g. for each request on a connection
+    // that isn't pipelining them.
     while (true)
     {
-        std::optional<clock::duration> timeout;
-
-        {
-            std::scoped_lock lock{mu};
-
-            // NOTE: the scope interrupts the loop once it has drained after being closed.
-            if (stopping && scope.empty()) return;
-
-            if (!timers.empty()) timeout = std::max(timers.begin()->first - clock::now(), clock::duration::zero());
-        }
-
-        auto num_ready = loop.wait(events, timeout);
+        std::optional<clock::time_point> next_deadline;
+        bool                             finished = false;
 
         {
             std::scoped_lock lock{mu};
             dispatch(std::span{events}.first(num_ready), done);
             expire_timers(done);
+
+            // NOTE: the scope interrupts the loop once it has drained after being closed.
+            finished = stopping && scope.empty();
+
+            if (!timers.empty()) next_deadline = timers.begin()->first;
         }
 
         resume(done);
         done.clear();
+
+        if (finished) return;
+
+        // NOTE: a wait with an earlier deadline, from since the lock was released, interrupts the loop.
+        std::optional<clock::duration> timeout;
+        if (next_deadline) timeout = std::max(*next_deadline - clock::now(), clock::duration::zero());
+
+        num_ready = loop.wait(events, timeout);
     }
 }
 
