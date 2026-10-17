@@ -63,7 +63,8 @@ scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shar
     workers_poll = this->workers->attach(this);
 }
 
-scheduler::~scheduler() noexcept
+// NOTE: shutdown() throws if this is one of the pool's workers, which would wait for itself: that terminates.
+scheduler::~scheduler() noexcept // NOLINT(bugprone-exception-escape)
 {
     shutdown();
     if (workers_poll) workers->detach(this);
@@ -524,8 +525,12 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
 
 bool scheduler::stop_requested() const noexcept { return stopping.load(std::memory_order::acquire); }
 
-void scheduler::shutdown() noexcept
+void scheduler::shutdown()
 {
+    // it would wait for the task calling it to finish, which it never would.
+    if (workers->on_worker())
+        throw std::logic_error{"scheduler::shutdown() was called from one of its workers: use request_stop()"};
+
     request_stop();
     scope.join_blocking();
     running.wait(true, std::memory_order::acquire);

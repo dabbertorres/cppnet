@@ -190,6 +190,27 @@ TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up",
     CHECK(idle_err == std::errc::operation_canceled);
 }
 
+TEST_CASE("shutdown from one of the scheduler's tasks throws, rather than waiting for itself", "[io][scheduler]")
+{
+    scheduler sched{make_pool()};
+
+    const auto shut_down = [](scheduler* sched) -> task<bool>
+    {
+        try
+        {
+            sched->shutdown();
+        }
+        catch (const std::logic_error&)
+        {
+            co_return true;
+        }
+
+        co_return false;
+    };
+
+    CHECK(sched.run_to_completion(shut_down(&sched)));
+}
+
 TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][scheduler]")
 {
     scheduler sched{make_pool()};
