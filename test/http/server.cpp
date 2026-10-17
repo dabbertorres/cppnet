@@ -72,7 +72,7 @@ task<response> get(net::io::scheduler* sched, std::uint16_t port, std::string pa
         .uri     = net::url::parse("http://127.0.0.1:" + std::to_string(port) + path).to_value(),
     };
 
-    auto resp = co_await client.send(req);
+    auto resp = co_await client.send(std::move(req));
     if (!resp.has_value())
         co_return response{.status = http::status::NONE, .connection = "", .body = "error: " + resp.error().message()};
 

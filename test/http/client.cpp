@@ -109,7 +109,7 @@ TEST_CASE("the client sends a request, and reads the response", "[http][client]"
             .uri     = parsed.to_value(),
         };
 
-        auto resp = co_await client.send(req);
+        auto resp = co_await client.send(std::move(req));
         if (!resp.has_value()) co_return std::pair{net::http::status::NONE, resp.error().message()};
 
         // the body is read after send() has returned: the connection must still be there.
@@ -136,7 +136,7 @@ TEST_CASE("the client only sends HTTP/1.x", "[http][client]")
         net::http::client_request req{.method = net::http::request_method::GET, .version = {.major = 2, .minor = 0}};
         req.uri.host = "127.0.0.1";
 
-        auto resp = co_await client.send(req);
+        auto resp = co_await client.send(std::move(req));
         co_return resp.has_value() ? std::error_code{} : resp.error();
     };
 
@@ -286,6 +286,24 @@ T run(net::io::scheduler& sched, keepalive_server& server, task<T> test)
     return sched.run_to_completion(std::move(test));
 }
 
+}
+
+TEST_CASE("a request made for send() lasts until its task is awaited", "[http][client]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    keepalive_server   server{&sched};
+    net::http::client  client{&sched};
+
+    // the request is a temporary, gone before the task starts (which ASan would catch, if send() referred to it).
+    auto test = [](net::http::client* client, std::string port) -> task<std::string>
+    {
+        auto sending = client->send(get_request("127.0.0.1", port));
+        auto resp    = co_await std::move(sending);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+        co_return co_await read_all(resp->body.get());
+    };
+
+    CHECK(run(sched, server, test(&client, server.port)) == "hello");
 }
 
 TEST_CASE("connections are reused", "[http][client][pool]")
@@ -497,7 +515,7 @@ TEST_CASE("requests are retried if a reused connection was closed", "[http][clie
             post.method = net::http::request_method::POST;
             post.headers.set_content_length(0);
 
-            auto resp = co_await client->send(post);
+            auto resp = co_await client->send(std::move(post));
             co_return first + (resp.has_value() ? "sent" : " failed");
         };
 
@@ -587,7 +605,7 @@ net::http::client_request post_request(const std::string& port)
 // post sends req, and returns the response's status and body, or the error.
 task<std::string> post(net::http::client* client, net::http::client_request req)
 {
-    auto resp = co_await client->send(req);
+    auto resp = co_await client->send(std::move(req));
     if (!resp.has_value()) co_return "error: " + resp.error().message();
 
     auto body = co_await read_all(resp->body.get());
