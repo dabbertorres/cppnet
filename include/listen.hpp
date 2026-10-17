@@ -7,8 +7,8 @@
 #include <system_error>
 
 #include "coro/task.hpp"
+#include "io/io.hpp"
 #include "io/scheduler.hpp"
-
 #include "ip_addr.hpp"
 #include "tcp.hpp"
 
@@ -67,7 +67,7 @@ public:
     // std::errc::operation_canceled (as do any accepts already waiting).
     [[nodiscard]] coro::task<std::expected<tcp_socket, std::error_code>> accept() const;
 
-    [[nodiscard]] int native_handle() const noexcept { return main_fd; }
+    [[nodiscard]] io::handle native_handle() const noexcept { return main_fd; }
 
     // local_port is the port the listener is bound to: e.g. the one chosen for it, if it was created with port "0". It
     // throws std::system_error if the OS can't say.
@@ -77,17 +77,17 @@ public:
     void shutdown() noexcept;
 
 private:
-    listener(io::scheduler* scheduler, int fd) noexcept;
+    listener(io::scheduler* scheduler, io::handle fd) noexcept;
 
     // open binds a socket, and registers it with the scheduler, returning it.
-    static std::expected<int, std::error_code>
+    static std::expected<io::handle, std::error_code>
     open(io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto);
 
     void close() noexcept;
 
     io::scheduler*    scheduler;
     std::atomic<bool> is_listening;
-    int               main_fd;
+    io::handle        main_fd;
 };
 
 }

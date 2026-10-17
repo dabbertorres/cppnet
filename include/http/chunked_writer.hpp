@@ -25,7 +25,7 @@ public:
     // finish writes the last chunk, which ends the body.
     coro::task<io::result> finish();
 
-    [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
+    [[nodiscard]] io::handle native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
     io::writer* parent = nullptr;

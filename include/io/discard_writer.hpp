@@ -22,7 +22,7 @@ public:
         return coro::ready_task<result>(result{.count = data.size()});
     }
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] handle native_handle() const noexcept override { return -1; }
 };
 
 }

@@ -14,7 +14,7 @@
 namespace net
 {
 
-udp_socket::udp_socket(io::scheduler* scheduler, int fd) noexcept
+udp_socket::udp_socket(io::scheduler* scheduler, io::handle fd) noexcept
     : socket{scheduler, fd}
 {}
 
@@ -26,7 +26,7 @@ udp_socket::udp_socket(io::scheduler* scheduler, std::string_view host, std::str
     : socket{scheduler, open(host, port, proto)}
 {}
 
-int udp_socket::open(std::string_view host, std::string_view port, protocol proto)
+io::handle udp_socket::open(std::string_view host, std::string_view port, protocol proto)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -53,7 +53,7 @@ int udp_socket::open(std::string_view host, std::string_view port, protocol prot
     if (sts != 0) throw std::system_error{make_gai_error_code(sts), "getaddrinfo"};
 
     // find first valid addr, and use it!
-    int fd = -1;
+    io::handle fd = -1;
 
     for (const ::addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {

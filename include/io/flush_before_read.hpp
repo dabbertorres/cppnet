@@ -35,7 +35,7 @@ public:
 
     using reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return conn->native_handle(); }
+    [[nodiscard]] handle native_handle() const noexcept override { return conn->native_handle(); }
 
 private:
     // flush_and_read finishes read(), once flushing (which needed a coroutine) does.

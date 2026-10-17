@@ -111,7 +111,7 @@ namespace detail
         // socket is the TCP connection (under TLS's, if it's TLS), e.g. for deadlines and timeouts.
         [[nodiscard]] tcp_socket& socket() noexcept;
 
-        [[nodiscard]] int native_handle() const noexcept override;
+        [[nodiscard]] io::handle native_handle() const noexcept override;
 
     private:
 #ifdef NET_HAS_TLS

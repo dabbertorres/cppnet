@@ -75,10 +75,10 @@ public:
     void shutdown_read() const noexcept;
 
 protected:
-    static constexpr int invalid_fd = -1;
+    static constexpr io::handle invalid_fd = -1;
 
     template<typename T>
-    static bool set_option(int fd, int flag, T* value) noexcept
+    static bool set_option(io::handle fd, int flag, T* value) noexcept
     {
         int sts = ::setsockopt(fd, SOL_SOCKET, flag, value, sizeof(T));
         return sts == 0;
@@ -149,7 +149,7 @@ private:
                                                       std::size_t&               written) const noexcept;
 
     io::scheduler*                       scheduler;
-    int                                  fd;
+    io::handle                           fd;
     std::optional<io::clock::time_point> read_deadline;
     std::optional<io::clock::time_point> write_deadline;
     std::optional<io::clock::duration>   read_timeout;

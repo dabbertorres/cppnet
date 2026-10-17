@@ -48,7 +48,7 @@ private:
     // change applies flags (e.g. EV_ADD) to both of the handle's filters.
     void change(handle fd, std::uint16_t flags);
 
-    int descriptor;
+    handle descriptor;
 };
 
 }

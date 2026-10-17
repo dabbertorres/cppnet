@@ -46,7 +46,7 @@ public:
         co_return {.count = amount};
     }
 
-    [[nodiscard]] int native_handle() const noexcept override { return 0; }
+    [[nodiscard]] handle native_handle() const noexcept override { return 0; }
 
 private:
     std::span<const std::byte> view;
@@ -74,7 +74,7 @@ public:
 
     using reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return 0; }
+    [[nodiscard]] handle native_handle() const noexcept override { return 0; }
 
 private:
     std::string               content;

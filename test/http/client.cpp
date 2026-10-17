@@ -836,7 +836,7 @@ public:
 
     using net::io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 };
 
 // timed runs test, and returns its result, and how long it took.

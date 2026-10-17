@@ -116,7 +116,7 @@ public:
 
     using net::io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 
 private:
     task<net::io::result> wait_then_read(std::span<std::byte> data)

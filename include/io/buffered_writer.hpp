@@ -20,7 +20,7 @@ public:
 
     using writer::write;
 
-    [[nodiscard]] int native_handle() const noexcept override;
+    [[nodiscard]] handle native_handle() const noexcept override;
 
     coro::task<result> flush();
 

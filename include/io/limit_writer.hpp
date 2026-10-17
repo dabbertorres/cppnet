@@ -30,7 +30,7 @@ public:
     // remaining is how many bytes can still be written.
     [[nodiscard]] std::size_t remaining() const noexcept { return left; }
 
-    [[nodiscard]] int native_handle() const noexcept override { return out != nullptr ? out->native_handle() : -1; }
+    [[nodiscard]] handle native_handle() const noexcept override { return out != nullptr ? out->native_handle() : -1; }
 
 private:
     // finish counts what a write of amount bytes (of wanted) wrote.

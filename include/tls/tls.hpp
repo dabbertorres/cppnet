@@ -147,7 +147,7 @@ public:
     // socket is the TCP socket the stream runs over: e.g. for its deadlines and timeouts. Don't read or write it.
     [[nodiscard]] tcp_socket& socket() noexcept;
 
-    [[nodiscard]] int native_handle() const noexcept override;
+    [[nodiscard]] io::handle native_handle() const noexcept override;
 
 private:
     explicit stream(std::unique_ptr<detail::connection> conn) noexcept;

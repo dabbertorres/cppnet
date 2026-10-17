@@ -48,7 +48,7 @@ tcp_socket& connection::socket() noexcept
     return *std::get_if<tcp_socket>(&conn);
 }
 
-int connection::native_handle() const noexcept
+io::handle connection::native_handle() const noexcept
 {
 #ifdef NET_HAS_TLS
     if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->native_handle();

@@ -7,6 +7,7 @@
 
 #include "coro/task.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/io.hpp"
 #include "io/reader.hpp"
 
 namespace net::http::http11
@@ -41,7 +42,7 @@ public:
 
     using io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
+    [[nodiscard]] io::handle native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
     coro::task<std::error_code> read_chunk_size();

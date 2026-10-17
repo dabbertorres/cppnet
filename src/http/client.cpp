@@ -90,7 +90,7 @@ public:
 
     using net::io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override
+    [[nodiscard]] net::io::handle native_handle() const noexcept override
     {
         return leased.conn != nullptr ? leased.conn->native_handle() : -1;
     }

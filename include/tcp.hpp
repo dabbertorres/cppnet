@@ -29,7 +29,7 @@ public:
     };
 
     explicit tcp_socket(io::scheduler* scheduler) noexcept;
-    tcp_socket(io::scheduler* scheduler, int fd);
+    tcp_socket(io::scheduler* scheduler, io::handle fd);
 
     // connect resolves host, and connects to the first of its addresses that accepts. It fails with:
     // - an error in gai_category() if the host can't be resolved.

@@ -31,7 +31,7 @@ public:
     coro::task<result>         read(std::byte& data) { return read({&data, 1}); }
     coro::task<result>         read(char& data) { return read({&data, 1}); }
 
-    [[nodiscard]] virtual int native_handle() const noexcept = 0;
+    [[nodiscard]] virtual handle native_handle() const noexcept = 0;
 
 protected:
     reader() = default;

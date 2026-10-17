@@ -13,7 +13,7 @@ namespace net
 class udp_socket : public socket
 {
 public:
-    udp_socket(io::scheduler* scheduler, int fd) noexcept;
+    udp_socket(io::scheduler* scheduler, io::handle fd) noexcept;
     udp_socket(io::scheduler* scheduler, std::string_view port, protocol proto = protocol::not_care);
     udp_socket(io::scheduler*   scheduler,
                std::string_view host,
@@ -21,7 +21,7 @@ public:
                protocol         proto = protocol::not_care);
 
 private:
-    static int open(std::string_view host, std::string_view port, protocol proto);
+    static io::handle open(std::string_view host, std::string_view port, protocol proto);
 };
 
 }

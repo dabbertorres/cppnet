@@ -36,7 +36,7 @@ public:
     coro::task<result> write(std::byte data) { co_return co_await write(std::span{&data, 1}); }
     coro::task<result> write(char data) { co_return co_await write(std::span{&data, 1}); }
 
-    [[nodiscard]] virtual int native_handle() const noexcept = 0;
+    [[nodiscard]] virtual handle native_handle() const noexcept = 0;
 
 protected:
     writer() = default;

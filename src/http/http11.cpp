@@ -332,7 +332,7 @@ public:
 
     using net::io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return body->native_handle(); }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return body->native_handle(); }
 
 private:
     // NOTE: declared first, so it's destroyed last: body reads from it.

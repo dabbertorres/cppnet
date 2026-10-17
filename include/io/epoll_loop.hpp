@@ -45,8 +45,8 @@ public:
     void interrupt() noexcept;
 
 private:
-    int epoll_fd;
-    int interrupt_fd;
+    handle epoll_fd;
+    handle interrupt_fd;
 };
 
 }

@@ -41,7 +41,7 @@ public:
 
     using net::io::writer::write;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 
     std::string out;
 
@@ -67,7 +67,7 @@ public:
 
     using net::io::writer::write;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 
 private:
     static net::coro::task<net::io::result> wrote_nothing() { co_return {.count = 0}; }

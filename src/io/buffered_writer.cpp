@@ -68,7 +68,7 @@ coro::task<result> buffered_writer::write_through(std::span<const std::byte> dat
     co_return result{.count = data.size()};
 }
 
-int buffered_writer::native_handle() const noexcept { return impl->native_handle(); }
+handle buffered_writer::native_handle() const noexcept { return impl->native_handle(); }
 
 std::span<std::byte> buffered_writer::prepare(std::size_t size)
 {

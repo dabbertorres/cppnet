@@ -62,7 +62,7 @@ public:
 
     void reset() { parts.clear(); }
 
-    [[nodiscard]] int native_handle() const noexcept override { return 0; }
+    [[nodiscard]] handle native_handle() const noexcept override { return 0; }
 
 private:
     std::deque<string> parts;

@@ -64,7 +64,7 @@ std::error_code from_errno(int err) noexcept { return {err, std::system_category
 // (e.g. as Linux reports a socket that isn't connected yet as hung up, when it's registered), so that's checked, and it
 // waits again if it's still connecting.
 net::coro::task<std::error_code>
-wait_connected(net::io::scheduler* scheduler, int fd, net::io::clock::time_point deadline)
+wait_connected(net::io::scheduler* scheduler, net::io::handle fd, net::io::clock::time_point deadline)
 {
     while (true)
     {
@@ -90,7 +90,7 @@ tcp_socket::tcp_socket(io::scheduler* scheduler) noexcept
     : socket{scheduler, invalid_fd}
 {}
 
-tcp_socket::tcp_socket(io::scheduler* scheduler, int fd)
+tcp_socket::tcp_socket(io::scheduler* scheduler, io::handle fd)
     : socket{scheduler, fd}
 {}
 
@@ -116,7 +116,7 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
 
     for (const auto* info = addresses->get(); info != nullptr; info = info->ai_next)
     {
-        int fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+        io::handle fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
         if (fd == -1)
         {
             last_err = from_errno(errno);

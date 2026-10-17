@@ -48,7 +48,7 @@ public:
 
     using net::io::reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 
 private:
     net::io::string_reader<char> content;

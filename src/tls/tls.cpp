@@ -762,6 +762,5 @@ std::string_view stream::alpn() const noexcept { return conn->alpn; }
 
 tcp_socket& stream::socket() noexcept { return conn->socket; }
 
-int stream::native_handle() const noexcept { return conn->socket.native_handle(); }
-
+io::handle stream::native_handle() const noexcept { return conn->socket.native_handle(); }
 }

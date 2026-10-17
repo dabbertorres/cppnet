@@ -27,9 +27,9 @@
 namespace net
 {
 
-constexpr int invalid_fd = -1;
+constexpr net::io::handle invalid_fd = -1;
 
-std::expected<int, std::error_code>
+std::expected<net::io::handle, std::error_code>
 listener::open(io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
 {
 #pragma clang diagnostic push
@@ -59,7 +59,7 @@ listener::open(io::scheduler* scheduler, const std::string& host, const std::str
     if (sts != 0) return std::unexpected(make_gai_error_code(sts));
 
     // find first valid addr, and use it
-    int fd       = invalid_fd;
+    net::io::handle fd       = invalid_fd;
     int last_err = 0;
     for (const addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
@@ -130,7 +130,7 @@ std::expected<listener, std::error_code> listener::make(io::scheduler*     sched
     return out;
 }
 
-listener::listener(io::scheduler* scheduler, int fd) noexcept
+listener::listener(io::scheduler* scheduler, io::handle fd) noexcept
     : scheduler{scheduler}
     , is_listening{false}
     , main_fd{fd}
@@ -207,7 +207,7 @@ coro::task<std::expected<tcp_socket, std::error_code>> listener::accept() const
     {
         if (!is_listening.load(std::memory_order::acquire)) co_return std::unexpected(canceled);
 
-        int inc_fd = ::accept(main_fd, nullptr, nullptr);
+        io::handle inc_fd = ::accept(main_fd, nullptr, nullptr);
         if (inc_fd != -1) co_return tcp_socket{scheduler, inc_fd};
 
         auto err = errno;

@@ -21,7 +21,7 @@ public:
     using reader::read;
     using writer::write;
 
-    [[nodiscard]] int native_handle() const noexcept override { return -1; }
+    [[nodiscard]] handle native_handle() const noexcept override { return -1; }
 
     [[nodiscard]] std::string to_string() const;
 

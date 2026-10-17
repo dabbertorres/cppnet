@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "io/io.hpp"
 #include "reader.hpp"
 
 namespace net::io
@@ -77,7 +78,7 @@ public:
     // Potentially useful if e.g. peek() fails.
     [[nodiscard]] std::error_code error() const;
 
-    [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
+    [[nodiscard]] handle native_handle() const noexcept override { return impl->native_handle(); }
 
 private:
     // read_more reads what's buffered, and then more.

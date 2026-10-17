@@ -32,7 +32,7 @@ public:
 
     using reader::read;
 
-    [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
+    [[nodiscard]] handle native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
     coro::task<result> count_after(coro::task<result> inner);
