@@ -20,9 +20,14 @@ namespace net::coro
 
 std::size_t hardware_concurrency(std::size_t minus_amount = 0) noexcept;
 
+// RangeOf is a range of V (for thread_pool::resume()).
 template<typename T, typename V>
 concept RangeOf = std::ranges::range<T> && std::is_same_v<V, std::ranges::range_value_t<T>>;
 
+// thread_pool runs coroutines on its worker threads. An application usually makes one, and gives it to an
+// io::scheduler, which runs the application's tasks on it (see io/scheduler.hpp); schedule() moves a coroutine onto it.
+//
+// poller, attach(), detach() and resume() are for what readies coroutines (the scheduler), not applications.
 class thread_pool
 {
 public:
