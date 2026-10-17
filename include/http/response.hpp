@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "http/chunked_writer.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -267,6 +268,16 @@ public:
     //       send(), which then throws when it's called, rather than when it's awaited.
     coro::task<io::writer*> send(status status_code, std::size_t content_length);
 
+    // send sends the response's status and headers without a Content-Length, for a body whose length isn't known
+    // beforehand, and returns the writer for it: the body is as long as what's written to it. It's sent chunked to an
+    // HTTP/1.1 client, and finish() (which the server calls once the handler returns) ends it; to an HTTP/1.0 client,
+    // closing the connection ends it. Otherwise, as send(status_code, content_length).
+    coro::task<io::writer*> send(status status_code);
+
+    // finish ends the body of a response sent without a Content-Length, if it's chunked (see send(status)). It does
+    // nothing otherwise, or if the body was ended already.
+    coro::task<io::result> finish();
+
     // body_remaining is how much of the body the handler has yet to write.
     [[nodiscard]] std::size_t body_remaining() const noexcept { return body.remaining(); }
 
@@ -277,17 +288,31 @@ public:
     [[nodiscard]] bool sent() const noexcept { return final_sent; }
 
 private:
+    // how a response's body is framed: by its Content-Length, chunks, or closing the connection.
+    enum class framing : std::uint8_t
+    {
+        length,
+        chunked,
+        close,
+    };
+
+    // start starts sending the response, framing its body as framing says (with a length of body_length).
+    coro::task<io::writer*> start(status status_code, framing how, std::size_t body_length);
+
     // finish_send finishes sending the response, once encoding (which needed a coroutine) does.
-    coro::task<io::writer*> finish_send(coro::task<response_encoder_result> encoding, std::size_t body_length);
+    coro::task<io::writer*>
+    finish_send(coro::task<response_encoder_result> encoding, framing how, std::size_t body_length);
 
     // take_encoding takes the encoder's result, returning the body's writer, or throwing if it failed.
-    io::writer* take_encoding(const response_encoder_result& res, std::size_t body_length);
+    io::writer* take_encoding(const response_encoder_result& res, framing how, std::size_t body_length);
 
-    io::writer*      writer;
-    server_response* resp;
-    response_encoder encode;
-    io::limit_writer body;
-    bool             final_sent = false;
+    io::writer*            writer;
+    server_response*       resp;
+    response_encoder       encode;
+    io::limit_writer       body;
+    http11::chunked_writer chunked{nullptr};
+    bool                   chunked_open = false;
+    bool                   final_sent   = false;
 };
 
 }

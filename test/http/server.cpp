@@ -185,6 +185,62 @@ TEST_CASE("a server serves with the listener it's given", "[http][server]")
     CHECK(resp.body == "hello");
 }
 
+TEST_CASE("a response's body needn't have a known length", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/stream",
+               [](const http::server_request&, http::response_writer& resp) -> task<void>
+               {
+                   auto* body = co_await resp.send(http::status::OK);
+                   co_await net::io::write_all(*body, "hello"sv);
+                   co_await net::io::write_all(*body, ", world"sv);
+               });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    SECTION("chunked, to an HTTP/1.1 client, which can reuse the connection")
+    {
+        auto resp = sched.run_to_completion(get(&sched, server.local_port(), "/stream"));
+        CHECK(resp.status == http::status::OK);
+        CHECK(resp.connection.empty());
+        CHECK(resp.body == "hello, world");
+    }
+
+    SECTION("in chunks, as the handler wrote them")
+    {
+        auto raw = sched.run_to_completion(
+            exchange(&sched, server.local_port(), "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+        CHECK(raw.contains("\r\nTransfer-Encoding: chunked\r\n"));
+        CHECK_FALSE(raw.contains("Content-Length"));
+        CHECK(raw.ends_with("\r\n\r\n5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n"));
+    }
+
+    SECTION("ended by closing the connection, to an HTTP/1.0 client")
+    {
+        auto raw = sched.run_to_completion(exchange(&sched, server.local_port(), "GET /stream HTTP/1.0\r\n\r\n"));
+        CHECK(raw.starts_with("HTTP/1.0 200 OK\r\n"));
+        CHECK(raw.contains("\r\nConnection: close\r\n"));
+        CHECK_FALSE(raw.contains("Transfer-Encoding"));
+        CHECK_FALSE(raw.contains("Content-Length"));
+        CHECK(raw.ends_with("\r\n\r\nhello, world"));
+    }
+
+    SECTION("without a body, for HEAD")
+    {
+        auto raw = sched.run_to_completion(
+            exchange(&sched, server.local_port(), "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+        CHECK(raw.contains("\r\nTransfer-Encoding: chunked\r\n"));
+        CHECK(raw.ends_with("\r\n\r\n"));
+    }
+}
+
 TEST_CASE("responses to HEAD requests have no body", "[http][server]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
