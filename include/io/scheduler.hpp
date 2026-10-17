@@ -162,6 +162,7 @@ public:
     // handle_operation is an operation on a handle (e.g. a socket's recv()) that the scheduler performs once the
     // handle's ready, rather than resuming the waiting coroutine to try it again: so that coroutine is only resumed
     // once it's finished, and needn't be one of its own that tries and waits in turn (see socket's reads and writes).
+    // It, register_handle() and deregister_handle() are for I/O objects (e.g. sockets), not applications.
     class handle_operation
     {
     public:
@@ -265,7 +266,7 @@ public:
     ~scheduler() noexcept override;
 
     // register_handle must be called before waiting on a handle, and deregister_handle before closing it.
-    // deregister_handle cancels any waits on the handle.
+    // deregister_handle cancels any waits on the handle. (For I/O objects, e.g. sockets, which call them.)
     void register_handle(handle fd);
     void deregister_handle(handle fd) noexcept;
 
