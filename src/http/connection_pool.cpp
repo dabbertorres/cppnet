@@ -58,7 +58,12 @@ io::handle connection::native_handle() const noexcept
 
 connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}
+#ifdef NET_HAS_TLS
     , config{std::move(options)}
+#else
+    // NOTE: trivially copyable
+    , config{options}
+#endif
 {}
 
 connection_pool::~connection_pool() = default;
