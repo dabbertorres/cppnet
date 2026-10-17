@@ -117,11 +117,11 @@ public:
     // connect runs a client's handshake over conn, with host (the server's name, for SNI, and which its certificate
     // must have), until deadline.
     static coro::task<std::expected<stream, std::error_code>>
-    connect(tcp_socket conn, const client_context& ctx, std::string host, io::clock::time_point deadline);
+    connect(tcp_socket conn, client_context ctx, std::string host, io::clock::time_point deadline);
 
     // accept runs a server's handshake over conn, until deadline.
     static coro::task<std::expected<stream, std::error_code>>
-    accept(tcp_socket conn, const server_context& ctx, io::clock::time_point deadline);
+    accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline);
 
     stream(const stream&)            = delete;
     stream& operator=(const stream&) = delete;

@@ -649,7 +649,7 @@ stream& stream::operator=(stream&&) noexcept = default;
 stream::~stream()                            = default;
 
 coro::task<std::expected<stream, std::error_code>>
-stream::connect(tcp_socket conn, const client_context& ctx, std::string host, io::clock::time_point deadline)
+stream::connect(tcp_socket conn, client_context ctx, std::string host, io::clock::time_point deadline)
 {
     // the certificate is checked against host: without one, nothing would be.
     if (host.empty() && !ctx.state->skip_verification)
@@ -681,7 +681,7 @@ stream::connect(tcp_socket conn, const client_context& ctx, std::string host, io
 }
 
 coro::task<std::expected<stream, std::error_code>>
-stream::accept(tcp_socket conn, const server_context& ctx, io::clock::time_point deadline)
+stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline)
 {
     auto c = std::make_unique<detail::connection>(std::move(conn));
 
