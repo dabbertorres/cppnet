@@ -1,5 +1,6 @@
 #include "http/headers.hpp"
 
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -9,6 +10,26 @@
 #include <catch2/catch_test_macros.hpp>
 
 using namespace std::string_view_literals;
+
+TEST_CASE("fields are set and read with any kind of string", "[http][headers]")
+{
+    net::http::headers fields;
+    const std::string  key   = "X-Key";
+    std::string        value = "moved";
+
+    fields.set("Content-Type", "text/plain");
+    fields.set("X-String", std::string{"string"});
+    fields.set(key, std::move(value));
+    fields.set("X-List", {"a", "b"});
+    fields.add("X-List", "c");
+    fields.add(key, std::string{"more"});
+
+    CHECK(fields.get("Content-Type") == "text/plain"sv);
+    CHECK(fields["X-String"] == "string"sv);
+    CHECK(fields.get(key) == "moved"sv);
+    CHECK(fields.get_list("X-List") == std::vector{"a"sv, "b"sv, "c"sv});
+    CHECK(std::ranges::distance(*fields.get_all(key)) == 2);
+}
 
 TEST_CASE("list-based fields are split on commas outside quotes", "[http][headers][get_list]")
 {

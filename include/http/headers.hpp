@@ -68,23 +68,17 @@ public:
 
     ~headers() = default;
 
-    headers& set(const std::string& key, std::string val);
-    headers& set(const std::string& key, std::initializer_list<std::string> vals);
-    headers& set(const std::string& key, std::vector<std::string>&& vals);
-    headers& add(const std::string& key, std::string val);
-
+    // set replaces key's values with val (or vals), and add adds val to them. Keys and values may be any kind of string
+    // (e.g. set("Content-Type", "text/plain")); a std::string value is moved in, rather than copied.
     headers& set(std::string_view key, std::string val);
-    headers& set(std::string_view key, std::initializer_list<std::string> vals);
-    headers& set(std::string_view key, std::vector<std::string>&& vals);
-    headers& add(std::string_view key, std::string val);
-
-    headers& set(const std::string& key, std::string_view val);
-    headers& set(const std::string& key, std::initializer_list<std::string_view> vals);
-    headers& add(const std::string& key, std::string_view val);
-
     headers& set(std::string_view key, std::string_view val);
+    headers& set(std::string_view key, const char* val) { return set(key, std::string_view{val}); }
     headers& set(std::string_view key, std::initializer_list<std::string_view> vals);
+    headers& set(std::string_view key, std::vector<std::string>&& vals);
+
+    headers& add(std::string_view key, std::string val);
     headers& add(std::string_view key, std::string_view val);
+    headers& add(std::string_view key, const char* val) { return add(key, std::string_view{val}); }
 
     // remove removes key's values, if it has any.
     headers& remove(std::string_view key);
@@ -97,13 +91,10 @@ public:
 
     // NOTE: the views get() and get_all() return are only valid until the headers are next changed (as a vector's
     //       elements' are), as the fields are held in order, rather than one by one.
-    [[nodiscard]] std::optional<std::string_view> get(const std::string& key) const;
     [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const;
-    [[nodiscard]] std::optional<std::string_view> operator[](const std::string& key) const;
     [[nodiscard]] std::optional<std::string_view> operator[](std::string_view key) const;
 
     // get_all returns every value of key: one per field line, as they were received or set.
-    [[nodiscard]] std::optional<values_range> get_all(const std::string& key) const;
     [[nodiscard]] std::optional<values_range> get_all(std::string_view key) const;
 
     // get_list returns the elements of a list-based field (e.g. "Transfer-Encoding: gzip, chunked"), over all of its
