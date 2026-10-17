@@ -1,6 +1,7 @@
 # Plan: TLS, with Botan
 
-Status: stage 1 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`.
+Status: stages 1 and 2 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`; and
+`https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`).
 
 ## Goal
 
@@ -169,6 +170,17 @@ const std::error_category& category() noexcept;
 - Botan 3.12 doesn't build with libc++ 23 (missing includes): `ports/botan/` patches it.
 - macOS's `getaddrinfo()` leaves allocations in the Network framework that LeakSanitizer reports (suppressed in
   `test/sanitizers.cpp`).
+
+## Learned in stage 2
+
+- The pool holds a `detail::connection`: a `tcp_socket` or a `tls::stream`, as a reader and writer; deadlines and
+  timeouts are set on its socket either way. Its keys are scheme, host and port, so `http://` and `https://`
+  connections to the same port aren't mixed up.
+- The pool makes its `tls::client_context` the first time it needs one (`std::call_once`), as loading the system's
+  trust store isn't worth it for a client that never uses https; it offers ALPN `http/1.1` (the client's own, rather
+  than whatever `client_options::tls` says).
+- Checking that an idle connection is still open (peeking at its socket) works for TLS too: a server that has closed
+  it has sent close_notify (or closed the socket), either of which the peek sees.
 
 ## Stages
 

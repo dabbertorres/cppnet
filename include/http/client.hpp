@@ -15,7 +15,10 @@
 namespace net::http
 {
 
-// client sends HTTP/1.x requests, reusing connections within the limits of its client_options.
+// client sends HTTP/1.x requests, reusing connections within the limits of its client_options: to http:// URLs, and
+// (with NET_HAS_TLS) https:// ones, over TLS, verifying the server's certificate against client_options::tls's trusted
+// certificate authorities (the system's, by default). Without NET_HAS_TLS, https fails with
+// std::errc::protocol_not_supported.
 //
 // A connection is reused once the response's body has been read to its end (until a read reports
 // io::errc::end_of_stream, or all of its Content-Length has been read). Destroying a response whose body hasn't been

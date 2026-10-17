@@ -55,7 +55,7 @@ public:
 
     ~pooled_body() override { finish(false); }
 
-    [[nodiscard]] net::tcp_socket*          connection() const noexcept { return leased.conn.get(); }
+    [[nodiscard]] net::http::detail::connection* connection() const noexcept { return leased.conn.get(); }
     [[nodiscard]] net::io::buffered_reader* buffered() const noexcept { return reader.get(); }
 
     // attach sets the body that's read from the connection. length is how long it is, if it's known up front.
@@ -130,6 +130,19 @@ bool is_idempotent(net::http::request_method method) noexcept
     return method == GET || method == HEAD || method == OPTIONS || method == TRACE || method == PUT || method == DELETE;
 }
 
+// endpoint is the scheme ("http", unless it's "https") and port (the scheme's default, if the URL has none) that a
+// request is sent to. It fails with std::errc::protocol_not_supported for other schemes. (The pool refuses https
+// without TLS.)
+std::expected<std::pair<std::string, std::string>, std::error_code> endpoint(const net::url& uri)
+{
+    const bool https = net::util::equal_ignore_case(std::string_view{uri.scheme}, "https"sv);
+    if (!https && !uri.scheme.empty() && !net::util::equal_ignore_case(std::string_view{uri.scheme}, "http"sv))
+        return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+
+    return std::pair{std::string{https ? "https" : "http"},
+                     !uri.port.empty() ? uri.port : std::string{https ? "443" : "80"}};
+}
+
 // closed_early is whether a request failed as it would on a connection the server had closed before getting it.
 bool closed_early(std::error_code err) noexcept { return err == net::io::status_condition::closed; }
 
@@ -163,15 +176,15 @@ client::client(io::scheduler* scheduler, const client_options& options)
 
 coro::task<std::expected<client_response, std::error_code>> client::send(client_request request)
 {
-    // Only HTTP/1.x over TCP is implemented. In particular, the http2 encoders are stubs, and there's no TLS.
+    // Only HTTP/1.x is implemented: the http2 encoders are stubs.
     if (request.version.major > 1) co_return std::unexpected(std::make_error_code(std::errc::not_supported));
-    if (!request.uri.scheme.empty() && !util::equal_ignore_case(std::string_view{request.uri.scheme}, "http"sv))
-        co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+
+    auto target = endpoint(request.uri);
+    if (!target.has_value()) co_return std::unexpected(target.error());
+    const auto& [scheme, port] = *target;
 
     // before taking a connection, which a request that can't be sent would waste.
     if (auto err = http11::check_request(request); err) co_return std::unexpected(err);
-
-    const auto port = !request.uri.port.empty() ? request.uri.port : std::string{"80"};
 
     // a request that closes its connection can't be followed by another.
     const bool reusable_request = request.version.minor >= 1 && !has_close(request.headers);
@@ -179,7 +192,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
     for (int attempt = 0;; ++attempt)
     {
         // a retry is because a reused connection had been closed, so the others may have been too.
-        auto leased = co_await pool->acquire(request.uri.host, port, attempt == 0);
+        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0);
         if (!leased.has_value()) co_return std::unexpected(leased.error());
 
         const bool reused = leased->reused;
@@ -188,8 +201,9 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
 
         // NOTE: set every time, as a reused connection has whatever its last request left.
         const auto& options = pool->options();
-        conn->set_deadline(std::nullopt);
-        conn->set_timeout(limit(options.io_timeout));
+        auto&       sock    = conn->socket();
+        sock.set_deadline(std::nullopt);
+        sock.set_timeout(limit(options.io_timeout));
 
         // NOTE: not with a body, which has been read.
         const auto retry = [&](std::error_code err)
@@ -216,12 +230,12 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
             if (request.body == nullptr || !closed_early(res.error())) co_return std::unexpected(res.error());
         }
 
-        if (auto wait = limit(options.response_header_timeout)) conn->set_read_deadline(io::clock::now() + *wait);
+        if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
 
         auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
 
         // the body's reads are only limited by io_timeout.
-        conn->set_read_deadline(std::nullopt);
+        sock.set_read_deadline(std::nullopt);
         if (!resp.has_value())
         {
             if (write_failed) co_return std::unexpected(res.error());
