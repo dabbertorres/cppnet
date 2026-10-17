@@ -614,7 +614,7 @@ private:
 
     template<std::size_t I>
     static constexpr bool takes_params =
-        std::invocable<const handler_type<I>&, const server_request&, response_writer&, params<entry_type<I>::pattern>>;
+        std::invocable<const handler_type<I>&, server_request&, response_writer&, params<entry_type<I>::pattern>>;
 
     // call calls the handler of route I, with its params if it takes them.
     template<std::size_t I>
@@ -629,11 +629,11 @@ private:
             static_assert(!detail::takes_params_by_reference<handler_type<I>>,
                           "a handler takes its params by value (they're a pointer and an index)");
 
-            return handler(std::as_const(req), resp, params<entry_type<I>::pattern>{req});
+            return handler(req, resp, params<entry_type<I>::pattern>{req});
         }
         else
         {
-            return std::invoke(handler, std::as_const(req), resp);
+            return std::invoke(handler, req, resp);
         }
     }
 

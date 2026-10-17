@@ -166,6 +166,21 @@ TEST_CASE("handlers get the route's parameters", "[http][router][path_value]")
     CHECK(missing.empty());
 }
 
+TEST_CASE("handlers may take the request as const, or not", "[http][router]")
+{
+    http::router router;
+    router.GET("/const", ok);
+    router.GET("/mutable",
+               [](http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   req.extensions.emplace<int>(42);
+                   co_await resp.send(http::status::OK, 0);
+               });
+
+    CHECK(route(router, http::request_method::GET, "/const").status == http::status::OK);
+    CHECK(route(router, http::request_method::GET, "/mutable").status == http::status::OK);
+}
+
 TEST_CASE("literal segments win over parameters, without backtracking", "[http][router]")
 {
     http::router router;
