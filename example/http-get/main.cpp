@@ -1,150 +1,67 @@
-#include <array>
-#include <chrono>
-#include <expected>
+// http-get fetches a URL, and prints the response: e.g. `net-example-http-get http://example.com/`.
+
+#include <cstddef>
 #include <iostream>
 #include <memory>
-#include <span>
 #include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
-
-#include <spdlog/common.h>
-#include <spdlog/logger.h>
-#include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
-#include "http/headers.hpp"
 #include "http/http.hpp"
-#include "http/request.hpp"
-#include "http/response.hpp"
-#include "io/io.hpp"
-#include "io/reader.hpp"
 #include "io/scheduler.hpp"
-#include "url.hpp"
+#include "io/util.hpp"
 
 namespace http = net::http;
 
 namespace
 {
 
-net::coro::task<bool> run_request(http::client& client, http::client_request req);
+// fetch GETs url, and prints the response, returning whether it could.
+net::coro::task<bool> fetch(http::client& client, std::string url)
+{
+    auto resp = co_await client.get(url);
+    if (!resp.has_value())
+    {
+        std::cerr << "request failed: " << resp.error().message() << '\n';
+        co_return false;
+    }
+
+    std::cout << static_cast<int>(resp->status_code) << ' ' << http::reason_phrase(resp->status_code) << '\n';
+    for (const auto& [name, values] : resp->headers)
+    {
+        for (const auto& value : values) std::cout << name << ": " << value << '\n';
+    }
+    std::cout << '\n';
+
+    // the body is read after the head, until it ends (up to 10 MiB).
+    constexpr std::size_t max_body = std::size_t{10} * 1024 * 1024;
+
+    auto body = co_await net::io::read_all(*resp->body, max_body);
+    if (!body.has_value())
+    {
+        std::cerr << "reading the body failed: " << body.error().message() << '\n';
+        co_return false;
+    }
+
+    std::cout << *body << '\n';
+    co_return true;
+}
+
 }
 
 int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signature.
 {
-    using namespace std::chrono_literals;
-    using namespace std::string_view_literals;
-
     if (argc != 2)
     {
-        std::cerr << "Must provide a single url to GET.\n";
+        std::cerr << "usage: " << argv[0] << " <url>\n";
         return 1;
     }
 
-    auto parse_result = net::url::parse(argv[1]);
-    if (!parse_result.has_value())
-    {
-        auto err = parse_result.error();
-        std::cerr << "Invalid url: unexpected character at " << err.index << " in "
-                  << net::url_parse_state_to_string(err.failed_at) << "\n";
-        return 1;
-    }
-
-    auto url = parse_result.value();
-    if (url.scheme.empty()) url.scheme = "http";
-    if (url.port.empty())
-    {
-        if (url.scheme == "http") url.port = "80";
-        else if (url.scheme == "https") url.port = "443";
-    }
-
-    std::cout << "fetching from:\n"
-              << "scheme: " << url.scheme << '\n'
-              << "userinfo: " << url.userinfo.username << '\n'
-              << "host: " << url.host << '\n'
-              << "port: " << url.port << '\n'
-              << "path: " << url.path << '\n';
-
-    auto workers = std::make_shared<net::coro::thread_pool>(1);
-
-    auto logger = spdlog::default_logger();
-    logger->set_level(spdlog::level::trace);
-
-    net::io::scheduler scheduler{workers, logger};
+    // the runtime: worker threads, and a scheduler that runs tasks on them and waits for their I/O.
+    net::io::scheduler scheduler{std::make_shared<net::coro::thread_pool>()};
     http::client       client{&scheduler};
 
-    http::client_request req{
-        .method  = http::request_method::GET,
-        .version = {.major = 1, .minor = 1},
-        .uri     = url,
-        // clang-format off
-        .headers = {
-            {"User-Agent", {"cppnet/http/client"}},
-            {"Accept", {"*/*"}},
-        },
-        // clang-format on
-    };
-
-    std::cout << "sending request...\n";
-    bool success = scheduler.run_to_completion(run_request(client, std::move(req)));
-
-    return success ? 0 : 1;
-}
-
-namespace
-{
-
-net::coro::task<bool> run_request(http::client& client, http::client_request req)
-{
-    auto get_result = co_await client.send(std::move(req));
-    if (!get_result.has_value())
-    {
-        std::cerr << "Error sending request: " << get_result.error().message() << "\n";
-        co_return false;
-    }
-
-    std::cout << "received response!\n";
-
-    auto& resp = get_result.value();
-
-    std::cout << static_cast<int>(resp.status_code) << ' ' << http::reason_phrase(resp.status_code) << '\n';
-
-    for (const auto& [k, vals] : resp.headers)
-    {
-        std::cout << k << ":";
-
-        for (const auto& v : vals)
-        {
-            std::cout << ' ' << v;
-        }
-
-        std::cout << '\n';
-    }
-
-    if (resp.body)
-    {
-        std::cout << '\n';
-
-        std::array<char, 512> buf{};
-
-        auto res = co_await resp.body->read(buf);
-        if (res.err)
-        {
-            std::cerr << "error reading body: " << res.err.message() << '\n';
-            co_return false;
-        }
-
-        if (res.count != 0)
-        {
-            std::cout << std::string_view{std::span{buf}.subspan(0, res.count)} << '\n';
-        }
-    }
-
-    co_return true;
-}
-
+    // runs the task (and the scheduler, on this thread) until it's finished.
+    return scheduler.run_to_completion(fetch(client, argv[1])) ? 0 : 1;
 }

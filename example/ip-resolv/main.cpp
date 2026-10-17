@@ -1,3 +1,5 @@
+// ip-resolv prints a host name's addresses: e.g. `net-example-ip-resolv example.com`.
+
 #include <iostream>
 #include <string>
 #include <string_view>
