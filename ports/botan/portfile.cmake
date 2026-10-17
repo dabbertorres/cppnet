@@ -142,6 +142,21 @@ else()
         vcpkg_list(APPEND configure_arguments --cc=emcc)
     elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         vcpkg_list(APPEND configure_arguments --cc=gcc)
+
+        # cppnet: GCC on macOS can't compile what's left out here:
+        # - the keychain's trust store, as Apple's headers use blocks, which only Clang supports. Botan's system trust
+        #   store reads /etc/ssl/cert.pem (Apple's bundle of the system's roots) instead, which configure.py finds.
+        # - on Apple Silicon, the ARMv8 SM3 code (which TLS doesn't use), as GCC writes SM3's instructions (e.g.
+        #   "sm3tt1a v30.4s, v29.4s, v31.4s[0]") in a form Apple's assembler rejects.
+        if(VCPKG_TARGET_IS_OSX)
+            set(cppnet_disabled_modules certstor_system_macos)
+            if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+                list(APPEND cppnet_disabled_modules sm3_armv8)
+            endif()
+
+            list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
+            vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
+        endif()
     elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         vcpkg_list(APPEND configure_arguments --cc=clang)
     endif()
