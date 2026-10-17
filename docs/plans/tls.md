@@ -19,7 +19,7 @@ default, against the system's trust store.
 - **Botan stays private**, as glaze does: cppnet's API has its own TLS options, and no Botan types.
 - **Optional at build time, on by default**: a vcpkg manifest feature (`tls`) and a CMake option (`NET_TLS`, default
   `ON`), so builds that don't need it skip Botan's build (vcpkg's port can't trim Botan's modules: it's the whole
-  library). `config.hpp` defines `NET_HAS_TLS` when it's on.
+  library). CMake defines `NET_HAS_TLS` (a public compile definition of `net`) when it's on.
 - **Client first.**
 - **Each `http::client` has its own `client_context`** (trust store, session cache), not one shared process-wide.
 - **The client's handshake times out after 10s by default** (`client_options::tls_handshake_timeout`, separate from
@@ -114,7 +114,8 @@ public:
     tcp_socket& socket() noexcept; // e.g. for deadlines and timeouts
 };
 
-// tls_category: errors from Botan (alerts, certificate verification) as error_conditions.
+// category: TLS's errors (alerts, either side's) as error codes; verification_category(): why a certificate was
+// rejected; alert: conditions matching either side's alerts.
 const std::error_category& category() noexcept;
 
 }
@@ -145,7 +146,7 @@ const std::error_category& category() noexcept;
 
 - **Client:** `https://` URLs connect with `stream::connect()` (port 443 by default). `connection_pool` keys connections
   by scheme as well as host and port, and holds `stream`s or plain sockets. `client_options` gets a `tls::client_options`
-  (so tests can trust a test CA). Without `NET_HAS_TLS`, `https://` fails with `not_supported`.
+  (so tests can trust a test CA). Without `NET_HAS_TLS`, `https://` fails with `protocol_not_supported` (as it does before stage 2).
 - **Server (stage 3):** `server_config` gets an optional `tls::server_options`; `serve_connection` runs
   `stream::accept()` (under `header_read_timeout`) before reading requests, and serves over the stream.
 
@@ -156,6 +157,12 @@ const std::error_category& category() noexcept;
 - Botan's default policy requires revocation information (OCSP or CRLs) for the chain, which rejects certificates that
   have none (e.g. Let's Encrypt's: it stopped OCSP in 2025). cppnet's policy doesn't require it, as browsers, Go and
   OpenSSL don't.
+- Botan's default policy also requires TLS 1.2 peers to support Extended Master Secret, which rejects servers that
+  don't (e.g. badssl.com) with only `handshake_failure`. cppnet's policy doesn't, unless `require_extended_master_secret`
+  is set, as browsers, Go and OpenSSL don't. (Found by a review that tried the library from its docs.)
+- Botan reports a failure as an exception with an alert and text: cppnet's errors say which side sent the alert, and a
+  certificate that failed verification is its own code (Botan's `Certificate_Status_Code`, whose text is its message),
+  which our `tls_verify_cert_chain` records (doing what Botan's does) before throwing.
 - In TLS 1.3, a server may send data (and close_notify) straight after its handshake messages, so they can arrive with
   the end of the client's handshake: the handshake waits for `is_handshake_complete()`, not `is_active()` (which is
   false once the peer has closed), and leaves the rest for `read()`.
