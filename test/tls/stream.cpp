@@ -172,20 +172,41 @@ task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& s)
     }
 }
 
-// serve_once accepts a connection, runs the server's handshake, and hands the stream to serve (or the handshake's error
-// to failed, if any).
+// handshake_outcome is how a server's handshake ended, for a test to wait for (with wait()).
+struct handshake_outcome
+{
+    net::io::scheduler*        sched;
+    std::error_code            err;
+    std::atomic<std::uint64_t> done{0};
+
+    void finish(std::error_code result)
+    {
+        err = result;
+        done.store(1);
+        sched->notify_all(done);
+    }
+
+    task<> wait()
+    {
+        const auto deadline = net::io::clock::now() + 5s;
+        while (done.load() == 0)
+        {
+            if (co_await sched->wait_on(done, 0, deadline)) co_return;
+        }
+    }
+};
+
+// serve_once accepts a connection, runs the server's handshake, and hands the stream to serve (and how the handshake
+// ended to outcome, if any).
 template<typename Serve>
-task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, std::error_code* failed = nullptr)
+task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, handshake_outcome* outcome = nullptr)
 {
     auto accepted = co_await listener->accept();
     if (!accepted.has_value()) co_return;
 
     auto s = co_await tls::stream::accept(std::move(*accepted), ctx, net::io::clock::now() + 5s);
-    if (!s.has_value())
-    {
-        if (failed != nullptr) *failed = s.error();
-        co_return;
-    }
+    if (outcome != nullptr) outcome->finish(s.has_value() ? std::error_code{} : s.error());
+    if (!s.has_value()) co_return;
 
     co_await serve(*s);
 }
@@ -214,7 +235,6 @@ task<> echo(tls::stream& s)
     co_await s.close();
 }
 
-std::error_code alert(int code) { return {code, tls::category()}; }
 }
 
 TEST_CASE("a client and server talk over TLS", "[tls]")
@@ -269,32 +289,66 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
         std::string           host;
         bool                  skip_verification;
         bool                  succeeds;
+        std::string_view      reason = {};
     };
+
+    // Botan's reasons.
+    constexpr auto name_mismatch = "Certificate does not match provided name"sv;
+    constexpr auto untrusted     = "Certificate issuer not found"sv;
 
     const auto& p  = pki();
     const auto  tc = GENERATE_REF(
-        test_case{"another name's", p.other_name_chain, p.other_name_key, "localhost", false, false},
-        test_case{"an untrusted CA's", p.untrusted_chain, p.untrusted_key, "localhost", false, false},
+        test_case{"another name's", p.other_name_chain, p.other_name_key, "localhost", false, false, name_mismatch},
+        test_case{"an untrusted CA's", p.untrusted_chain, p.untrusted_key, "localhost", false, false, untrusted},
         test_case{"an untrusted CA's, not verified", p.untrusted_chain, p.untrusted_key, "localhost", true, true},
         test_case{"for the IP address", p.localhost_chain, p.localhost_key, "127.0.0.1", false, true},
-        test_case{"not for the IP address", p.other_name_chain, p.other_name_key, "127.0.0.1", false, false});
+        test_case{"not for the IP address",
+                  p.other_name_chain,
+                  p.other_name_key,
+                  "127.0.0.1",
+                  false,
+                  false,
+                  name_mismatch});
     CAPTURE(tc.name);
 
     net::io::scheduler sched{make_pool()};
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    std::error_code server_failed;
-    REQUIRE(sched.spawn(serve_once(&listener, server_with(tc.chain, tc.key), echo, &server_failed)));
+    handshake_outcome server{.sched = &sched, .err = {}};
+    REQUIRE(sched.spawn(serve_once(&listener, server_with(tc.chain, tc.key), echo, &server)));
 
     auto ctx = tls::client_context::make({.trusted_ca_file = p.ca, .insecure_skip_verification = tc.skip_verification});
     REQUIRE(ctx.has_value());
 
-    auto s = sched.run_to_completion(connect_to(&sched, listener.local_port(), *ctx, tc.host));
+    // the client's result, once the server's handshake has ended too.
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx,
+                           std::string         host,
+                           handshake_outcome*  server) -> task<std::expected<tls::stream, std::error_code>>
+    {
+        auto s = co_await connect_to(sched, port, std::move(ctx), std::move(host));
+        co_await server->wait();
+        co_return s;
+    };
+
+    auto s = sched.run_to_completion(client(&sched, listener.local_port(), *ctx, tc.host, &server));
     CAPTURE(s.has_value() ? "connected" : s.error().message());
+    CAPTURE(server.err.message());
 
     CHECK(s.has_value() == tc.succeeds);
-    if (!tc.succeeds) CHECK(s.error() == alert(42)); // bad_certificate
+    if (tc.succeeds) return;
+
+    // the client says why it rejected the certificate, and the server that the client sent bad_certificate.
+    CHECK(s.error().category() == tls::verification_category());
+    CHECK(s.error() == tls::alert::bad_certificate);
+    CHECK_FALSE(tls::from_peer(s.error()));
+    CHECK(s.error().message().contains(tc.reason));
+
+    CHECK(server.err == tls::alert::bad_certificate);
+    CHECK(tls::from_peer(server.err));
+    CHECK(server.err.message() == "bad_certificate (from the peer)");
 }
 
 TEST_CASE("a TLS stream ends with close_notify, and is cut short without it", "[tls]")
@@ -384,15 +438,17 @@ TEST_CASE("contexts fail to load what isn't there", "[tls]")
 TEST_CASE("the system's trust store verifies a public server", "[tls][network]")
 {
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be
-    //       required.
-    const std::string host = GENERATE("example.com", "letsencrypt.org");
-    CAPTURE(host);
+    //       required. badssl.com speaks TLS 1.2 without the Extended Master Secret extension, which mustn't be either,
+    //       unless asked for.
+    const std::string host        = GENERATE("example.com", "letsencrypt.org", "badssl.com");
+    const bool        require_ems = GENERATE(false, true);
+    CAPTURE(host, require_ems);
 
     net::io::scheduler sched{make_pool()};
 
-    const auto client = [](net::io::scheduler* sched, std::string host) -> task<std::string>
+    const auto client = [](net::io::scheduler* sched, std::string host, bool require_ems) -> task<std::string>
     {
-        auto ctx = tls::client_context::make();
+        auto ctx = tls::client_context::make({.require_extended_master_secret = require_ems});
         if (!ctx.has_value()) co_return "context: " + ctx.error().message();
 
         auto conn = co_await net::tcp_socket::connect(sched, host, "443");
@@ -405,5 +461,7 @@ TEST_CASE("the system's trust store verifies a public server", "[tls][network]")
         co_return "ok";
     };
 
-    CHECK(sched.run_to_completion(client(&sched, host)) == "ok");
+    const std::string_view expected =
+        require_ems && host == "badssl.com" ? "handshake: handshake_failure (sent to the peer)" : "ok";
+    CHECK(sched.run_to_completion(client(&sched, host, require_ems)) == expected);
 }
