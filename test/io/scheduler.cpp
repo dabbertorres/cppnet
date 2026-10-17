@@ -669,9 +669,11 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
 {
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
-    writer.set_write_timeout(100ms);
+    // NOTE: the timeout leaves plenty of room for a busy machine (e.g. CI's) to pause, as each wait is ~10ms (below).
+    constexpr auto timeout = 500ms;
+    writer.set_write_timeout(timeout);
 
-    constexpr std::size_t total = std::size_t{16} * 1'024 * 1'024;
+    constexpr std::size_t total = std::size_t{2} * 1'024 * 1'024;
 
     // more than the socket's buffers hold, so the write has to wait for the reader several times.
     auto write_all_of_it = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
@@ -681,13 +683,14 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
         co_return std::pair{res.count, res.err};
     };
 
-    // reads a little at a time: so the write makes progress well within the timeout, but takes longer altogether. It
-    // stops once the write has, if that's first (e.g. as it timed out).
+    // reads a little at a time (16 KiB every 10ms, so over a second for all of it): the write makes progress well
+    // within the timeout, but takes longer altogether. It stops once the write has, if that's first (e.g. as it timed
+    // out).
     std::size_t       read          = 0;
     std::atomic<bool> write_stopped = false;
     std::thread       slow_reader{[&, fd = reader.native_handle()]
                                   {
-                                std::vector<char> buf(std::size_t{256} * 1'024);
+                                std::vector<char> buf(std::size_t{16} * 1'024);
                                 while (read < total && !write_stopped.load())
                                 {
                                     std::this_thread::sleep_for(10ms);
@@ -711,7 +714,7 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
     CHECK(read == total);
 
     // or the test shows nothing: the timeout would have ended a write limited altogether.
-    CHECK(elapsed > 100ms);
+    CHECK(elapsed > timeout);
 }
 
 TEST_CASE("a coroutine destroyed while it waits to read a socket is neither resumed, nor holds it", "[io][socket]")
