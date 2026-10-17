@@ -32,8 +32,6 @@
 namespace net::http
 {
 
-using namespace std::chrono_literals;
-
 struct server_config
 {
     // Where to listen, for the constructors that don't take a listener.
@@ -42,11 +40,11 @@ struct server_config
     std::size_t max_header_bytes = 8'192;
     // How long to wait for a request's headers, from when the server starts waiting for them, so it includes waiting
     // for the next request on a kept-alive connection. The connection is closed once it passes. 0 disables it.
-    std::chrono::seconds header_read_timeout = 5s;
+    std::chrono::seconds header_read_timeout = std::chrono::seconds{5};
     // How long reading a request's body (by the handler, or skipping what it didn't read), and writing a response, may
     // each go without progress. The connection is closed once either passes. 0 disables them.
-    std::chrono::seconds body_read_timeout = 60s;
-    std::chrono::seconds write_timeout     = 60s;
+    std::chrono::seconds body_read_timeout = std::chrono::seconds{60};
+    std::chrono::seconds write_timeout     = std::chrono::seconds{60};
     // The most connections served at once: once that many are open, the server waits for one to close before
     // accepting another. 0 doesn't limit them. (512 is nginx's worker_connections default.)
     std::size_t                     max_connections         = 512;

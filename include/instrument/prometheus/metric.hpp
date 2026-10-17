@@ -20,8 +20,6 @@
 namespace net::instrument::prometheus
 {
 
-using namespace std::string_view_literals;
-
 enum class metric_type : std::uint8_t
 {
     counter,

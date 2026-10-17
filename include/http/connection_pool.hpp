@@ -21,12 +21,10 @@
 namespace net::http
 {
 
-using namespace std::chrono_literals;
-
 struct client_options
 {
     // How long to wait for a connection: both to connect, and for one to be free when at a limit.
-    std::chrono::milliseconds connect_timeout = 10s;
+    std::chrono::milliseconds connect_timeout = std::chrono::seconds{10};
 
     // Whether to turn on TCP keepalives (SO_KEEPALIVE), which detect connections to hosts that have gone away.
     bool tcp_keepalive = true;
@@ -40,14 +38,14 @@ struct client_options
     std::size_t max_connections          = 0;
 
     // How long a connection is kept idle, waiting to be reused, before it's closed.
-    std::chrono::milliseconds idle_timeout = 90s;
+    std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
 
     // How long to wait for a response's head, once its request has been sent. 0 is no limit.
-    std::chrono::milliseconds response_header_timeout = 30s;
+    std::chrono::milliseconds response_header_timeout = std::chrono::seconds{30};
 
     // How long sending a request, or reading a response's body, may go without progress: each read or write of the
     // connection may wait this long for it. Slow but steady transfers aren't limited. 0 is no limit.
-    std::chrono::milliseconds io_timeout = 30s;
+    std::chrono::milliseconds io_timeout = std::chrono::seconds{30};
 };
 
 struct connection_stats
