@@ -160,6 +160,23 @@ TEST_CASE("static routes' handlers get their parameters by name", "[http][static
     CHECK(post == "7");
 }
 
+TEST_CASE("static routes' handlers may take the request as const, or not", "[http][static_router]")
+{
+    const auto routes = http::make_static_router(
+        http::GET("/const"_route,
+                  [](const http::server_request&, http::response_writer& resp) -> task<void>
+                  { co_await resp.send(http::status::OK, 0); }),
+        http::GET("/mutable/:id"_route,
+                  [](http::server_request& req, http::response_writer& resp, http::params<"/mutable/:id">) -> task<void>
+                  {
+                      req.extensions.emplace<int>(42);
+                      co_await resp.send(http::status::OK, 0);
+                  }));
+
+    CHECK(route(routes, http::request_method::GET, "/const").status == http::status::OK);
+    CHECK(route(routes, http::request_method::GET, "/mutable/7").status == http::status::OK);
+}
+
 TEST_CASE("handlers in a group take their own route's parameters", "[http][static_router][params]")
 {
     std::string id;
