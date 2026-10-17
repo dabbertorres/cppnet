@@ -146,6 +146,9 @@ public:
     [[nodiscard]] std::size_t queue_size() const noexcept;
     [[nodiscard]] bool        queue_empty() const noexcept;
 
+    // on_worker is whether the calling thread is one of the pool's workers.
+    [[nodiscard]] bool on_worker() const noexcept;
+
 private:
     // poll_interval is how many jobs a worker runs before polling (if no one else is), even if more are queued, so
     // that I/O isn't held up by a queue that never empties. (Tokio's event_interval.)
