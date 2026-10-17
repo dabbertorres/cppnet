@@ -373,6 +373,13 @@ coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease 
 
             if (!rw.sent()) co_await rw.send(status::OK, 0);
 
+            // ends a body sent without a Content-Length, chunked.
+            if (auto finished = co_await rw.finish(); finished.err)
+            {
+                logger->debug("failed to end the response's body: {}", finished.err.message());
+                break;
+            }
+
             // the client would wait for the rest of the body, so it's told there's no more by closing the connection.
             // NOTE: not for HEAD, whose body isn't sent.
             if (req.method != request_method::HEAD && rw.body_remaining() > 0)
