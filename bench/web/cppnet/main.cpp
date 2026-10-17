@@ -92,7 +92,8 @@ int main()
     http::server server{
         &scheduler,
         router,
-        {.port = port != nullptr ? port : "8080", .max_pending_connections = 4'096}
+        // NOTE: no limit on connections, as the benchmarks open up to 1024 (and the other servers don't limit them).
+        {.port = port != nullptr ? port : "8080", .max_connections = 0, .max_pending_connections = 4'096}
     };
 
     scheduler.spawn(server.serve());

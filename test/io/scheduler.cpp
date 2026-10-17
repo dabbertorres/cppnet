@@ -713,3 +713,28 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
     // or the test shows nothing: the timeout would have ended a write limited altogether.
     CHECK(elapsed > 100ms);
 }
+
+TEST_CASE("a coroutine destroyed while it waits to read a socket is neither resumed, nor holds it", "[io][socket]")
+{
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    {
+        std::string ignored;
+        auto        waiting = read_some(&reader, &ignored);
+
+        // nothing to read yet, so it waits.
+        waiting.get_handle().resume();
+        REQUIRE_FALSE(waiting.is_ready());
+    }
+
+    // had its wait been left, the scheduler would now read into the destroyed coroutine's buffer, and resume it (which
+    // ASan reports), and the next read would find the socket busy.
+    REQUIRE(::send(writer.native_handle(), "x", 1, 0) == 1);
+
+    std::string received;
+    auto        res = sched.run_to_completion(read_some(&reader, &received));
+
+    CHECK_FALSE(res.err);
+    CHECK(received == "x");
+}

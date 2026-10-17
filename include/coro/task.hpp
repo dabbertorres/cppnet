@@ -16,26 +16,16 @@ namespace net::coro
 template<typename T>
 class promise;
 
-// operation is something a task can await without a coroutine (see operation_task()): e.g. a socket's read that has to
-// wait for data, which the scheduler performs once the socket's ready, and then resumes the awaiting coroutine. Its
-// state lives elsewhere (e.g. in the socket), as the task only points to it, so one is reused: whatever makes a task of
-// it claims it first (try_claim()), and it's released once its result is taken, or if the task is destroyed without
-// being awaited.
-template<typename T>
-class operation
+class promise_base;
+
+// operation_base is what every operation<T> has: claiming it for a task, and cancelling it (see operation).
+class operation_base
 {
 public:
-    operation(const operation&)                = delete;
-    operation(operation&&) noexcept            = delete;
-    operation& operator=(const operation&)     = delete;
-    operation& operator=(operation&&) noexcept = delete;
-
-    // start starts the operation, for awaiting to be resumed once it's finished, and returns whether awaiting must
-    // suspend: false if it finished straight away (then awaiting isn't resumed by it).
-    virtual bool start(std::coroutine_handle<> awaiting) noexcept = 0;
-
-    // result is the finished operation's result. It must release() the operation, once it no longer needs its state.
-    virtual T result() = 0;
+    operation_base(const operation_base&)                = delete;
+    operation_base(operation_base&&) noexcept            = delete;
+    operation_base& operator=(const operation_base&)     = delete;
+    operation_base& operator=(operation_base&&) noexcept = delete;
 
     // try_claim claims the operation, for a task, returning false if one already has it.
     [[nodiscard]] bool try_claim() noexcept { return !claimed.exchange(true, std::memory_order::acq_rel); }
@@ -45,12 +35,42 @@ public:
     //       coroutines that are awaited directly, as it can't tell that the handle doesn't escape).
     void release() noexcept { claimed.store(false, std::memory_order::release); }
 
+    // cancel stops the operation, which has started, without resuming the coroutine awaiting it (which is being
+    // destroyed while it waits), and releases it. NOTE: called by the coroutine's promise, as it's destroyed.
+    virtual void cancel() noexcept = 0;
+
 protected:
-    operation() noexcept = default;
-    ~operation()         = default;
+    operation_base() noexcept = default;
+    ~operation_base()         = default;
 
 private:
     std::atomic<bool> claimed = false;
+};
+
+// operation is something a task can await without a coroutine (see operation_task()): e.g. a socket's read that has to
+// wait for data, which the scheduler performs once the socket's ready, and then resumes the awaiting coroutine. Its
+// state lives elsewhere (e.g. in the socket), as the task only points to it, so one is reused: whatever makes a task of
+// it claims it first (try_claim()), and it's released once its result is taken, or if the task is destroyed without
+// being awaited, or the awaiting coroutine is destroyed while it waits (cancel()).
+template<typename T>
+class operation : public operation_base
+{
+public:
+    // start starts the operation, for awaiting to be resumed once it's finished, and returns whether awaiting must
+    // suspend: false if it finished straight away (then awaiting isn't resumed by it).
+    virtual bool start(std::coroutine_handle<> awaiting) noexcept = 0;
+
+    // result is the finished operation's result. It must release() the operation, once it no longer needs its state.
+    virtual T result() = 0;
+
+    operation(const operation&)                = delete;
+    operation(operation&&) noexcept            = delete;
+    operation& operator=(const operation&)     = delete;
+    operation& operator=(operation&&) noexcept = delete;
+
+protected:
+    operation() noexcept = default;
+    ~operation()         = default;
 };
 
 // task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it
@@ -118,9 +138,10 @@ public:
 
         // await_suspend starts the task, and only suspends the awaiting coroutine if the task suspended (see task's
         // comment, for why not symmetric transfer).
-        bool await_suspend(std::coroutine_handle<> continuation) noexcept
+        template<typename Promise>
+        bool await_suspend(std::coroutine_handle<Promise> continuation) noexcept
         {
-            if (op != nullptr) return op->start(continuation);
+            if (op != nullptr) return start_operation(continuation);
 
             auto& promise = handle.promise();
             promise.set_continuation(continuation);
@@ -134,9 +155,34 @@ public:
             return !promise.mark_awaiter_or_finished();
         }
 
+        // start_operation starts op, recording it in the awaiting coroutine's promise meanwhile: so that destroying the
+        // coroutine while it waits cancels op, rather than leaving it to resume a coroutine that's gone.
+        template<typename Promise>
+        bool start_operation(std::coroutine_handle<Promise> continuation) noexcept
+        {
+            if constexpr (std::is_base_of_v<promise_base, Promise>)
+            {
+                waiting = &continuation.promise();
+                started_operation();
+            }
+
+            // NOTE: once it's started, the coroutine may be resumed (on another thread) at any moment, so nothing here
+            //       may be touched again.
+            if (op->start(continuation)) return true;
+
+            finished_operation();
+            return false;
+        }
+
+        // started_operation records op in the awaiting coroutine's promise, and finished_operation forgets it, once
+        // it's finished (see start_operation).
+        void started_operation() noexcept;
+        void finished_operation() noexcept;
+
         std::coroutine_handle<promise_type> handle{nullptr};
         std::optional<ready_type>           ready;
-        operation<T>*                       op = nullptr;
+        operation<T>*                       op      = nullptr;
+        promise_base*                       waiting = nullptr; // the awaiting coroutine's, while op runs
     };
 
     constexpr task() noexcept
@@ -188,7 +234,11 @@ public:
             T await_resume()
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
-                if (this->op != nullptr) return this->op->result();
+                if (this->op != nullptr)
+                {
+                    this->finished_operation();
+                    return this->op->result();
+                }
                 if (!this->handle) throw std::logic_error{"awaited an empty task"};
                 return this->handle.promise().result();
             }
@@ -207,7 +257,11 @@ public:
             T await_resume()
             {
                 if (this->ready.has_value()) return task::from_ready(std::move(*this->ready));
-                if (this->op != nullptr) return this->op->result();
+                if (this->op != nullptr)
+                {
+                    this->finished_operation();
+                    return this->op->result();
+                }
                 if (!this->handle) throw std::logic_error{"awaited an empty task"};
                 return std::move(this->handle.promise()).result();
             }
@@ -322,6 +376,20 @@ class promise_base
 public:
     promise_base() noexcept = default;
 
+    promise_base(const promise_base&)            = delete;
+    promise_base(promise_base&&)                 = delete;
+    promise_base& operator=(const promise_base&) = delete;
+    promise_base& operator=(promise_base&&)      = delete;
+
+    // the coroutine is destroyed while it waits for an operation: which mustn't resume it, then.
+    ~promise_base()
+    {
+        if (suspended_in != nullptr) suspended_in->cancel();
+    }
+
+    // suspended_in is the operation the coroutine waits for, if any (see task's awaiter).
+    operation_base* suspended_in = nullptr;
+
     auto initial_suspend() noexcept { return std::suspend_always{}; }
     auto final_suspend() noexcept { return final_awaitable{}; }
 
@@ -362,6 +430,18 @@ private:
     std::coroutine_handle<> continuation{nullptr};
     std::atomic<bool>       second{false};
 };
+
+template<typename T>
+void task<T>::awaitable_base::started_operation() noexcept
+{
+    waiting->suspended_in = op;
+}
+
+template<typename T>
+void task<T>::awaitable_base::finished_operation() noexcept
+{
+    if (waiting != nullptr) waiting->suspended_in = nullptr;
+}
 
 template<typename T>
 class promise final : public promise_base

@@ -47,8 +47,8 @@ struct server_config
     std::chrono::seconds body_read_timeout = 60s;
     std::chrono::seconds write_timeout     = 60s;
     // The most connections served at once: once that many are open, the server waits for one to close before
-    // accepting another. 0 doesn't limit them.
-    std::size_t                     max_connections         = 0;
+    // accepting another. 0 doesn't limit them. (512 is nginx's worker_connections default.)
+    std::size_t                     max_connections         = 512;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
 };
