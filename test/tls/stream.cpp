@@ -1,12 +1,16 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -20,6 +24,7 @@
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
 #include "listen.hpp"
@@ -56,8 +61,8 @@ task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& s)
     }
 }
 
-// handshake_outcome is how a server's handshake ended, for a test to wait for (with wait()).
-struct handshake_outcome
+// server_outcome is how a server's task (e.g. its handshake) ended, for a test to wait for (with wait()).
+struct server_outcome
 {
     net::io::scheduler*        sched;
     std::error_code            err;
@@ -83,7 +88,7 @@ struct handshake_outcome
 // serve_once accepts a connection, runs the server's handshake, and hands the stream to serve (and how the handshake
 // ended to outcome, if any).
 template<typename Serve>
-task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, handshake_outcome* outcome = nullptr)
+task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, server_outcome* outcome = nullptr)
 {
     auto accepted = co_await listener->accept();
     if (!accepted.has_value()) co_return;
@@ -199,7 +204,7 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    handshake_outcome server{.sched = &sched, .err = {}};
+    server_outcome server{.sched = &sched, .err = {}};
     REQUIRE(sched.spawn(serve_once(&listener, server_with(tc.chain, tc.key), echo, &server)));
 
     auto ctx = tls::client_context::make({.trusted_ca_file = p.ca, .insecure_skip_verification = tc.skip_verification});
@@ -210,7 +215,7 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
                            std::uint16_t       port,
                            tls::client_context ctx,
                            std::string         host,
-                           handshake_outcome*  server) -> task<std::expected<tls::stream, std::error_code>>
+                           server_outcome*     server) -> task<std::expected<tls::stream, std::error_code>>
     {
         auto s = co_await connect_to(sched, port, std::move(ctx), std::move(host));
         co_await server->wait();
@@ -269,6 +274,117 @@ TEST_CASE("a TLS stream ends with close_notify, and is cut short without it", "[
     if (notify) CHECK(err == net::io::errc::end_of_stream);
     else CHECK(err == tls::errc::stream_truncated);
     CHECK(err == net::io::status_condition::closed);
+}
+
+TEST_CASE("shutting a stream down sends close_notify, and what the peer sent can still be read", "[tls]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // what the server read after shutting its side, and how its reading ended (which the client waits for).
+    std::string    server_read;
+    server_outcome server_done{.sched = &sched, .err = {}};
+
+    const auto server = [](std::string* server_read, server_outcome* server_done)
+    {
+        return [server_read, server_done](tls::stream& s) -> task<>
+        {
+            co_await net::io::write_all(s, "ping"sv);
+            if (auto err = co_await s.shutdown(); err)
+            {
+                server_done->finish(err);
+                co_return;
+            }
+
+            auto [read, err] = co_await read_to_end(s);
+            *server_read     = std::move(read);
+            co_await s.close();
+            server_done->finish(err);
+        };
+    };
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   server(&server_read, &server_done))));
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           server_outcome*     server_done) -> task<std::pair<std::string, std::error_code>>
+    {
+        auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value()) co_return std::pair{"connect failed: " + s.error().message(), s.error()};
+
+        // NOTE: sent before reading the server's close_notify, which is answered with the client's own (so nothing more
+        //       could be written).
+        co_await net::io::write_all(*s, "pong"sv);
+
+        auto received = co_await read_to_end(*s);
+        co_await server_done->wait();
+        co_return received;
+    };
+
+    auto [received, err] = sched.run_to_completion(client(&sched, listener.local_port(), &server_done));
+
+    CAPTURE(err.message());
+    CHECK(received == "ping");
+    CHECK(err == net::io::errc::end_of_stream);
+
+    CAPTURE(server_done.err.message());
+    CHECK(server_done.done.load() == 1);
+    CHECK(server_read == "pong");
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+}
+
+TEST_CASE("requesting stop ends a handshake", "[tls]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    const bool already = GENERATE(true, false);
+    CAPTURE(already);
+
+    // a server that accepts the connection, but never answers.
+    std::atomic<bool> done   = false;
+    const auto        silent = [](net::listener* listener, std::atomic<bool>* done, net::io::scheduler* sched) -> task<>
+    {
+        auto accepted = co_await listener->accept();
+        while (!done->load()) (void)co_await sched->sleep_until(net::io::clock::now() + 10ms);
+    };
+    REQUIRE(sched.spawn(silent(&listener, &done, &sched)));
+
+    std::stop_source stop;
+    if (already) stop.request_stop();
+
+    const auto stop_soon = [](net::io::scheduler* sched, std::stop_source* stop) -> task<>
+    {
+        (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+        stop->request_stop();
+    };
+    if (!already) REQUIRE(sched.spawn(stop_soon(&sched, &stop)));
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           std::stop_token     token,
+                           std::atomic<bool>*  done) -> task<std::error_code>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+        if (!conn.has_value()) co_return conn.error();
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client(),
+                                               "localhost",
+                                               net::io::clock::now() + 5s,
+                                               std::move(token));
+        done->store(true);
+        co_return s.has_value() ? std::error_code{} : s.error();
+    };
+
+    const auto start = std::chrono::steady_clock::now();
+    auto       err   = sched.run_to_completion(client(&sched, listener.local_port(), stop.get_token(), &done));
+    CAPTURE(err.message());
+    CHECK(err == std::errc::operation_canceled);
+    CHECK(std::chrono::steady_clock::now() - start < 3s);
 }
 
 TEST_CASE("a handshake that doesn't finish by its deadline fails", "[tls]")

@@ -1,13 +1,11 @@
 #pragma once
 
-#include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -15,7 +13,6 @@
 #include <vector>
 
 #include "coro/task.hpp"
-#include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
@@ -108,20 +105,25 @@ private:
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends
-// the stream (io::errc::end_of_stream). Both compare equal to io::status_condition::closed.
+// the stream (io::errc::end_of_stream), and is answered with close_notify, so nothing more can be written either. Both
+// compare equal to io::status_condition::closed.
 class stream final
     : public io::reader
     , public io::writer
 {
 public:
     // connect runs a client's handshake over conn, with host (the server's name, for SNI, and which its certificate
-    // must have), until deadline.
-    static coro::task<std::expected<stream, std::error_code>>
-    connect(tcp_socket conn, client_context ctx, std::string host, io::clock::time_point deadline);
+    // must have), until deadline. Requesting stop (from another task or thread) ends it, failing with
+    // std::errc::operation_canceled.
+    static coro::task<std::expected<stream, std::error_code>> connect(tcp_socket            conn,
+                                                                      client_context        ctx,
+                                                                      std::string           host,
+                                                                      io::clock::time_point deadline,
+                                                                      std::stop_token       stop = {});
 
-    // accept runs a server's handshake over conn, until deadline.
+    // accept runs a server's handshake over conn, until deadline, or stop is requested (as connect).
     static coro::task<std::expected<stream, std::error_code>>
-    accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline);
+    accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, std::stop_token stop = {});
 
     stream(const stream&)            = delete;
     stream& operator=(const stream&) = delete;
@@ -138,7 +140,11 @@ public:
     using io::reader::read;
     using io::writer::write;
 
-    // close sends close_notify (telling the peer that nothing was cut short), and closes the socket.
+    // shutdown sends close_notify (telling the peer that nothing was cut short), and ends the socket's outgoing side,
+    // without closing it: what the peer sent before its own close_notify can still be read, but nothing more written.
+    coro::task<std::error_code> shutdown();
+
+    // close sends close_notify, if shutdown() hasn't, and closes the socket.
     coro::task<> close();
 
     // alpn is the protocol the handshake agreed on: empty if none.

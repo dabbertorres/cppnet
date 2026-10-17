@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -22,8 +23,11 @@
 #include <botan/certstor_system.h>
 #include <botan/credentials_manager.h>
 #include <botan/data_src.h>
+#include <botan/exceptn.h>
+#include <botan/pk_keys.h>
 #include <botan/pkcs8.h>
 #include <botan/pkix_enums.h>
+#include <botan/rng.h>
 #include <botan/system_rng.h>
 #include <botan/tls_alert.h>
 #include <botan/tls_callbacks.h>
@@ -33,6 +37,7 @@
 #include <botan/tls_policy.h>
 #include <botan/tls_server.h>
 #include <botan/tls_server_info.h>
+#include <botan/tls_session_manager.h>
 #include <botan/tls_session_manager_memory.h>
 #include <botan/tls_session_manager_noop.h>
 #include <botan/tls_version.h>
@@ -268,7 +273,6 @@ struct server_state
     std::vector<std::string>                      alpn;
 };
 
-struct connection;
 
 // callbacks are Botan's calls back into a connection. They're only made while the connection's mutex is held (from
 // inside the channel's methods, which are only called holding it), and only touch what it guards.
@@ -441,12 +445,23 @@ struct connection
         co_return res.err;
     }
 
-    // handshake runs the handshake until it's done, deadline passes, or it fails.
-    coro::task<std::error_code> handshake(io::clock::time_point deadline)
+    // handshake runs the handshake until it's done, deadline passes, stop is requested, or it fails.
+    coro::task<std::error_code> handshake(io::clock::time_point deadline, std::stop_token stop)
     {
         socket.set_deadline(deadline);
         util::defer no_deadline{[this] noexcept { socket.set_deadline(std::nullopt); }};
 
+        // NOTE: ending the socket's incoming side ends a read waiting for the peer (it finds the end of the stream).
+        std::stop_callback on_stop{stop, [this] noexcept { socket.shutdown_read(); }};
+
+        auto err = co_await handshake_steps();
+        if (err && stop.stop_requested()) co_return std::make_error_code(std::errc::operation_canceled);
+        co_return err;
+    }
+
+    // handshake_steps sends and receives the handshake's messages until it's done, or fails.
+    coro::task<std::error_code> handshake_steps()
+    {
         // e.g. the client's hello.
         if (auto err = co_await flush(); err) co_return err;
 
@@ -648,8 +663,8 @@ stream::stream(stream&&) noexcept            = default;
 stream& stream::operator=(stream&&) noexcept = default;
 stream::~stream()                            = default;
 
-coro::task<std::expected<stream, std::error_code>>
-stream::connect(tcp_socket conn, client_context ctx, std::string host, io::clock::time_point deadline)
+coro::task<std::expected<stream, std::error_code>> stream::connect(
+    tcp_socket conn, client_context ctx, std::string host, io::clock::time_point deadline, std::stop_token stop)
 {
     // the certificate is checked against host: without one, nothing would be.
     if (host.empty() && !ctx.state->skip_verification)
@@ -676,12 +691,12 @@ stream::connect(tcp_socket conn, client_context ctx, std::string host, io::clock
         co_return std::unexpected(make_error_code(errc::protocol_error));
     }
 
-    if (auto err = co_await c->handshake(deadline); err) co_return std::unexpected(err);
+    if (auto err = co_await c->handshake(deadline, std::move(stop)); err) co_return std::unexpected(err);
     co_return stream{std::move(c)};
 }
 
 coro::task<std::expected<stream, std::error_code>>
-stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline)
+stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, std::stop_token stop)
 {
     auto c = std::make_unique<detail::connection>(std::move(conn));
 
@@ -701,7 +716,7 @@ stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadli
         co_return std::unexpected(make_error_code(errc::protocol_error));
     }
 
-    if (auto err = co_await c->handshake(deadline); err) co_return std::unexpected(err);
+    if (auto err = co_await c->handshake(deadline, std::move(stop)); err) co_return std::unexpected(err);
     co_return stream{std::move(c)};
 }
 
@@ -747,14 +762,29 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
     }(conn.get(), written);
 }
 
-coro::task<> stream::close()
+coro::task<std::error_code> stream::shutdown()
 {
     {
         std::scoped_lock lock{conn->mu};
-        if (!conn->channel->is_closed()) conn->channel->close();
+
+        try
+        {
+            if (!conn->channel->is_closed_for_writing()) conn->channel->close();
+        }
+        catch (const std::exception&)
+        {
+            co_return make_error_code(errc::protocol_error);
+        }
     }
 
-    (void)co_await conn->flush();
+    auto err = co_await conn->flush();
+    conn->socket.shutdown_write();
+    co_return err;
+}
+
+coro::task<> stream::close()
+{
+    (void)co_await shutdown();
     conn->socket.close(false);
 }
 
