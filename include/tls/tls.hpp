@@ -40,6 +40,11 @@ struct client_options
 
     // The ALPN protocols to offer (e.g. {"http/1.1"}), in order of preference. Empty offers none.
     std::vector<std::string> alpn{};
+
+    // Require TLS 1.2 servers to support the Extended Master Secret extension (RFC 7627), without which TLS 1.2 is open
+    // to the triple handshake attack, refusing those that don't (with handshake_failure). Off by default, as in
+    // browsers, Go and OpenSSL, as some servers still lack it. TLS 1.3 doesn't need it.
+    bool require_extended_master_secret = false;
 };
 
 namespace detail
@@ -77,6 +82,9 @@ struct server_options
     // The ALPN protocols the server speaks, in order of preference: the first the client also offers is chosen. A
     // client that offers none of them is still served (without ALPN).
     std::vector<std::string> alpn = {"http/1.1"};
+
+    // Require TLS 1.2 clients to support the Extended Master Secret extension (see client_options).
+    bool require_extended_master_secret = false;
 };
 
 // server_context holds what a server's connections share: its certificate and key, and the policy. It's cheap to copy,
@@ -151,7 +159,16 @@ private:
     std::unique_ptr<detail::connection> conn;
 };
 
-// errc are TLS's errors, besides its alerts (whose codes, e.g. 42 for bad_certificate, are also in category()).
+// Errors:
+// - a fatal alert the peer sent (in category(), by its code in the TLS RFCs, e.g. 42 for bad_certificate);
+// - one sent to the peer, for what was wrong here (in category(), as sent_alert_base plus its code);
+// - the peer's certificate failing verification, for which bad_certificate was sent (in verification_category(), whose
+//   message says why: e.g. it expired, or isn't for the host name);
+// - or errc.
+// Compare them with alert, which matches an alert whichever side sent it (and verification failures, bad_certificate);
+// from_peer() says which side did.
+
+// errc are TLS's errors, besides alerts.
 enum class errc : std::uint16_t
 {
     // the peer closed the connection without close_notify, so what was read may have been cut short.
@@ -160,12 +177,61 @@ enum class errc : std::uint16_t
     protocol_error = 257,
 };
 
-// category is TLS's errors: alerts (by their codes in the TLS RFCs), and errc.
+// sent_alert_base is added to an alert's code for an error that sent it to the peer.
+inline constexpr int sent_alert_base = 512;
+
+// category is TLS's errors: alerts (the peer's, and those sent to it), and errc.
 [[nodiscard]] const std::error_category& category() noexcept;
 
+// verification_category is why the peer's certificate couldn't be verified.
+[[nodiscard]] const std::error_category& verification_category() noexcept;
+
 [[nodiscard]] std::error_code make_error_code(errc err) noexcept;
+
+// alert are TLS's alerts (RFC 8446, section 6.2, and RFC 5246's), as conditions to compare errors with: e.g.
+// err == tls::alert::handshake_failure.
+enum class alert : std::uint8_t
+{
+    unexpected_message              = 10,
+    bad_record_mac                  = 20,
+    record_overflow                 = 22,
+    handshake_failure               = 40,
+    bad_certificate                 = 42,
+    unsupported_certificate         = 43,
+    certificate_revoked             = 44,
+    certificate_expired             = 45,
+    certificate_unknown             = 46,
+    illegal_parameter               = 47,
+    unknown_ca                      = 48,
+    access_denied                   = 49,
+    decode_error                    = 50,
+    decrypt_error                   = 51,
+    protocol_version                = 70,
+    insufficient_security           = 71,
+    internal_error                  = 80,
+    inappropriate_fallback          = 86,
+    user_canceled                   = 90,
+    missing_extension               = 109,
+    unsupported_extension           = 110,
+    unrecognized_name               = 112,
+    bad_certificate_status_response = 113,
+    unknown_psk_identity            = 115,
+    certificate_required            = 116,
+    no_application_protocol         = 120,
+};
+
+[[nodiscard]] const std::error_category& alert_category() noexcept;
+
+[[nodiscard]] std::error_condition make_error_condition(alert a) noexcept;
+
+// from_peer is whether err is an alert the peer sent, rather than one sent to it.
+[[nodiscard]] bool from_peer(std::error_code err) noexcept;
 }
 
 template<>
 struct std::is_error_code_enum<net::tls::errc> : std::true_type
+{};
+
+template<>
+struct std::is_error_condition_enum<net::tls::alert> : std::true_type
 {};

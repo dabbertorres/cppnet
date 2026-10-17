@@ -23,6 +23,7 @@
 #include <botan/credentials_manager.h>
 #include <botan/data_src.h>
 #include <botan/pkcs8.h>
+#include <botan/pkix_enums.h>
 #include <botan/system_rng.h>
 #include <botan/tls_alert.h>
 #include <botan/tls_callbacks.h>
@@ -36,6 +37,7 @@
 #include <botan/tls_session_manager_noop.h>
 #include <botan/tls_version.h>
 #include <botan/x509cert.h>
+#include <botan/x509path.h>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -45,6 +47,8 @@
 
 namespace
 {
+
+std::string alert_name(int code) { return Botan::TLS::Alert(static_cast<Botan::TLS::Alert::Type>(code)).type_string(); }
 
 class tls_category_impl final : public std::error_category
 {
@@ -59,7 +63,9 @@ public:
         case net::tls::errc::protocol_error: return "the peer isn't speaking TLS (or broke its protocol)";
         }
 
-        if (code >= 0 && code <= 255) return Botan::TLS::Alert(static_cast<Botan::TLS::Alert::Type>(code)).type_string();
+        if (code >= 0 && code <= 255) return alert_name(code) + " (from the peer)";
+        if (code >= net::tls::sent_alert_base && code <= net::tls::sent_alert_base + 255)
+            return alert_name(code - net::tls::sent_alert_base) + " (sent to the peer)";
         return "unknown TLS error";
     }
 
@@ -72,9 +78,56 @@ public:
     }
 };
 
-std::error_code alert_code(Botan::TLS::Alert::Type type) noexcept
+class verification_category_impl final : public std::error_category
+{
+public:
+    [[nodiscard]] const char* name() const noexcept override { return "tls::verification"; }
+
+    [[nodiscard]] std::string message(int code) const override
+    {
+        return std::string{"the peer's certificate couldn't be verified: "}
+             + Botan::to_string(static_cast<Botan::Certificate_Status_Code>(code));
+    }
+
+    // for which bad_certificate was sent.
+    [[nodiscard]] std::error_condition default_error_condition(int /*code*/) const noexcept override
+    {
+        return make_error_condition(net::tls::alert::bad_certificate);
+    }
+};
+
+class alert_category_impl final : public std::error_category
+{
+public:
+    [[nodiscard]] const char* name() const noexcept override { return "tls::alert"; }
+
+    [[nodiscard]] std::string message(int code) const override { return alert_name(code); }
+
+    // an alert matches whichever side sent it. (Verification failures match bad_certificate by their
+    // default_error_condition().)
+    [[nodiscard]] bool equivalent(const std::error_code& code, int condition) const noexcept override
+    {
+        if (code.category() != net::tls::category()) return false;
+
+        const auto value = code.value();
+        if (value >= net::tls::sent_alert_base) return value - net::tls::sent_alert_base == condition;
+        return value == condition;
+    }
+};
+
+const verification_category_impl the_verification_category;
+const alert_category_impl        the_alert_category;
+
+// peer_alert is the error for an alert the peer sent.
+std::error_code peer_alert(Botan::TLS::Alert::Type type) noexcept
 {
     return {static_cast<int>(type), net::tls::category()};
+}
+
+// sent_alert is the error for an alert sent to the peer.
+std::error_code sent_alert(Botan::TLS::Alert::Type type) noexcept
+{
+    return {net::tls::sent_alert_base + static_cast<int>(type), net::tls::category()};
 }
 
 // read_file reads a whole file, failing with the error opening it (e.g. no_such_file_or_directory).
@@ -119,10 +172,21 @@ load_certificates(const std::filesystem::path& path)
 // policy is Botan's default TLS policy, except that it doesn't require revocation information (OCSP or CRLs) for the
 // peer's certificates: many servers have none to give (e.g. Let's Encrypt's, which stopped OCSP in 2025), and neither
 // browsers, Go, nor OpenSSL require it by default.
+//
+// Nor does it require the Extended Master Secret extension of TLS 1.2 peers (as Botan's does, but browsers, Go and
+// OpenSSL don't), unless asked to.
 class policy final : public Botan::TLS::Policy
 {
 public:
+    explicit policy(bool require_ems) noexcept
+        : require_ems{require_ems}
+    {}
+
     [[nodiscard]] bool require_cert_revocation_info() const override { return false; }
+    [[nodiscard]] bool require_extended_master_secret() const override { return require_ems; }
+
+private:
+    bool require_ems;
 };
 
 // client_credentials gives a client the certificate authorities it trusts.
@@ -222,6 +286,9 @@ public:
     void tls_record_received(std::uint64_t seq_no, std::span<const std::uint8_t> data) override;
     void tls_alert(Botan::TLS::Alert alert) override;
 
+    // record_verification_failure keeps why the peer's certificate was rejected.
+    void record_verification_failure(Botan::Certificate_Status_Code status) noexcept;
+
     void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate>&                cert_chain,
                                const std::vector<std::optional<Botan::OCSP::Response>>&   ocsp_responses,
                                const std::vector<Botan::Certificate_Store*>&              trusted_roots,
@@ -230,7 +297,30 @@ public:
                                const Botan::TLS::Policy&                                  policy) override
     {
         if (skip_verification) return;
-        Callbacks::tls_verify_cert_chain(cert_chain, ocsp_responses, trusted_roots, usage, hostname, policy);
+
+        // as Botan's Callbacks::tls_verify_cert_chain does, keeping why it failed (which its exception only has as
+        // text).
+        if (cert_chain.empty()) throw Botan::Invalid_Argument("Certificate chain was empty");
+
+        const Botan::Path_Validation_Restrictions restrictions{policy.require_cert_revocation_info(),
+                                                               policy.minimum_signature_strength()};
+
+        // the host name is only matched against a server's certificate.
+        const auto name   = usage == Botan::Usage_Type::TLS_CLIENT_AUTH ? std::string_view{} : hostname;
+        const auto result = Botan::x509_path_validate(cert_chain,
+                                                      restrictions,
+                                                      trusted_roots,
+                                                      name,
+                                                      usage,
+                                                      tls_current_timestamp(),
+                                                      tls_verify_cert_chain_ocsp_timeout(),
+                                                      ocsp_responses);
+        if (!result.successful_validation())
+        {
+            record_verification_failure(result.result());
+            throw Botan::TLS::TLS_Exception(Botan::TLS::Alert::BadCertificate,
+                                            "Certificate validation failure: " + result.result_string());
+        }
     }
 
     std::string tls_server_choose_app_protocol(const std::vector<std::string>& client_protos) override
@@ -282,7 +372,12 @@ struct connection
         }
         catch (const Botan::TLS::TLS_Exception& ex)
         {
-            if (!failure) failure = alert_code(ex.type());
+            if (!failure)
+            {
+                failure = verification_failure
+                            ? std::error_code{static_cast<int>(*verification_failure), verification_category()}
+                            : sent_alert(ex.type());
+            }
         }
         catch (const std::exception&)
         {
@@ -412,6 +507,7 @@ struct connection
     std::size_t               received_start = 0;
     bool                      peer_closed    = false; // the peer's close_notify
     std::error_code           failure;                // a fatal alert, or a broken protocol
+    std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
     bool                      flushing = false;
     std::string               alpn;
 
@@ -432,10 +528,15 @@ void callbacks::tls_record_received(std::uint64_t /*seq_no*/, std::span<const st
     conn->received.insert(conn->received.end(), data.begin(), data.end());
 }
 
+void callbacks::record_verification_failure(Botan::Certificate_Status_Code status) noexcept
+{
+    conn->verification_failure = status;
+}
+
 void callbacks::tls_alert(Botan::TLS::Alert alert)
 {
     if (alert.type() == Botan::TLS::Alert::CloseNotify) conn->peer_closed = true;
-    else if (alert.is_fatal() && !conn->failure) conn->failure = alert_code(alert.type());
+    else if (alert.is_fatal() && !conn->failure) conn->failure = peer_alert(alert.type());
 }
 
 }
@@ -449,7 +550,18 @@ const std::error_category& category() noexcept
     return instance;
 }
 
+const std::error_category& verification_category() noexcept { return the_verification_category; }
+
 std::error_code make_error_code(errc err) noexcept { return {static_cast<int>(err), category()}; }
+
+const std::error_category& alert_category() noexcept { return the_alert_category; }
+
+std::error_condition make_error_condition(alert a) noexcept { return {static_cast<int>(a), the_alert_category}; }
+
+bool from_peer(std::error_code err) noexcept
+{
+    return err.category() == category() && err.value() >= 0 && err.value() <= 255;
+}
 
 client_context::client_context(std::shared_ptr<detail::client_state> state) noexcept
     : state{std::move(state)}
@@ -479,7 +591,7 @@ std::expected<client_context, std::error_code> client_context::make(const client
             .rng               = rng,
             .credentials       = std::make_shared<client_credentials>(std::move(store)),
             .sessions          = std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng),
-            .policy            = std::make_shared<policy>(),
+            .policy            = std::make_shared<policy>(options.require_extended_master_secret),
             .skip_verification = options.insecure_skip_verification,
             .alpn              = options.alpn,
         });
@@ -515,7 +627,7 @@ std::expected<server_context, std::error_code> server_context::make(const server
             .rng         = rng,
             .credentials = std::make_shared<server_credentials>(std::move(*chain), std::move(key)),
             .sessions    = std::make_shared<Botan::TLS::Session_Manager_Noop>(),
-            .policy      = std::make_shared<policy>(),
+            .policy      = std::make_shared<policy>(options.require_extended_master_secret),
             .alpn        = options.alpn,
         });
 
