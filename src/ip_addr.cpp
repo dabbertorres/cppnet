@@ -1,11 +1,12 @@
 #include "ip_addr.hpp"
 
-#include <optional>
+#include <expected>
+#include <system_error>
 
 namespace net
 {
 
-std::optional<ip_addr> ip_addr::parse(std::string_view str) noexcept
+std::expected<ip_addr, std::error_code> ip_addr::parse(std::string_view str) noexcept
 {
     if (str.contains(':'))
         if (auto result = ipv6_addr::parse(str); result) return *result;
@@ -13,7 +14,7 @@ std::optional<ip_addr> ip_addr::parse(std::string_view str) noexcept
     if (str.contains('.'))
         if (auto result = ipv4_addr::parse(str); result) return *result;
 
-    return std::nullopt;
+    return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 }
 
 }

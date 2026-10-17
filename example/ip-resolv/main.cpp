@@ -14,7 +14,14 @@ int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signat
         return 1;
     }
 
-    for (auto addr : net::dns_lookup(argv[1]))
+    auto addrs = net::dns_lookup(argv[1]);
+    if (!addrs.has_value())
+    {
+        std::cerr << "failed to resolve " << argv[1] << ": " << addrs.error().message() << '\n';
+        return 1;
+    }
+
+    for (auto addr : *addrs)
     {
         std::cout << (addr.is_ipv4() ? "IPv4: " : "IPv6: ") << addr.to_string() << '\n';
     }

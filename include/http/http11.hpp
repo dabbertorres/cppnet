@@ -10,13 +10,11 @@
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/writer.hpp"
-#include "util/result.hpp"
 
 namespace net::http::http11
 {
 
 using coro::task;
-using util::result;
 
 // check_request checks that a request can be encoded, as request_encode does first. It fails with:
 // - std::errc::invalid_argument if a header field is malformed, or the body doesn't fit its framing (e.g. a

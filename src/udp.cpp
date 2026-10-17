@@ -50,7 +50,7 @@ int udp_socket::open(std::string_view host, std::string_view port, protocol prot
 
     addrinfo* servinfo = nullptr;
     int sts = ::getaddrinfo(host.empty() ? nullptr : host_str.c_str(), port_str.c_str(), &hints, &servinfo);
-    if (sts != 0) throw_for_gai_error(sts);
+    if (sts != 0) throw std::system_error{make_gai_error_code(sts), "getaddrinfo"};
 
     // find first valid addr, and use it!
     int fd = -1;
