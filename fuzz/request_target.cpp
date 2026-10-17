@@ -54,7 +54,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     auto parsed = net::url::parse(input);
     if (parsed.has_value())
     {
-        auto origin = parsed.to_value().origin_form();
+        auto origin = parsed.value().origin_form();
         if (!parse_request_target(request_method::GET, origin)) fail("origin_form produced an invalid target", input, origin);
     }
 

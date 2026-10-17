@@ -69,7 +69,7 @@ task<response> get(net::io::scheduler* sched, std::uint16_t port, std::string pa
     http::client_request req{
         .method  = http::request_method::GET,
         .version = {.major = 1, .minor = 1},
-        .uri     = net::url::parse("http://127.0.0.1:" + std::to_string(port) + path).to_value(),
+        .uri     = net::url::parse("http://127.0.0.1:" + std::to_string(port) + path).value(),
     };
 
     auto resp = co_await client.send(std::move(req));
@@ -159,6 +159,30 @@ TEST_CASE("the server responds for handlers that don't", "[http][server]")
         CHECK(resp.connection == "close");
         CHECK(resp.body.empty());
     }
+}
+
+TEST_CASE("a server serves with the listener it's given", "[http][server]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    http::router router;
+    router.GET("/hello",
+               [](const http::server_request&, http::response_writer& resp) -> task<void>
+               {
+                   resp.headers().set("Content-Type", "text/plain");
+                   auto* body = co_await resp.send(http::status::OK, 5);
+                   co_await net::io::write_all(*body, "hello"sv);
+               });
+
+    http::server server{&sched, std::move(*listener), std::move(router)};
+    REQUIRE(sched.spawn(server.serve()));
+
+    auto resp = sched.run_to_completion(get(&sched, server.local_port(), "/hello"));
+    CHECK(resp.status == http::status::OK);
+    CHECK(resp.body == "hello");
 }
 
 TEST_CASE("responses to HEAD requests have no body", "[http][server]")

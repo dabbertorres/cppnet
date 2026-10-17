@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <span>
 #include <string>
@@ -56,7 +57,7 @@ namespace net
 {
 
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range (from find).
-std::optional<ipv6_addr> ipv6_addr::parse(std::string_view str) noexcept
+std::expected<ipv6_addr, std::error_code> ipv6_addr::parse(std::string_view str) noexcept
 {
     groups_t groups{};
 
@@ -65,20 +66,22 @@ std::optional<ipv6_addr> ipv6_addr::parse(std::string_view str) noexcept
     if (gap == std::string_view::npos)
     {
         auto parsed = parse_groups(str, groups, true);
-        if (!parsed || *parsed != groups.size()) return std::nullopt;
+        if (!parsed || *parsed != groups.size())
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
         return ipv6_addr(groups);
     }
 
     // otherwise "::" stands for at least one group of zeros, between those before it and those after it.
     const auto before = str.substr(0, gap);
     const auto after  = str.substr(gap + 2);
-    if (after.contains("::")) return std::nullopt;
+    if (after.contains("::")) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     groups_t after_groups{};
 
     auto parsed_before = parse_groups(before, groups, false);
     auto parsed_after  = parse_groups(after, after_groups, true);
-    if (!parsed_before || !parsed_after || *parsed_before + *parsed_after >= groups.size()) return std::nullopt;
+    if (!parsed_before || !parsed_after || *parsed_before + *parsed_after >= groups.size())
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     std::copy_n(after_groups.begin(), *parsed_after, groups.end() - static_cast<std::ptrdiff_t>(*parsed_after));
     return ipv6_addr(groups);

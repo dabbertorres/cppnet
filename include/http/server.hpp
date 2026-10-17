@@ -36,6 +36,7 @@ using namespace std::chrono_literals;
 
 struct server_config
 {
+    // Where to listen, for the constructors that don't take a listener.
     std::string host{};
     std::string port             = "8080";
     std::size_t max_header_bytes = 8'192;
@@ -57,11 +58,24 @@ class server
 {
 public:
     // The server listens from when it's constructed, queuing connections (up to max_pending_connections) until serve()
-    // accepts them.
+    // accepts them: on cfg's host and port, or with listener (e.g. from listener::make(), which reports a failure to
+    // listen as an error, where these constructors throw std::system_error).
     //
     // handler is called for each request. If it returns without sending a response, an empty 200 OK is sent. If it
     // throws, a 500 Internal Server Error is sent (if nothing was yet), and the connection is closed.
-    server(io::scheduler* scheduler, request_handler handler, const server_config& cfg = server_config{});
+    server(io::scheduler* scheduler, net::listener listener, request_handler handler, const server_config& cfg = {});
+
+    server(io::scheduler* scheduler, net::listener listener, router&& handler, const server_config& cfg = {})
+        : server{scheduler, std::move(listener), make_handler(std::move(handler)), cfg}
+    {}
+
+    server(io::scheduler*       scheduler,
+           request_handler      handler,
+           const server_config& cfg =
+               server_config{
+    })
+        : server{scheduler, net::listener{scheduler, cfg.host, cfg.port, network::tcp}, std::move(handler), cfg}
+    {}
 
     server(io::scheduler* scheduler, router&& handler, const server_config& cfg = server_config{})
         : server{scheduler, make_handler(std::move(handler)), cfg}

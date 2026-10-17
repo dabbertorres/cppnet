@@ -2,12 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "util/result.hpp"
 
 namespace net
 {
@@ -73,7 +73,7 @@ public:
     // parse_query decodes a query (without its '?') as application/x-www-form-urlencoded (so '+' is a space).
     static query_values parse_query(std::string_view query);
 
-    using parse_result = util::result<url, url_parse_failure>;
+    using parse_result = std::expected<url, url_parse_failure>;
 
     // parse splits a URL as RFC 3986 does (with "//" before the authority), except that a URL with neither a scheme
     // nor "//", and not starting with '/', starts with its host (e.g. "example.com/path").

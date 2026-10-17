@@ -14,7 +14,6 @@
 #include "http/headers.hpp"
 #include "io/io.hpp"
 #include "io/util.hpp"
-#include "util/result.hpp"
 
 namespace
 {
@@ -79,8 +78,8 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
 coro::task<std::error_code> chunked_reader::read_chunk_size()
 {
     auto read = co_await io::read_terminated_line(parent, max_size_line);
-    if (read.has_error()) co_return truncated(read.to_error());
-    const auto& line = read.to_value();
+    if (!read.has_value()) co_return truncated(read.error());
+    const auto& line = read.value();
 
     // chunk-size = 1*HEXDIG
     std::size_t size   = 0;
@@ -119,8 +118,8 @@ coro::task<std::error_code> chunked_reader::read_trailers()
     while (true)
     {
         auto read = co_await io::read_terminated_line(parent, remaining);
-        if (read.has_error()) co_return truncated(read.to_error());
-        const auto& line = read.to_value();
+        if (!read.has_value()) co_return truncated(read.error());
+        const auto& line = read.value();
         remaining -= line.size() + 2;
 
         if (line.empty()) co_return std::error_code{};
