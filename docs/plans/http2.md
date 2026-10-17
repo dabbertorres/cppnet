@@ -1,7 +1,8 @@
 # Plan: HTTP/2
 
-Status: proposed, with its design decided (2026-10-17). Nothing is implemented: `include/http/http2.hpp` and
-`src/http/http2.cpp` are a parked stub, to be replaced (see Where things stand).
+Status: stage 1 (HPACK) implemented (2026-10-17): `include/http/hpack.hpp`, `src/http/hpack.cpp`,
+`test/http/hpack.cpp`, `fuzz/hpack.cpp`. The rest isn't: `include/http/http2.hpp` and `src/http/http2.cpp` are a
+parked stub, to be replaced (see Where things stand).
 
 ## Goal
 
@@ -254,6 +255,24 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
   client against public servers.
 - `bench_request` and `bench/web/run.sh` with HTTP/2 (h2load), against the same servers as now; and the primitives'
   benchmark (see Decided).
+
+## Learned in stage 1
+
+- The static table and the Huffman code are generated from RFC 7541's text (Appendices A and B), checking as they're
+  parsed that each code's bits match its value and length, and that the code is complete; the tests' examples
+  (Appendix C, with the dynamic table after each block) are generated the same way. The Huffman decoder's table (256
+  states, one per internal node of the code's tree, by 16 nibbles) is built at compile time, and a `static_assert`
+  checks the tree has 256 internal nodes.
+- A never-indexed field must stay a never-indexed literal when re-encoded, even if the static table has it (e.g.
+  `:authority` with an empty value): as an index, whoever decodes it next wouldn't know not to index it (RFC 7541,
+  section 6.2.3). Fuzzing found this, by checking that what's decoded, encoded again, decodes the same.
+- The decoder takes a whole header block (HEADERS and its CONTINUATIONs, joined), rather than decoding as frames
+  arrive: so the frames' layer (stage 2) bounds the encoded block (its size, and the number of CONTINUATIONs), and the
+  decoder bounds the decoded header list (an HPACK bomb is decoded to the end, to keep the dynamic table in step, but
+  without passing on its fields).
+- A decoder starts with its dynamic table at the size it's given, as both sides start with the same
+  SETTINGS_HEADER_TABLE_SIZE (4096, unless the RFC's examples say otherwise); `set_max_table_size()` lowers the limit
+  once the peer has acknowledged this side's, and then the next block must start with a size update.
 
 ## Stages
 
