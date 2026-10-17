@@ -10,6 +10,8 @@
 #include "io/buffered_reader.hpp"
 #include "io/writer.hpp"
 
+// HTTP/2 is parked, not implemented: these encoders and decoders are stubs (the server answers HTTP/2 requests with
+// 505 HTTP Version Not Supported, and the client refuses to send them).
 namespace net::http::http2
 {
 
