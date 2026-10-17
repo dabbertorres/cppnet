@@ -1,13 +1,14 @@
 # Plan: TLS, with Botan
 
-Status: stages 1 and 2 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`; and
-`https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`).
+Status: stages 1 to 3 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`;
+`https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`); and HTTPS in `http::server`
+(`server_config::tls`, `test/tls/server.cpp`).
 
 ## Goal
 
 HTTPS: first for `http::client` (most APIs a side project calls need it), then for `http::server`. TLS should fit the
 coroutine runtime as the sockets do: handshakes and reads are `co_await`ed, bounded by deadlines, canceled by
-`scheduler::request_stop()`, and fail with `std::error_condition`s rather than exceptions. Certificates are verified by
+`scheduler::request_stop()`, and fail with `std::error_code`s rather than exceptions. Certificates are verified by
 default, against the system's trust store.
 
 ## Decided
@@ -77,7 +78,7 @@ struct client_options
 class client_context
 {
 public:
-    static std::expected<client_context, std::error_condition> make(const client_options& options);
+    static std::expected<client_context, std::error_code> make(const client_options& options);
     ...
 };
 
@@ -96,11 +97,11 @@ class stream final : public io::reader, public io::writer
 public:
     // connect runs the client's handshake over conn, for host (SNI, and the name the certificate must have), until
     // deadline.
-    static coro::task<std::expected<stream, std::error_condition>>
+    static coro::task<std::expected<stream, std::error_code>>
     connect(tcp_socket conn, const client_context& ctx, std::string host, io::clock::time_point deadline);
 
     // accept runs the server's handshake over conn.
-    static coro::task<std::expected<stream, std::error_condition>>
+    static coro::task<std::expected<stream, std::error_code>>
     accept(tcp_socket conn, const server_context& ctx, io::clock::time_point deadline);
 
     coro::task<io::result> read(std::span<std::byte> data) override;   // application data
@@ -148,8 +149,10 @@ const std::error_category& category() noexcept;
 - **Client:** `https://` URLs connect with `stream::connect()` (port 443 by default). `connection_pool` keys connections
   by scheme as well as host and port, and holds `stream`s or plain sockets. `client_options` gets a `tls::client_options`
   (so tests can trust a test CA). Without `NET_HAS_TLS`, `https://` fails with `protocol_not_supported` (as it does before stage 2).
-- **Server (stage 3):** `server_config` gets an optional `tls::server_options`; `serve_connection` runs
-  `stream::accept()` (under `header_read_timeout`) before reading requests, and serves over the stream.
+- **Server (stage 3):** `server_config` gets an optional `tls::server_context` (made with `server_context::make()`, so a
+  certificate or key that can't be loaded is an error before the server starts, rather than an exception from its
+  constructor); `serve_connection` runs `stream::accept()` (with its own `header_read_timeout` deadline) before reading
+  requests, and serves over the stream.
 
 ## Learned in stage 1
 
@@ -181,6 +184,28 @@ const std::error_category& category() noexcept;
   than whatever `client_options::tls` says).
 - Checking that an idle connection is still open (peeking at its socket) works for TLS too: a server that has closed
   it has sent close_notify (or closed the socket), either of which the peek sees.
+
+## Learned in stage 3
+
+- The server serves a `detail::connection` (now in `http/connection.hpp`, shared with the client's pool): a
+  `tcp_socket`, or a `tls::stream`. `server_request::tls` tells handlers which.
+- `server::close()` ended connections by shutting down the reading side of each one's socket, from a set of socket
+  pointers. During a TLS handshake, the socket is inside `stream::accept()` (moved to the stream's state), out of the
+  server's reach, so `close()` couldn't end one (and `~server` would wait out its deadline, or for ever without
+  `header_read_timeout`). `stream::connect()` and `accept()` now take a `std::stop_token`, whose callback shuts the
+  socket's reading side during the handshake; and the server's connections use the same (a `std::stop_source` that
+  `close()` requests, and a `std::stop_callback` per connection), instead of the mutex-guarded set. Requesting stop
+  runs callbacks registered later straight away, so a connection that starts after `close()` ends at once.
+- After an error response, the server lingers (draining what the client still sends, so closing doesn't reset the
+  connection before the client reads the response). Over TLS it sends close_notify first, without closing the socket:
+  `stream::shutdown()`. The drained bytes are read from the socket, undecrypted.
+- Botan answers a peer's close_notify with its own (`Callbacks::tls_peer_closed_connection()` returns true by default),
+  so after reading the end of the stream, nothing more can be written: TLS 1.3 allows half-closed connections, but
+  Botan's default doesn't keep them.
+- The server's ALPN protocols come from the `server_context` (whose default is `http/1.1`), so one that offers `h2`
+  could agree on it; until HTTP/2 is served, the server closes a connection that agreed on anything but `http/1.1`.
+- A plain HTTP request to an HTTPS port fails the handshake (Botan sends an alert, which e.g. curl reports as an
+  HTTP/0.9 response); answering it with a plaintext 400, as Go does, was decided against for now.
 
 ## Stages
 

@@ -6,11 +6,10 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
-#include <mutex>
+#include <optional>
+#include <stop_token>
 #include <string>
-#include <string_view>
 #include <system_error>
-#include <unordered_set>
 #include <utility>
 
 #include <spdlog/logger.h>
@@ -18,16 +17,17 @@
 
 #include "coro/async_scope.hpp"
 #include "coro/task.hpp"
-#include "http/http.hpp"
-#include "http/request.hpp"
+#include "http/connection.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
-#include "io/buffered_reader.hpp"
-#include "io/buffered_writer.hpp"
 #include "io/discard_writer.hpp"
 #include "io/scheduler.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+
+#ifdef NET_HAS_TLS
+#    include "tls/tls.hpp"
+#endif
 
 namespace net::http
 {
@@ -50,6 +50,13 @@ struct server_config
     std::size_t                     max_connections         = 512;
     std::uint16_t                   max_pending_connections = 512;
     std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
+
+#ifdef NET_HAS_TLS
+    // Serve HTTPS: each connection starts with a TLS handshake, with this context's certificate and key (see
+    // tls::server_context::make()), which has header_read_timeout to finish. Only HTTP/1.1 is served: a client that
+    // agrees on another protocol with ALPN (e.g. h2, if the context offers it) is disconnected.
+    std::optional<tls::server_context> tls{};
+#endif
 };
 
 class server
@@ -109,22 +116,34 @@ private:
     // serve_connection serves conn's requests, holding a lease on running (so the server isn't destroyed meanwhile).
     coro::task<> serve_connection(tcp_socket conn, coro::async_scope::lease held) noexcept;
 
-    // set_head_deadline sets how long conn may take to send the next request's head (see header_read_timeout).
-    void set_head_deadline(tcp_socket& conn) const;
+    // open_connection makes conn the connection to serve: over TLS, after a handshake (none, if it fails).
+    coro::task<std::optional<detail::connection>> open_connection(tcp_socket conn);
+
+#ifdef NET_HAS_TLS
+    // accept_tls runs conn's TLS handshake with ctx.
+    coro::task<std::optional<detail::connection>> accept_tls(tcp_socket conn, tls::server_context ctx);
+#endif
+
+    // serve_requests reads and responds to conn's requests, until it closes (or should be).
+    coro::task<> serve_requests(detail::connection& conn);
+
+    // head_deadline is how long a connection may take to send the next request's head, or finish its TLS handshake
+    // (see header_read_timeout).
+    [[nodiscard]] std::optional<io::clock::time_point> head_deadline() const;
 
     // start_response readies the connection's response for the request it has just decoded, with no_body for its body
     // if it's to a HEAD request.
     static void start_response(connection_state& state, io::discard_writer& no_body);
 
     // The ways a connection ends other than the client closing it, which close it.
-    coro::task<> end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_code err);
-    coro::task<> end_after_handler_failure(tcp_socket&        conn,
-                                           connection_state&  state,
-                                           response_writer&   rw,
-                                           std::exception_ptr failure);
+    coro::task<> end_after_decode_error(detail::connection& conn, connection_state& state, std::error_code err);
+    coro::task<> end_after_handler_failure(detail::connection& conn,
+                                           connection_state&   state,
+                                           response_writer&    rw,
+                                           std::exception_ptr  failure);
 
     // respond_and_close sends a response of just code (closing the connection), and closes it.
-    coro::task<> respond_and_close(tcp_socket& conn, connection_state& state, status code);
+    coro::task<> respond_and_close(detail::connection& conn, connection_state& state, status code);
 
     net::listener                   listener;
     std::atomic_bool                is_serving;
@@ -142,9 +161,12 @@ private:
     // open_connections counts the connections being served, for max_connections (waited on, with the scheduler).
     std::atomic<std::uint64_t> open_connections = 0;
 
-    // connections are the sockets being served, for close() to end. Each removes itself before closing its socket.
-    std::mutex                      connections_mu;
-    std::unordered_set<tcp_socket*> connections;
+#ifdef NET_HAS_TLS
+    std::optional<tls::server_context> tls_ctx;
+#endif
+
+    // closing is requested by close(), to end the connections (and TLS handshakes) being served.
+    std::stop_source closing;
 
     // running counts serve() and the connections (which are the scheduler's tasks), for the destructor to wait for.
     coro::async_scope running;

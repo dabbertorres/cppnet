@@ -2,7 +2,7 @@
 
 A C++23 networking library, built on its own coroutine runtime: TCP sockets, DNS lookups, URLs, an HTTP/1.1
 client and server (with a router, and middleware for Prometheus metrics and OpenTelemetry tracing), and TLS (with
-Botan).
+Botan), for HTTPS in both.
 
 ```cpp
 namespace http = net::http;
@@ -23,8 +23,8 @@ scheduler.spawn(server.serve());
 ```
 
 [docs/guide.md](docs/guide.md) explains how it fits together: the runtime, errors, lifetimes, and each part of the
-library. [example/](example/) has whole programs: an HTTP client (`http-get`), an HTTP server (`http-server`), a TCP
-echo server (`tcp-echo-server`), and a DNS lookup (`ip-resolv`).
+library. [example/](example/) has whole programs: an HTTP client (`http-get`), an HTTP server (`http-server`, which
+serves HTTPS given `--cert` and `--key`), a TCP echo server (`tcp-echo-server`), and a DNS lookup (`ip-resolv`).
 
 ## Requirements
 

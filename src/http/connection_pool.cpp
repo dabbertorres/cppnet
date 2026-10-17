@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ratio>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -39,22 +40,6 @@ bool still_open(const net::http::detail::connection& conn) noexcept
 
 namespace net::http::detail
 {
-
-tcp_socket& connection::socket() noexcept
-{
-#ifdef NET_HAS_TLS
-    if (auto* tls = std::get_if<tls::stream>(&conn)) return tls->socket();
-#endif
-    return *std::get_if<tcp_socket>(&conn);
-}
-
-int connection::native_handle() const noexcept
-{
-#ifdef NET_HAS_TLS
-    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->native_handle();
-#endif
-    return std::get_if<tcp_socket>(&conn)->native_handle();
-}
 
 connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}

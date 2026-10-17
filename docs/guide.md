@@ -198,6 +198,19 @@ scheduler.spawn(server.serve());
   listener from `listener::make()` instead of a host and port.
 - **Stopping:** `server.close()` stops accepting and ends the connections, then `scheduler.shutdown()` waits for
   them.
+- **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
+  files). Making it reports a file that can't be loaded as an error, before the server starts:
+
+  ```cpp
+  auto ctx = net::tls::server_context::make({.certificate_chain = "chain.pem", .private_key = "key.pem"});
+  if (!ctx.has_value()) { /* ctx.error() */ }
+
+  net::http::server server{&scheduler, std::move(*listener), std::move(router), {.tls = std::move(*ctx)}};
+  ```
+
+  Each connection's handshake has `header_read_timeout` to finish, and `req.tls` tells a handler its request came
+  over TLS. Only HTTP/1.1 is served: a client that agrees on another protocol with ALPN is disconnected.
+  `example/http-server` serves HTTPS with `--cert` and `--key`.
 
 ## TLS
 
@@ -217,7 +230,13 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 - Errors compare with `tls::alert` conditions (e.g. `err == tls::alert::bad_certificate`), whichever side sent the
   alert; `tls::from_peer(err)` says which. A certificate that failed verification says why in its message (e.g.
   "Certificate does not match provided name").
-- A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()`.
+- A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()` (as
+  `http::server` does).
+- `stream::connect()` and `stream::accept()` take an optional `std::stop_token`: requesting stop ends a handshake that's
+  waiting, with `std::errc::operation_canceled`.
+- `co_await tls->shutdown()` sends close_notify without closing the socket, so what the peer sent before its own
+  close_notify can still be read. The peer's close_notify ends the stream (`io::errc::end_of_stream`), and is answered
+  with close_notify, so nothing more can be written either.
 
 ## Instrumentation
 

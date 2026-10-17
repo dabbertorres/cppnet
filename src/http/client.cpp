@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "http/connection.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
