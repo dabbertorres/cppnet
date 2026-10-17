@@ -18,8 +18,6 @@
 namespace net
 {
 
-using namespace std::chrono_literals;
-
 class socket
     : public io::reader
     , public io::writer
@@ -66,7 +64,7 @@ public:
     // written, after it's closed. If graceful, close waits (up to graceful_timeout) for that to be acknowledged:
     // NOTE: blocking the calling thread, even though the socket is non-blocking (as Linux's close() does), so not
     //       on one of the scheduler's workers. The destructor doesn't.
-    void close(bool graceful = false, std::chrono::seconds graceful_timeout = 5s) noexcept;
+    void close(bool graceful = false, std::chrono::seconds graceful_timeout = std::chrono::seconds{5}) noexcept;
 
     // shutdown_write ends the outgoing side of the connection (the peer reads the end of the stream), while reads
     // carry on.

@@ -25,8 +25,6 @@
 namespace net::tls
 {
 
-using namespace std::chrono_literals;
-
 // client_options configures a client_context.
 struct client_options
 {

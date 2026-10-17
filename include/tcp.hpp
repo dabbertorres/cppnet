@@ -14,8 +14,6 @@
 namespace net
 {
 
-using namespace std::chrono_literals;
-
 class tcp_socket : public socket
 {
 public:
@@ -25,7 +23,7 @@ public:
 
         // How long to wait for a connection, over all of the host's addresses. (Resolving the host isn't included:
         // getaddrinfo() has its own timeouts.)
-        std::chrono::milliseconds timeout = 10s;
+        std::chrono::milliseconds timeout = std::chrono::seconds{10};
 
         bool keepalive = true;
     };
