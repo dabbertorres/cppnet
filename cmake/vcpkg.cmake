@@ -1,15 +1,3 @@
-# hack in using libc++ when building dependencies from vcpkg...
-if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
-  set(
-    VCPKG_C_FLAGS
-    "-stdlib=libc++"
-  )
-  set(
-    VCPKG_CXX_FLAGS
-    "-stdlib=libc++"
-  )
-endif()
-
 # use vcpkg for dependency management
 
 # Prefer the submodule, which matches the manifest's builtin-baseline. $VCPKG_ROOT is only a fallback, for when the
