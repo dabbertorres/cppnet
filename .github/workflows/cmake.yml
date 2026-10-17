@@ -26,11 +26,11 @@ jobs:
     # NOTE: before checking out, so that it uses git (for the vcpkg submodule) rather than downloading an archive.
     - name: Install tools (Linux)
       if: runner.os == 'Linux'
-      run: pacman -Syu --noconfirm --needed git cmake ninja clang curl zip unzip tar pkgconf
+      run: pacman -Syu --noconfirm --needed git cmake ninja clang curl zip unzip tar zstd pkgconf ccache
 
     - name: Install tools (macOS)
       if: runner.os == 'macOS'
-      run: brew install gcc llvm ninja
+      run: brew install gcc llvm ninja ccache
 
     - uses: actions/checkout@v7
       with:
@@ -66,17 +66,70 @@ jobs:
         "$CC" --version
         "$CXX" --version
 
+    # Caches: vcpkg's built packages (e.g. Botan, which takes a while), and ccache's of this project's compilation. Each
+    # is keyed by the compiler's version, as what one builds doesn't suit another's. NOTE: relative paths, and
+    # $GITHUB_WORKSPACE in the steps, as ${{ github.workspace }} is the host's path, not the container's, on Linux.
+    - name: Cache settings
+      id: cache
+      run: |
+        echo "compiler=$("$CXX" --version | head -1 | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        echo "vcpkg=$(git -c safe.directory='*' -C vcpkg rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        mkdir -p .cache/vcpkg .cache/ccache
+        echo "VCPKG_BINARY_SOURCES=clear;files,$GITHUB_WORKSPACE/.cache/vcpkg,readwrite" >> "$GITHUB_ENV"
+        echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=500M" >> "$GITHUB_ENV"
+
+    # vcpkg's packages change with its baseline (the submodule), the manifest, and the overlay ports.
+    - name: Restore vcpkg's packages
+      id: vcpkg-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/vcpkg
+        key: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-${{ steps.cache.outputs.vcpkg }}-${{ hashFiles('vcpkg.json', 'ports/**') }}
+        restore-keys: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-
+
+    # ccache's changes with every commit, so each run saves its own, starting from the latest.
+    - name: Restore ccache's cache
+      id: ccache-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/ccache
+        key: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-${{ github.sha }}
+        restore-keys: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-
+
     - name: Configure CMake
       run: >-
         cmake -G Ninja -B build
         -DCMAKE_BUILD_TYPE=Debug
         -DCMAKE_C_COMPILER="$CC"
         -DCMAKE_CXX_COMPILER="$CXX"
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
         -DBUILD_TESTING=ON
         -DBUILD_EXAMPLE=ON
 
     - name: Build
       run: cmake --build build --parallel
+
+    # NOTE: saved even if a later step fails (e.g. a test), as what was built is still good.
+    - name: Save vcpkg's packages
+      if: always() && steps.vcpkg-cache.outputs.cache-primary-key != '' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/vcpkg
+        key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+    - name: Show ccache's statistics
+      if: always() && steps.ccache-cache.outputs.cache-primary-key != ''
+      run: ccache --show-stats
+
+    - name: Save ccache's cache
+      if: always() && steps.ccache-cache.outputs.cache-primary-key != ''
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/ccache
+        key: ${{ steps.ccache-cache.outputs.cache-primary-key }}
 
     - name: Test
       run: ctest --test-dir build --output-on-failure
