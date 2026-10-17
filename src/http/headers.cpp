@@ -120,28 +120,7 @@ headers& headers::set_one(std::string_view key, V&& val)
     return *this;
 }
 
-headers& headers::set(const std::string& key, std::string val) { return set(std::string_view{key}, std::move(val)); }
-
-headers& headers::set(const std::string& key, std::initializer_list<std::string> vals)
-{
-    return set(std::string_view{key}, vals);
-}
-
-headers& headers::set(const std::string& key, std::vector<std::string>&& vals)
-{
-    return set(std::string_view{key}, std::move(vals));
-}
-
-headers& headers::add(const std::string& key, std::string val) { return add(std::string_view{key}, std::move(val)); }
-
 headers& headers::set(std::string_view key, std::string val) { return set_one(key, std::move(val)); }
-
-headers& headers::set(std::string_view key, std::initializer_list<std::string> vals)
-{
-    auto& out = assign(key);
-    for (const auto& val : vals) out.push_back(val);
-    return *this;
-}
 
 headers& headers::set(std::string_view key, std::vector<std::string>&& vals)
 {
@@ -157,15 +136,6 @@ headers& headers::add(std::string_view key, std::string val)
     else set_values(add_field(key).second, std::move(val));
     return *this;
 }
-
-headers& headers::set(const std::string& key, std::string_view val) { return set(std::string_view{key}, val); }
-
-headers& headers::set(const std::string& key, std::initializer_list<std::string_view> vals)
-{
-    return set(std::string_view{key}, vals);
-}
-
-headers& headers::add(const std::string& key, std::string_view val) { return add(std::string_view{key}, val); }
 
 headers& headers::set(std::string_view key, std::string_view val) { return set_one(key, val); }
 
@@ -212,11 +182,6 @@ headers& headers::set_content_type(const content_type& content_type)
     return set("Content-Type"sv, ss.str());
 }
 
-[[nodiscard]] std::optional<std::string_view> headers::get(const std::string& key) const
-{
-    return get(std::string_view{key});
-}
-
 [[nodiscard]] std::optional<std::string_view> headers::get(std::string_view key) const
 {
     const auto* field = find(key);
@@ -225,13 +190,7 @@ headers& headers::set_content_type(const content_type& content_type)
     return std::string_view{field->second.front()};
 }
 
-[[nodiscard]] std::optional<std::string_view> headers::operator[](const std::string& key) const { return get(key); }
 [[nodiscard]] std::optional<std::string_view> headers::operator[](std::string_view key) const { return get(key); }
-
-[[nodiscard]] std::optional<headers::values_range> headers::get_all(const std::string& key) const
-{
-    return get_all(std::string_view{key});
-}
 
 [[nodiscard]] std::optional<headers::values_range> headers::get_all(std::string_view key) const
 {
