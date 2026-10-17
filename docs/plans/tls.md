@@ -1,6 +1,6 @@
 # Plan: TLS, with Botan
 
-Status: proposed (2026-10-17). Nothing below is implemented yet.
+Status: stage 1 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`.
 
 ## Goal
 
@@ -148,6 +148,20 @@ const std::error_category& category() noexcept;
   (so tests can trust a test CA). Without `NET_HAS_TLS`, `https://` fails with `not_supported`.
 - **Server (stage 3):** `server_config` gets an optional `tls::server_options`; `serve_connection` runs
   `stream::accept()` (under `header_read_timeout`) before reading requests, and serves over the stream.
+
+## Learned in stage 1
+
+- Botan's default verification does check the server's name (and IP addresses, against the certificate's), failing
+  with `bad_certificate`; and it offers TLS 1.3 (with 1.2 allowed).
+- Botan's default policy requires revocation information (OCSP or CRLs) for the chain, which rejects certificates that
+  have none (e.g. Let's Encrypt's: it stopped OCSP in 2025). cppnet's policy doesn't require it, as browsers, Go and
+  OpenSSL don't.
+- In TLS 1.3, a server may send data (and close_notify) straight after its handshake messages, so they can arrive with
+  the end of the client's handshake: the handshake waits for `is_handshake_complete()`, not `is_active()` (which is
+  false once the peer has closed), and leaves the rest for `read()`.
+- Botan 3.12 doesn't build with libc++ 23 (missing includes): `ports/botan/` patches it.
+- macOS's `getaddrinfo()` leaves allocations in the Network framework that LeakSanitizer reports (suppressed in
+  `test/sanitizers.cpp`).
 
 ## Stages
 

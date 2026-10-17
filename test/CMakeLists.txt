@@ -9,6 +9,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Catch2 CONFIG REQUIRED)
 
 file(GLOB_RECURSE test_sources CONFIGURE_DEPENDS "*.cpp")
+if(NOT NET_TLS)
+  list(FILTER test_sources EXCLUDE REGEX "/test/tls/")
+endif()
 add_executable(tests ${test_sources})
 
 target_include_directories(
@@ -25,6 +28,11 @@ target_link_libraries(
   Catch2::Catch2WithMain
   net
 )
+
+# the TLS tests make their certificates with Botan.
+if(NET_TLS)
+  target_link_libraries(tests PRIVATE ${NET_BOTAN_TARGET})
+endif()
 
 include(Catch)
 catch_discover_tests(tests)

@@ -15,9 +15,10 @@ extern "C"
 // NOLINTNEXTLINE(*-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp): the sanitizer runtime looks for this name.
 [[gnu::visibility("default"), gnu::used]] const char* __lsan_default_suppressions()
 {
-    // macOS: getaddrinfo() sets up process-wide state in the Network framework, to synthesize NAT64 addresses, which it
-    // never frees.
-    return "leak:_gai_nat64_second_pass\n";
+    // macOS: getaddrinfo() sets up process-wide state in the Network framework, which it never frees: to synthesize
+    // NAT64 addresses, and (resolving a name, rather than a number) through nw_path_libinfo_path_check, once.
+    return "leak:_gai_nat64_second_pass\n"
+           "leak:nw_path_libinfo_path_check\n";
 }
 
 }

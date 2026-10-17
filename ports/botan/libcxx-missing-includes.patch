@@ -1,0 +1,308 @@
+diff -ruN a/src/lib/ffi/ffi_zfec.cpp b/src/lib/ffi/ffi_zfec.cpp
+--- a/src/lib/ffi/ffi_zfec.cpp
++++ b/src/lib/ffi/ffi_zfec.cpp
+@@ -4,6 +4,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <algorithm>
+ #include <botan/ffi.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/hash/streebog/streebog.cpp b/src/lib/hash/streebog/streebog.cpp
+--- a/src/lib/hash/streebog/streebog.cpp
++++ b/src/lib/hash/streebog/streebog.cpp
+@@ -6,6 +6,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <algorithm>
+ #include <botan/internal/streebog.h>
+ 
+ #include <botan/exceptn.h>
+diff -ruN a/src/lib/math/pcurves/pcurves_impl/pcurves_impl.h b/src/lib/math/pcurves/pcurves_impl/pcurves_impl.h
+--- a/src/lib/math/pcurves/pcurves_impl/pcurves_impl.h
++++ b/src/lib/math/pcurves/pcurves_impl/pcurves_impl.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_PCURVES_IMPL_H_
+ #define BOTAN_PCURVES_IMPL_H_
+ 
++#include <algorithm>
+ #include <botan/rng.h>
+ #include <botan/internal/buffer_stuffer.h>
+ #include <botan/internal/ct_utils.h>
+diff -ruN a/src/lib/math/pcurves/pcurves_impl/pcurves_util.h b/src/lib/math/pcurves/pcurves_impl/pcurves_util.h
+--- a/src/lib/math/pcurves/pcurves_impl/pcurves_util.h
++++ b/src/lib/math/pcurves/pcurves_impl/pcurves_util.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_PCURVES_UTIL_H_
+ #define BOTAN_PCURVES_UTIL_H_
+ 
++#include <algorithm>
+ #include <botan/internal/mp_core.h>
+ #include <array>
+ 
+diff -ruN a/src/lib/modes/cipher_mode.h b/src/lib/modes/cipher_mode.h
+--- a/src/lib/modes/cipher_mode.h
++++ b/src/lib/modes/cipher_mode.h
+@@ -8,6 +8,7 @@
+ #ifndef BOTAN_CIPHER_MODE_H_
+ #define BOTAN_CIPHER_MODE_H_
+ 
++#include <algorithm>
+ #include <botan/concepts.h>
+ #include <botan/secmem.h>
+ #include <botan/sym_algo.h>
+diff -ruN a/src/lib/permutations/keccak_perm/keccak_helpers.cpp b/src/lib/permutations/keccak_perm/keccak_helpers.cpp
+--- a/src/lib/permutations/keccak_perm/keccak_helpers.cpp
++++ b/src/lib/permutations/keccak_perm/keccak_helpers.cpp
+@@ -6,6 +6,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  */
+ 
++#include <algorithm>
+ #include <botan/internal/keccak_helpers.h>
+ 
+ #include <botan/internal/bit_ops.h>
+diff -ruN a/src/lib/pubkey/dilithium/dilithium_common/dilithium.cpp b/src/lib/pubkey/dilithium/dilithium_common/dilithium.cpp
+--- a/src/lib/pubkey/dilithium/dilithium_common/dilithium.cpp
++++ b/src/lib/pubkey/dilithium/dilithium_common/dilithium.cpp
+@@ -12,6 +12,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <algorithm>
+ #include <botan/dilithium.h>
+ 
+ #include <botan/exceptn.h>
+diff -ruN a/src/lib/pubkey/kex_to_kem_adapter/kex_to_kem_adapter.cpp b/src/lib/pubkey/kex_to_kem_adapter/kex_to_kem_adapter.cpp
+--- a/src/lib/pubkey/kex_to_kem_adapter/kex_to_kem_adapter.cpp
++++ b/src/lib/pubkey/kex_to_kem_adapter/kex_to_kem_adapter.cpp
+@@ -8,6 +8,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  */
+ 
++#include <algorithm>
+ #include <botan/internal/kex_to_kem_adapter.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/pubkey/kyber/kyber_common/kyber.cpp b/src/lib/pubkey/kyber/kyber_common/kyber.cpp
+--- a/src/lib/pubkey/kyber/kyber_common/kyber.cpp
++++ b/src/lib/pubkey/kyber/kyber_common/kyber.cpp
+@@ -12,6 +12,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  */
+ 
++#include <algorithm>
+ #include <botan/kyber.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/pubkey/kyber/kyber_common/kyber_keys.cpp b/src/lib/pubkey/kyber/kyber_common/kyber_keys.cpp
+--- a/src/lib/pubkey/kyber/kyber_common/kyber_keys.cpp
++++ b/src/lib/pubkey/kyber/kyber_common/kyber_keys.cpp
+@@ -9,6 +9,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  */
+ 
++#include <algorithm>
+ #include <botan/internal/kyber_keys.h>
+ 
+ #include <botan/internal/buffer_slicer.h>
+diff -ruN a/src/lib/pubkey/mce/mceliece_key.cpp b/src/lib/pubkey/mce/mceliece_key.cpp
+--- a/src/lib/pubkey/mce/mceliece_key.cpp
++++ b/src/lib/pubkey/mce/mceliece_key.cpp
+@@ -10,6 +10,7 @@
+  *
+  */
+ 
++#include <algorithm>
+ #include <botan/mceliece.h>
+ 
+ #include <botan/ber_dec.h>
+diff -ruN a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_address.h b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_address.h
+--- a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_address.h
++++ b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_address.h
+@@ -9,6 +9,7 @@
+ #ifndef BOTAN_SPHINCS_PLUS_ADDRESS_H_
+ #define BOTAN_SPHINCS_PLUS_ADDRESS_H_
+ 
++#include <algorithm>
+ #include <botan/internal/loadstor.h>
+ #include <botan/internal/sp_types.h>
+ #include <array>
+diff -ruN a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_hash.cpp b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_hash.cpp
+--- a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_hash.cpp
++++ b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_hash.cpp
+@@ -6,6 +6,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  **/
+ 
++#include <algorithm>
+ #include <botan/internal/sp_hash.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_wots.cpp b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_wots.cpp
+--- a/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_wots.cpp
++++ b/src/lib/pubkey/sphincsplus/sphincsplus_common/sp_wots.cpp
+@@ -6,6 +6,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ **/
+ 
++#include <algorithm>
+ #include <botan/internal/sp_wots.h>
+ 
+ #include <botan/internal/buffer_slicer.h>
+diff -ruN a/src/lib/pubkey/sphincsplus/sphincsplus_common/sphincsplus_sha2_base/sp_hash_sha2.h b/src/lib/pubkey/sphincsplus/sphincsplus_common/sphincsplus_sha2_base/sp_hash_sha2.h
+--- a/src/lib/pubkey/sphincsplus/sphincsplus_common/sphincsplus_sha2_base/sp_hash_sha2.h
++++ b/src/lib/pubkey/sphincsplus/sphincsplus_common/sphincsplus_sha2_base/sp_hash_sha2.h
+@@ -9,6 +9,7 @@
+ #ifndef BOTAN_SP_HASH_SHA2_H_
+ #define BOTAN_SP_HASH_SHA2_H_
+ 
++#include <algorithm>
+ #include <botan/internal/sp_hash.h>
+ 
+ #include <botan/internal/concat_util.h>
+diff -ruN a/src/lib/pubkey/xmss/xmss_address.h b/src/lib/pubkey/xmss/xmss_address.h
+--- a/src/lib/pubkey/xmss/xmss_address.h
++++ b/src/lib/pubkey/xmss/xmss_address.h
+@@ -9,6 +9,7 @@
+ #ifndef BOTAN_XMSS_ADDRESS_H_
+ #define BOTAN_XMSS_ADDRESS_H_
+ 
++#include <algorithm>
+ #include <botan/assert.h>
+ #include <botan/types.h>
+ #include <array>
+diff -ruN a/src/lib/pubkey/xmss/xmss_signature.cpp b/src/lib/pubkey/xmss/xmss_signature.cpp
+--- a/src/lib/pubkey/xmss/xmss_signature.cpp
++++ b/src/lib/pubkey/xmss/xmss_signature.cpp
+@@ -5,6 +5,7 @@
+  * Botan is released under the Simplified BSD License (see license.txt)
+  **/
+ 
++#include <algorithm>
+ #include <botan/internal/xmss_signature.h>
+ #include <iterator>
+ 
+diff -ruN a/src/lib/rng/system_rng/system_rng.cpp b/src/lib/rng/system_rng/system_rng.cpp
+--- a/src/lib/rng/system_rng/system_rng.cpp
++++ b/src/lib/rng/system_rng/system_rng.cpp
+@@ -6,6 +6,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <cerrno>
+ #include <botan/system_rng.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/tls/tls12/tls_handshake_state.cpp b/src/lib/tls/tls12/tls_handshake_state.cpp
+--- a/src/lib/tls/tls12/tls_handshake_state.cpp
++++ b/src/lib/tls/tls12/tls_handshake_state.cpp
+@@ -6,6 +6,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <algorithm>
+ #include <botan/internal/tls_handshake_state.h>
+ 
+ #include <botan/kdf.h>
+diff -ruN a/src/lib/utils/alignment_buffer.h b/src/lib/utils/alignment_buffer.h
+--- a/src/lib/utils/alignment_buffer.h
++++ b/src/lib/utils/alignment_buffer.h
+@@ -9,6 +9,7 @@
+ #ifndef BOTAN_ALIGNMENT_BUFFER_H_
+ #define BOTAN_ALIGNMENT_BUFFER_H_
+ 
++#include <algorithm>
+ #include <botan/internal/buffer_slicer.h>
+ #include <botan/internal/mem_utils.h>
+ #include <array>
+diff -ruN a/src/lib/utils/buffer_slicer.h b/src/lib/utils/buffer_slicer.h
+--- a/src/lib/utils/buffer_slicer.h
++++ b/src/lib/utils/buffer_slicer.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_BUFFER_SLICER_H_
+ #define BOTAN_BUFFER_SLICER_H_
+ 
++#include <algorithm>
+ #include <botan/assert.h>
+ #include <botan/concepts.h>
+ #include <botan/secmem.h>
+diff -ruN a/src/lib/utils/buffer_stuffer.h b/src/lib/utils/buffer_stuffer.h
+--- a/src/lib/utils/buffer_stuffer.h
++++ b/src/lib/utils/buffer_stuffer.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_BUFFER_STUFFER_H_
+ #define BOTAN_BUFFER_STUFFER_H_
+ 
++#include <algorithm>
+ #include <botan/assert.h>
+ #include <botan/strong_type.h>
+ #include <botan/types.h>
+diff -ruN a/src/lib/utils/concat_util.h b/src/lib/utils/concat_util.h
+--- a/src/lib/utils/concat_util.h
++++ b/src/lib/utils/concat_util.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_CONCAT_UTIL_H_
+ #define BOTAN_CONCAT_UTIL_H_
+ 
++#include <algorithm>
+ #include <botan/assert.h>
+ #include <botan/concepts.h>
+ #include <botan/range_concepts.h>
+diff -ruN a/src/lib/utils/mem_ops.h b/src/lib/utils/mem_ops.h
+--- a/src/lib/utils/mem_ops.h
++++ b/src/lib/utils/mem_ops.h
+@@ -8,6 +8,7 @@
+ #ifndef BOTAN_MEMORY_OPS_H_
+ #define BOTAN_MEMORY_OPS_H_
+ 
++#include <algorithm>
+ #include <botan/assert.h>
+ #include <botan/range_concepts.h>
+ #include <botan/types.h>
+diff -ruN a/src/lib/utils/mem_pool/mem_pool.cpp b/src/lib/utils/mem_pool/mem_pool.cpp
+--- a/src/lib/utils/mem_pool/mem_pool.cpp
++++ b/src/lib/utils/mem_pool/mem_pool.cpp
+@@ -4,6 +4,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <exception>
+ #include <botan/internal/mem_pool.h>
+ 
+ #include <botan/mem_ops.h>
+diff -ruN a/src/lib/x509/certstor_system_macos/certstor_macos.cpp b/src/lib/x509/certstor_system_macos/certstor_macos.cpp
+--- a/src/lib/x509/certstor_system_macos/certstor_macos.cpp
++++ b/src/lib/x509/certstor_system_macos/certstor_macos.cpp
+@@ -6,6 +6,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <iterator>
+ #include <botan/certstor_macos.h>
+ 
+ #include <botan/assert.h>
+diff -ruN a/src/lib/x509/x509_ca.cpp b/src/lib/x509/x509_ca.cpp
+--- a/src/lib/x509/x509_ca.cpp
++++ b/src/lib/x509/x509_ca.cpp
+@@ -5,6 +5,7 @@
+ * Botan is released under the Simplified BSD License (see license.txt)
+ */
+ 
++#include <algorithm>
+ #include <botan/x509_ca.h>
+ 
+ #include <botan/asn1_obj.h>
+diff -ruN a/src/lib/x509/x509_utils.h b/src/lib/x509/x509_utils.h
+--- a/src/lib/x509/x509_utils.h
++++ b/src/lib/x509/x509_utils.h
+@@ -7,6 +7,7 @@
+ #ifndef BOTAN_X509_UTILS_H_
+ #define BOTAN_X509_UTILS_H_
+ 
++#include <algorithm>
+ #include <botan/asn1_obj.h>
+ #include <initializer_list>
+ #include <optional>
