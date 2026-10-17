@@ -195,10 +195,15 @@ public:
         // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress.
         void set_deadline(std::optional<clock::time_point> deadline) noexcept { state.deadline = deadline; }
 
+        // cancel_wait stops waiting (if it still is), without resuming the coroutine that began it: for when that's
+        // being destroyed. NOTE: it must not race with the wait finishing (which resumes the coroutine).
+        void cancel_wait() noexcept;
+
     private:
         friend class scheduler;
 
-        waiter state{};
+        waiter     state{};
+        scheduler* sched = nullptr;
     };
 
     // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
@@ -416,6 +421,9 @@ private:
     // ready_for completes the waiter that slot (in sh) holds, now its handle's ready, or performs its operation, which
     // may keep it waiting (see handle_operation). Must be called holding sh's lock.
     void ready_for(shard& sh, direction& slot, completions& done) noexcept;
+
+    // cancel stops a handle's waiter waiting (if it still is), without completing it.
+    void cancel(waiter& state) noexcept;
 
     // retime replaces the timer of a waiter (whose handle is in sh) for its deadline. Must be called holding sh's lock.
     void retime(shard& sh, waiter& state) noexcept;

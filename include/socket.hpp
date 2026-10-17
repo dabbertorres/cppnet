@@ -105,6 +105,7 @@ private:
 
         bool       start(std::coroutine_handle<> awaiting) noexcept override;
         io::result result() noexcept override;
+        void       cancel() noexcept override;
         bool       perform() noexcept override;
 
     private:
@@ -129,6 +130,7 @@ private:
 
         bool       start(std::coroutine_handle<> awaiting) noexcept override;
         io::result result() noexcept override;
+        void       cancel() noexcept override;
         bool       perform() noexcept override;
 
     private:

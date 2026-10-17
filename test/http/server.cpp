@@ -1,6 +1,7 @@
 #include "http/server.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <utility>
 
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -23,6 +25,9 @@
 #include <arpa/inet.h>
 #include <catch2/catch_test_macros.hpp>
 #include <netinet/in.h>
+#include <spdlog/details/log_msg.h>
+#include <spdlog/logger.h>
+#include <spdlog/sinks/callback_sink.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
@@ -38,6 +43,7 @@
 #include "io/writer.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
+#include "util/defer.hpp"
 
 namespace http = net::http;
 
@@ -744,4 +750,67 @@ TEST_CASE("connections made before the server serves are queued, not refused", "
 
     REQUIRE(running.sched.spawn(server.serve()));
     CHECK(conn.read_some().ends_with("\r\n\r\nearly"));
+}
+
+TEST_CASE("the server backs off when accepting fails, e.g. as it's out of file descriptors", "[http][server][limits]")
+{
+    // counts the server's failures to accept, which it logs.
+    std::atomic<int> failures = 0;
+    auto             sink     = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&](const spdlog::details::log_msg& msg)
+        {
+            if (std::string_view{msg.payload.data(), msg.payload.size()}.starts_with("failed to accept")) ++failures;
+        });
+
+    running_scheduler running;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .logger = std::make_shared<spdlog::logger>("accept-backoff", sink)}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(server.local_port());
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    // the client's socket is made first, as no file can be opened once the limit's lowered.
+    const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(client != -1);
+    net::util::defer close_client{[&] noexcept { ::close(client); }};
+
+    {
+        // the process may only have the files it has open now: the lowest free descriptor is the limit.
+        const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(probe != -1);
+        ::close(probe);
+
+        rlimit original{};
+        REQUIRE(::getrlimit(RLIMIT_NOFILE, &original) == 0);
+
+        rlimit lowered   = original;
+        lowered.rlim_cur = static_cast<rlim_t>(probe);
+        REQUIRE(::setrlimit(RLIMIT_NOFILE, &lowered) == 0);
+        net::util::defer restore{[&] noexcept { ::setrlimit(RLIMIT_NOFILE, &original); }};
+
+        // the connection is made (the kernel accepts it), but the server can't accept it: there's no descriptor left.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
+        REQUIRE(::connect(client, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        std::this_thread::sleep_for(300ms);
+    }
+
+    // backing off (from 5ms, doubling) tries a few times in 300ms (Linux leaves the connection queued, so it fails each
+    // time; macOS drops it after the first): retrying straight away would be thousands of times.
+    CHECK(failures.load() >= 1);
+    CHECK(failures.load() <= 10);
+
+    // and once descriptors are free again, it serves.
+    blocking_client later{server.local_port()};
+    later.send("GET /later HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(later.read_some().ends_with("\r\n\r\nlater"));
 }

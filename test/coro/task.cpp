@@ -133,9 +133,16 @@ public:
         return value;
     }
 
+    void cancel() noexcept override
+    {
+        cancelled = true;
+        release();
+    }
+
     void finish() const { waiting.resume(); }
 
     bool                    finish_at_start = true;
+    bool                    cancelled       = false;
     bool                    started         = false;
     int                     value           = 0;
     std::coroutine_handle<> waiting{nullptr};
@@ -174,6 +181,30 @@ TEST_CASE("operation tasks", "[coro][task][operation]")
         REQUIRE(awaiting.is_ready());
         const int value = std::move(awaiting).result();
         CHECK(value == 6);
+    }
+
+    SECTION("destroying the coroutine waiting for one cancels it, rather than leaving it to resume what's gone")
+    {
+        op.finish_at_start = false;
+        REQUIRE(op.try_claim());
+
+        {
+            auto awaiting = await_it();
+            awaiting.get_handle().resume();
+            REQUIRE_FALSE(awaiting.is_ready());
+        }
+
+        CHECK(op.cancelled);
+        CHECK(op.try_claim());
+    }
+
+    SECTION("one that finishes isn't cancelled when the coroutine is destroyed")
+    {
+        op.value = 7;
+        REQUIRE(op.try_claim());
+
+        CHECK(test::sync_wait(await_it()) == 7);
+        CHECK_FALSE(op.cancelled);
     }
 
     SECTION("one that's claimed can't be again until it's released, e.g. as its task is never awaited")

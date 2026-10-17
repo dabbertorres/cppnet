@@ -383,8 +383,35 @@ bool scheduler::handle_operation::begin(scheduler&                       sched,
                                         std::optional<clock::time_point> deadline,
                                         std::coroutine_handle<>          awaiting) noexcept
 {
-    state = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
+    state       = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
+    this->sched = &sched;
     return sched.suspend(state, awaiting);
+}
+
+void scheduler::handle_operation::cancel_wait() noexcept
+{
+    if (sched != nullptr) sched->cancel(state);
+}
+
+void scheduler::cancel(waiter& state) noexcept
+{
+    auto&            sh = shard_for(state.fd);
+    std::scoped_lock lock{sh.mu};
+
+    auto it = sh.registrations.find(state.fd);
+    if (it == sh.registrations.end()) return;
+
+    // it may have finished (or been cancelled by deregistering the handle) already.
+    auto& slot = state.op == poll_op::read ? it->second.read : it->second.write;
+    if (slot.waiting != &state) return;
+
+    slot.waiting = nullptr;
+    if (state.timer)
+    {
+        sh.timers.remove(*state.timer);
+        state.timer.reset();
+        sh.update_earliest();
+    }
 }
 
 void scheduler::expire_timers(completions& done) noexcept

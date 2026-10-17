@@ -102,9 +102,26 @@ TEST_CASE("process threads", "[instrument][system]")
         std::jthread warm_up{[] {}};
     }
 
-    // started counts the threads before and while running one more.
-    const auto started = []
+    // settled waits (a little) for the count to stop changing: a thread that's been joined may still be counted for a
+    // moment, while the kernel finishes with it (longer under ThreadSanitizer), e.g. the warm-up's, or the last
+    // attempt's below.
+    const auto settled = []
     {
+        auto count = system_stats::process_threads();
+        for (int wait = 0; wait < 100; ++wait)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            auto again = system_stats::process_threads();
+            if (again == count) break;
+            count = again;
+        }
+    };
+
+    // started counts the threads before and while running one more.
+    const auto started = [&]
+    {
+        settled();
+
         auto before = system_stats::process_threads();
         REQUIRE(before.has_value());
         CHECK(*before >= 1);
@@ -126,7 +143,7 @@ TEST_CASE("process threads", "[instrument][system]")
         return static_cast<std::ptrdiff_t>(*during) - static_cast<std::ptrdiff_t>(*before);
     };
 
-    // NOTE: tried a few times, as threads that earlier tests started may still be finishing, meanwhile.
+    // NOTE: tried a few times, as threads that earlier tests started may still be finishing (or starting), meanwhile.
     std::ptrdiff_t counted = 0;
     for (int attempt = 0; attempt < 10 && counted != 1; ++attempt) counted = started();
 

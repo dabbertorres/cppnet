@@ -253,6 +253,12 @@ io::result socket::read_operation::result() noexcept
     return out;
 }
 
+void socket::read_operation::cancel() noexcept
+{
+    cancel_wait();
+    release();
+}
+
 bool socket::write_operation::claim(std::span<const std::byte> from, std::size_t already) noexcept
 {
     if (!try_claim()) return false;
@@ -296,6 +302,12 @@ io::result socket::write_operation::result() noexcept
     auto out = error() ? io::result{.count = written, .err = error()} : res;
     release();
     return out;
+}
+
+void socket::write_operation::cancel() noexcept
+{
+    cancel_wait();
+    release();
 }
 
 std::optional<io::result> socket::try_read(std::span<std::byte> data) const noexcept
