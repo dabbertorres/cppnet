@@ -8,52 +8,75 @@ on:
 
 jobs:
   build:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-12]
-        cc: [gcc-12, clang-15]
-        cxx: [g++-12, clang++-15]
-        exclude:
-        - cc: gcc-12
-          cxx: clang++-15
-        - cc: clang-15
-          cxx: g++-12
+        os: [ubuntu-26.04, macos-26]
+        compiler: [gcc, clang]
 
     runs-on: ${{ matrix.os }}
 
-    defaults:
-      run:
-        working-directory: ${{ github.workspace }}
+    # The latest major versions of both compilers: on Linux, Arch's packages (GCC 16 and Clang 23, as of October 2026),
+    # as Ubuntu's (and apt.llvm.org's stable ones) lag behind; on macOS, Homebrew's.
+    container: ${{ startsWith(matrix.os, 'ubuntu') && 'archlinux:base-devel' || '' }}
 
     steps:
-    - uses: actions/checkout@v3
+    # NOTE: before checking out, so that it uses git (for the vcpkg submodule) rather than downloading an archive.
+    - name: Install tools (Linux)
+      if: runner.os == 'Linux'
+      run: pacman -Syu --noconfirm --needed git cmake ninja clang curl zip unzip tar pkgconf
+
+    - name: Install tools (macOS)
+      if: runner.os == 'macOS'
+      run: brew install gcc llvm ninja
+
+    - uses: actions/checkout@v7
       with:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Select Linux Compilers
+    - name: Select compilers (Linux)
       if: runner.os == 'Linux'
       run: |
-        echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
-        echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+        if [ "${{ matrix.compiler }}" = gcc ]; then
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CXX=g++" >> "$GITHUB_ENV"
+        else
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+        fi
 
-    - name: Select MacOS Compilers (Clang)
-      if: runner.os == 'MacOS' && matrix.cc == 'clang-15'
+    # NOTE: Homebrew's, as macOS' own gcc and clang are Apple's clang.
+    - name: Select compilers (macOS)
+      if: runner.os == 'macOS'
       run: |
-        echo "CC=$(brew --prefix llvm@15)/bin/clang" >> $GITHUB_ENV
-        echo "CXX=$(brew --prefix llvm@15)/bin/clang++" >> $GITHUB_ENV
+        if [ "${{ matrix.compiler }}" = gcc ]; then
+          gcc_major="$(brew list --versions gcc | awk '{print $2}' | cut -d. -f1)"
+          echo "CC=$(brew --prefix gcc)/bin/gcc-${gcc_major}" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix gcc)/bin/g++-${gcc_major}" >> "$GITHUB_ENV"
+        else
+          echo "CC=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+        fi
 
-    - name: Select MacOS Compilers (GCC)
-      if: runner.os == 'MacOS' && matrix.cc == 'gcc-12'
+    - name: Show compiler versions
       run: |
-        echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
-        echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+        "$CC" --version
+        "$CXX" --version
 
     - name: Configure CMake
-      run: cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ env.CC }} -DCMAKE_CXX_COMPILER=${{ env.CXX }} -DBUILD_TESTING=TRUE -DBUILD_EXAMPLE=TRUE -DCMAKE_MAKE_PROGRAM=make -B build/
+      run: >-
+        cmake -G Ninja -B build
+        -DCMAKE_BUILD_TYPE=Debug
+        -DCMAKE_C_COMPILER="$CC"
+        -DCMAKE_CXX_COMPILER="$CXX"
+        -DBUILD_TESTING=ON
+        -DBUILD_EXAMPLE=ON
 
     - name: Build
-      run: cmake --build build/
+      run: cmake --build build --parallel
 
     - name: Test
-      run: ctest --test-dir build/
+      run: ctest --test-dir build --output-on-failure
