@@ -76,6 +76,12 @@ protected:
 // task is a lazy coroutine: it starts when it's first co_awaited, and then resumes whatever awaited it when it
 // finishes.
 //
+// As it's lazy, what a coroutine takes by reference (or as a view, e.g. a std::span or std::string_view) must outlive
+// its task, not just the call: in `auto t = f(make_arg()); co_await std::move(t);`, f's reference is to a temporary
+// that's gone before t starts. Awaiting the call directly is fine (`co_await f(make_arg())`), as a temporary lasts
+// until the end of the full expression, which includes the co_await; otherwise, keep the argument alive until the task
+// has finished. (Functions that keep what they're given, e.g. http::client::send, take it by value.)
+//
 // How co_await hands over to a task (and back), and why:
 //
 // The usual way is symmetric transfer: await_suspend returns the task's handle (so the awaiting coroutine suspends, and

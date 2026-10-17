@@ -31,7 +31,7 @@ namespace http = net::http;
 namespace
 {
 
-net::coro::task<bool> run_request(http::client& client, const http::client_request& req);
+net::coro::task<bool> run_request(http::client& client, http::client_request req);
 }
 
 int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signature.
@@ -90,7 +90,7 @@ int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signat
     };
 
     std::cout << "sending request...\n";
-    bool success = scheduler.run_to_completion(run_request(client, req));
+    bool success = scheduler.run_to_completion(run_request(client, std::move(req)));
 
     return success ? 0 : 1;
 }
@@ -98,9 +98,9 @@ int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signat
 namespace
 {
 
-net::coro::task<bool> run_request(http::client& client, const http::client_request& req)
+net::coro::task<bool> run_request(http::client& client, http::client_request req)
 {
-    auto get_result = co_await client.send(req);
+    auto get_result = co_await client.send(std::move(req));
     if (!get_result.has_value())
     {
         std::cerr << "Error sending request: " << get_result.error().message() << "\n";

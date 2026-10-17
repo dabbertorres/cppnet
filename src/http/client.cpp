@@ -161,7 +161,7 @@ client::client(io::scheduler* scheduler, const client_options& options)
     : pool{std::make_shared<detail::connection_pool>(scheduler, options)}
 {}
 
-coro::task<std::expected<client_response, std::error_code>> client::send(const client_request& request)
+coro::task<std::expected<client_response, std::error_code>> client::send(client_request request)
 {
     // Only HTTP/1.x over TCP is implemented. In particular, the http2 encoders are stubs, and there's no TLS.
     if (request.version.major > 1) co_return std::unexpected(std::make_error_code(std::errc::not_supported));
