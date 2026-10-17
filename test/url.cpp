@@ -1,6 +1,7 @@
 #include "url.hpp"
 
 #include <exception> // IWYU pragma: keep
+#include <expected>
 #include <string>
 #include <string_view>
 
@@ -9,7 +10,6 @@
 #include <catch2/catch_tostring.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
-#include "util/result.hpp"
 
 using namespace std::string_view_literals;
 
@@ -26,14 +26,11 @@ struct StringMaker<net::url_parse_failure>
 };
 
 template<typename T, typename E>
-struct StringMaker<net::util::result<T, E>>
+struct StringMaker<std::expected<T, E>>
 {
-    static std::string convert(const net::util::result<T, E>& value)
+    static std::string convert(const std::expected<T, E>& value)
     {
-        std::string ret;
-        value.if_value([&](const T& val) { ret = StringMaker<T>::convert(val); })
-            .if_error([&](const E& err) { ret = StringMaker<E>::convert(err); });
-        return ret;
+        return value.has_value() ? StringMaker<T>::convert(*value) : StringMaker<E>::convert(value.error());
     }
 };
 
@@ -46,7 +43,7 @@ TEST_CASE("url::parse '/'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme.empty());
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -64,7 +61,7 @@ TEST_CASE("url::parse 'foo/'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme.empty());
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -82,7 +79,7 @@ TEST_CASE("url::parse 'foo:9123/'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "foo");
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -100,7 +97,7 @@ TEST_CASE("url::parse 'http:///'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -118,7 +115,7 @@ TEST_CASE("url::parse 'http://foo/'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -136,7 +133,7 @@ TEST_CASE("url::parse 'http://foo:9123/'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -154,7 +151,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar#fragment'", "
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username == "user");
     CHECK(u.userinfo.password == "password");
@@ -175,7 +172,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path?foo=bar'", "[url][par
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username == "user");
     CHECK(u.userinfo.password == "password");
@@ -196,7 +193,7 @@ TEST_CASE("url::parse 'http://user:password@host:9123/path#fragment'", "[url][pa
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.username == "user");
     CHECK(u.userinfo.password == "password");
@@ -214,7 +211,7 @@ TEST_CASE("url::parse '/path?foo=bar&baz=xyzzy&qux=plugh'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme.empty());
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -237,7 +234,7 @@ TEST_CASE("url::parse '/path?foo=bar&foo=baz&foo=qux'", "[url][parse]")
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme.empty());
     CHECK(u.userinfo.username.empty());
     CHECK(u.userinfo.password.empty());
@@ -263,7 +260,7 @@ TEST_CASE("url::parse 'http://http://http://@http://http://?http://#http://'", "
     CAPTURE(result);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
 
     CHECK(u.scheme == "http");
     CHECK(u.userinfo.empty());
@@ -312,7 +309,7 @@ TEST_CASE("url::parse splits at the right delimiters", "[url][parse]")
     auto result = net::url::parse(tc.input);
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.scheme == tc.scheme);
     CHECK(u.host == tc.host);
     CHECK(u.port == tc.port);
@@ -324,7 +321,7 @@ TEST_CASE("url::parse userinfo", "[url][parse]")
     auto result = net::url::parse("http://us%40er:p:w@host/");
     REQUIRE(result.has_value());
 
-    auto u = result.to_value();
+    auto u = result.value();
     CHECK(u.userinfo.username == "us@er");
     CHECK(u.userinfo.password == "p:w");
     CHECK(u.host == "host");
@@ -355,8 +352,8 @@ TEST_CASE("url::parse rejects invalid hosts and ports", "[url][parse]")
     CAPTURE(tc.input);
 
     auto result = net::url::parse(tc.input);
-    REQUIRE(result.has_error());
-    CHECK(result.to_error().failed_at == tc.failed_at);
+    REQUIRE(!result.has_value());
+    CHECK(result.error().failed_at == tc.failed_at);
 }
 
 TEST_CASE("url::parse query", "[url][parse]")
@@ -364,11 +361,11 @@ TEST_CASE("url::parse query", "[url][parse]")
     auto result = net::url::parse("/?a=1&a=x+y%26z&b&&c=");
     REQUIRE(result.has_value());
 
-    CHECK(result.to_value().query
+    CHECK(result.value().query
           == net::url::query_values{
               {"a", {"1", "x y&z"}},
-              {"b", {}},
-              {"c", {""}},
+              {"b",             {}},
+              {"c",           {""}},
     });
 }
 
@@ -386,7 +383,7 @@ TEST_CASE("url::build", "[url][build]")
 
         auto parsed = net::url::parse(input);
         REQUIRE(parsed.has_value());
-        CHECK(parsed.to_value().build() == input);
+        CHECK(parsed.value().build() == input);
     }
 
     SECTION("encodes what would change the URL's meaning")
@@ -404,7 +401,7 @@ TEST_CASE("url::build", "[url][build]")
 
         auto reparsed = net::url::parse(built);
         REQUIRE(reparsed.has_value());
-        CHECK(reparsed.to_value() == u);
+        CHECK(reparsed.value() == u);
     }
 }
 
@@ -460,5 +457,5 @@ TEST_CASE("url::parse keeps invalid escapes", "[url][parse]")
 {
     auto result = net::url::parse("/a%zz/%");
     REQUIRE(result.has_value());
-    CHECK(result.to_value().path == "/a%zz/%");
+    CHECK(result.value().path == "/a%zz/%");
 }

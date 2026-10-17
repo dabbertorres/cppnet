@@ -2,9 +2,10 @@
 
 #include <array>
 #include <cstdint>
-#include <optional>
+#include <expected>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace net
 {
@@ -12,19 +13,20 @@ namespace net
 class ipv4_addr
 {
 public:
-    static std::optional<ipv4_addr> parse(std::string_view str) noexcept;
-    static constexpr ipv4_addr      loopback() noexcept { return ipv4_addr{127, 0, 0, 1}; }
+    // parse parses an address, failing with std::errc::invalid_argument if str isn't one.
+    static std::expected<ipv4_addr, std::error_code> parse(std::string_view str) noexcept;
+    static constexpr ipv4_addr                       loopback() noexcept { return ipv4_addr{127, 0, 0, 1}; }
 
     constexpr ipv4_addr() noexcept = default;
 
     // addr is in host byte order, e.g. 0x7f000001 for 127.0.0.1: use ntohl() on an in_addr's s_addr.
     constexpr explicit ipv4_addr(std::uint32_t addr) noexcept
         : data{
-            static_cast<std::uint8_t>(addr >> 24),
-            static_cast<std::uint8_t>(addr >> 16),
-            static_cast<std::uint8_t>(addr >> 8),
-            static_cast<std::uint8_t>(addr >> 0),
-        }
+              static_cast<std::uint8_t>(addr >> 24),
+              static_cast<std::uint8_t>(addr >> 16),
+              static_cast<std::uint8_t>(addr >> 8),
+              static_cast<std::uint8_t>(addr >> 0),
+          }
     {}
 
     constexpr explicit ipv4_addr(const std::array<std::uint8_t, 4>& parts) noexcept

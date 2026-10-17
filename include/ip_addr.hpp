@@ -1,9 +1,10 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
+#include <expected>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <variant>
 
 #include "ipv4_addr.hpp"
@@ -22,7 +23,8 @@ enum class protocol : std::uint8_t
 class ip_addr
 {
 public:
-    static std::optional<ip_addr> parse(std::string_view str) noexcept;
+    // parse parses an address, failing with std::errc::invalid_argument if str isn't one.
+    static std::expected<ip_addr, std::error_code> parse(std::string_view str) noexcept;
 
     constexpr ip_addr() noexcept = default;
 

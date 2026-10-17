@@ -152,8 +152,8 @@ namespace net::http
 
 using namespace std::string_view_literals;
 
-server::server(io::scheduler* scheduler, request_handler handler, const server_config& cfg)
-    : listener{scheduler, cfg.host, cfg.port, network::tcp}
+server::server(io::scheduler* scheduler, net::listener listener, request_handler handler, const server_config& cfg)
+    : listener{std::move(listener)}
     , is_serving{false}
     , handler{std::move(handler)}
     , logger{cfg.logger}
@@ -167,7 +167,7 @@ server::server(io::scheduler* scheduler, request_handler handler, const server_c
 {
     // NOTE: listening from now, rather than from when serve() starts (on a worker), so connections made in between are
     //       queued (up to max_pending_connections) rather than refused.
-    listener.listen(max_pending_connections);
+    if (!this->listener.listening()) this->listener.listen(max_pending_connections);
 }
 
 server::~server()

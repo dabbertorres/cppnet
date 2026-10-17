@@ -58,7 +58,7 @@ TEST_CASE("empty", "[io][readline]")
     auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
-    auto line = res.to_value();
+    const auto& line = res.value();
     CHECK(line.empty());
 }
 
@@ -71,14 +71,14 @@ TEST_CASE("no newline character", "[io][readline]")
     auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
-    auto line = res.to_value();
+    const auto& line = res.value();
     CHECK(line == "foobar"sv);
 
     auto task2 = net::io::readline(&buffer);
     auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
-    auto line2 = res2.to_value();
+    const auto& line2 = res2.value();
     CHECK(line2.empty());
 }
 
@@ -91,14 +91,14 @@ TEST_CASE("single line", "[io][readline]")
     auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
-    auto line = res.to_value();
+    const auto& line = res.value();
     CHECK(line == "foobar"sv);
 
     auto task2 = net::io::readline(&buffer);
     auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
-    auto line2 = res2.to_value();
+    const auto& line2 = res2.value();
     CHECK(line2.empty());
 }
 
@@ -111,21 +111,21 @@ TEST_CASE("multiple lines", "[io][readline]")
     auto res  = test::sync_wait(std::move(task));
     REQUIRE(res.has_value());
 
-    auto line = res.to_value();
+    const auto& line = res.value();
     CHECK(line == "foo"sv);
 
     auto task2 = net::io::readline(&buffer);
     auto res2  = test::sync_wait(std::move(task2));
     REQUIRE(res2.has_value());
 
-    auto line2 = res2.to_value();
+    const auto& line2 = res2.value();
     CHECK(line2 == "bar"sv);
 
     auto task3 = net::io::readline(&buffer);
     auto res3  = test::sync_wait(std::move(task3));
     REQUIRE(res3.has_value());
 
-    auto line3 = res3.to_value();
+    const auto& line3 = res3.value();
     CHECK(line3.empty());
 }
 
@@ -136,8 +136,8 @@ TEST_CASE("errors other than the end of the stream are reported", "[io][readline
     net::io::buffered_reader buffer(&reader);
 
     auto res = test::sync_wait(net::io::readline(&buffer));
-    REQUIRE(res.has_error());
-    CHECK(res.to_error() == std::errc::timed_out);
+    REQUIRE(!res.has_value());
+    CHECK(res.error() == std::errc::timed_out);
 }
 
 TEST_CASE("terminated lines must end, and fit", "[io][read_terminated_line]")
@@ -149,15 +149,15 @@ TEST_CASE("terminated lines must end, and fit", "[io][read_terminated_line]")
         return test::sync_wait(net::io::read_terminated_line(&buffer, max));
     };
 
-    CHECK(read("foo\r\nbar"sv, 5).to_value() == "foo");
-    CHECK(read("\r\n"sv, 2).to_value().empty());
+    CHECK(read("foo\r\nbar"sv, 5).value() == "foo");
+    CHECK(read("\r\n"sv, 2).value().empty());
 
-    CHECK(read("foo"sv, 100).to_error() == net::io::errc::end_of_stream);
-    CHECK(read(""sv, 100).to_error() == net::io::errc::end_of_stream);
-    CHECK(read("foo\r\n"sv, 4).to_error() == std::errc::value_too_large);
+    CHECK(read("foo"sv, 100).error() == net::io::errc::end_of_stream);
+    CHECK(read(""sv, 100).error() == net::io::errc::end_of_stream);
+    CHECK(read("foo\r\n"sv, 4).error() == std::errc::value_too_large);
 
     // a bare LF doesn't end the line.
-    CHECK(read("foo\nbar\r\n"sv, 100).to_value() == "foo\nbar");
+    CHECK(read("foo\nbar\r\n"sv, 100).value() == "foo\nbar");
 }
 
 TEST_CASE("long lines don't take a coroutine per byte", "[io][readline][read_terminated_line]")
@@ -173,7 +173,7 @@ TEST_CASE("long lines don't take a coroutine per byte", "[io][readline][read_ter
 
         auto res = test::sync_wait(net::io::readline(&buffer));
         REQUIRE(res.has_value());
-        CHECK(res.to_value() == long_line);
+        CHECK(res.value() == long_line);
     }
 
     {
@@ -182,7 +182,7 @@ TEST_CASE("long lines don't take a coroutine per byte", "[io][readline][read_ter
 
         auto res = test::sync_wait(net::io::read_terminated_line(&buffer, 2'000'000));
         REQUIRE(res.has_value());
-        CHECK(res.to_value() == long_line);
+        CHECK(res.value() == long_line);
     }
 }
 

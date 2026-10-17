@@ -107,7 +107,7 @@ TEST_CASE("the client sends a request, and reads the response", "[http][client]"
         net::http::client_request req{
             .method  = net::http::request_method::GET,
             .version = {.major = 1, .minor = 1},
-            .uri     = parsed.to_value(),
+            .uri     = parsed.value(),
         };
 
         auto resp = co_await client.send(std::move(req));

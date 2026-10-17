@@ -221,7 +221,7 @@ url::parse_result parse_url(std::string_view input)
         if (authority_end == std::string_view::npos) authority_end = input.size();
 
         if (auto err = parse_authority(input.substr(authority_start, authority_end - authority_start), authority_start, out))
-            return {*err};
+            return std::unexpected(*err);
 
         pos = authority_end;
     }
@@ -336,7 +336,7 @@ url::parse_result url::parse(std::string_view s) noexcept
     catch (...)
     {
         // only allocation can fail.
-        return {url_parse_failure{.failed_at = url_parse_state::scheme, .index = 0}};
+        return std::unexpected(url_parse_failure{.failed_at = url_parse_state::scheme, .index = 0});
     }
 }
 

@@ -90,9 +90,9 @@ struct head_reader
     task<std::error_code> read_line() noexcept
     {
         auto read = co_await net::io::read_terminated_line(reader, remaining);
-        if (read.has_error()) co_return read.to_error();
+        if (!read.has_value()) co_return read.error();
 
-        line = std::move(read.to_value());
+        line = std::move(read.value());
         remaining -= line.size() + 2;
         co_return std::error_code{};
     }

@@ -46,15 +46,15 @@ int main(int argc, char** argv) // NOLINT(misc-const-correctness): main's signat
     }
 
     auto parse_result = net::url::parse(argv[1]);
-    if (parse_result.has_error())
+    if (!parse_result.has_value())
     {
-        auto err = parse_result.to_error();
+        auto err = parse_result.error();
         std::cerr << "Invalid url: unexpected character at " << err.index << " in "
                   << net::url_parse_state_to_string(err.failed_at) << "\n";
         return 1;
     }
 
-    auto url = parse_result.to_value();
+    auto url = parse_result.value();
     if (url.scheme.empty()) url.scheme = "http";
     if (url.port.empty())
     {

@@ -307,7 +307,7 @@ TEST_CASE("requests are encoded in origin-form, with a Host header", "[http][1.1
     net::http::client_request req{
         .method  = net::http::request_method::GET,
         .version = {.major = 1, .minor = 1},
-        .uri     = parsed.to_value(),
+        .uri     = parsed.value(),
     };
 
     // nothing in the url can end the request line, and start a header.

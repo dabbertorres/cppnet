@@ -29,10 +29,8 @@ namespace net
 
 constexpr int invalid_fd = -1;
 
-listener::listener(
-    io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
-    : scheduler{scheduler}
-    , main_fd{invalid_fd}
+std::expected<int, std::error_code>
+listener::open(io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -44,7 +42,7 @@ listener::listener(
     case protocol::not_care: hints.ai_family = AF_UNSPEC; break;
     case protocol::ipv4: hints.ai_family = AF_INET; break;
     case protocol::ipv6: hints.ai_family = AF_INET6; break;
-    default: throw exception{"invalid protocol"};
+    default: return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
     if (host.empty()) hints.ai_flags = AI_PASSIVE;
@@ -53,66 +51,100 @@ listener::listener(
     {
     case network::tcp: hints.ai_socktype = SOCK_STREAM; break;
     case network::udp: hints.ai_socktype = SOCK_DGRAM; break;
-    default: throw exception{"invalid network type"};
+    default: return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
     addrinfo* servinfo = nullptr;
     int       sts      = ::getaddrinfo(!host.empty() ? host.data() : nullptr, port.data(), &hints, &servinfo);
-    if (sts != 0) throw_for_gai_error(sts);
+    if (sts != 0) return std::unexpected(make_gai_error_code(sts));
 
     // find first valid addr, and use it
-
+    int fd       = invalid_fd;
+    int last_err = 0;
     for (const addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
-        main_fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
-        if (main_fd < 0) continue;
-
-        int yes = 1;
-        sts     = ::setsockopt(main_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
-        if (sts != 0)
+        fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+        if (fd < 0)
         {
-            ::close(main_fd);
-            main_fd = invalid_fd;
+            last_err = errno;
             continue;
         }
 
-        sts = ::bind(main_fd, info->ai_addr, info->ai_addrlen);
-        if (sts != 0)
+        int yes = 1;
+        if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) != 0
+            || ::bind(fd, info->ai_addr, info->ai_addrlen) != 0)
         {
-            ::close(main_fd);
-            main_fd = invalid_fd;
+            last_err = errno;
+            ::close(std::exchange(fd, invalid_fd));
             continue;
         }
 
         break;
     }
 
-    auto last_err = errno;
-
     ::freeaddrinfo(servinfo);
 
-    if (main_fd == invalid_fd) throw system_error_from_errno(last_err, "failed to bind a socket matching options");
+    if (fd == invalid_fd) return std::unexpected(std::error_code{last_err, std::system_category()});
 
     // accept() must never block (the scheduler only says a connection may be ready), and the socket shouldn't leak into
     // child processes.
-    int flags = ::fcntl(main_fd, F_GETFL);
-    if (flags == -1 || ::fcntl(main_fd, F_SETFL, flags | O_NONBLOCK) == -1
-        || ::fcntl(main_fd, F_SETFD, FD_CLOEXEC) == -1)
+    int flags = ::fcntl(fd, F_GETFL);
+    if (flags == -1 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1 || ::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
     {
         auto err = errno;
-        ::close(std::exchange(main_fd, invalid_fd));
-        throw system_error_from_errno(err, "failed to make listener non-blocking");
+        ::close(fd);
+        return std::unexpected(std::error_code{err, std::system_category()});
     }
 
     try
     {
-        scheduler->register_handle(main_fd);
+        scheduler->register_handle(fd);
     }
-    catch (...)
+    catch (const std::system_error& ex)
     {
-        ::close(std::exchange(main_fd, invalid_fd));
-        throw;
+        ::close(fd);
+        return std::unexpected(ex.code());
     }
+
+    return fd;
+}
+
+std::expected<listener, std::error_code> listener::make(io::scheduler*     scheduler,
+                                                        const std::string& host,
+                                                        const std::string& port,
+                                                        network            net,
+                                                        protocol           proto,
+                                                        std::uint16_t      max_backlog)
+{
+    auto fd = open(scheduler, host, port, net, proto);
+    if (!fd.has_value()) return std::unexpected(fd.error());
+
+    listener out{scheduler, *fd};
+    if (net == network::tcp)
+    {
+        if (::listen(out.main_fd, max_backlog) == -1)
+            return std::unexpected(std::error_code{errno, std::system_category()});
+        out.is_listening.store(true, std::memory_order::release);
+    }
+
+    return out;
+}
+
+listener::listener(io::scheduler* scheduler, int fd) noexcept
+    : scheduler{scheduler}
+    , is_listening{false}
+    , main_fd{fd}
+{}
+
+listener::listener(
+    io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
+    : scheduler{scheduler}
+    , is_listening{false}
+    , main_fd{invalid_fd}
+{
+    auto fd = open(scheduler, host, port, net, proto);
+    if (!fd.has_value()) throw std::system_error{fd.error(), "failed to bind a listener"};
+    main_fd = *fd;
 }
 
 listener::listener(listener&& other) noexcept

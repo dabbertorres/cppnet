@@ -31,7 +31,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     auto parsed = net::url::parse(input);
     if (!parsed.has_value()) return 0;
 
-    const auto& u     = parsed.to_value();
+    const auto& u     = parsed.value();
     auto        built = u.build();
 
     for (unsigned char c : built)
@@ -39,7 +39,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 
     auto reparsed = net::url::parse(built);
     if (!reparsed.has_value()) fail("build() output doesn't parse", input, built);
-    if (!(reparsed.to_value() == u)) fail("build() doesn't round-trip", input, built);
+    if (!(reparsed.value() == u)) fail("build() doesn't round-trip", input, built);
 
     auto origin = u.origin_form();
     for (unsigned char c : origin)

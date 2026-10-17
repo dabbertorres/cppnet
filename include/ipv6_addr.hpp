@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <optional>
+#include <expected>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace net
 {
@@ -13,51 +14,52 @@ namespace net
 class ipv6_addr
 {
 public:
-    static std::optional<ipv6_addr> parse(std::string_view str) noexcept;
-    static constexpr ipv6_addr      loopback() noexcept { return ipv6_addr(0, 0, 0, 0, 0, 0, 0, 1); }
+    // parse parses an address, failing with std::errc::invalid_argument if str isn't one.
+    static std::expected<ipv6_addr, std::error_code> parse(std::string_view str) noexcept;
+    static constexpr ipv6_addr                       loopback() noexcept { return ipv6_addr(0, 0, 0, 0, 0, 0, 0, 1); }
 
     constexpr ipv6_addr() noexcept = default;
 
     constexpr explicit ipv6_addr(std::uint64_t subnet, std::uint64_t interface) noexcept
         : data{
-            static_cast<std::uint8_t>(subnet >> 56),
-            static_cast<std::uint8_t>(subnet >> 48),
-            static_cast<std::uint8_t>(subnet >> 40),
-            static_cast<std::uint8_t>(subnet >> 32),
-            static_cast<std::uint8_t>(subnet >> 24),
-            static_cast<std::uint8_t>(subnet >> 16),
-            static_cast<std::uint8_t>(subnet >> 8),
-            static_cast<std::uint8_t>(subnet >> 0),
-            static_cast<std::uint8_t>(interface >> 56),
-            static_cast<std::uint8_t>(interface >> 48),
-            static_cast<std::uint8_t>(interface >> 40),
-            static_cast<std::uint8_t>(interface >> 32),
-            static_cast<std::uint8_t>(interface >> 24),
-            static_cast<std::uint8_t>(interface >> 16),
-            static_cast<std::uint8_t>(interface >> 8),
-            static_cast<std::uint8_t>(interface >> 0),
-        }
+              static_cast<std::uint8_t>(subnet >> 56),
+              static_cast<std::uint8_t>(subnet >> 48),
+              static_cast<std::uint8_t>(subnet >> 40),
+              static_cast<std::uint8_t>(subnet >> 32),
+              static_cast<std::uint8_t>(subnet >> 24),
+              static_cast<std::uint8_t>(subnet >> 16),
+              static_cast<std::uint8_t>(subnet >> 8),
+              static_cast<std::uint8_t>(subnet >> 0),
+              static_cast<std::uint8_t>(interface >> 56),
+              static_cast<std::uint8_t>(interface >> 48),
+              static_cast<std::uint8_t>(interface >> 40),
+              static_cast<std::uint8_t>(interface >> 32),
+              static_cast<std::uint8_t>(interface >> 24),
+              static_cast<std::uint8_t>(interface >> 16),
+              static_cast<std::uint8_t>(interface >> 8),
+              static_cast<std::uint8_t>(interface >> 0),
+          }
     {}
 
     constexpr explicit ipv6_addr(const std::array<std::uint16_t, 8>& parts) noexcept
         : data{
-            static_cast<std::uint8_t>(parts[0] >> 8),
-            static_cast<std::uint8_t>(parts[0] >> 0),
-            static_cast<std::uint8_t>(parts[1] >> 8),
-            static_cast<std::uint8_t>(parts[1] >> 0),
-            static_cast<std::uint8_t>(parts[2] >> 8),
-            static_cast<std::uint8_t>(parts[2] >> 0),
-            static_cast<std::uint8_t>(parts[3] >> 8),
-            static_cast<std::uint8_t>(parts[3] >> 0),
-            static_cast<std::uint8_t>(parts[4] >> 8),
-            static_cast<std::uint8_t>(parts[4] >> 0),
-            static_cast<std::uint8_t>(parts[5] >> 8),
-            static_cast<std::uint8_t>(parts[5] >> 0),
-            static_cast<std::uint8_t>(parts[6] >> 8),
-            static_cast<std::uint8_t>(parts[6] >> 0),
-            static_cast<std::uint8_t>(parts[7] >> 8),
-            static_cast<std::uint8_t>(parts[7] >> 0),
-        }
+              static_cast<std::uint8_t>(parts[0] >> 8),
+              static_cast<std::uint8_t>(parts[0] >> 0),
+              static_cast<std::uint8_t>(parts[1] >> 8),
+              static_cast<std::uint8_t>(parts[1] >> 0),
+              static_cast<std::uint8_t>(parts[2] >> 8),
+              static_cast<std::uint8_t>(parts[2] >> 0),
+              static_cast<std::uint8_t>(parts[3] >> 8),
+              static_cast<std::uint8_t>(parts[3] >> 0),
+              static_cast<std::uint8_t>(parts[4] >> 8),
+              static_cast<std::uint8_t>(parts[4] >> 0),
+              static_cast<std::uint8_t>(parts[5] >> 8),
+              static_cast<std::uint8_t>(parts[5] >> 0),
+              static_cast<std::uint8_t>(parts[6] >> 8),
+              static_cast<std::uint8_t>(parts[6] >> 0),
+              static_cast<std::uint8_t>(parts[7] >> 8),
+              static_cast<std::uint8_t>(parts[7] >> 0),
+          }
     {}
 
     constexpr explicit ipv6_addr(const std::array<std::uint8_t, 16>& parts) noexcept
@@ -93,23 +95,23 @@ public:
                                  std::uint16_t p6,
                                  std::uint16_t p7) noexcept
         : data{
-            static_cast<std::uint8_t>(p0 >> 8),
-            static_cast<std::uint8_t>(p0 >> 0),
-            static_cast<std::uint8_t>(p1 >> 8),
-            static_cast<std::uint8_t>(p1 >> 0),
-            static_cast<std::uint8_t>(p2 >> 8),
-            static_cast<std::uint8_t>(p2 >> 0),
-            static_cast<std::uint8_t>(p3 >> 8),
-            static_cast<std::uint8_t>(p3 >> 0),
-            static_cast<std::uint8_t>(p4 >> 8),
-            static_cast<std::uint8_t>(p4 >> 0),
-            static_cast<std::uint8_t>(p5 >> 8),
-            static_cast<std::uint8_t>(p5 >> 0),
-            static_cast<std::uint8_t>(p6 >> 8),
-            static_cast<std::uint8_t>(p6 >> 0),
-            static_cast<std::uint8_t>(p7 >> 8),
-            static_cast<std::uint8_t>(p7 >> 0),
-        }
+              static_cast<std::uint8_t>(p0 >> 8),
+              static_cast<std::uint8_t>(p0 >> 0),
+              static_cast<std::uint8_t>(p1 >> 8),
+              static_cast<std::uint8_t>(p1 >> 0),
+              static_cast<std::uint8_t>(p2 >> 8),
+              static_cast<std::uint8_t>(p2 >> 0),
+              static_cast<std::uint8_t>(p3 >> 8),
+              static_cast<std::uint8_t>(p3 >> 0),
+              static_cast<std::uint8_t>(p4 >> 8),
+              static_cast<std::uint8_t>(p4 >> 0),
+              static_cast<std::uint8_t>(p5 >> 8),
+              static_cast<std::uint8_t>(p5 >> 0),
+              static_cast<std::uint8_t>(p6 >> 8),
+              static_cast<std::uint8_t>(p6 >> 0),
+              static_cast<std::uint8_t>(p7 >> 8),
+              static_cast<std::uint8_t>(p7 >> 0),
+          }
     {}
 
     constexpr explicit ipv6_addr(std::uint8_t p0,

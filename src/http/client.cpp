@@ -250,7 +250,7 @@ coro::task<std::expected<client_response, std::error_code>> client::get(std::str
             std::unexpected(std::make_error_code(std::errc::invalid_argument)));
     }
 
-    return send(client_request{.uri = std::move(parsed).to_value()});
+    return send(client_request{.uri = std::move(parsed).value()});
 }
 
 void client::close_idle() noexcept { pool->close_idle(); }

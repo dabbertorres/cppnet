@@ -3,7 +3,7 @@
 #include <array>
 #include <charconv>
 #include <cstddef>
-#include <optional>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -14,21 +14,22 @@ namespace net
 {
 
 // NOLINTNEXTLINE(bugprone-exception-escape): split_string's substr positions are in range.
-std::optional<ipv4_addr> ipv4_addr::parse(std::string_view str) noexcept
+std::expected<ipv4_addr, std::error_code> ipv4_addr::parse(std::string_view str) noexcept
 {
     std::array<std::uint8_t, 4> values{};
 
     std::size_t parsed = 0;
     for (auto part : util::split_string(str, '.'))
     {
-        if (parsed == values.size()) return std::nullopt;
+        if (parsed == values.size()) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
         auto& value     = values[parsed++];
         auto [end, err] = std::from_chars(part.data(), part.data() + part.size(), value);
-        if (err != std::errc{} || end != part.data() + part.size() || part.empty()) return std::nullopt;
+        if (err != std::errc{} || end != part.data() + part.size() || part.empty())
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
-    if (parsed != values.size()) return std::nullopt;
+    if (parsed != values.size()) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     return ipv4_addr(values);
 }
 

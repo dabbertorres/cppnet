@@ -10,14 +10,13 @@
 #include "coro/task.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/reader.hpp"
-#include "util/result.hpp"
 
 namespace net::io
 {
 
 using namespace std::string_view_literals;
 
-using readline_result = util::result<std::string, std::error_code>;
+using readline_result = std::expected<std::string, std::error_code>;
 
 // readline reads a line, up to end_of_line, which isn't included. The end of the stream also ends a line.
 coro::task<readline_result> readline(buffered_reader* reader, std::string_view end_of_line = "\r\n"sv) noexcept;
