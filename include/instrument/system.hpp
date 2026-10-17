@@ -19,35 +19,35 @@ using time_point = std::chrono::system_clock::time_point;
 inline constexpr std::size_t unlimited = static_cast<std::size_t>(-1);
 
 // process_cpu_seconds is how much CPU time the process has used (in user and system mode).
-std::expected<std::chrono::duration<double>, std::error_condition> process_cpu_seconds() noexcept;
+std::expected<std::chrono::duration<double>, std::error_code> process_cpu_seconds() noexcept;
 
 // process_open_fds is how many file descriptors the process has open.
-std::expected<std::size_t, std::error_condition> process_open_fds() noexcept;
+std::expected<std::size_t, std::error_code> process_open_fds() noexcept;
 
 // process_max_fds is how many file descriptors the process may have open (its soft limit), or unlimited.
-std::expected<std::size_t, std::error_condition> process_max_fds() noexcept;
+std::expected<std::size_t, std::error_code> process_max_fds() noexcept;
 
 // process_virtual_memory is the size of the process' virtual memory, in bytes.
-std::expected<std::size_t, std::error_condition> process_virtual_memory() noexcept;
+std::expected<std::size_t, std::error_code> process_virtual_memory() noexcept;
 
 // process_virtual_memory_max is how large the process' virtual memory may be, in bytes (its soft limit), or
 // unlimited.
-std::expected<std::size_t, std::error_condition> process_virtual_memory_max() noexcept;
+std::expected<std::size_t, std::error_code> process_virtual_memory_max() noexcept;
 
 // process_resident_memory is how much of the process' memory is resident (in RAM), in bytes.
-std::expected<std::size_t, std::error_condition> process_resident_memory() noexcept;
+std::expected<std::size_t, std::error_code> process_resident_memory() noexcept;
 
 // process_heap is how much memory the process has allocated with malloc (and so new), in bytes, as the allocator
 // counts it: glibc's (with mallinfo2) on Linux, or the malloc zones' on macOS.
 //
 // NOTE: a sanitizer's allocator, if any, may not count it.
-std::expected<std::size_t, std::error_condition> process_heap() noexcept;
+std::expected<std::size_t, std::error_code> process_heap() noexcept;
 
 // process_start_time is when the process started.
-std::expected<time_point, std::error_condition> process_start_time() noexcept;
+std::expected<time_point, std::error_code> process_start_time() noexcept;
 
 // process_threads is how many threads the process has.
-std::expected<std::size_t, std::error_condition> process_threads() noexcept;
+std::expected<std::size_t, std::error_code> process_threads() noexcept;
 
 // process_info is the process' resource usage, as getrusage() reports it.
 struct process_info
@@ -68,6 +68,5 @@ struct process_info
     std::size_t num_involuntary_context_switches;
 };
 
-std::expected<process_info, std::error_condition> process_usage() noexcept;
-
+std::expected<process_info, std::error_code> process_usage() noexcept;
 }

@@ -78,7 +78,7 @@ task<net::io::result> read_some(net::socket* sock, std::string* out)
 }
 
 // read_until_canceled reads until it fails, and then records how (and that it got to run code afterwards).
-task<> read_until_failure(net::socket* sock, std::error_condition* err, std::atomic<bool>* finished)
+task<> read_until_failure(net::socket* sock, std::error_code* err, std::atomic<bool>* finished)
 {
     std::string ignored;
 
@@ -136,7 +136,7 @@ TEST_CASE("reads report the other end closing", "[io][scheduler]")
     std::string received;
     auto        res = sched.run_to_completion(read_some(&reader, &received));
 
-    CHECK(res.err == net::io::status_condition::closed);
+    CHECK(res.err == net::io::errc::end_of_stream);
 }
 
 TEST_CASE("reads time out once their deadline passes", "[io][scheduler]")
@@ -163,7 +163,7 @@ TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up",
     auto [timed_reader, timed_writer] = make_socket_pair(&sched);
 
     // with only this wait, the loop waits without a timeout.
-    std::error_condition idle_err;
+    std::error_code      idle_err;
     std::atomic<bool>    idle_finished = false;
     REQUIRE(sched.spawn(read_until_failure(&idle_reader, &idle_err, &idle_finished)));
 
@@ -195,7 +195,7 @@ TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][schedul
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    std::error_condition err;
+    std::error_code      err;
     std::atomic<bool>    finished = false;
     REQUIRE(sched.spawn(read_until_failure(&reader, &err, &finished)));
 
@@ -213,12 +213,12 @@ TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][schedul
 
 TEST_CASE("a scheduler that never ran can be destroyed", "[io][scheduler]")
 {
-    std::error_condition err;
+    std::error_code      err;
     std::atomic<bool>    finished = false;
 
     // NOTE: a sleep rather than a socket's read, as the socket would be closed first (and the workers poll, whether or
     //       not the scheduler runs).
-    const auto sleep = [](scheduler* sched, std::error_condition* err, std::atomic<bool>* finished) -> task<>
+    const auto sleep = [](scheduler* sched, std::error_code* err, std::atomic<bool>* finished) -> task<>
     {
         *err = co_await sched->sleep_until(net::io::clock::now() + 1h);
         finished->store(true);
@@ -260,7 +260,7 @@ TEST_CASE("waits on unregistered handles fail", "[io][scheduler]")
 {
     scheduler sched{make_pool()};
 
-    auto wait = [](scheduler* sched) -> task<std::error_condition>
+    auto wait = [](scheduler* sched) -> task<std::error_code>
     { co_return co_await sched->wait(1'000'000, net::io::poll_op::read); };
 
     CHECK(sched.run_to_completion(wait(&sched)) == std::errc::bad_file_descriptor);
@@ -271,8 +271,8 @@ TEST_CASE("only one task may wait for each operation on a handle", "[io][schedul
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    std::error_condition first_err;
-    std::error_condition second_err;
+    std::error_code      first_err;
+    std::error_code      second_err;
     std::atomic<bool>    first_finished  = false;
     std::atomic<bool>    second_finished = false;
 
@@ -364,10 +364,10 @@ TEST_CASE("shutting down a listener cancels a pending accept", "[io][scheduler][
     net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    std::error_condition accept_err;
+    std::error_code      accept_err;
     std::atomic<bool>    finished = false;
 
-    auto accept = [](net::listener* listener, std::error_condition* err, std::atomic<bool>* finished) -> task<>
+    auto accept = [](net::listener* listener, std::error_code* err, std::atomic<bool>* finished) -> task<>
     {
         auto res = co_await listener->accept();
         if (!res.has_value()) *err = res.error();
@@ -495,7 +495,7 @@ TEST_CASE("wait_on doesn't wait once the word has changed", "[io][scheduler][wai
     std::atomic<std::uint64_t> word{1};
 
     // with no notification to come, it would wait forever.
-    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_condition>
+    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_code>
     { co_return co_await sched->wait_on(*word, 0); };
 
     CHECK_FALSE(sched.run_to_completion(wait(&sched, &word)));
@@ -543,7 +543,7 @@ TEST_CASE("wait_on times out", "[io][scheduler][wait_on]")
     scheduler                  sched{make_pool()};
     std::atomic<std::uint64_t> word{0};
 
-    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_condition>
+    auto wait = [](scheduler* sched, std::atomic<std::uint64_t>* word) -> task<std::error_code>
     { co_return co_await sched->wait_on(*word, 0, net::io::clock::now() + 20ms); };
 
     CHECK(sched.run_to_completion(wait(&sched, &word)) == std::errc::timed_out);
@@ -555,7 +555,7 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
     {
         scheduler sched{make_pool()};
 
-        auto sleep = [](scheduler* sched) -> task<std::pair<std::error_condition, net::io::clock::duration>>
+        auto sleep = [](scheduler* sched) -> task<std::pair<std::error_code, net::io::clock::duration>>
         {
             auto start = net::io::clock::now();
             auto err   = co_await sched->sleep_until(start + 50ms);
@@ -571,13 +571,13 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
     {
         scheduler                  sched{make_pool()};
         std::atomic<std::uint64_t> word{0};
-        std::error_condition       sleep_err;
-        std::error_condition       wait_err;
+        std::error_code            sleep_err;
+        std::error_code            wait_err;
 
-        auto sleeper = [](scheduler* sched, std::error_condition* err) -> task<>
+        auto sleeper = [](scheduler* sched, std::error_code* err) -> task<>
         { *err = co_await sched->sleep_until(net::io::clock::now() + 1h); };
 
-        auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::error_condition* err) -> task<>
+        auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::error_code* err) -> task<>
         { *err = co_await sched->wait_on(*word, 0); };
 
         auto stopper = [&](scheduler* sched) -> task<>
@@ -612,7 +612,7 @@ TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][s
         }
     };
 
-    auto read_all = [](net::socket* reader) -> task<std::pair<std::string, std::error_condition>>
+    auto read_all = [](net::socket* reader) -> task<std::pair<std::string, std::error_code>>
     {
         std::string got;
         while (true)
@@ -635,7 +635,7 @@ TEST_CASE("socket write timeouts", "[io][socket][timeout]")
     writer.set_write_timeout(100ms);
 
     // nothing reads, so the socket's buffers fill, and the write has to wait.
-    auto write_lots = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
+    auto write_lots = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_code>>
     {
         std::vector<std::byte> lots(static_cast<std::size_t>(64 * 1'024) * 1'024);
         auto                   res = co_await writer->write(lots);
@@ -658,7 +658,7 @@ TEST_CASE("a scheduler whose workers poll for another scheduler polls in run()",
     scheduler first{pool};
     scheduler second{pool};
 
-    const auto sleep = [](scheduler* sched) -> net::coro::task<std::error_condition>
+    const auto sleep = [](scheduler* sched) -> net::coro::task<std::error_code>
     { co_return co_await sched->sleep_until(net::io::clock::now() + 10ms); };
 
     CHECK_FALSE(second.run_to_completion(sleep(&second)));
@@ -676,7 +676,7 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
     constexpr std::size_t total = std::size_t{2} * 1'024 * 1'024;
 
     // more than the socket's buffers hold, so the write has to wait for the reader several times.
-    auto write_all_of_it = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_condition>>
+    auto write_all_of_it = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_code>>
     {
         std::vector<std::byte> lots(total);
         auto                   res = co_await writer->write(lots);

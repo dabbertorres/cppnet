@@ -25,7 +25,7 @@ namespace
 
 using addrinfo_ptr = std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)>;
 
-std::expected<addrinfo_ptr, std::error_condition>
+std::expected<addrinfo_ptr, std::error_code>
 resolve(const std::string& host, const std::string& port, net::protocol proto) noexcept
 {
     addrinfo hints{};
@@ -51,19 +51,19 @@ resolve(const std::string& host, const std::string& port, net::protocol proto) n
         err            = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found);
     }
 
-    if (err != 0) return std::unexpected(net::make_gai_error_condition(err));
+    if (err != 0) return std::unexpected(net::make_gai_error_code(err));
 
     return addrinfo_ptr{found, &::freeaddrinfo};
 }
 
-std::error_condition from_errno(int err) noexcept { return {err, std::generic_category()}; }
+std::error_code from_errno(int err) noexcept { return {err, std::system_category()}; }
 
 // wait_connected waits for a connection that's in progress to be established, returning the error if it fails.
 //
 // The connection is established (or failed) once the socket is writable. The socket may be reported ready before then
 // (e.g. as Linux reports a socket that isn't connected yet as hung up, when it's registered), so that's checked, and it
 // waits again if it's still connecting.
-net::coro::task<std::error_condition>
+net::coro::task<std::error_code>
 wait_connected(net::io::scheduler* scheduler, int fd, net::io::clock::time_point deadline)
 {
     while (true)
@@ -77,7 +77,7 @@ wait_connected(net::io::scheduler* scheduler, int fd, net::io::clock::time_point
 
         sockaddr_storage peer{};
         socklen_t        peer_size = sizeof(peer);
-        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size) == 0) co_return std::error_condition{};
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size) == 0) co_return std::error_code{};
         if (errno != ENOTCONN) co_return from_errno(errno);
     }
 }
@@ -94,15 +94,15 @@ tcp_socket::tcp_socket(io::scheduler* scheduler, int fd)
     : socket{scheduler, fd}
 {}
 
-std::expected<void, std::error_condition> tcp_socket::set_nodelay(bool nodelay) const noexcept
+std::expected<void, std::error_code> tcp_socket::set_nodelay(bool nodelay) const noexcept
 {
     const int value = nodelay ? 1 : 0;
     if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) == -1)
-        return std::unexpected(std::error_condition{errno, std::generic_category()});
+        return std::unexpected(std::error_code{errno, std::system_category()});
     return {};
 }
 
-coro::task<std::expected<tcp_socket, std::error_condition>>
+coro::task<std::expected<tcp_socket, std::error_code>>
 tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options)
 {
     // getaddrinfo() blocks, so keep it off the worker threads.
@@ -112,7 +112,7 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
 
     const auto deadline = io::clock::now() + options.timeout;
 
-    std::error_condition last_err = std::make_error_condition(std::errc::host_unreachable);
+    std::error_code last_err = std::make_error_code(std::errc::host_unreachable);
 
     for (const auto* info = addresses->get(); info != nullptr; info = info->ai_next)
     {

@@ -19,12 +19,12 @@
 namespace
 {
 
-std::error_condition malformed() noexcept { return std::make_error_condition(std::errc::illegal_byte_sequence); }
+std::error_code malformed() noexcept { return std::make_error_code(std::errc::illegal_byte_sequence); }
 
 // truncated is for a body that the end of the stream cuts short: that's not the end of the body.
-std::error_condition truncated(std::error_condition err) noexcept
+std::error_code truncated(std::error_code err) noexcept
 {
-    if (err == net::io::status_condition::closed) return std::make_error_condition(std::errc::connection_aborted);
+    if (err == net::io::errc::end_of_stream) return std::make_error_code(std::errc::connection_aborted);
     return err;
 }
 
@@ -46,7 +46,7 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
     if (data.empty()) co_return {.count = 0};
 
     // don't read past the end of the body, into whatever follows it.
-    if (done) co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
+    if (done) co_return {.count = 0, .err = make_error_code(io::errc::end_of_stream)};
 
     if (chunk_remaining == 0)
     {
@@ -64,7 +64,7 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
             if (auto err = co_await read_trailers(); err) co_return {.err = err};
 
             done = true;
-            co_return {.count = 0, .err = make_error_condition(io::status_condition::closed)};
+            co_return {.count = 0, .err = make_error_code(io::errc::end_of_stream)};
         }
     }
 
@@ -76,7 +76,7 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
     co_return {.count = res.count};
 }
 
-coro::task<std::error_condition> chunked_reader::read_chunk_size()
+coro::task<std::error_code> chunked_reader::read_chunk_size()
 {
     auto read = co_await io::read_terminated_line(parent, max_size_line);
     if (read.has_error()) co_return truncated(read.to_error());
@@ -109,10 +109,10 @@ coro::task<std::error_condition> chunked_reader::read_chunk_size()
     }
 
     chunk_remaining = size;
-    co_return std::error_condition{};
+    co_return std::error_code{};
 }
 
-coro::task<std::error_condition> chunked_reader::read_trailers()
+coro::task<std::error_code> chunked_reader::read_trailers()
 {
     std::size_t remaining = max_trailers;
 
@@ -123,14 +123,14 @@ coro::task<std::error_condition> chunked_reader::read_trailers()
         const auto& line = read.to_value();
         remaining -= line.size() + 2;
 
-        if (line.empty()) co_return std::error_condition{};
+        if (line.empty()) co_return std::error_code{};
 
         // trailers aren't kept, but must be well-formed.
         if (!parse_field_line(line).has_value()) co_return malformed();
     }
 }
 
-coro::task<std::error_condition> chunked_reader::read_crlf()
+coro::task<std::error_code> chunked_reader::read_crlf()
 {
     constexpr std::array crlf{'\r', '\n'};
 
@@ -139,11 +139,11 @@ coro::task<std::error_condition> chunked_reader::read_crlf()
         char next = 0;
         auto res  = co_await parent->read(next);
         if (res.err) co_return truncated(res.err);
-        if (res.count == 0) co_return truncated(make_error_condition(io::status_condition::closed));
+        if (res.count == 0) co_return truncated(make_error_code(io::errc::end_of_stream));
         if (next != expect) co_return malformed();
     }
 
-    co_return std::error_condition{};
+    co_return std::error_code{};
 }
 
 }

@@ -237,24 +237,24 @@ using coro::task;
 
 task<request_encoder_result> request_encode(io::writer* /*writer*/, const client_request& /*req*/) noexcept
 {
-    co_return std::unexpected(std::make_error_condition(std::errc::function_not_supported)); // TODO
+    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
 }
 
 task<response_encoder_result> response_encode(io::writer* /*writer*/, const server_response& /*resp*/) noexcept
 {
-    co_return std::unexpected(std::make_error_condition(std::errc::function_not_supported)); // TODO
+    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
 }
 
 task<request_decoder_result> request_decode(io::buffered_reader* /*reader*/, std::size_t /*max_header_bytes*/) noexcept
 {
-    co_return std::unexpected(std::make_error_condition(std::errc::function_not_supported)); // TODO
+    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
 }
 
 task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> /*reader*/,
                                               request_method /*method*/,
                                               std::size_t /*max_header_bytes*/) noexcept
 {
-    co_return std::unexpected(std::make_error_condition(std::errc::function_not_supported)); // TODO
+    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
 }
 
 }

@@ -67,7 +67,7 @@ std::string hex(const Id& id)
 // int64_field is an int64 as proto3's JSON mapping reads it: usually a string, but possibly a number.
 using int64_field = std::optional<std::variant<std::int64_t, std::string>>;
 
-std::expected<std::int64_t, std::error_condition> int64_from(const int64_field& field)
+std::expected<std::int64_t, std::error_code> int64_from(const int64_field& field)
 {
     if (!field.has_value()) return 0;
     if (const auto* number = std::get_if<std::int64_t>(&*field)) return *number;
@@ -77,7 +77,7 @@ std::expected<std::int64_t, std::error_condition> int64_from(const int64_field& 
     std::int64_t v  = 0;
     auto [end, err] = std::from_chars(text.data(), text.data() + text.size(), v);
     if (err != std::errc{} || end != text.data() + text.size())
-        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     return v;
 }
@@ -601,11 +601,11 @@ std::string write(const T& value)
 
 // read reads json as T, ignoring fields it doesn't know (as proto3's JSON mapping allows).
 template<typename T>
-std::expected<T, std::error_condition> read(std::string_view json)
+std::expected<T, std::error_code> read(std::string_view json)
 {
     T value{};
     if (glz::read<glz::opts{.error_on_unknown_keys = false}>(value, json))
-        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     return value;
 }
 
@@ -645,7 +645,7 @@ std::string to_json(const export_trace_service_request& value) { return write(va
 std::string to_json(const export_metrics_service_request& value) { return write(value); }
 
 template<>
-std::expected<export_trace_service_response, std::error_condition>
+std::expected<export_trace_service_response, std::error_code>
 from_json<export_trace_service_response>(std::string_view json)
 {
     auto read_json = read<trace_response_json>(json);
@@ -667,7 +667,7 @@ from_json<export_trace_service_response>(std::string_view json)
 }
 
 template<>
-std::expected<export_metrics_service_response, std::error_condition>
+std::expected<export_metrics_service_response, std::error_code>
 from_json<export_metrics_service_response>(std::string_view json)
 {
     auto read_json = read<metrics_response_json>(json);

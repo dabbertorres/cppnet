@@ -75,7 +75,7 @@ net::coro::task<bool> discard_rest(net::io::reader&                 body,
     while (true)
     {
         total += res.count;
-        if (res.err) co_return res.err == net::io::status_condition::closed;
+        if (res.err) co_return res.err == net::io::errc::end_of_stream;
         if (total > max_discard_bytes) co_return false;
 
         res = co_await body.read(scratch);
@@ -96,7 +96,7 @@ net::coro::task<bool> discard_body(net::io::reader& body, std::span<std::byte> s
 
         auto res = std::move(reading).result();
         total += res.count;
-        if (res.err) return net::coro::ready_task<bool>(res.err == net::io::status_condition::closed);
+        if (res.err) return net::coro::ready_task<bool>(res.err == net::io::errc::end_of_stream);
     }
 
     return net::coro::ready_task<bool>(false);
@@ -136,7 +136,7 @@ net::http::protocol_version response_version(net::http::protocol_version version
 }
 
 // decode_error_status is the response to a request that couldn't be decoded.
-net::http::status decode_error_status(std::error_condition err) noexcept
+net::http::status decode_error_status(std::error_code err) noexcept
 {
     using enum net::http::status;
 
@@ -445,7 +445,7 @@ void server::start_response(connection_state& state, io::discard_writer& no_body
     else if (http10) resp.headers.set("Connection"sv, "keep-alive"sv);
 }
 
-coro::task<> server::end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_condition err)
+coro::task<> server::end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_code err)
 {
     if (err == io::status_condition::closed)
     {

@@ -74,7 +74,7 @@ std::string encoding::encode(std::span<const std::byte> data) const noexcept
     return out;
 }
 
-std::expected<std::vector<std::byte>, std::error_condition> encoding::decode(std::string_view data) const
+std::expected<std::vector<std::byte>, std::error_code> encoding::decode(std::string_view data) const
 {
     std::vector<std::byte> out(decoded_size(data.size()));
 
@@ -85,10 +85,10 @@ std::expected<std::vector<std::byte>, std::error_condition> encoding::decode(std
     return out;
 }
 
-std::expected<std::size_t, std::error_condition> encoding::decode_to(std::string_view     data,
-                                                                     std::span<std::byte> out) const noexcept
+std::expected<std::size_t, std::error_code> encoding::decode_to(std::string_view     data,
+                                                                std::span<std::byte> out) const noexcept
 {
-    const auto invalid = std::unexpected{std::make_error_condition(std::errc::invalid_argument)};
+    const auto invalid = std::unexpected{std::make_error_code(std::errc::invalid_argument)};
 
     if (padchar != 0)
     {
@@ -105,7 +105,7 @@ std::expected<std::size_t, std::error_condition> encoding::decode_to(std::string
 
     const auto groups = data.size() / 4;
     const auto size   = (groups * 3) + (tail == 0 ? 0 : tail - 1);
-    if (out.size() < size) return std::unexpected{std::make_error_condition(std::errc::value_too_large)};
+    if (out.size() < size) return std::unexpected{std::make_error_code(std::errc::value_too_large)};
 
     for (std::size_t i = 0; i < groups; ++i)
     {

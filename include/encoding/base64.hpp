@@ -65,12 +65,12 @@ public:
     //   end. Without: no padchars, and not one more than a multiple of 4.
     // - the bits of the last character that aren't part of a byte are zero, so that data is the only encoding of
     //   what it decodes to.
-    [[nodiscard]] std::expected<std::vector<std::byte>, std::error_condition> decode(std::string_view data) const;
+    [[nodiscard]] std::expected<std::vector<std::byte>, std::error_code> decode(std::string_view data) const;
 
     // decode_to decodes data (as decode does) into out, returning how many bytes it wrote. It fails with
     // value_too_large if they don't fit: decoded_size(data.size()) always do.
-    [[nodiscard]] std::expected<std::size_t, std::error_condition> decode_to(std::string_view     data,
-                                                                             std::span<std::byte> out) const noexcept;
+    [[nodiscard]] std::expected<std::size_t, std::error_code> decode_to(std::string_view     data,
+                                                                        std::span<std::byte> out) const noexcept;
 
 private:
     void encode_triplet(char* out, const std::byte* data) const noexcept;

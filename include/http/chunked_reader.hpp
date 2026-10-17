@@ -44,9 +44,9 @@ public:
     [[nodiscard]] int native_handle() const noexcept override { return parent->native_handle(); }
 
 private:
-    coro::task<std::error_condition> read_chunk_size();
-    coro::task<std::error_condition> read_trailers();
-    coro::task<std::error_condition> read_crlf();
+    coro::task<std::error_code> read_chunk_size();
+    coro::task<std::error_code> read_trailers();
+    coro::task<std::error_code> read_crlf();
 
     std::unique_ptr<io::buffered_reader> owned           = nullptr;
     io::buffered_reader*                 parent          = nullptr;

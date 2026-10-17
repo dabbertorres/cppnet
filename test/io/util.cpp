@@ -31,8 +31,7 @@ public:
 
     net::coro::task<net::io::result> read(std::span<std::byte> data) override
     {
-        if (content.empty())
-            co_return {.count = 0, .err = std::make_error_condition(std::errc::timed_out)};
+        if (content.empty()) co_return {.count = 0, .err = std::make_error_code(std::errc::timed_out)};
 
         auto count = std::min(data.size(), content.size());
         std::ranges::copy(std::as_bytes(std::span{content.substr(0, count)}), data.begin());
@@ -153,8 +152,8 @@ TEST_CASE("terminated lines must end, and fit", "[io][read_terminated_line]")
     CHECK(read("foo\r\nbar"sv, 5).to_value() == "foo");
     CHECK(read("\r\n"sv, 2).to_value().empty());
 
-    CHECK(read("foo"sv, 100).to_error() == net::io::status_condition::closed);
-    CHECK(read(""sv, 100).to_error() == net::io::status_condition::closed);
+    CHECK(read("foo"sv, 100).to_error() == net::io::errc::end_of_stream);
+    CHECK(read(""sv, 100).to_error() == net::io::errc::end_of_stream);
     CHECK(read("foo\r\n"sv, 4).to_error() == std::errc::value_too_large);
 
     // a bare LF doesn't end the line.

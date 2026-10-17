@@ -167,9 +167,9 @@ std::uint16_t listener::local_port() const
     }
 }
 
-coro::task<std::expected<tcp_socket, std::error_condition>> listener::accept() const
+coro::task<std::expected<tcp_socket, std::error_code>> listener::accept() const
 {
-    const auto canceled = std::make_error_condition(std::errc::operation_canceled);
+    const auto canceled = std::make_error_code(std::errc::operation_canceled);
 
     while (true)
     {
@@ -200,7 +200,7 @@ coro::task<std::expected<tcp_socket, std::error_condition>> listener::accept() c
             continue;
         }
 
-        default: co_return std::unexpected(std::error_condition{err, std::generic_category()});
+        default: co_return std::unexpected(std::error_code{err, std::system_category()});
         }
     }
 }

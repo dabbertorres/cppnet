@@ -22,7 +22,7 @@ using util::result;
 // - std::errc::invalid_argument if a header field is malformed, or the body doesn't fit its framing (e.g. a
 //   Content-Length without a body, or a body without one in HTTP/1.0, which can't send it chunked).
 // - std::errc::not_supported for transfer codings other than chunked, or versions other than HTTP/1.0 and 1.1.
-std::error_condition check_request(const client_request& req) noexcept;
+std::error_code check_request(const client_request& req) noexcept;
 
 // request_encode writes a request, including its body: with its Content-Length (which it must match), or chunked.
 // POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
@@ -47,7 +47,7 @@ request_decode(io::buffered_reader* reader,
 // request_decode decodes a request's head into req, as the other does, reusing req's memory (e.g. for each request on
 // a connection): its strings, fields, and body (if it's the reader the body needs). If it fails, req is left part-way
 // decoded.
-task<std::error_condition>
+task<std::error_code>
 request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept;
 
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to

@@ -6,60 +6,72 @@
 namespace
 {
 
-struct status_condition_category : std::error_category
+class io_category final : public std::error_category
 {
+public:
+    [[nodiscard]] const char* name() const noexcept override { return "net::io"; }
+
+    [[nodiscard]] std::string message(int ev) const override
+    {
+        switch (static_cast<net::io::errc>(ev))
+        {
+        case net::io::errc::end_of_stream: return "end of stream";
+        case net::io::errc::no_progress: return "a reader or writer made no progress";
+        default: return "(unrecognized)";
+        }
+    }
+
+    [[nodiscard]] std::error_condition default_error_condition(int ev) const noexcept override
+    {
+        if (static_cast<net::io::errc>(ev) == net::io::errc::end_of_stream)
+            return make_error_condition(net::io::status_condition::closed);
+        return {ev, *this};
+    }
+};
+
+class status_condition_category final : public std::error_category
+{
+public:
     [[nodiscard]] const char* name() const noexcept override { return "net::io::status_condition"; }
+
     [[nodiscard]] std::string message(int ev) const override
     {
         switch (static_cast<net::io::status_condition>(ev))
         {
         case net::io::status_condition::closed: return "closed";
         case net::io::status_condition::timed_out: return "timed out";
-        case net::io::status_condition::error: return "error";
         default: return "(unrecognized)";
         }
     }
 
+    // NOTE: codes in other categories (e.g. io::errc's) match by their default_error_condition(), which the comparison
+    // also checks; this matches the OS's.
     [[nodiscard]] bool equivalent(const std::error_code& code, int condition) const noexcept override
     {
-        auto code_value = static_cast<std::errc>(code.value());
+        if (code.category() != std::system_category() && code.category() != std::generic_category()) return false;
 
+        const auto err = static_cast<std::errc>(code.value());
         switch (static_cast<net::io::status_condition>(condition))
         {
         case net::io::status_condition::closed:
-            switch (code_value)
+            switch (err)
             {
             case std::errc::broken_pipe:
             case std::errc::connection_aborted:
-            case std::errc::connection_refused:
-            case std::errc::host_unreachable:
-            case std::errc::interrupted:
-            case std::errc::io_error:
-            case std::errc::network_down:
+            case std::errc::connection_reset:
             case std::errc::network_reset:
-            case std::errc::network_unreachable:
-            case std::errc::no_message:
-            case std::errc::no_such_device_or_address:
-            case std::errc::no_such_device:
-            case std::errc::no_such_process:
-            case std::errc::not_a_socket:
-            case std::errc::not_connected:
-            case std::errc::operation_canceled:
-            case std::errc::owner_dead:
-            case std::errc::state_not_recoverable: return true;
-
+            case std::errc::not_connected: return true;
             default: return false;
             }
 
-        case net::io::status_condition::timed_out: return code_value == std::errc::timed_out;
-
-        case net::io::status_condition::error: return code_value != std::errc{};
+        case net::io::status_condition::timed_out: return err == std::errc::timed_out;
 
         default: return false;
         }
     }
 };
 
+const io_category               the_io_category;
 const status_condition_category the_status_condition_category;
 
 }
@@ -67,11 +79,14 @@ const status_condition_category the_status_condition_category;
 namespace net::io
 {
 
-std::error_condition make_error_condition(status_condition code)
-{
-    return {static_cast<int>(code), the_status_condition_category};
-}
+const std::error_category& category() noexcept { return the_io_category; }
+
+std::error_code make_error_code(errc err) noexcept { return {static_cast<int>(err), the_io_category}; }
 
 const std::error_category& status_condition_category() noexcept { return the_status_condition_category; }
 
+std::error_condition make_error_condition(status_condition cond) noexcept
+{
+    return {static_cast<int>(cond), the_status_condition_category};
+}
 }

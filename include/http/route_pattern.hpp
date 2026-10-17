@@ -21,7 +21,7 @@ enum class route_error : std::uint8_t
     duplicate_parameter_name, // e.g. "/a/:id/b/:id", which would make path_value ambiguous.
 };
 
-std::error_condition make_error_condition(route_error err) noexcept;
+std::error_code make_error_code(route_error err) noexcept;
 
 const std::error_category& route_error_category() noexcept;
 
@@ -129,10 +129,9 @@ public:
     }
 
     // parse checks a pattern that's only known at runtime.
-    static std::expected<route_pattern, std::error_condition> parse(std::string_view str) noexcept
+    static std::expected<route_pattern, std::error_code> parse(std::string_view str) noexcept
     {
-        if (auto err = check_route_pattern(str); err != route_error::none)
-            return std::unexpected(make_error_condition(err));
+        if (auto err = check_route_pattern(str); err != route_error::none) return std::unexpected(make_error_code(err));
         return route_pattern{checked{}, str};
     }
 
@@ -155,7 +154,7 @@ namespace std
 {
 
 template<>
-struct is_error_condition_enum<net::http::route_error> : std::true_type
+struct is_error_code_enum<net::http::route_error> : std::true_type
 {};
 
 }

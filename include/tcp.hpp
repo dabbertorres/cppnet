@@ -38,10 +38,10 @@ public:
     // - std::errc::timed_out if no address accepted in time.
     // - std::errc::operation_canceled if the scheduler is stopped.
     // - otherwise, the error from the last address tried (e.g. std::errc::connection_refused).
-    static coro::task<std::expected<tcp_socket, std::error_condition>>
+    static coro::task<std::expected<tcp_socket, std::error_code>>
     connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options);
 
-    static coro::task<std::expected<tcp_socket, std::error_condition>>
+    static coro::task<std::expected<tcp_socket, std::error_code>>
     connect(io::scheduler* scheduler, std::string host, std::string port)
     {
         return connect(scheduler, std::move(host), std::move(port), connect_options{});
@@ -49,7 +49,7 @@ public:
 
     // set_nodelay turns Nagle's algorithm off (TCP_NODELAY), so a small write is sent right away, rather than when what
     // was sent before is acknowledged.
-    [[nodiscard]] std::expected<void, std::error_condition> set_nodelay(bool nodelay = true) const noexcept;
+    [[nodiscard]] std::expected<void, std::error_code> set_nodelay(bool nodelay = true) const noexcept;
 };
 
 }

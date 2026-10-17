@@ -48,7 +48,7 @@ public:
 
     // accept waits for the next connection. Once the listener is shut down, it fails with
     // std::errc::operation_canceled (as do any accepts already waiting).
-    [[nodiscard]] coro::task<std::expected<tcp_socket, std::error_condition>> accept() const;
+    [[nodiscard]] coro::task<std::expected<tcp_socket, std::error_code>> accept() const;
 
     [[nodiscard]] int native_handle() const noexcept { return main_fd; }
 

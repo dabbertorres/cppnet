@@ -56,7 +56,7 @@ using net::http::server_request;
 using net::http::status;
 using net::io::buffered_reader;
 
-std::error_condition invalid() noexcept { return std::make_error_condition(std::errc::invalid_argument); }
+std::error_code invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
 
 constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 
@@ -87,14 +87,14 @@ struct head_reader
     }
 
     // read_line reads the next line (without its CRLF) into line.
-    task<std::error_condition> read_line() noexcept
+    task<std::error_code> read_line() noexcept
     {
         auto read = co_await net::io::read_terminated_line(reader, remaining);
         if (read.has_error()) co_return read.to_error();
 
         line = std::move(read.to_value());
         remaining -= line.size() + 2;
-        co_return std::error_condition{};
+        co_return std::error_code{};
     }
 };
 
@@ -112,7 +112,7 @@ std::optional<protocol_version> parse_http_version(std::string_view str) noexcep
 
 // parse_status_line parses "HTTP/1.1 200 OK". The reason (and the space before it) may be missing: it's ignored anyway.
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range (after the size check).
-std::error_condition parse_status_line(std::string_view line, client_response& resp) noexcept
+std::error_code parse_status_line(std::string_view line, client_response& resp) noexcept
 {
     auto version = parse_http_version(line.substr(0, line.find(' ')));
     if (!version.has_value() || line.size() < 12 || line[8] != ' ') return invalid();
@@ -129,7 +129,7 @@ std::error_condition parse_status_line(std::string_view line, client_response& r
 
 // parse_request_line parses "GET /path HTTP/1.1" (RFC 9112, section 3), with exactly one space between each part.
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
-std::error_condition parse_request_line(std::string_view line, server_request& req) noexcept
+std::error_code parse_request_line(std::string_view line, server_request& req) noexcept
 {
     auto method_end = line.find(' ');
     if (method_end == std::string_view::npos) return invalid();
@@ -146,7 +146,7 @@ std::error_condition parse_request_line(std::string_view line, server_request& r
     // methods are case-sensitive, and one that's well-formed, but unknown, isn't implemented (RFC 9110, section 9.1).
     req.method = parse_method(method);
     if (req.method == request_method::NONE || method_string(req.method) != method)
-        return std::make_error_condition(std::errc::not_supported);
+        return std::make_error_code(std::errc::not_supported);
 
     req.version = *version;
     return parse_request_target(req.method, target, req.target);
@@ -154,11 +154,11 @@ std::error_condition parse_request_line(std::string_view line, server_request& r
 
 // add_field_line adds a field line to fields, returning whether it was the empty line that ends them. count is how many
 // came before it.
-std::expected<bool, std::error_condition> add_field_line(std::string_view line, std::size_t count, headers& fields)
+std::expected<bool, std::error_code> add_field_line(std::string_view line, std::size_t count, headers& fields)
 {
     if (line.empty()) return true;
     if (count == net::http::http11::max_fields)
-        return std::unexpected(std::make_error_condition(std::errc::value_too_large));
+        return std::unexpected(std::make_error_code(std::errc::value_too_large));
 
     auto field = net::http::parse_field_line(line);
     if (!field.has_value()) return std::unexpected(invalid());
@@ -169,7 +169,7 @@ std::expected<bool, std::error_condition> add_field_line(std::string_view line, 
 }
 
 // parse_fields reads field lines up to the empty line that ends them.
-task<std::error_condition> parse_fields(head_reader& head, headers& fields) noexcept
+task<std::error_code> parse_fields(head_reader& head, headers& fields) noexcept
 {
     for (std::size_t count = 0;; ++count)
     {
@@ -182,7 +182,7 @@ task<std::error_condition> parse_fields(head_reader& head, headers& fields) noex
 
         auto added = add_field_line(*line, count, fields);
         if (!added.has_value()) co_return added.error();
-        if (*added) co_return std::error_condition{};
+        if (*added) co_return std::error_code{};
     }
 }
 
@@ -194,7 +194,7 @@ std::size_t count_values(const headers& fields, std::string_view key)
 }
 
 // parse_host_header checks the Host header (RFC 9112, section 3.2), and sets the request's host.
-std::error_condition parse_host_header(server_request& req)
+std::error_code parse_host_header(server_request& req)
 {
     const auto lines = count_values(req.headers, "Host"sv);
 
@@ -233,7 +233,7 @@ void reuse_or_make(std::unique_ptr<net::io::reader>& body, Args&&... args)
 // set_request_body decides how long the request's body is (RFC 9112, section 6.3), and sets its body to read only that
 // much of reader. The rules are strict where requests are ambiguous, as an ambiguity between this server and anything
 // in front of it is what request smuggling exploits.
-std::error_condition set_request_body(buffered_reader* reader, server_request& req)
+std::error_code set_request_body(buffered_reader* reader, server_request& req)
 {
     if (req.headers.get_all("Transfer-Encoding"sv).has_value())
     {
@@ -248,7 +248,7 @@ std::error_condition set_request_body(buffered_reader* reader, server_request& r
         if (codings.empty() || !chunked(codings.back()) || how_many > 1) return invalid();
 
         // and nothing else is implemented.
-        if (codings.size() > 1) return std::make_error_condition(std::errc::not_supported);
+        if (codings.size() > 1) return std::make_error_code(std::errc::not_supported);
 
         reuse_or_make<net::http::http11::chunked_reader>(req.body, reader);
         return {};
@@ -275,7 +275,7 @@ enum class response_framing : std::uint8_t
     connection // with the connection: if nothing else says, or after a 101 (when it's the new protocol's).
 };
 
-std::expected<response_framing, std::error_condition> framing_of(const client_response& resp, request_method method)
+std::expected<response_framing, std::error_code> framing_of(const client_response& resp, request_method method)
 {
     if (resp.status_code == status::SWITCHING_PROTOCOLS) return response_framing::connection;
 
@@ -297,7 +297,7 @@ std::expected<response_framing, std::error_condition> framing_of(const client_re
 }
 
 // make_response_body wraps reader (which it borrows) to read only the response's body.
-std::expected<std::unique_ptr<net::io::reader>, std::error_condition>
+std::expected<std::unique_ptr<net::io::reader>, std::error_code>
 make_response_body(buffered_reader* reader, const client_response& resp, request_method method)
 {
     auto framing = framing_of(resp, method);
@@ -366,12 +366,12 @@ protocol_version effective_version(const client_request& req) noexcept
 
 // frame_request decides how a request's body is sent (RFC 9112, section 6), from its Content-Length or
 // Transfer-Encoding if it has them.
-std::expected<request_framing, std::error_condition> frame_request(const client_request& req)
+std::expected<request_framing, std::error_code> frame_request(const client_request& req)
 {
     using enum request_framing::kind;
 
     const auto version = effective_version(req);
-    if (version.major != 1 || version.minor > 1) return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (version.major != 1 || version.minor > 1) return std::unexpected(std::make_error_code(std::errc::not_supported));
 
     const bool has_te = req.headers.get_all("Transfer-Encoding"sv).has_value();
     const bool has_cl = req.headers.get_all("Content-Length"sv).has_value();
@@ -382,7 +382,7 @@ std::expected<request_framing, std::error_condition> frame_request(const client_
         auto codings = req.headers.get_list("Transfer-Encoding"sv);
         if (has_cl || version.minor == 0) return std::unexpected(invalid());
         if (codings.size() != 1 || !net::util::equal_ignore_case(codings.front(), "chunked"sv))
-            return std::unexpected(std::make_error_condition(std::errc::not_supported));
+            return std::unexpected(std::make_error_code(std::errc::not_supported));
 
         return request_framing{.how = chunked, .length = 0, .field = {}};
     }
@@ -409,18 +409,18 @@ std::expected<request_framing, std::error_condition> frame_request(const client_
     return request_framing{.how = none, .length = 0, .field = expects_content ? "Content-Length: 0\r\n"sv : ""sv};
 }
 
-task<std::error_condition> write_full(net::io::writer& out, std::span<const std::byte> data)
+task<std::error_code> write_full(net::io::writer& out, std::span<const std::byte> data)
 {
     while (!data.empty())
     {
         auto res = co_await out.write(data);
         if (res.err) co_return res.err;
-        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+        if (res.count == 0) co_return make_error_code(net::io::errc::no_progress);
 
         data = data.subspan(res.count);
     }
 
-    co_return std::error_condition{};
+    co_return std::error_code{};
 }
 
 // max_start_line_overhead is enough for a request or status line, apart from the request's target: e.g. the method,
@@ -431,7 +431,7 @@ constexpr std::size_t max_start_line_overhead = 128;
 constexpr std::size_t body_buffer = std::size_t{16} * 1'024;
 
 // copy_length copies exactly length bytes from body, which mustn't end before then.
-task<std::error_condition> copy_length(net::io::reader& body, net::io::writer& out, std::size_t length)
+task<std::error_code> copy_length(net::io::reader& body, net::io::writer& out, std::size_t length)
 {
     std::vector<std::byte> buf(std::min(length, body_buffer));
 
@@ -445,16 +445,16 @@ task<std::error_condition> copy_length(net::io::reader& body, net::io::writer& o
         if (length == 0) break;
 
         // a body shorter than its Content-Length is the caller's mistake.
-        if (res.err == net::io::status_condition::closed) co_return invalid();
+        if (res.err == net::io::errc::end_of_stream) co_return invalid();
         if (res.err) co_return res.err;
-        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+        if (res.count == 0) co_return make_error_code(net::io::errc::no_progress);
     }
 
-    co_return std::error_condition{};
+    co_return std::error_code{};
 }
 
 // copy_chunked copies body, until it ends, as chunks.
-task<std::error_condition> copy_chunked(net::io::reader& body, net::io::writer& out)
+task<std::error_code> copy_chunked(net::io::reader& body, net::io::writer& out)
 {
     net::http::http11::chunked_writer chunked{&out};
     std::vector<std::byte>            buf(body_buffer);
@@ -468,9 +468,9 @@ task<std::error_condition> copy_chunked(net::io::reader& body, net::io::writer& 
             if (auto written = co_await chunked.write(std::span{buf}.first(res.count)); written.err) co_return written.err;
         }
 
-        if (res.err == net::io::status_condition::closed) break;
+        if (res.err == net::io::errc::end_of_stream) break;
         if (res.err) co_return res.err;
-        if (res.count == 0) co_return make_error_condition(net::io::status_condition::error);
+        if (res.count == 0) co_return make_error_code(net::io::errc::no_progress);
     }
 
     co_return (co_await chunked.finish()).err;
@@ -576,7 +576,7 @@ task<net::http::response_encoder_result> write_status_head(net::io::writer*     
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 }
 
@@ -590,7 +590,7 @@ struct head_state
 
 // take_head_line parses the next line of a request's head, returning whether it was the last (the empty line after the
 // fields).
-std::expected<bool, std::error_condition> take_head_line(std::string_view line, head_state& state, server_request& req)
+std::expected<bool, std::error_code> take_head_line(std::string_view line, head_state& state, server_request& req)
 {
     if (!state.started)
     {
@@ -618,8 +618,7 @@ bool head_is_buffered(const buffered_reader* reader, std::size_t max_header_byte
 }
 
 // decode_buffered decodes a request whose head is buffered (see head_is_buffered), without a coroutine.
-std::error_condition
-decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+std::error_code decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     try
     {
@@ -642,14 +641,14 @@ decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_re
     }
     catch (const std::bad_alloc&)
     {
-        return std::make_error_condition(std::errc::not_enough_memory);
+        return std::make_error_code(std::errc::not_enough_memory);
     }
 }
 
 // decode_reading decodes a request whose head isn't all buffered yet, reading the rest. Each line is still parsed as it
 // comes (so a malformed one fails without waiting for the rest), from the reader's buffer: it's refilled until the line
 // is all there, rather than the line read into a string, unless the buffer can't hold it.
-task<std::error_condition>
+task<std::error_code>
 decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     try
@@ -667,7 +666,7 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
             else if (reader->size() >= head.remaining)
             {
                 // the head's longer than it may be.
-                co_return std::make_error_condition(std::errc::value_too_large);
+                co_return std::make_error_code(std::errc::value_too_large);
             }
             else if (reader->size() == reader->capacity())
             {
@@ -691,7 +690,7 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::make_error_condition(std::errc::not_enough_memory);
+        co_return std::make_error_code(std::errc::not_enough_memory);
     }
 }
 }
@@ -701,7 +700,7 @@ namespace net::http::http11
 
 using coro::task;
 
-std::error_condition check_request(const client_request& req) noexcept
+std::error_code check_request(const client_request& req) noexcept
 {
     try
     {
@@ -714,7 +713,7 @@ std::error_condition check_request(const client_request& req) noexcept
     }
     catch (const std::bad_alloc&)
     {
-        return std::make_error_condition(std::errc::not_enough_memory);
+        return std::make_error_code(std::errc::not_enough_memory);
     }
 }
 
@@ -761,7 +760,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
     try
     {
-        std::error_condition err;
+        std::error_code err;
 
         switch (framing.how)
         {
@@ -786,7 +785,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 
     co_return writer;
@@ -818,7 +817,7 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
         }
         catch (const std::bad_alloc&)
         {
-            return coro::ready_task<result>(std::unexpected(std::make_error_condition(std::errc::not_enough_memory)));
+            return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::not_enough_memory)));
         }
     }
 
@@ -835,18 +834,18 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 }
 
-task<std::error_condition>
+task<std::error_code>
 request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     req.clear();
 
     // e.g. for pipelined requests, which are read together.
     if (head_is_buffered(reader, max_header_bytes))
-        return coro::ready_task<std::error_condition>(decode_buffered(reader, max_header_bytes, req));
+        return coro::ready_task<std::error_code>(decode_buffered(reader, max_header_bytes, req));
 
     return decode_reading(reader, max_header_bytes, req);
 }
@@ -884,7 +883,7 @@ response_decode(io::buffered_reader* reader, request_method method, std::size_t 
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 }
 
@@ -901,7 +900,7 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 
     co_return resp;

@@ -101,7 +101,7 @@ std::string transcript(net::io::reader* conn)
             if (res.err)
             {
                 out += "body: " + body + " (" + res.err.message() + ")\n";
-                if (res.err != net::io::status_condition::closed) return out;
+                if (res.err != net::io::errc::end_of_stream) return out;
                 break;
             }
         }

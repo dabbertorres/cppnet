@@ -34,10 +34,7 @@ const route_error_category the_route_error_category;
 namespace net::http
 {
 
-std::error_condition make_error_condition(route_error err) noexcept
-{
-    return {static_cast<int>(err), the_route_error_category};
-}
+std::error_code make_error_code(route_error err) noexcept { return {static_cast<int>(err), the_route_error_category}; }
 
 const std::error_category& route_error_category() noexcept { return the_route_error_category; }
 

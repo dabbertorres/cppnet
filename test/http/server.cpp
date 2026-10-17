@@ -224,7 +224,7 @@ TEST_CASE("a response's body is as long as its Content-Length", "[http][server]"
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
 
-    std::error_condition long_err;
+    std::error_code long_err;
 
     http::router router;
     router

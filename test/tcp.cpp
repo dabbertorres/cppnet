@@ -30,16 +30,16 @@ namespace
 
 using namespace std::chrono_literals;
 
-using connect_result = std::expected<net::tcp_socket, std::error_condition>;
+using connect_result = std::expected<net::tcp_socket, std::error_code>;
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(2); }
 
 // connect_error connects, and returns why it failed (or nothing, if it didn't).
-net::coro::task<std::error_condition>
+net::coro::task<std::error_code>
 connect_error(net::io::scheduler* sched, std::string host, std::string port, std::chrono::milliseconds timeout)
 {
     auto conn = co_await net::tcp_socket::connect(sched, std::move(host), std::move(port), {.timeout = timeout});
-    co_return conn.has_value() ? std::error_condition{} : conn.error();
+    co_return conn.has_value() ? std::error_code{} : conn.error();
 }
 
 std::string closed_port()

@@ -42,24 +42,21 @@ namespace
 using net::instrument::system::unlimited;
 
 template<typename T>
-using result = std::expected<T, std::error_condition>;
+using result = std::expected<T, std::error_code>;
 
 // from_errno is the error a system call failed with (or, if it didn't set errno, std::errc::io_error).
-std::unexpected<std::error_condition> from_errno() noexcept
+std::unexpected<std::error_code> from_errno() noexcept
 {
     const int err = errno;
     return std::unexpected{
-        err != 0 ? std::error_condition{err, std::generic_category()}
-            : std::make_error_condition(std::errc::io_error)
+        err != 0 ? std::error_code{err, std::system_category()}
+            : std::make_error_code(std::errc::io_error)
     };
 }
 
-std::unexpected<std::error_condition> failed(std::errc err) noexcept
-{
-    return std::unexpected{std::make_error_condition(err)};
-}
+std::unexpected<std::error_code> failed(std::errc err) noexcept { return std::unexpected{std::make_error_code(err)}; }
 
-[[maybe_unused]] std::unexpected<std::error_condition> not_supported() noexcept
+[[maybe_unused]] std::unexpected<std::error_code> not_supported() noexcept
 {
     return failed(std::errc::function_not_supported);
 }
@@ -211,12 +208,12 @@ result<T> pid_info(int flavor) noexcept
 namespace net::instrument::system
 {
 
-std::expected<std::chrono::duration<double>, std::error_condition> process_cpu_seconds() noexcept
+std::expected<std::chrono::duration<double>, std::error_code> process_cpu_seconds() noexcept
 {
     return usage().transform([](const rusage& ru) { return to_duration(ru.ru_utime) + to_duration(ru.ru_stime); });
 }
 
-std::expected<std::size_t, std::error_condition> process_open_fds() noexcept
+std::expected<std::size_t, std::error_code> process_open_fds() noexcept
 {
 #ifdef NET_IS_LINUX
     DIR* dir = ::opendir("/proc/self/fd");
@@ -264,9 +261,9 @@ std::expected<std::size_t, std::error_condition> process_open_fds() noexcept
 #endif
 }
 
-std::expected<std::size_t, std::error_condition> process_max_fds() noexcept { return soft_limit(RLIMIT_NOFILE); }
+std::expected<std::size_t, std::error_code> process_max_fds() noexcept { return soft_limit(RLIMIT_NOFILE); }
 
-std::expected<std::size_t, std::error_condition> process_virtual_memory() noexcept
+std::expected<std::size_t, std::error_code> process_virtual_memory() noexcept
 {
 #ifdef NET_IS_LINUX
     return statm_bytes(0);
@@ -278,9 +275,9 @@ std::expected<std::size_t, std::error_condition> process_virtual_memory() noexce
 #endif
 }
 
-std::expected<std::size_t, std::error_condition> process_virtual_memory_max() noexcept { return soft_limit(RLIMIT_AS); }
+std::expected<std::size_t, std::error_code> process_virtual_memory_max() noexcept { return soft_limit(RLIMIT_AS); }
 
-std::expected<std::size_t, std::error_condition> process_resident_memory() noexcept
+std::expected<std::size_t, std::error_code> process_resident_memory() noexcept
 {
 #ifdef NET_IS_LINUX
     return statm_bytes(1);
@@ -292,7 +289,7 @@ std::expected<std::size_t, std::error_condition> process_resident_memory() noexc
 #endif
 }
 
-std::expected<std::size_t, std::error_condition> process_heap() noexcept
+std::expected<std::size_t, std::error_code> process_heap() noexcept
 {
 #if defined(NET_IS_LINUX) && defined(__GLIBC__)
     // the bytes allocated: from the main heap (arena), and with mmap (for large allocations).
@@ -308,7 +305,7 @@ std::expected<std::size_t, std::error_condition> process_heap() noexcept
 #endif
 }
 
-std::expected<time_point, std::error_condition> process_start_time() noexcept
+std::expected<time_point, std::error_code> process_start_time() noexcept
 {
 #ifdef NET_IS_LINUX
     // starttime is in clock ticks since the system booted, and /proc/stat's btime is when that was, in Unix time.
@@ -346,7 +343,7 @@ std::expected<time_point, std::error_condition> process_start_time() noexcept
 #endif
 }
 
-std::expected<std::size_t, std::error_condition> process_threads() noexcept
+std::expected<std::size_t, std::error_code> process_threads() noexcept
 {
 #ifdef NET_IS_LINUX
     return stat_field<std::size_t>(20);
@@ -358,7 +355,7 @@ std::expected<std::size_t, std::error_condition> process_threads() noexcept
 #endif
 }
 
-std::expected<process_info, std::error_condition> process_usage() noexcept
+std::expected<process_info, std::error_code> process_usage() noexcept
 {
 #ifdef NET_IS_OSX
     constexpr std::size_t max_rss_unit = 1; // bytes

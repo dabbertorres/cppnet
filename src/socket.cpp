@@ -193,14 +193,14 @@ coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
 {
     if (fd == invalid_fd || scheduler == nullptr)
         return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)});
+            io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)});
 
     if (auto res = try_read(data); res.has_value()) return coro::ready_task<io::result>(*res);
 
     // the scheduler reads, once the socket's ready (see read_operation).
     if (!reading.claim(data))
         return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_condition(std::errc::device_or_resource_busy)});
+            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
 
     return coro::operation_task(reading);
 }
@@ -209,7 +209,7 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 {
     if (fd == invalid_fd || scheduler == nullptr)
         return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_condition(std::errc::bad_file_descriptor)});
+            io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)});
 
     std::size_t written = 0;
     if (auto res = try_write(data, written); res.has_value()) return coro::ready_task<io::result>(*res);
@@ -217,7 +217,7 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
     // the scheduler writes the rest, once the socket's ready (see write_operation).
     if (!writing.claim(data, written))
         return coro::ready_task<io::result>(
-            io::result{.count = written, .err = std::make_error_condition(std::errc::device_or_resource_busy)});
+            io::result{.count = written, .err = std::make_error_code(std::errc::device_or_resource_busy)});
 
     return coro::operation_task(writing);
 }
@@ -319,14 +319,14 @@ std::optional<io::result> socket::try_read(std::span<std::byte> data) const noex
         if (num > 0) return io::result{.count = static_cast<std::size_t>(num)};
 
         // the other end closed the connection
-        if (num == 0) return io::result{.count = 0, .err = make_error_condition(io::status_condition::closed)};
+        if (num == 0) return io::result{.count = 0, .err = make_error_code(io::errc::end_of_stream)};
 
         auto err = errno;
         if (err == EINTR) continue;
         if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
         return io::result{
             .count = 0,
-            .err   = {err, std::generic_category()}
+            .err   = {err, std::system_category()}
         };
     }
 }
@@ -354,7 +354,7 @@ std::optional<io::result> socket::try_write(std::span<const std::byte> data, std
         if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
         return io::result{
             .count = written,
-            .err   = {err, std::generic_category()}
+            .err   = {err, std::system_category()}
         };
     }
 

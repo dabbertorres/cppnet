@@ -37,8 +37,8 @@ read_line(buffered_reader* reader, std::size_t max_length, std::string_view end_
 
             // the end of the stream may end the line, but anything else (e.g. a timeout) is an error.
             auto err = reader->error();
-            if (err && err != status_condition::closed) co_return err;
-            if (!end_of_stream_ends_line) co_return make_error_condition(status_condition::closed);
+            if (err && err != errc::end_of_stream) co_return err;
+            if (!end_of_stream_ends_line) co_return make_error_code(errc::end_of_stream);
             break;
         }
 
@@ -53,7 +53,7 @@ read_line(buffered_reader* reader, std::size_t max_length, std::string_view end_
         line.append(chars.substr(0, std::min(taken, room)));
         reader->consume(std::min(taken, room));
 
-        if (taken > room) co_return std::make_error_condition(std::errc::value_too_large);
+        if (taken > room) co_return std::make_error_code(std::errc::value_too_large);
     }
 
     if (line.ends_with(end_of_line)) line.resize(line.size() - end_of_line.size());

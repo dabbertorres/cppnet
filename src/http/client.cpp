@@ -70,13 +70,13 @@ public:
 
     net::coro::task<net::io::result> read(std::span<std::byte> data) override
     {
-        if (body == nullptr) co_return {.err = make_error_condition(net::io::status_condition::closed)};
+        if (body == nullptr) co_return {.err = make_error_code(net::io::errc::end_of_stream)};
 
         auto res = co_await body->read(data);
 
         if (res.err)
         {
-            finish(res.err == net::io::status_condition::closed);
+            finish(res.err == net::io::errc::end_of_stream);
         }
         else if (remaining.has_value())
         {
@@ -131,11 +131,7 @@ bool is_idempotent(net::http::request_method method) noexcept
 }
 
 // closed_early is whether a request failed as it would on a connection the server had closed before getting it.
-bool closed_early(std::error_condition err) noexcept
-{
-    return err == net::io::status_condition::closed || err == std::errc::connection_reset
-        || err == std::errc::broken_pipe || err == std::errc::connection_aborted;
-}
+bool closed_early(std::error_code err) noexcept { return err == net::io::status_condition::closed; }
 
 bool has_close(const net::http::headers& fields)
 {
@@ -165,12 +161,12 @@ client::client(io::scheduler* scheduler, const client_options& options)
     : pool{std::make_shared<detail::connection_pool>(scheduler, options)}
 {}
 
-coro::task<std::expected<client_response, std::error_condition>> client::send(const client_request& request)
+coro::task<std::expected<client_response, std::error_code>> client::send(const client_request& request)
 {
     // Only HTTP/1.x over TCP is implemented. In particular, the http2 encoders are stubs, and there's no TLS.
-    if (request.version.major > 1) co_return std::unexpected(std::make_error_condition(std::errc::not_supported));
+    if (request.version.major > 1) co_return std::unexpected(std::make_error_code(std::errc::not_supported));
     if (!request.uri.scheme.empty() && !util::equal_ignore_case(std::string_view{request.uri.scheme}, "http"sv))
-        co_return std::unexpected(std::make_error_condition(std::errc::protocol_not_supported));
+        co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
 
     // before taking a connection, which a request that can't be sent would waste.
     if (auto err = http11::check_request(request); err) co_return std::unexpected(err);
@@ -196,7 +192,7 @@ coro::task<std::expected<client_response, std::error_condition>> client::send(co
         conn->set_timeout(limit(options.io_timeout));
 
         // NOTE: not with a body, which has been read.
-        const auto retry = [&](std::error_condition err)
+        const auto retry = [&](std::error_code err)
         {
             return reused && attempt == 0 && request.body == nullptr && is_idempotent(request.method)
                 && closed_early(err);

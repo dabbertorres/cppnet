@@ -29,8 +29,8 @@ public:
         , writer{writer}
     {}
 
-    // read fails with status_condition::closed if what was written can't be sent: the other end can't be answered any
-    // more, which ends the connection as its closing would.
+    // read fails with errc::end_of_stream if what was written can't be sent: the other end can't be answered any more,
+    // which ends the connection as its closing would.
     coro::task<result> read(std::span<std::byte> data) override;
 
     using reader::read;

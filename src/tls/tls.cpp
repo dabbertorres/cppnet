@@ -62,20 +62,27 @@ public:
         if (code >= 0 && code <= 255) return Botan::TLS::Alert(static_cast<Botan::TLS::Alert::Type>(code)).type_string();
         return "unknown TLS error";
     }
+
+    // a truncated stream still ended, as io::status_condition::closed groups.
+    [[nodiscard]] std::error_condition default_error_condition(int code) const noexcept override
+    {
+        if (static_cast<net::tls::errc>(code) == net::tls::errc::stream_truncated)
+            return make_error_condition(net::io::status_condition::closed);
+        return {code, *this};
+    }
 };
 
-std::error_condition alert_condition(Botan::TLS::Alert::Type type) noexcept
+std::error_code alert_code(Botan::TLS::Alert::Type type) noexcept
 {
     return {static_cast<int>(type), net::tls::category()};
 }
 
 // read_file reads a whole file, failing with the error opening it (e.g. no_such_file_or_directory).
-std::expected<std::unique_ptr<Botan::DataSource_Stream>, std::error_condition> open_file(const std::filesystem::path& path)
+std::expected<std::unique_ptr<Botan::DataSource_Stream>, std::error_code> open_file(const std::filesystem::path& path)
 {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec))
-        return std::unexpected(ec ? ec.default_error_condition()
-                                  : std::make_error_condition(std::errc::no_such_file_or_directory));
+        return std::unexpected(ec ? ec : std::make_error_code(std::errc::no_such_file_or_directory));
 
     try
     {
@@ -83,12 +90,12 @@ std::expected<std::unique_ptr<Botan::DataSource_Stream>, std::error_condition> o
     }
     catch (const std::exception&)
     {
-        return std::unexpected(std::make_error_condition(std::errc::io_error));
+        return std::unexpected(std::make_error_code(std::errc::io_error));
     }
 }
 
 // load_certificates reads every certificate in a PEM file, failing if there are none.
-std::expected<std::vector<Botan::X509_Certificate>, std::error_condition>
+std::expected<std::vector<Botan::X509_Certificate>, std::error_code>
 load_certificates(const std::filesystem::path& path)
 {
     auto source = open_file(path);
@@ -102,10 +109,10 @@ load_certificates(const std::filesystem::path& path)
     catch (const std::exception&)
     {
         // e.g. trailing text after the last certificate, which ends them.
-        if (certs.empty()) return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        if (certs.empty()) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 
-    if (certs.empty()) return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    if (certs.empty()) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     return certs;
 }
 
@@ -275,23 +282,23 @@ struct connection
         }
         catch (const Botan::TLS::TLS_Exception& ex)
         {
-            if (!failure) failure = alert_condition(ex.type());
+            if (!failure) failure = alert_code(ex.type());
         }
         catch (const std::exception&)
         {
-            if (!failure) failure = make_error_condition(errc::protocol_error);
+            if (!failure) failure = make_error_code(errc::protocol_error);
         }
     }
 
     // flush writes what the channel has emitted (handshake messages, records, alerts) to the socket. If another call
     // is flushing already, that one writes it (so writes go out in the order they were emitted), and this returns.
-    coro::task<std::error_condition> flush()
+    coro::task<std::error_code> flush()
     {
         std::vector<std::uint8_t> pending;
 
         {
             std::scoped_lock lock{mu};
-            if (flushing || outgoing.empty()) co_return std::error_condition{};
+            if (flushing || outgoing.empty()) co_return std::error_code{};
 
             flushing = true;
             pending.swap(outgoing);
@@ -312,7 +319,7 @@ struct connection
             if (outgoing.empty())
             {
                 flushing = false;
-                co_return std::error_condition{};
+                co_return std::error_code{};
             }
 
             pending.swap(outgoing);
@@ -320,7 +327,7 @@ struct connection
     }
 
     // receive reads from the socket once, and passes what it read to the channel, returning the read's error (if any).
-    coro::task<std::error_condition> receive()
+    coro::task<std::error_code> receive()
     {
         // NOTE: only one read waits at once (as for the socket), so ciphertext isn't shared.
         auto res = co_await socket.read(std::as_writable_bytes(std::span{ciphertext}));
@@ -340,7 +347,7 @@ struct connection
     }
 
     // handshake runs the handshake until it's done, deadline passes, or it fails.
-    coro::task<std::error_condition> handshake(io::clock::time_point deadline)
+    coro::task<std::error_code> handshake(io::clock::time_point deadline)
     {
         socket.set_deadline(deadline);
         util::defer no_deadline{[this] noexcept { socket.set_deadline(std::nullopt); }};
@@ -360,9 +367,9 @@ struct connection
                 if (channel->is_handshake_complete())
                 {
                     alpn = channel->application_protocol();
-                    co_return std::error_condition{};
+                    co_return std::error_code{};
                 }
-                if (peer_closed) co_return make_error_condition(io::status_condition::closed);
+                if (peer_closed) co_return make_error_code(io::errc::end_of_stream);
             }
 
             if (auto err = co_await receive(); err)
@@ -385,12 +392,11 @@ struct connection
                 std::scoped_lock lock{mu};
                 if (auto count = take_received(data); count > 0) co_return io::result{.count = count};
                 if (failure) co_return io::result{.err = failure};
-                if (peer_closed) co_return io::result{.err = make_error_condition(io::status_condition::closed)};
+                if (peer_closed) co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
             }
 
             // the connection ended without close_notify: what was read may have been cut short.
-            if (err == io::status_condition::closed)
-                co_return io::result{.err = make_error_condition(errc::stream_truncated)};
+            if (err == io::errc::end_of_stream) co_return io::result{.err = make_error_code(errc::stream_truncated)};
             if (err) co_return io::result{.err = err};
         }
     }
@@ -405,7 +411,7 @@ struct connection
     std::vector<std::uint8_t> received; // decrypted data not read yet, from received_start
     std::size_t               received_start = 0;
     bool                      peer_closed    = false; // the peer's close_notify
-    std::error_condition      failure;                // a fatal alert, or a broken protocol
+    std::error_code           failure;                // a fatal alert, or a broken protocol
     bool                      flushing = false;
     std::string               alpn;
 
@@ -429,7 +435,7 @@ void callbacks::tls_record_received(std::uint64_t /*seq_no*/, std::span<const st
 void callbacks::tls_alert(Botan::TLS::Alert alert)
 {
     if (alert.type() == Botan::TLS::Alert::CloseNotify) conn->peer_closed = true;
-    else if (alert.is_fatal() && !conn->failure) conn->failure = alert_condition(alert.type());
+    else if (alert.is_fatal() && !conn->failure) conn->failure = alert_code(alert.type());
 }
 
 }
@@ -443,13 +449,13 @@ const std::error_category& category() noexcept
     return instance;
 }
 
-std::error_condition make_error_condition(errc err) noexcept { return {static_cast<int>(err), category()}; }
+std::error_code make_error_code(errc err) noexcept { return {static_cast<int>(err), category()}; }
 
 client_context::client_context(std::shared_ptr<detail::client_state> state) noexcept
     : state{std::move(state)}
 {}
 
-std::expected<client_context, std::error_condition> client_context::make(const client_options& options)
+std::expected<client_context, std::error_code> client_context::make(const client_options& options)
 {
     try
     {
@@ -483,7 +489,7 @@ std::expected<client_context, std::error_condition> client_context::make(const c
     catch (const std::exception&)
     {
         // e.g. the system's trust store couldn't be read.
-        return std::unexpected(std::make_error_condition(std::errc::io_error));
+        return std::unexpected(std::make_error_code(std::errc::io_error));
     }
 }
 
@@ -491,7 +497,7 @@ server_context::server_context(std::shared_ptr<detail::server_state> state) noex
     : state{std::move(state)}
 {}
 
-std::expected<server_context, std::error_condition> server_context::make(const server_options& options)
+std::expected<server_context, std::error_code> server_context::make(const server_options& options)
 {
     try
     {
@@ -502,7 +508,7 @@ std::expected<server_context, std::error_condition> server_context::make(const s
         if (!key_source.has_value()) return std::unexpected(key_source.error());
 
         std::shared_ptr<Botan::Private_Key> key = Botan::PKCS8::load_key(**key_source);
-        if (!key) return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        if (!key) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
         auto rng   = std::make_shared<Botan::System_RNG>();
         auto state = std::make_shared<detail::server_state>(detail::server_state{
@@ -518,7 +524,7 @@ std::expected<server_context, std::error_condition> server_context::make(const s
     catch (const std::exception&)
     {
         // e.g. the key isn't PKCS #8.
-        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 }
 
@@ -530,12 +536,12 @@ stream::stream(stream&&) noexcept            = default;
 stream& stream::operator=(stream&&) noexcept = default;
 stream::~stream()                            = default;
 
-coro::task<std::expected<stream, std::error_condition>>
+coro::task<std::expected<stream, std::error_code>>
 stream::connect(tcp_socket conn, const client_context& ctx, std::string host, io::clock::time_point deadline)
 {
     // the certificate is checked against host: without one, nothing would be.
     if (host.empty() && !ctx.state->skip_verification)
-        co_return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+        co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     auto c = std::make_unique<detail::connection>(std::move(conn));
 
@@ -555,14 +561,14 @@ stream::connect(tcp_socket conn, const client_context& ctx, std::string host, io
     }
     catch (const std::exception&)
     {
-        co_return std::unexpected(make_error_condition(errc::protocol_error));
+        co_return std::unexpected(make_error_code(errc::protocol_error));
     }
 
     if (auto err = co_await c->handshake(deadline); err) co_return std::unexpected(err);
     co_return stream{std::move(c)};
 }
 
-coro::task<std::expected<stream, std::error_condition>>
+coro::task<std::expected<stream, std::error_code>>
 stream::accept(tcp_socket conn, const server_context& ctx, io::clock::time_point deadline)
 {
     auto c = std::make_unique<detail::connection>(std::move(conn));
@@ -580,7 +586,7 @@ stream::accept(tcp_socket conn, const server_context& ctx, io::clock::time_point
     }
     catch (const std::exception&)
     {
-        co_return std::unexpected(make_error_condition(errc::protocol_error));
+        co_return std::unexpected(make_error_code(errc::protocol_error));
     }
 
     if (auto err = co_await c->handshake(deadline); err) co_return std::unexpected(err);
@@ -596,7 +602,7 @@ coro::task<io::result> stream::read(std::span<std::byte> data)
         if (auto count = conn->take_received(data); count > 0) return coro::ready_task<io::result>(io::result{.count = count});
         if (conn->failure) return coro::ready_task<io::result>(io::result{.err = conn->failure});
         if (conn->peer_closed)
-            return coro::ready_task<io::result>(io::result{.err = make_error_condition(io::status_condition::closed)});
+            return coro::ready_task<io::result>(io::result{.err = make_error_code(io::errc::end_of_stream)});
     }
 
     return conn->read_more(data);
@@ -608,7 +614,7 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
         std::scoped_lock lock{conn->mu};
         if (conn->failure) return coro::ready_task<io::result>(io::result{.err = conn->failure});
         if (conn->channel->is_closed_for_writing())
-            return coro::ready_task<io::result>(io::result{.err = make_error_condition(io::status_condition::closed)});
+            return coro::ready_task<io::result>(io::result{.err = make_error_code(io::errc::end_of_stream)});
 
         try
         {
@@ -616,7 +622,7 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
         }
         catch (const std::exception&)
         {
-            return coro::ready_task<io::result>(io::result{.err = make_error_condition(errc::protocol_error)});
+            return coro::ready_task<io::result>(io::result{.err = make_error_code(errc::protocol_error)});
         }
     }
 

@@ -57,7 +57,7 @@ class client_context
 {
 public:
     // make loads the trusted certificate authorities, failing if trusted_ca_file can't be read.
-    static std::expected<client_context, std::error_condition> make(const client_options& options = {});
+    static std::expected<client_context, std::error_code> make(const client_options& options = {});
 
 private:
     friend class stream;
@@ -85,7 +85,7 @@ class server_context
 {
 public:
     // make loads the certificate chain and private key, failing if either can't be read.
-    static std::expected<server_context, std::error_condition> make(const server_options& options);
+    static std::expected<server_context, std::error_code> make(const server_options& options);
 
 private:
     friend class stream;
@@ -102,7 +102,7 @@ private:
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends
-// the stream (io::status_condition::closed).
+// the stream (io::errc::end_of_stream). Both compare equal to io::status_condition::closed.
 class stream final
     : public io::reader
     , public io::writer
@@ -110,11 +110,11 @@ class stream final
 public:
     // connect runs a client's handshake over conn, with host (the server's name, for SNI, and which its certificate
     // must have), until deadline.
-    static coro::task<std::expected<stream, std::error_condition>>
+    static coro::task<std::expected<stream, std::error_code>>
     connect(tcp_socket conn, const client_context& ctx, std::string host, io::clock::time_point deadline);
 
     // accept runs a server's handshake over conn, until deadline.
-    static coro::task<std::expected<stream, std::error_condition>>
+    static coro::task<std::expected<stream, std::error_code>>
     accept(tcp_socket conn, const server_context& ctx, io::clock::time_point deadline);
 
     stream(const stream&)            = delete;
@@ -163,10 +163,9 @@ enum class errc : std::uint16_t
 // category is TLS's errors: alerts (by their codes in the TLS RFCs), and errc.
 [[nodiscard]] const std::error_category& category() noexcept;
 
-[[nodiscard]] std::error_condition make_error_condition(errc err) noexcept;
-
+[[nodiscard]] std::error_code make_error_code(errc err) noexcept;
 }
 
 template<>
-struct std::is_error_condition_enum<net::tls::errc> : std::true_type
+struct std::is_error_code_enum<net::tls::errc> : std::true_type
 {};

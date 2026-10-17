@@ -158,8 +158,8 @@ struct server_request
     }
 };
 
-using request_decoder_result = std::expected<server_request, std::error_condition>;
-using request_encoder_result = std::expected<io::writer*, std::error_condition>;
+using request_decoder_result = std::expected<server_request, std::error_code>;
+using request_encoder_result = std::expected<io::writer*, std::error_code>;
 
 // request_decoders borrow the connection's reader, which must outlive the decoded request's body. The reader is kept
 // for the connection, rather than per request, so that anything buffered past the end of one request is still there

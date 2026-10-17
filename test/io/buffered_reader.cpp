@@ -77,7 +77,7 @@ TEST_CASE("large read past the end reports closed", "[io][buffered_reader]")
     std::string buf(20, 0);
 
     auto res = test::sync_wait(reader.read(buf));
-    CHECK(res.err == net::io::status_condition::closed);
+    CHECK(res.err == net::io::errc::end_of_stream);
     CHECK(res.count == 3);
     CHECK(buf.substr(0, res.count) == "abc"sv);
 }
@@ -90,10 +90,10 @@ TEST_CASE("reader that makes no progress is an error", "[io][buffered_reader]")
     std::string large(20, 0);
 
     auto res = test::sync_wait(reader.read(large));
-    CHECK(res.err == net::io::status_condition::error);
+    CHECK(res.err == net::io::errc::no_progress);
 
     std::string small(2, 0);
 
     res = test::sync_wait(reader.read(small));
-    CHECK(res.err == net::io::status_condition::error);
+    CHECK(res.err == net::io::errc::no_progress);
 }

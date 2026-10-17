@@ -105,7 +105,7 @@ private:
     static void start_response(connection_state& state, io::discard_writer& no_body);
 
     // The ways a connection ends other than the client closing it, which close it.
-    coro::task<> end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_condition err);
+    coro::task<> end_after_decode_error(tcp_socket& conn, connection_state& state, std::error_code err);
     coro::task<> end_after_handler_failure(tcp_socket&        conn,
                                            connection_state&  state,
                                            response_writer&   rw,
