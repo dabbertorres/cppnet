@@ -9,6 +9,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# TLS (e.g. HTTPS), with Botan: vcpkg's "tls" feature, which is on by default. Turning it off skips building Botan.
+option(NET_TLS "Build TLS support (with Botan)" ON)
+if(NOT NET_TLS)
+  set(VCPKG_MANIFEST_NO_DEFAULT_FEATURES ON)
+endif()
+
 # use vcpkg for dependency management
 include("cmake/vcpkg.cmake")
 
@@ -22,6 +28,9 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(glaze CONFIG REQUIRED)
 
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "src/*.cpp")
+if(NOT NET_TLS)
+  list(FILTER sources EXCLUDE REGEX "/src/tls/")
+endif()
 add_library(net ${sources})
 
 target_include_directories(
@@ -45,6 +54,26 @@ target_link_libraries(
   PUBLIC spdlog::spdlog
   PRIVATE glaze::glaze
 )
+
+if(NET_TLS)
+  find_package(Botan CONFIG REQUIRED)
+
+  # vcpkg builds Botan as a static library (or a shared one, with a dynamic triplet).
+  if(TARGET botan::botan)
+    set(NET_BOTAN_TARGET botan::botan)
+  else()
+    set(NET_BOTAN_TARGET botan::botan-static)
+  endif()
+
+  target_link_libraries(net PRIVATE ${NET_BOTAN_TARGET})
+  target_compile_definitions(net PUBLIC NET_HAS_TLS=1)
+
+  # Botan reads the system's trust store from the keychain on Apple's platforms, which its CMake package doesn't say
+  # needs these when it's a static library.
+  if(APPLE)
+    target_link_libraries(net PRIVATE "-framework CoreFoundation" "-framework Security")
+  endif()
+endif()
 
 if(BUILD_TESTING)
   include(CTest)
