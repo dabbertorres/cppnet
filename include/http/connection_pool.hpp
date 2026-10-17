@@ -9,20 +9,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <system_error>
 #include <unordered_map>
-#include <utility>
-#include <variant>
 #include <vector>
 
 #include "coro/task.hpp"
-#include "io/io.hpp"
-#include "io/reader.hpp"
+#include "http/connection.hpp"
 #include "io/scheduler.hpp"
-#include "io/writer.hpp"
-#include "tcp.hpp"
 
 #ifdef NET_HAS_TLS
 #    include "tls/tls.hpp"
@@ -78,48 +72,6 @@ struct connection_stats
 
 namespace detail
 {
-
-    // connection is a connection to a server: TCP, or TLS over TCP.
-    class connection final
-        : public io::reader
-        , public io::writer
-    {
-    public:
-        explicit connection(tcp_socket conn) noexcept
-            : conn{std::move(conn)}
-        {}
-
-#ifdef NET_HAS_TLS
-        explicit connection(tls::stream conn) noexcept
-            : conn{std::move(conn)}
-        {}
-#endif
-
-        coro::task<io::result> read(std::span<std::byte> data) override
-        {
-            return std::visit([&](auto& c) { return c.read(data); }, conn);
-        }
-
-        coro::task<io::result> write(std::span<const std::byte> data) override
-        {
-            return std::visit([&](auto& c) { return c.write(data); }, conn);
-        }
-
-        using io::reader::read;
-        using io::writer::write;
-
-        // socket is the TCP connection (under TLS's, if it's TLS), e.g. for deadlines and timeouts.
-        [[nodiscard]] tcp_socket& socket() noexcept;
-
-        [[nodiscard]] io::handle native_handle() const noexcept override;
-
-    private:
-#ifdef NET_HAS_TLS
-        std::variant<tcp_socket, tls::stream> conn;
-#else
-        std::variant<tcp_socket> conn;
-#endif
-    };
 
     // connection_pool keeps connections open for reuse, keyed by scheme, host and port, within client_options' limits.
     //

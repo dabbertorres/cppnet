@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ratio>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -31,7 +32,7 @@ bool still_open(const net::http::detail::connection& conn) noexcept
 {
     char byte = 0;
     // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): MSG_DONTWAIT, so it doesn't block.
-    auto n = ::recv(conn.native_handle(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    auto n = ::recv(net::http::detail::native_handle(conn), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     return n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
@@ -39,22 +40,6 @@ bool still_open(const net::http::detail::connection& conn) noexcept
 
 namespace net::http::detail
 {
-
-tcp_socket& connection::socket() noexcept
-{
-#ifdef NET_HAS_TLS
-    if (auto* tls = std::get_if<tls::stream>(&conn)) return tls->socket();
-#endif
-    return *std::get_if<tcp_socket>(&conn);
-}
-
-io::handle connection::native_handle() const noexcept
-{
-#ifdef NET_HAS_TLS
-    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->native_handle();
-#endif
-    return std::get_if<tcp_socket>(&conn)->native_handle();
-}
 
 connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}

@@ -110,6 +110,9 @@ struct server_request
     // The host the request is for: from the target, if it has one, otherwise the Host header.
     std::string host{};
 
+    // Whether the request came over TLS (HTTPS): e.g. for building absolute URLs, or Secure cookies.
+    bool tls = false;
+
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
     // It views the router's copy, so is only valid while the router is (as it is while the router handles it).
     std::string_view route{};
@@ -140,7 +143,8 @@ struct server_request
     // target.path, after any added before it, and name must outlive the request (e.g. being the router's).
     void add_path_value(std::string_view name, std::string_view encoded);
 
-    // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces).
+    // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces), and
+    // tls, as the next request comes over the same connection.
     void clear() noexcept
     {
         method  = request_method::NONE;

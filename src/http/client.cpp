@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "http/connection.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
@@ -42,10 +43,10 @@ class pooled_body final : public net::io::reader
 {
 public:
     pooled_body(std::shared_ptr<net::http::detail::connection_pool> pool,
-                net::http::detail::connection_pool::lease          leased)
+                net::http::detail::connection_pool::lease           leased)
         : pool{std::move(pool)}
         , leased{std::move(leased)}
-        , reader{std::make_unique<net::io::buffered_reader>(this->leased.conn.get())}
+        , reader{std::make_unique<net::io::buffered_reader>(&net::http::detail::as_reader(*this->leased.conn))}
     {}
 
     pooled_body(const pooled_body&)            = delete;
@@ -92,7 +93,7 @@ public:
 
     [[nodiscard]] net::io::handle native_handle() const noexcept override
     {
-        return leased.conn != nullptr ? leased.conn->native_handle() : -1;
+        return leased.conn != nullptr ? net::http::detail::native_handle(*leased.conn) : -1;
     }
 
 private:
@@ -201,7 +202,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
 
         // NOTE: set every time, as a reused connection has whatever its last request left.
         const auto& options = pool->options();
-        auto&       sock    = conn->socket();
+        auto&       sock    = detail::socket_of(*conn);
         sock.set_deadline(std::nullopt);
         sock.set_timeout(limit(options.io_timeout));
 
@@ -213,7 +214,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
         };
 
         // the head in one write, rather than one per field.
-        io::buffered_writer out{body->connection(), 4'096};
+        io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
 
         auto res = co_await http11::request_encode(&out, request);
         if (res.has_value())
