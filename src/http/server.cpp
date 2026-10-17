@@ -164,7 +164,11 @@ server::server(io::scheduler* scheduler, request_handler handler, const server_c
     , write_timeout{cfg.write_timeout}
     , max_connections{cfg.max_connections}
     , max_pending_connections{cfg.max_pending_connections}
-{}
+{
+    // NOTE: listening from now, rather than from when serve() starts (on a worker), so connections made in between are
+    //       queued (up to max_pending_connections) rather than refused.
+    listener.listen(max_pending_connections);
+}
 
 server::~server()
 {
@@ -203,8 +207,6 @@ coro::task<> server::serve()
     {
         throw exception{"already serving"};
     }
-
-    listener.listen(max_pending_connections);
 
     auto backoff = io::clock::duration::zero();
 

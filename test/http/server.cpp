@@ -724,3 +724,24 @@ TEST_CASE("the server serves at most max_connections at once", "[http][server][l
     second.set_receive_timeout(5s);
     CHECK(second.read_some().ends_with("\r\n\r\nsecond"));
 }
+
+TEST_CASE("connections made before the server serves are queued, not refused", "[http][server]")
+{
+    running_scheduler running;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+
+    // connects (and sends a request) before serve() has even been spawned.
+    blocking_client conn{server.local_port()};
+    conn.send("GET /early HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    REQUIRE(running.sched.spawn(server.serve()));
+    CHECK(conn.read_some().ends_with("\r\n\r\nearly"));
+}

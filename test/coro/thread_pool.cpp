@@ -269,6 +269,9 @@ TEST_CASE("a worker that's stuck running a coroutine doesn't hold up polling", "
 {
     thread_pool pool{3};
     test_poller poller;
+
+    // NOTE: the workers fall asleep before the poller's attached, as a scheduler's usually do.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
     REQUIRE(pool.attach(&poller));
 
     // the worker that polled runs the first coroutine it readied, which gets stuck.

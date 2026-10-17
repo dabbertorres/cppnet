@@ -256,14 +256,10 @@ public:
         addr.sin_port        = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-        // the server may not be listening yet.
+        // NOTE: the server listens from when it's constructed.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
-        while (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
-        {
-            ::close(fd);
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-            fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        }
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
+            std::println(stderr, "failed to connect to the server");
     }
 
     client(const client&)            = delete;
