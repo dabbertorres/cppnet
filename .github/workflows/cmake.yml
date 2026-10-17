@@ -7,7 +7,7 @@ on:
     branches: [ master ]
 
 jobs:
-  build:
+  test:
     name: ${{ matrix.os }} / ${{ matrix.compiler }}
 
     strategy:
@@ -133,3 +133,13 @@ jobs:
 
     - name: Test
       run: ctest --test-dir build --output-on-failure
+
+  # The check master's branch protection requires, which passes only if every job of the matrix did, so the matrix can
+  # change without changing the protection.
+  build:
+    needs: test
+    if: always()
+    runs-on: ubuntu-26.04
+    steps:
+    - name: Check the matrix's results
+      run: test "${{ needs.test.result }}" = success
