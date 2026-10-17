@@ -684,14 +684,15 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
     };
 
     // reads a little at a time (16 KiB every 10ms, so over a second for all of it): the write makes progress well
-    // within the timeout, but takes longer altogether. It stops once the write has, if that's first (e.g. as it timed
-    // out).
-    std::size_t       read          = 0;
-    std::atomic<bool> write_stopped = false;
+    // within the timeout, but takes longer altogether. It stops if the write fails (e.g. times out), as the rest won't
+    // come; otherwise, it reads it all, as the write finishes once its data is in the socket's buffers, before it's
+    // read.
+    std::size_t       read         = 0;
+    std::atomic<bool> write_failed = false;
     std::thread       slow_reader{[&, fd = reader.native_handle()]
                                   {
                                 std::vector<char> buf(std::size_t{16} * 1'024);
-                                while (read < total && !write_stopped.load())
+                                while (read < total && !write_failed.load())
                                 {
                                     std::this_thread::sleep_for(10ms);
 
@@ -706,7 +707,7 @@ TEST_CASE("socket write timeouts limit each wait, rather than the whole write", 
     auto [count, err] = sched.run_to_completion(write_all_of_it(&writer));
     auto elapsed      = net::io::clock::now() - start;
 
-    write_stopped = true;
+    if (err) write_failed = true;
     slow_reader.join();
 
     CHECK_FALSE(err);
