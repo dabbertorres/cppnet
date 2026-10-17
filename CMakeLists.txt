@@ -9,13 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# TLS (e.g. HTTPS), with Botan: vcpkg's "tls" feature, which is on by default. Turning it off skips building Botan.
-option(NET_TLS "Build TLS support (with Botan)" ON)
-if(NOT NET_TLS)
-  set(VCPKG_MANIFEST_NO_DEFAULT_FEATURES ON)
-endif()
-
-# use vcpkg for dependency management
+# use vcpkg for dependency management (and NET_TLS: see there)
 include("cmake/vcpkg.cmake")
 
 project(
@@ -32,6 +26,7 @@ if(NOT NET_TLS)
   list(FILTER sources EXCLUDE REGEX "/src/tls/")
 endif()
 add_library(net ${sources})
+add_library(net::net ALIAS net)
 
 target_include_directories(
   net
@@ -75,6 +70,11 @@ if(NET_TLS)
   endif()
 endif()
 
+# The rest is cppnet's own: not built when another project builds cppnet (with add_subdirectory()).
+if(NOT CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  return()
+endif()
+
 if(BUILD_TESTING)
   include(CTest)
   add_subdirectory("test/")
@@ -87,7 +87,7 @@ if(BUILD_BENCHMARKS)
 endif()
 
 if(BUILD_EXAMPLE)
-  file(GLOB example_dirs LIST_DIRECTORIES true "example/*")
+  file(GLOB example_dirs LIST_DIRECTORIES true CONFIGURE_DEPENDS "example/*")
   foreach(dir ${example_dirs})
     if(IS_DIRECTORY ${dir})
       add_subdirectory(${dir})
