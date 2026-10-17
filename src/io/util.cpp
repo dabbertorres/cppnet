@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <expected>
 #include <limits>
 #include <span>
 #include <string>
@@ -13,6 +14,7 @@
 #include "coro/task.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 
 namespace net::io
 {
@@ -73,4 +75,33 @@ read_terminated_line(buffered_reader* reader, std::size_t max_length, std::strin
     co_return co_await read_line(reader, max_length, end_of_line, false);
 }
 
+coro::task<std::expected<std::string, std::error_code>> read_all(reader& in, std::size_t max_size)
+{
+    constexpr std::size_t chunk = 16'384;
+
+    std::string out;
+    while (true)
+    {
+        const auto room = std::min(chunk, max_size - out.size());
+
+        // with no room left, whether there's more decides between done and too large.
+        if (room == 0)
+        {
+            std::byte extra{};
+            auto      res = co_await in.read(extra);
+            if (res.count > 0) co_return std::unexpected(std::make_error_code(std::errc::value_too_large));
+            if (res.err == errc::end_of_stream) co_return out;
+            co_return std::unexpected(res.err ? res.err : make_error_code(errc::no_progress));
+        }
+
+        const auto size = out.size();
+        out.resize(size + room);
+        auto res = co_await in.read(std::span{out}.subspan(size));
+        out.resize(size + res.count);
+
+        if (res.err == errc::end_of_stream) co_return out;
+        if (res.err) co_return std::unexpected(res.err);
+        if (res.count == 0) co_return std::unexpected(make_error_code(errc::no_progress));
+    }
+}
 }

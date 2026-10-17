@@ -1,12 +1,15 @@
 #pragma once
 
 #include <cstddef>
+#include <expected>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
 
 #include "coro/task.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/reader.hpp"
 #include "util/result.hpp"
 
 namespace net::io
@@ -25,4 +28,8 @@ coro::task<readline_result> readline(buffered_reader* reader, std::string_view e
 coro::task<readline_result>
 read_terminated_line(buffered_reader* reader, std::size_t max_length, std::string_view end_of_line = "\r\n"sv) noexcept;
 
+// read_all reads in until the stream ends (errc::end_of_stream), and returns what it read. It fails with the error that
+// stopped it otherwise, or std::errc::value_too_large if there's more than max_size bytes.
+coro::task<std::expected<std::string, std::error_code>>
+read_all(reader& in, std::size_t max_size = std::numeric_limits<std::size_t>::max());
 }
