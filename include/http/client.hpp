@@ -3,6 +3,7 @@
 #include <expected>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 #include "coro/task.hpp"
@@ -43,6 +44,10 @@ public:
     // than response_header_timeout, or sending the request stalls for io_timeout. Reading the body fails the same way
     // if it stalls for io_timeout.
     coro::task<std::expected<client_response, std::error_code>> send(client_request request);
+
+    // get sends a GET request for url (e.g. "http://example.com/path"), as send() does. It fails with
+    // std::errc::invalid_argument if url isn't valid.
+    coro::task<std::expected<client_response, std::error_code>> get(std::string_view url);
 
     // close_idle closes the connections that are waiting to be reused.
     void close_idle() noexcept;
