@@ -12,6 +12,15 @@
 namespace net::coro
 {
 
+namespace
+{
+
+    // current_pool is the pool whose worker the thread is, if any. (Set by the workers, so not const.)
+    // NOLINTNEXTLINE(*-avoid-non-const-global-variables)
+    thread_local const thread_pool* current_pool = nullptr;
+
+}
+
 std::size_t hardware_concurrency(std::size_t minus_amount) noexcept
 {
     static const auto count = std::thread::hardware_concurrency();
@@ -119,8 +128,12 @@ std::size_t thread_pool::queue_size() const noexcept
 
 bool thread_pool::queue_empty() const noexcept { return queue_size() == 0; }
 
+bool thread_pool::on_worker() const noexcept { return current_pool == this; }
+
 void thread_pool::worker()
 {
+    current_pool = this;
+
     std::vector<std::coroutine_handle<>> ready;
     std::size_t                          since_poll = 0;
 

@@ -260,7 +260,8 @@ public:
     scheduler(scheduler&&)            = delete;
     scheduler& operator=(scheduler&&) = delete;
 
-    // Calls shutdown(): must not be destroyed from one of its own tasks.
+    // Calls shutdown(): must not be destroyed from one of its own tasks (or one of the pool's workers), which
+    // terminates the program (as shutdown() throws).
     ~scheduler() noexcept override;
 
     // register_handle must be called before waiting on a handle, and deregister_handle before closing it.
@@ -406,8 +407,9 @@ public:
     [[nodiscard]] bool stop_requested() const noexcept;
 
     // shutdown stops the scheduler, and blocks until its tasks have finished, and run() has returned (if running). It
-    // must not be called from one of the scheduler's own tasks, which would then wait for itself.
-    void shutdown() noexcept;
+    // throws std::logic_error if it's called from one of the pool's workers (e.g. by one of the scheduler's tasks),
+    // which would wait for itself: call request_stop() there instead.
+    void shutdown();
 
 private:
     using completions = std::vector<std::coroutine_handle<>>;
