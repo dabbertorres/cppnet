@@ -84,8 +84,9 @@ bool thread_pool::attach(poller* p) noexcept
 
         polls = p;
 
-        // a sleeping worker can poll now.
-        woken = wake_locked(1);
+        // a sleeping worker can poll now, and another be the standby (see worker()): workers that fell asleep before
+        // there was a poller aren't, and wouldn't check.
+        woken = wake_locked(2);
     }
 
     notify(woken);

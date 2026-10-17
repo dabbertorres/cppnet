@@ -56,6 +56,9 @@ struct server_config
 class server
 {
 public:
+    // The server listens from when it's constructed, queuing connections (up to max_pending_connections) until serve()
+    // accepts them.
+    //
     // handler is called for each request. If it returns without sending a response, an empty 200 OK is sent. If it
     // throws, a 500 Internal Server Error is sent (if nothing was yet), and the connection is closed.
     server(io::scheduler* scheduler, request_handler handler, const server_config& cfg = server_config{});
