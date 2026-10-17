@@ -36,6 +36,7 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/string_reader.hpp"
+#include "io/util.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
@@ -124,6 +125,54 @@ TEST_CASE("the client sends a request, and reads the response", "[http][client]"
     CHECK(body == "hello");
     CHECK(request_head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
     CHECK(request_head.contains("\r\nHost: 127.0.0.1:" + port + "\r\n"));
+}
+
+TEST_CASE("get() sends a GET, over HTTP/1.1", "[http][client]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    std::string request_head;
+    REQUIRE(sched.spawn(serve_once(&listener, &request_head)));
+
+    auto get = [](net::io::scheduler* sched, std::string url) -> task<std::string>
+    {
+        net::http::client client{sched};
+
+        auto resp = co_await client.get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        co_return body.has_value() ? *body : "error: " + body.error().message();
+    };
+
+    auto port = local_port(listener);
+    CHECK(sched.run_to_completion(get(&sched, "http://127.0.0.1:" + port + "/path?q=1")) == "hello");
+    CHECK(request_head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+}
+
+TEST_CASE("requests must be valid to be sent", "[http][client]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    auto send = [](net::io::scheduler* sched) -> task<std::pair<std::error_code, std::error_code>>
+    {
+        net::http::client client{sched};
+
+        auto bad_url = co_await client.get("http://[::1");
+
+        net::http::client_request no_method{.method = net::http::request_method::NONE};
+        no_method.uri.host = "127.0.0.1";
+        auto sent          = co_await client.send(std::move(no_method));
+
+        co_return std::pair{bad_url.has_value() ? std::error_code{} : bad_url.error(),
+                            sent.has_value() ? std::error_code{} : sent.error()};
+    };
+
+    auto [bad_url, no_method] = sched.run_to_completion(send(&sched));
+    CHECK(bad_url == std::errc::invalid_argument);
+    CHECK(no_method == std::errc::invalid_argument);
 }
 
 TEST_CASE("the client only sends HTTP/1.x", "[http][client]")

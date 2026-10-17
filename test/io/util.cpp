@@ -185,3 +185,30 @@ TEST_CASE("long lines don't take a coroutine per byte", "[io][readline][read_ter
         CHECK(res.to_value() == long_line);
     }
 }
+
+TEST_CASE("read_all reads to the end of the stream, within its limit", "[io][read_all]")
+{
+    const auto read = [](std::string_view text, std::size_t max)
+    {
+        net::io::string_reader reader(text);
+        return test::sync_wait(net::io::read_all(reader, max));
+    };
+
+    CHECK(read("hello"sv, 100) == "hello");
+    CHECK(read(""sv, 100) == "");
+    CHECK(read("hello"sv, 5) == "hello");
+    CHECK(read("hello"sv, 4).error() == std::errc::value_too_large);
+    CHECK(read("hello"sv, 0).error() == std::errc::value_too_large);
+
+    const std::string big(100'000, 'x');
+    CHECK(read(big, big.size()) == big);
+}
+
+TEST_CASE("read_all reports what stopped it", "[io][read_all]")
+{
+    timing_out_reader reader("partial"sv);
+
+    auto res = test::sync_wait(net::io::read_all(reader));
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == std::errc::timed_out);
+}

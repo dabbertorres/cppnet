@@ -239,6 +239,20 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
     }
 }
 
+coro::task<std::expected<client_response, std::error_code>> client::get(std::string_view url)
+{
+    // NOTE: not a coroutine, so url is parsed before this returns, rather than when the task starts (when it might be
+    //       gone).
+    auto parsed = url::parse(url);
+    if (!parsed.has_value())
+    {
+        return coro::ready_task<std::expected<client_response, std::error_code>>(
+            std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+    }
+
+    return send(client_request{.uri = std::move(parsed).to_value()});
+}
+
 void client::close_idle() noexcept { pool->close_idle(); }
 
 connection_stats client::stats() const { return pool->stats(); }

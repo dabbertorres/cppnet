@@ -704,7 +704,7 @@ std::error_code check_request(const client_request& req) noexcept
 {
     try
     {
-        if (!valid_fields(req.headers)) return invalid();
+        if (req.method == request_method::NONE || !valid_fields(req.headers)) return invalid();
 
         auto framing = frame_request(req);
         if (!framing.has_value()) return framing.error();
