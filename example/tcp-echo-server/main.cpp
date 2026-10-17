@@ -1,20 +1,17 @@
+// tcp-echo-server echoes what each connection sends on port 7777, until SIGINT or SIGTERM.
+
 #include <array>
-#include <cerrno>
 #include <csignal>
 #include <cstddef>
-#include <cstdlib>
 #include <expected>
 #include <memory>
 #include <span>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <utility>
 
 #include <pthread.h>
 
-#include <spdlog/common.h>
-#include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
@@ -43,10 +40,8 @@ net::coro::task<> serve_connection(net::tcp_socket socket)
     }
 }
 
-net::coro::task<> run_echo_server(net::io::scheduler& scheduler, net::listener& listener)
+net::coro::task<> run_echo_server(net::io::scheduler& scheduler, const net::listener& listener)
 {
-    listener.listen(512);
-
     while (true)
     {
         auto socket = co_await listener.accept();
@@ -66,44 +61,39 @@ net::coro::task<> run_echo_server(net::io::scheduler& scheduler, net::listener& 
 
 int main()
 {
-    auto logger = spdlog::default_logger()->clone("default");
-    logger->set_level(spdlog::level::trace);
-    logger->set_pattern("[%T.%e] [%^%-5!l%$] [%-11!n] [t %-8!t] %v");
-    spdlog::set_default_logger(logger);
-
     // Block the signals before starting any threads (which inherit the mask), so that only sigwait() receives them.
-    sigset_t sig_set{};
-    sigemptyset(&sig_set);
-    sigaddset(&sig_set, SIGINT);
-    sigaddset(&sig_set, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &sig_set, nullptr);
+    sigset_t signals{};
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
-    auto workers = std::make_shared<net::coro::thread_pool>(net::coro::hardware_concurrency(1));
+    // the runtime: worker threads, and a scheduler that runs tasks on them and waits for their I/O.
+    net::io::scheduler scheduler{std::make_shared<net::coro::thread_pool>()};
 
-    net::io::scheduler scheduler{workers, logger};
-    net::listener      listener{&scheduler, "7777", net::network::tcp};
-
-    spdlog::info("starting...");
-    scheduler.spawn(run_echo_server(scheduler, listener));
-
-    auto run_thread = std::thread{[&] { scheduler.run(); }};
-
-    int sig = 0;
-    int ret = sigwait(&sig_set, &sig);
-    if (ret != 0)
+    auto listener = net::listener::make(&scheduler, "", "7777");
+    if (!listener.has_value())
     {
-        spdlog::critical("error in sigwait(): {}; errno = {}", ret, errno);
-        std::abort();
+        spdlog::critical("can't listen on port 7777: {}", listener.error().message());
+        return 1;
+    }
+
+    scheduler.spawn(run_echo_server(scheduler, *listener));
+    spdlog::info("echoing on port 7777");
+
+    // the scheduler's workers serve the connections: this thread only waits for a signal.
+    int sig = 0;
+    if (int err = sigwait(&signals, &sig); err != 0)
+    {
+        spdlog::critical("sigwait() failed: {}", err);
+        return 1;
     }
 
     spdlog::info("shutting down...");
 
-    listener.shutdown();
+    // stop accepting, and cancel what the connections are waiting for (ending them), then wait for them to finish.
+    listener->shutdown();
     scheduler.shutdown();
-
-    if (run_thread.joinable()) run_thread.join();
-
-    spdlog::info("done");
 
     return 0;
 }
