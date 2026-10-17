@@ -152,6 +152,23 @@ TEST_CASE("get() sends a GET, over HTTP/1.1", "[http][client]")
     CHECK(request_head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
 }
 
+#ifndef NET_HAS_TLS
+TEST_CASE("without TLS, https isn't supported", "[http][client]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    auto get = [](net::io::scheduler* sched) -> task<std::error_code>
+    {
+        net::http::client client{sched};
+
+        auto resp = co_await client.get("https://127.0.0.1/");
+        co_return resp.has_value() ? std::error_code{} : resp.error();
+    };
+
+    CHECK(sched.run_to_completion(get(&sched)) == std::errc::protocol_not_supported);
+}
+#endif
+
 TEST_CASE("requests must be valid to be sent", "[http][client]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};

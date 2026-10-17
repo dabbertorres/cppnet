@@ -133,13 +133,14 @@ blocks: call it with `run_blocking` from a task.
 
 ## HTTP client
 
-`http::client` (`http/client.hpp`) sends HTTP/1.1 requests, reusing connections within `client_options`' limits (per
-host, altogether, idle time), with timeouts for connecting, the response's head, and stalled reads and writes.
+`http::client` (`http/client.hpp`) sends HTTP/1.1 requests, to `http://` and `https://` URLs, reusing connections
+within `client_options`' limits (per host, altogether, idle time), with timeouts for connecting, the TLS handshake,
+the response's head, and stalled reads and writes.
 
 ```cpp
 net::http::client client{&scheduler};
 
-auto resp = co_await client.get("http://example.com/");    // std::expected<client_response, std::error_code>
+auto resp = co_await client.get("https://example.com/");   // std::expected<client_response, std::error_code>
 if (!resp) co_return;
 
 auto body = co_await net::io::read_all(*resp->body, 1024 * 1024);
@@ -158,6 +159,11 @@ auto resp = co_await client.send(std::move(req));
 
 A response's connection is reused once its body has been read to the end, and closed if the response is destroyed
 first.
+
+For `https://`, the server's certificate is verified against the system's trusted certificate authorities, or those
+in `client_options::tls` (e.g. `options.tls.trusted_ca_file = "ca.pem"`, for a private CA). A failed verification
+compares equal to `tls::alert::bad_certificate`, and says why in its message. Without TLS (`NET_TLS` off), `https://`
+fails with `std::errc::protocol_not_supported`.
 
 ## HTTP server
 
@@ -195,7 +201,8 @@ scheduler.spawn(server.serve());
 
 ## TLS
 
-TLS (`tls/tls.hpp`, built unless `NET_TLS` is off, when `NET_HAS_TLS` is defined) runs over a TCP socket:
+The HTTP client uses TLS for `https://` URLs by itself. To use it directly, TLS (`tls/tls.hpp`, built unless `NET_TLS`
+is off, when `NET_HAS_TLS` is defined) runs over a TCP socket:
 
 ```cpp
 auto ctx = net::tls::client_context::make();        // the system's trusted CAs (or client_options' CA file)

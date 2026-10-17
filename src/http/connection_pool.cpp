@@ -27,7 +27,7 @@ namespace
 
 // still_open checks that an idle connection hasn't been closed (or sent something unasked for) by the server, which
 // is common: servers close idle connections after their own timeouts.
-bool still_open(const net::tcp_socket& conn) noexcept
+bool still_open(const net::http::detail::connection& conn) noexcept
 {
     char byte = 0;
     // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): MSG_DONTWAIT, so it doesn't block.
@@ -40,24 +40,48 @@ bool still_open(const net::tcp_socket& conn) noexcept
 namespace net::http::detail
 {
 
-connection_pool::connection_pool(io::scheduler* scheduler, const client_options& options)
+tcp_socket& connection::socket() noexcept
+{
+#ifdef NET_HAS_TLS
+    if (auto* tls = std::get_if<tls::stream>(&conn)) return tls->socket();
+#endif
+    return *std::get_if<tcp_socket>(&conn);
+}
+
+int connection::native_handle() const noexcept
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->native_handle();
+#endif
+    return std::get_if<tcp_socket>(&conn)->native_handle();
+}
+
+connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}
-    , config{options}
+    , config{std::move(options)}
 {}
 
 connection_pool::~connection_pool() = default;
 
-std::string connection_pool::make_key(const std::string& host, const std::string& port)
+std::string connection_pool::make_key(const std::string& scheme, const std::string& host, const std::string& port)
 {
-    std::string key = host;
+    std::string key = scheme + "://" + host;
     std::ranges::transform(key, key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return key + " " + port;
 }
 
 coro::task<std::expected<connection_pool::lease, std::error_code>>
-connection_pool::acquire(std::string host, std::string port, bool allow_idle)
+connection_pool::acquire(std::string scheme, std::string host, std::string port, bool allow_idle)
 {
-    const auto key      = make_key(host, port);
+#ifdef NET_HAS_TLS
+    const bool tls = scheme == "https";
+    if (!tls && scheme != "http") co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+#else
+    constexpr bool tls = false;
+    if (scheme != "http") co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+#endif
+
+    const auto key      = make_key(scheme, host, port);
     const auto deadline = io::clock::now() + config.connect_timeout;
 
     // NOTE: declared before the lock, so the connections are closed after unlocking.
@@ -112,16 +136,7 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
 
     closing.clear();
 
-    // connect within what's left of the timeout.
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - io::clock::now());
-    auto conn      = co_await tcp_socket::connect(scheduler,
-                                                  host,
-                                                  port,
-                                                  {
-                                                      .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
-                                                      .keepalive = config.tcp_keepalive,
-                                                  });
-
+    auto conn = co_await connect(tls, std::move(host), std::move(port), deadline);
     if (!conn.has_value())
     {
         {
@@ -133,8 +148,57 @@ connection_pool::acquire(std::string host, std::string port, bool allow_idle)
         co_return std::unexpected(conn.error());
     }
 
-    co_return lease{.conn = std::make_unique<tcp_socket>(std::move(*conn)), .key = key, .reused = false};
+    co_return lease{.conn = std::move(*conn), .key = key, .reused = false};
 }
+
+coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
+connection_pool::connect(bool tls, std::string host, std::string port, io::clock::time_point deadline)
+{
+    // connect within what's left of the timeout.
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - io::clock::now());
+    auto conn      = co_await tcp_socket::connect(scheduler,
+                                                  host,
+                                                  port,
+                                                  {
+                                                      .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
+                                                      .keepalive = config.tcp_keepalive,
+                                                  });
+    if (!conn.has_value()) co_return std::unexpected(conn.error());
+
+    if (!tls) co_return std::make_unique<connection>(std::move(*conn));
+
+#ifdef NET_HAS_TLS
+    auto ctx = tls_context();
+    if (!ctx.has_value()) co_return std::unexpected(ctx.error());
+
+    // NOTE: 0 is no limit, but the handshake needs a deadline.
+    const auto handshake_timeout = config.tls_handshake_timeout > std::chrono::milliseconds::zero()
+                                     ? io::clock::duration{config.tls_handshake_timeout}
+                                     : io::clock::duration{std::chrono::hours{24} * 365};
+
+    auto stream = co_await tls::stream::connect(std::move(*conn), *ctx, host, io::clock::now() + handshake_timeout);
+    if (!stream.has_value()) co_return std::unexpected(stream.error());
+
+    co_return std::make_unique<connection>(std::move(*stream));
+#else
+    co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+#endif
+}
+
+#ifdef NET_HAS_TLS
+std::expected<tls::client_context, std::error_code> connection_pool::tls_context()
+{
+    std::call_once(tls_made,
+                   [this]
+                   {
+                       auto options = config.tls;
+                       options.alpn = {"http/1.1"};
+                       tls_ctx      = tls::client_context::make(options);
+                   });
+
+    return tls_ctx;
+}
+#endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): its members are moved from.
 void connection_pool::release(lease&& leased, bool reusable) noexcept
@@ -204,9 +268,17 @@ connection_stats connection_pool::stats(const std::string& host, const std::stri
 {
     std::scoped_lock lock{mu};
 
-    auto it = hosts.find(make_key(host, port));
-    if (it == hosts.end()) return {};
-    return {.open = it->second.open, .idle = it->second.idle.size()};
+    connection_stats out;
+    for (const auto* scheme : {"http", "https"})
+    {
+        auto it = hosts.find(make_key(scheme, host, port));
+        if (it == hosts.end()) continue;
+
+        out.open += it->second.open;
+        out.idle += it->second.idle.size();
+    }
+
+    return out;
 }
 
 coro::task<> connection_pool::reap(std::weak_ptr<connection_pool> weak, io::scheduler* scheduler)
@@ -269,7 +341,7 @@ bool connection_pool::evict_idle(const std::string& except_key, connections& clo
     return true;
 }
 
-void connection_pool::forget(const std::string& key, std::unique_ptr<tcp_socket>&& conn, connections& closing)
+void connection_pool::forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing)
 {
     if (conn != nullptr) closing.push_back(std::move(conn));
 
