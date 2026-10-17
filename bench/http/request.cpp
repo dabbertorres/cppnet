@@ -121,7 +121,7 @@ public:
 private:
     task<net::io::result> wait_then_read(std::span<std::byte> data)
     {
-        if (input.empty()) co_return net::io::result{.err = make_error_condition(net::io::status_condition::closed)};
+        if (input.empty()) co_return net::io::result{.err = make_error_code(net::io::errc::end_of_stream)};
 
         // the rest of the current request, or as much as fits.
         const auto next = std::min({data.size(), input.size(), request.size() - (offset % request.size())});

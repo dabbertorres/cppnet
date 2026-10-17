@@ -88,7 +88,7 @@ public:
     // acquire returns an idle connection to host (if allow_idle, and one is still open), or connects a new one if the
     // limits allow, waiting for one to be free if not. It fails with std::errc::timed_out if that takes longer than
     // connect_timeout, or as tcp_socket::connect does.
-    coro::task<std::expected<lease, std::error_condition>> acquire(std::string host, std::string port, bool allow_idle);
+    coro::task<std::expected<lease, std::error_code>> acquire(std::string host, std::string port, bool allow_idle);
 
     // release returns a leased connection: kept idle if it's reusable (it's at the start of a response, with nothing
     // unread), and closed otherwise.

@@ -54,7 +54,7 @@ std::string connection_pool::make_key(const std::string& host, const std::string
     return key + " " + port;
 }
 
-coro::task<std::expected<connection_pool::lease, std::error_condition>>
+coro::task<std::expected<connection_pool::lease, std::error_code>>
 connection_pool::acquire(std::string host, std::string port, bool allow_idle)
 {
     const auto key      = make_key(host, port);

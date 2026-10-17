@@ -160,7 +160,7 @@ tls::server_context server_with(const std::filesystem::path& chain, const std::f
 std::string as_string(std::span<const std::byte> data) { return {reinterpret_cast<const char*>(data.data()), data.size()}; }
 
 // read_to_end reads s until it ends (or fails), returning what it read and why it stopped.
-task<std::pair<std::string, std::error_condition>> read_to_end(net::io::reader& s)
+task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& s)
 {
     std::string                  out;
     std::array<std::byte, 4'096> buf{};
@@ -175,7 +175,7 @@ task<std::pair<std::string, std::error_condition>> read_to_end(net::io::reader& 
 // serve_once accepts a connection, runs the server's handshake, and hands the stream to serve (or the handshake's error
 // to failed, if any).
 template<typename Serve>
-task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, std::error_condition* failed = nullptr)
+task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve, std::error_code* failed = nullptr)
 {
     auto accepted = co_await listener->accept();
     if (!accepted.has_value()) co_return;
@@ -191,7 +191,7 @@ task<> serve_once(net::listener* listener, tls::server_context ctx, Serve serve,
 }
 
 // connect_to connects to the listener over TLS, as host.
-task<std::expected<tls::stream, std::error_condition>>
+task<std::expected<tls::stream, std::error_code>>
 connect_to(net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx, std::string host)
 {
     auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
@@ -214,8 +214,7 @@ task<> echo(tls::stream& s)
     co_await s.close();
 }
 
-std::error_condition alert(int code) { return {code, tls::category()}; }
-
+std::error_code alert(int code) { return {code, tls::category()}; }
 }
 
 TEST_CASE("a client and server talk over TLS", "[tls]")
@@ -285,7 +284,7 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    std::error_condition server_failed;
+    std::error_code server_failed;
     REQUIRE(sched.spawn(serve_once(&listener, server_with(tc.chain, tc.key), echo, &server_failed)));
 
     auto ctx = tls::client_context::make({.trusted_ca_file = p.ca, .insecure_skip_verification = tc.skip_verification});
@@ -318,7 +317,8 @@ TEST_CASE("a TLS stream ends with close_notify, and is cut short without it", "[
     };
     REQUIRE(sched.spawn(serve_once(&listener, server_with(pki().localhost_chain, pki().localhost_key), send_then_end)));
 
-    const auto client = [](net::io::scheduler* sched, std::uint16_t port) -> task<std::pair<std::string, std::error_condition>>
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port) -> task<std::pair<std::string, std::error_code>>
     {
         auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
         if (!s.has_value()) co_return std::pair{"connect failed: " + s.error().message(), s.error()};
@@ -328,8 +328,9 @@ TEST_CASE("a TLS stream ends with close_notify, and is cut short without it", "[
     auto [received, err] = sched.run_to_completion(client(&sched, listener.local_port()));
     CAPTURE(err.message());
     CHECK(received == "the end");
-    if (notify) CHECK(err == net::io::status_condition::closed);
+    if (notify) CHECK(err == net::io::errc::end_of_stream);
     else CHECK(err == tls::errc::stream_truncated);
+    CHECK(err == net::io::status_condition::closed);
 }
 
 TEST_CASE("a handshake that doesn't finish by its deadline fails", "[tls]")
@@ -347,14 +348,15 @@ TEST_CASE("a handshake that doesn't finish by its deadline fails", "[tls]")
     };
     REQUIRE(sched.spawn(silent(&listener, &done, &sched)));
 
-    const auto client = [](net::io::scheduler* sched, std::uint16_t port, std::atomic<bool>* done) -> task<std::error_condition>
+    const auto client =
+        [](net::io::scheduler* sched, std::uint16_t port, std::atomic<bool>* done) -> task<std::error_code>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
         if (!conn.has_value()) co_return conn.error();
 
         auto s = co_await tls::stream::connect(std::move(*conn), trusting_client(), "localhost", net::io::clock::now() + 200ms);
         done->store(true);
-        co_return s.has_value() ? std::error_condition{} : s.error();
+        co_return s.has_value() ? std::error_code{} : s.error();
     };
 
     const auto start = std::chrono::steady_clock::now();

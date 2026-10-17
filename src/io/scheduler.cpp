@@ -92,7 +92,7 @@ void scheduler::deregister_handle(handle fd) noexcept
         auto it = sh.registrations.find(fd);
         if (it == sh.registrations.end()) return;
 
-        auto canceled = std::make_error_condition(std::errc::operation_canceled);
+        auto canceled = std::make_error_code(std::errc::operation_canceled);
         if (it->second.read.waiting != nullptr) complete_handle_wait(sh, it->second.read, canceled, done);
         if (it->second.write.waiting != nullptr) complete_handle_wait(sh, it->second.write, canceled, done);
 
@@ -110,7 +110,7 @@ bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcep
     if (state.op == poll_op::none) return suspend_other(state, awaiting);
     if (state.op != poll_op::read && state.op != poll_op::write)
     {
-        state.result = std::make_error_condition(std::errc::invalid_argument);
+        state.result = std::make_error_code(std::errc::invalid_argument);
         return false;
     }
 
@@ -121,7 +121,7 @@ bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) 
 {
     const auto fail = [&](std::errc err)
     {
-        state.result = std::make_error_condition(err);
+        state.result = std::make_error_code(err);
         return false; // don't suspend
     };
 
@@ -173,7 +173,7 @@ bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) n
 {
     const auto fail = [&](std::errc err)
     {
-        state.result = std::make_error_condition(err);
+        state.result = std::make_error_code(err);
         return false; // don't suspend
     };
 
@@ -209,10 +209,7 @@ bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) n
     return true;
 }
 
-void scheduler::complete_handle_wait(shard&               sh,
-                                     direction&           slot,
-                                     std::error_condition result,
-                                     completions&         done) noexcept
+void scheduler::complete_handle_wait(shard& sh, direction& slot, std::error_code result, completions& done) noexcept
 {
     auto* state   = std::exchange(slot.waiting, nullptr);
     state->result = result;
@@ -227,7 +224,7 @@ void scheduler::complete_handle_wait(shard&               sh,
     done.push_back(state->awaiting);
 }
 
-void scheduler::complete_other(waiter* state, std::error_condition result, completions& done) noexcept
+void scheduler::complete_other(waiter* state, std::error_code result, completions& done) noexcept
 {
     if (state->watch)
     {
@@ -417,7 +414,7 @@ void scheduler::cancel(waiter& state) noexcept
 void scheduler::expire_timers(completions& done) noexcept
 {
     const auto now       = clock::now();
-    const auto timed_out = std::make_error_condition(std::errc::timed_out);
+    const auto timed_out = std::make_error_code(std::errc::timed_out);
 
     for (auto& sh : shards)
     {
@@ -447,7 +444,7 @@ void scheduler::expire_timers(completions& done) noexcept
         auto* state = timers.begin()->second;
 
         // a sleep that's over isn't an error.
-        complete_other(state, state->word == nullptr ? std::error_condition{} : timed_out, done);
+        complete_other(state, state->word == nullptr ? std::error_code{} : timed_out, done);
     }
 }
 
@@ -472,7 +469,7 @@ void scheduler::request_stop() noexcept
     stopping.notify_all(); // for run()
 
     completions done;
-    auto        canceled = std::make_error_condition(std::errc::operation_canceled);
+    auto        canceled = std::make_error_code(std::errc::operation_canceled);
 
     for (auto& sh : shards)
     {

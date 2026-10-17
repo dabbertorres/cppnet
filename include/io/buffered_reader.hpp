@@ -26,7 +26,7 @@ public:
     {
         std::span<std::byte> data;
         bool                 is_prefix;
-        std::error_condition err;
+        std::error_code      err;
     };
 
     // read_until returns a span of the data in the buffer up to (but not including)
@@ -48,7 +48,7 @@ public:
     // fill reads more into the buffer: as much as one read of what it wraps gives (after moving what's buffered to the
     // front, to make room). It returns the error that read failed with, if any, which error() also returns after. It
     // does nothing if the buffer is full.
-    coro::task<std::error_condition> fill();
+    coro::task<std::error_code> fill();
 
     // buffered returns what's buffered, without reading any more. Unlike read(), looking through it doesn't need a
     // coroutine per byte: when reads complete without suspending, each co_await can deepen the stack (where symmetric
@@ -75,7 +75,7 @@ public:
 
     // error returns the current error, if any.
     // Potentially useful if e.g. peek() fails.
-    [[nodiscard]] std::error_condition error() const;
+    [[nodiscard]] std::error_code error() const;
 
     [[nodiscard]] int native_handle() const noexcept override { return impl->native_handle(); }
 
@@ -84,10 +84,10 @@ private:
     coro::task<result> read_more(std::span<std::byte> data);
 
     // fill_after finishes fill(), once the read (which needed a coroutine) does.
-    coro::task<std::error_condition> fill_after(coro::task<result> reading);
+    coro::task<std::error_code> fill_after(coro::task<result> reading);
 
     // filled adds what a read for fill() read, returning its error.
-    std::error_condition filled(const result& res) noexcept;
+    std::error_code filled(const result& res) noexcept;
 
     // what's buffered is buf[start, end): consuming it moves start, rather than what's left, which is only moved to the
     // front of buf to make room for more.
@@ -95,7 +95,7 @@ private:
     std::vector<std::byte> buf;
     std::size_t            start = 0;
     std::size_t            end   = 0;
-    std::error_condition   err;
+    std::error_code        err;
 };
 
 }

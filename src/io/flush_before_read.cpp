@@ -31,6 +31,6 @@ coro::task<result> flush_before_read::flush_and_read(coro::task<result> flushing
 result flush_before_read::closed() noexcept
 {
     // the other end can't be answered any more, which ends the connection as its closing would.
-    return result{.err = make_error_condition(status_condition::closed)};
+    return result{.err = make_error_code(errc::end_of_stream)};
 }
 }

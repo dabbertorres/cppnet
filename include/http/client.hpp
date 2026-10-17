@@ -17,7 +17,7 @@ namespace net::http
 // client sends HTTP/1.x requests, reusing connections within the limits of its client_options.
 //
 // A connection is reused once the response's body has been read to its end (until a read reports
-// status_condition::closed, or all of its Content-Length has been read). Destroying a response whose body hasn't been
+// io::errc::end_of_stream, or all of its Content-Length has been read). Destroying a response whose body hasn't been
 // read to its end closes its connection.
 //
 // Copies of a client share its connections. They're all closed once the client (and its copies) and the responses
@@ -41,7 +41,7 @@ public:
     // It fails with std::errc::timed_out if connecting takes longer than connect_timeout, the response's head longer
     // than response_header_timeout, or sending the request stalls for io_timeout. Reading the body fails the same way
     // if it stalls for io_timeout.
-    coro::task<std::expected<client_response, std::error_condition>> send(const client_request& request);
+    coro::task<std::expected<client_response, std::error_code>> send(const client_request& request);
 
     // close_idle closes the connections that are waiting to be reused.
     void close_idle() noexcept;

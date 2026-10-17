@@ -211,17 +211,17 @@ namespace net::http
 
 url::query_values request_target::query_values() const { return url::parse_query(query); }
 
-std::expected<request_target, std::error_condition> parse_request_target(request_method   method,
-                                                                         std::string_view target) noexcept
+std::expected<request_target, std::error_code> parse_request_target(request_method   method,
+                                                                    std::string_view target) noexcept
 {
     request_target out;
     if (auto err = parse_request_target(method, target, out); err) return std::unexpected(err);
     return out;
 }
 
-std::error_condition parse_request_target(request_method method, std::string_view target, request_target& out) noexcept
+std::error_code parse_request_target(request_method method, std::string_view target, request_target& out) noexcept
 {
-    const auto invalid = std::make_error_condition(std::errc::invalid_argument);
+    const auto invalid = std::make_error_code(std::errc::invalid_argument);
 
     try
     {
@@ -259,11 +259,11 @@ std::error_condition parse_request_target(request_method method, std::string_vie
     catch (...)
     {
         // only allocation can fail.
-        return std::make_error_condition(std::errc::not_enough_memory);
+        return std::make_error_code(std::errc::not_enough_memory);
     }
 }
 
-std::expected<request_target, std::error_condition> parse_host(std::string_view value) noexcept
+std::expected<request_target, std::error_code> parse_host(std::string_view value) noexcept
 {
     try
     {
@@ -271,14 +271,14 @@ std::expected<request_target, std::error_condition> parse_host(std::string_view 
         out.kind = request_target::form::authority;
 
         if (!parse_authority(value, false, out))
-            return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
         return out;
     }
     catch (...)
     {
         // only allocation can fail.
-        return std::unexpected(std::make_error_condition(std::errc::not_enough_memory));
+        return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
     }
 }
 

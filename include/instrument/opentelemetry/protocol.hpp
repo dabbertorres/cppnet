@@ -449,13 +449,13 @@ struct export_metrics_service_response
 // from_json reads an export service's response (export_trace_service_response or export_metrics_service_response),
 // failing with std::errc::invalid_argument if it isn't one.
 template<typename T>
-[[nodiscard]] std::expected<T, std::error_condition> from_json(std::string_view json);
+[[nodiscard]] std::expected<T, std::error_code> from_json(std::string_view json);
 
 template<>
-std::expected<export_trace_service_response, std::error_condition>
+std::expected<export_trace_service_response, std::error_code>
 from_json<export_trace_service_response>(std::string_view json);
 
 template<>
-std::expected<export_metrics_service_response, std::error_condition>
+std::expected<export_metrics_service_response, std::error_code>
 from_json<export_metrics_service_response>(std::string_view json);
 }

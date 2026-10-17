@@ -113,7 +113,7 @@ private:
         poll_op                               op;
         std::optional<clock::time_point>      deadline;
         std::coroutine_handle<>               awaiting{nullptr};
-        std::error_condition                  result{};
+        std::error_code                       result{};
         std::optional<timer_list::iterator>   timer{}; // guarded by its shard's lock, or (if not a handle's) timers_mu
         const std::atomic<std::uint64_t>*     word     = nullptr;
         std::uint64_t                         expected = 0;
@@ -190,7 +190,7 @@ public:
 
         // error is why the wait ended without this finishing, if it did: e.g. std::errc::timed_out, or
         // std::errc::operation_canceled if the scheduler was stopped, or the handle deregistered.
-        [[nodiscard]] std::error_condition error() const noexcept { return state.result; }
+        [[nodiscard]] std::error_code error() const noexcept { return state.result; }
 
         // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress.
         void set_deadline(std::optional<clock::time_point> deadline) noexcept { state.deadline = deadline; }
@@ -242,7 +242,7 @@ public:
         {
             return sched->suspend(state, awaiting);
         }
-        [[nodiscard]] std::error_condition await_resume() const noexcept { return state.result; }
+        [[nodiscard]] std::error_code await_resume() const noexcept { return state.result; }
 
     private:
         scheduler* sched;
@@ -429,10 +429,10 @@ private:
     void retime(shard& sh, waiter& state) noexcept;
 
     // complete_handle_wait completes a handle's waiter, which slot (in sh) holds. Must be called holding sh's lock.
-    void complete_handle_wait(shard& sh, direction& slot, std::error_condition result, completions& done) noexcept;
+    void complete_handle_wait(shard& sh, direction& slot, std::error_code result, completions& done) noexcept;
 
     // complete_other completes a waiter that isn't for a handle. Must be called holding timers_mu.
-    void complete_other(waiter* state, std::error_condition result, completions& done) noexcept;
+    void complete_other(waiter* state, std::error_code result, completions& done) noexcept;
 
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
     void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;

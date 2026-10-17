@@ -34,7 +34,7 @@ result limit_writer::finish(result res, std::size_t amount, std::size_t wanted) 
     left -= res.count;
     if (res.err || res.count < amount) return res;
 
-    if (amount < wanted) res.err = std::make_error_condition(std::errc::value_too_large);
+    if (amount < wanted) res.err = std::make_error_code(std::errc::value_too_large);
     return res;
 }
 }

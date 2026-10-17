@@ -223,7 +223,7 @@ TEST_CASE("chunked", "[http][1.1][request_decode]")
 
     // the body ends at the final chunk, rather than reading into the next request.
     read_result = test::sync_wait(result->body->read(body));
-    CHECK(read_result.err == net::io::status_condition::closed);
+    CHECK(read_result.err == net::io::errc::end_of_stream);
     CHECK(read_result.count == 0);
 
     auto next = test::sync_wait(net::http::http11::request_decode(&buf_reader));
@@ -254,7 +254,7 @@ TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
     CHECK(body.substr(0, read_result.count) == "hello"sv);
 
     read_result = test::sync_wait(first->body->read(body));
-    CHECK(read_result.err == net::io::status_condition::closed);
+    CHECK(read_result.err == net::io::errc::end_of_stream);
 
     auto second = test::sync_wait(net::http::http11::request_decode(&buf_reader));
     REQUIRE(second.has_value());
@@ -598,7 +598,7 @@ std::string read_body(net::io::reader& body)
     {
         auto res = test::sync_wait(body.read(buf));
         out.append(buf.data(), res.count);
-        if (res.err) return res.err == net::io::status_condition::closed ? out : out + " [" + res.err.message() + "]";
+        if (res.err) return res.err == net::io::errc::end_of_stream ? out : out + " [" + res.err.message() + "]";
     }
 }
 
@@ -679,9 +679,8 @@ std::unique_ptr<net::io::reader> body_of(std::string content)
     return std::make_unique<net::io::owned_string_reader>(std::move(content));
 }
 
-std::string invalid_argument() { return "error: " + std::make_error_condition(std::errc::invalid_argument).message(); }
-std::string not_supported() { return "error: " + std::make_error_condition(std::errc::not_supported).message(); }
-
+std::string invalid_argument() { return "error: " + std::make_error_code(std::errc::invalid_argument).message(); }
+std::string not_supported() { return "error: " + std::make_error_code(std::errc::not_supported).message(); }
 }
 
 TEST_CASE("request bodies are encoded", "[http][1.1][request_encode][body]")
@@ -836,7 +835,7 @@ TEST_CASE("requests decoded into one request don't keep anything of the last", "
             out.append(chunk.data(), res.count);
             if (res.err)
             {
-                CHECK(res.err == net::io::status_condition::closed);
+                CHECK(res.err == net::io::errc::end_of_stream);
                 return out;
             }
         }

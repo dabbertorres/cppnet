@@ -21,7 +21,7 @@ coro::task<result> buffer::read(std::span<std::byte> data)
     if (data.empty()) co_return {.count = 0};
 
     auto unread = std::span{content}.subspan(read_at);
-    if (unread.empty()) co_return {.count = 0, .err = make_error_condition(status_condition::closed)};
+    if (unread.empty()) co_return {.count = 0, .err = make_error_code(errc::end_of_stream)};
 
     auto read_amount = std::min(data.size(), unread.size());
     std::copy_n(unread.begin(), read_amount, data.begin());

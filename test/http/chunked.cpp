@@ -69,7 +69,7 @@ private:
 struct read_result
 {
     std::string          body;
-    std::error_condition err; // other than the end of the body
+    std::error_code      err; // other than the end of the body
 };
 
 // read_chunked reads a chunked body from text, and returns it, and what follows it. By default, the text arrives a byte
@@ -90,7 +90,7 @@ std::pair<read_result, std::string> read_chunked(std::string_view text, bool tri
         out.body.append(buf.data(), res.count);
         if (res.err)
         {
-            if (res.err != net::io::status_condition::closed) out.err = res.err;
+            if (res.err != net::io::errc::end_of_stream) out.err = res.err;
             break;
         }
     }

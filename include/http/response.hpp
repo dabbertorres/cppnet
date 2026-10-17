@@ -240,8 +240,8 @@ struct server_response
     io::writer*        body = nullptr;
 };
 
-using response_encoder_result = std::expected<io::writer*, std::error_condition>;
-using response_decoder_result = std::expected<client_response, std::error_condition>;
+using response_encoder_result = std::expected<io::writer*, std::error_code>;
+using response_decoder_result = std::expected<client_response, std::error_code>;
 
 using response_encoder = coro::task<response_encoder_result> (*)(io::writer*, const server_response&) noexcept;
 using response_decoder = coro::task<response_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,

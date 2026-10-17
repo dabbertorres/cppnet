@@ -28,7 +28,7 @@ TEST_CASE("partial reading", "[io][string_reader]")
     REQUIRE(buf == "bar"sv);
 
     res = test::sync_wait(reader.read(buf));
-    REQUIRE(res.err == net::io::status_condition::closed);
+    REQUIRE(res.err == net::io::errc::end_of_stream);
     REQUIRE(res.count == 0);
     REQUIRE(buf == "bar"sv); // ensure it doesn't write anything at all
 }
@@ -57,7 +57,7 @@ TEST_CASE("full-length read", "[io][string_reader]")
     REQUIRE(buf == "foobar"sv);
 
     res = test::sync_wait(reader.read(buf));
-    REQUIRE(res.err == net::io::status_condition::closed);
+    REQUIRE(res.err == net::io::errc::end_of_stream);
     REQUIRE(res.count == 0);
     REQUIRE(buf == "foobar"sv); // ensure it doesn't write anything at all
 }

@@ -52,7 +52,7 @@ coro::task<result> buffered_reader::read_more(std::span<std::byte> data)
         total += res.count;
 
         if (res.err) co_return result{.count = total, .err = res.err};
-        if (res.count == 0) co_return result{.count = total, .err = make_error_condition(status_condition::error)};
+        if (res.count == 0) co_return result{.count = total, .err = make_error_code(errc::no_progress)};
     }
 
     // partial read of buffer capacity
@@ -128,11 +128,11 @@ void buffered_reader::consume(std::size_t count) noexcept
     if (start == end) reset();
 }
 
-std::error_condition buffered_reader::error() const { return err; }
+std::error_code buffered_reader::error() const { return err; }
 
-coro::task<std::error_condition> buffered_reader::fill()
+coro::task<std::error_code> buffered_reader::fill()
 {
-    if (size() == capacity()) return coro::ready_task<std::error_condition>();
+    if (size() == capacity()) return coro::ready_task<std::error_code>();
 
     // make as much room as there can be.
     if (start != 0)
@@ -146,22 +146,22 @@ coro::task<std::error_condition> buffered_reader::fill()
     // coro::ready_task).
     auto reading = impl->read(std::span{buf}.subspan(end));
     if (reading.finished_without_coroutine())
-        return coro::ready_task<std::error_condition>(filled(std::move(reading).result()));
+        return coro::ready_task<std::error_code>(filled(std::move(reading).result()));
 
     return fill_after(std::move(reading));
 }
 
-coro::task<std::error_condition> buffered_reader::fill_after(coro::task<result> reading)
+coro::task<std::error_code> buffered_reader::fill_after(coro::task<result> reading)
 {
     co_return filled(co_await std::move(reading));
 }
 
-std::error_condition buffered_reader::filled(const result& res) noexcept
+std::error_code buffered_reader::filled(const result& res) noexcept
 {
     end += res.count;
 
     // a reader that makes no progress without reporting why would otherwise leave callers waiting forever.
-    err = res.count == 0 && !res.err ? make_error_condition(status_condition::error) : res.err;
+    err = res.count == 0 && !res.err ? make_error_code(errc::no_progress) : res.err;
     return err;
 }
 }

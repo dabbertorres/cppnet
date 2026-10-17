@@ -152,7 +152,7 @@ TEST_CASE("writer that makes no progress is an error", "[io][buffered_writer]")
     net::io::buffered_writer writer{&underlying, 4};
 
     auto res = test::sync_wait(writer.write("ABCDEFGHIJ"sv));
-    CHECK(res.err == net::io::status_condition::error);
+    CHECK(res.err == net::io::errc::no_progress);
 
     // the unwritten data is kept, rather than dropped.
     CHECK(writer.size() == 4);

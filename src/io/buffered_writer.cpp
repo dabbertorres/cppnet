@@ -59,7 +59,7 @@ coro::task<result> buffered_writer::write_through(std::span<const std::byte> dat
         total += res.count;
 
         if (res.err) co_return result{.count = total, .err = res.err};
-        if (res.count == 0) co_return result{.count = total, .err = make_error_condition(status_condition::error)};
+        if (res.count == 0) co_return result{.count = total, .err = make_error_code(errc::no_progress)};
     }
 
     // the rest of the data, if any, is no more than the buffer capacity, and the buffer is empty, so buffer it.
@@ -120,7 +120,7 @@ result buffered_writer::flushed(std::size_t total, const result& last) noexcept
 
     // a write that made no progress without reporting why would otherwise leave the rest unwritten, unreported.
     if (!last.err && last.count == 0 && !buf.empty())
-        return result{.count = total, .err = make_error_condition(status_condition::error)};
+        return result{.count = total, .err = make_error_code(errc::no_progress)};
 
     return result{.count = total, .err = last.err};
 }

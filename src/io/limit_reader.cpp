@@ -13,7 +13,7 @@ namespace net::io
 coro::task<result> limit_reader::read(std::span<std::byte> data)
 {
     if (progress >= limit)
-        return coro::ready_task<result>(result{.count = 0, .err = make_error_condition(status_condition::closed)});
+        return coro::ready_task<result>(result{.count = 0, .err = make_error_code(errc::end_of_stream)});
 
     // the reader often finishes without a coroutine (e.g. a buffered one, with enough buffered): then so can this.
     auto inner = parent->read(data.first(std::min(data.size(), limit - progress)));

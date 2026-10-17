@@ -13,7 +13,7 @@
 namespace net
 {
 
-std::expected<std::string, std::error_condition> hostname()
+std::expected<std::string, std::error_code> hostname()
 {
     // the limit, if there is one, doesn't include the terminating null.
     const auto max = sysconf(_SC_HOST_NAME_MAX);
@@ -22,7 +22,7 @@ std::expected<std::string, std::error_condition> hostname()
     std::string name(len, '\0');
     if (gethostname(name.data(), name.size()) != 0)
     {
-        return std::unexpected(std::error_condition{errno, std::generic_category()});
+        return std::unexpected(std::error_code{errno, std::system_category()});
     }
 
     // it may be truncated without being terminated, if it's too long for the buffer.

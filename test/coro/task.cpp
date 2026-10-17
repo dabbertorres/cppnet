@@ -17,7 +17,7 @@ TEST_CASE("task of std::expected can be destroyed", "[coro][task]")
 {
     // Comparing the task's handle to nullptr used to find std::expected's operator== through ADL, which some standard
     // libraries don't constrain, and so recursed forever.
-    auto make = [] -> net::coro::task<std::expected<int*, std::error_condition>> { co_return nullptr; };
+    auto make = [] -> net::coro::task<std::expected<int*, std::error_code>> { co_return nullptr; };
 
     auto value = test::sync_wait(make());
     REQUIRE(value.has_value());

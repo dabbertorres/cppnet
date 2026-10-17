@@ -82,7 +82,7 @@ task<std::string> read_all(net::io::reader* body)
     {
         auto res = co_await body->read(buf);
         out.append(reinterpret_cast<const char*>(buf.data()), res.count);
-        if (res.err) co_return res.err == net::io::status_condition::closed ? out : out + " [" + res.err.message() + "]";
+        if (res.err) co_return res.err == net::io::errc::end_of_stream ? out : out + " [" + res.err.message() + "]";
     }
 }
 
@@ -130,14 +130,14 @@ TEST_CASE("the client only sends HTTP/1.x", "[http][client]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
 
-    auto send = [](net::io::scheduler* sched) -> task<std::error_condition>
+    auto send = [](net::io::scheduler* sched) -> task<std::error_code>
     {
         net::http::client         client{sched};
         net::http::client_request req{.method = net::http::request_method::GET, .version = {.major = 2, .minor = 0}};
         req.uri.host = "127.0.0.1";
 
         auto resp = co_await client.send(req);
-        co_return resp.has_value() ? std::error_condition{} : resp.error();
+        co_return resp.has_value() ? std::error_code{} : resp.error();
     };
 
     CHECK(sched.run_to_completion(send(&sched)) == std::errc::not_supported);
@@ -443,7 +443,7 @@ TEST_CASE("waiting for a connection times out", "[http][client][pool]")
 
     std::ranges::sort(results);
     CHECK(results
-          == std::vector<std::string>{"error: " + std::make_error_condition(std::errc::timed_out).message(), "hello"});
+          == std::vector<std::string>{"error: " + std::make_error_code(std::errc::timed_out).message(), "hello"});
 }
 
 TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool]")
@@ -666,7 +666,7 @@ TEST_CASE("requests with bodies that can't be sent don't use a connection", "[ht
 
     REQUIRE(sched.spawn(server.serve()));
     auto result = sched.run_to_completion(post(&client, std::move(req)));
-    CHECK(result == "error: " + std::make_error_condition(std::errc::invalid_argument).message());
+    CHECK(result == "error: " + std::make_error_code(std::errc::invalid_argument).message());
     CHECK(server.accepted == 0);
 }
 
@@ -764,8 +764,7 @@ std::pair<T, net::io::clock::duration> timed(net::io::scheduler& sched, task<T> 
     return {std::move(result), net::io::clock::now() - start};
 }
 
-std::string timed_out() { return "error: " + std::make_error_condition(std::errc::timed_out).message(); }
-
+std::string timed_out() { return "error: " + std::make_error_code(std::errc::timed_out).message(); }
 }
 
 TEST_CASE("waiting for a response's head times out", "[http][client][timeout]")
@@ -793,7 +792,7 @@ TEST_CASE("a stalled body times out", "[http][client][timeout]")
     auto [result, elapsed] = timed(sched, fetch(&client, "127.0.0.1", server.port));
 
     // what arrived, and then why the rest didn't.
-    CHECK(result == "hello [" + std::make_error_condition(std::errc::timed_out).message() + "]");
+    CHECK(result == "hello [" + std::make_error_code(std::errc::timed_out).message() + "]");
     CHECK(elapsed >= 100ms);
     CHECK(elapsed < 5s);
     CHECK(client.stats() == net::http::connection_stats{});

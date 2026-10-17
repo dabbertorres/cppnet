@@ -55,7 +55,7 @@ TEST_CASE("reads consume writes in order", "[io][buffer]")
     CHECK(out.substr(0, res.count) == "de"sv);
 
     res = test::sync_wait(buf.read(out));
-    CHECK(res.err == net::io::status_condition::closed);
+    CHECK(res.err == net::io::errc::end_of_stream);
     CHECK(res.count == 0);
 }
 

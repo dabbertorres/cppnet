@@ -18,8 +18,8 @@ public:
 // gai_category is the category of getaddrinfo()'s EAI_* errors.
 [[nodiscard]] const std::error_category& gai_category() noexcept;
 
-// make_gai_error_condition converts an error from getaddrinfo(). EAI_SYSTEM is reported as errno.
-[[nodiscard]] std::error_condition make_gai_error_condition(int err) noexcept;
+// make_gai_error_code converts an error from getaddrinfo(). EAI_SYSTEM is reported as errno.
+[[nodiscard]] std::error_code make_gai_error_code(int err) noexcept;
 
 // throw_for_gai_error throws an exception if err is unrecoverable (or logical) error.
 // If err is recoverable (e.g. retry), then it returns true.
