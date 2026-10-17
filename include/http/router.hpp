@@ -18,11 +18,13 @@
 namespace net::http
 {
 
-using handler_func = std::function<coro::task<void>(const server_request&, response_writer&)>;
-
 // request_handler is what a server calls for each request: e.g. a router, or middleware wrapping one (see
-// instrument/middleware.hpp). Unlike a handler_func, it can change the request (e.g. a router sets its route).
+// instrument/middleware.hpp), or a route's handler. It may take the request as const (most handlers only read it), or
+// not (e.g. middleware that adds to its extensions).
 using request_handler = std::function<coro::task<void>(server_request&, response_writer&)>;
+
+// handler_func is a route's handler (see router): a request_handler.
+using handler_func = request_handler;
 
 // make_handler makes a request_handler of h, which needn't be copyable (as a router isn't): copies of the
 // request_handler share it.
