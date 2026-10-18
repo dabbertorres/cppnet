@@ -302,10 +302,10 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
    `set_stop_token` (and `tls::stream`'s, and `connect`'s option), `run_blocking(func, stop)`, and
    `scheduler::stop_token()`. Tests. Useful without HTTP, and what the next stages build on.
 2. **The server's token**: `server_request::stop`; HTTP/2's per-stream sources, stopped outside the lock; HTTP/1.1's
-   per-connection source; `abort()`, `join()`, the destructor and the scheduler's stop; handlers returning after a stop (resets,
-   logging). The HTTP/2 allocation count. `docs/guide.md` (the server section's "which can't be cancelled", and the
-   runtime's waits), CLAUDE.md, and the comments on `run()`/`schedule()` and in `http2.md` that say handlers can't be
-   canceled.
+   per-connection source; `abort()`, `join()`, the destructor and the scheduler's stop; handlers returning after a stop
+   (resets, logging). The HTTP/2 allocation count. `docs/guide.md` (the server section's "which can't be cancelled", and
+   the runtime's waits), CLAUDE.md, and the comments on `run()`/`schedule()` and in `http2.md` that say handlers can't
+   be canceled.
 3. **The client**: `client_request::stop`, through the pool's waits, connecting, HTTP/1.1 and HTTP/2.
 4. **HTTP/1.1 noticing the client leave**: the watcher, `flush_before_read`'s hold, deadlines that apply to a read
    already waiting. Measured with `bench_request` before it's merged; if the hand-over costs too much, it's opt-in
