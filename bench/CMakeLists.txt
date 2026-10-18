@@ -12,6 +12,9 @@ endfunction()
 
 add_benchmark(bench_task coro/task.cpp)
 
+add_benchmark(bench_notifier coro/notifier.cpp)
+target_link_libraries(bench_notifier PRIVATE net)
+
 add_benchmark(bench_router http/router.cpp)
 target_link_libraries(bench_router PRIVATE net)
 
