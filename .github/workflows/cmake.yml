@@ -8,19 +8,34 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}${{ matrix.variant != 'default' && format(' / {0}', matrix.variant) || '' }}
 
+    # Each compiler on each OS builds and tests the default configuration; on Linux with Clang, two more variants check
+    # what the default doesn't: tsan (ThreadSanitizer: the races ASan can't see; the tests run once, in a random order)
+    # and no-tls (NET_TLS off: the build without Botan).
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04, macos-26]
         compiler: [gcc, clang]
+        variant: [default]
+        include:
+        - os: ubuntu-26.04
+          compiler: clang
+          variant: tsan
+        - os: ubuntu-26.04
+          compiler: clang
+          variant: no-tls
 
     runs-on: ${{ matrix.os }}
 
     # The latest major versions of both compilers: on Linux, Arch's packages (GCC 16 and Clang 23, as of October 2026),
     # as Ubuntu's (and apt.llvm.org's stable ones) lag behind; on macOS, Homebrew's.
-    container: ${{ startsWith(matrix.os, 'ubuntu') && 'archlinux:base-devel' || '' }}
+    # NOTE: tsan's container runs without Docker's default seccomp profile, which forbids the personality() call
+    #       ThreadSanitizer makes to run itself without ASLR (else it can't map its shadow memory).
+    container:
+      image: ${{ startsWith(matrix.os, 'ubuntu') && 'archlinux:base-devel' || '' }}
+      options: ${{ matrix.variant == 'tsan' && '--security-opt seccomp=unconfined' || '' }}
 
     steps:
     # NOTE: before checking out, so that it uses git (for the vcpkg submodule) rather than downloading an archive.
@@ -86,8 +101,8 @@ jobs:
       uses: actions/cache/restore@v6
       with:
         path: .cache/vcpkg
-        key: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-${{ steps.cache.outputs.vcpkg }}-${{ hashFiles('vcpkg.json', 'ports/**') }}
-        restore-keys: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-
+        key: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-${{ steps.cache.outputs.vcpkg }}-${{ hashFiles('vcpkg.json', 'ports/**') }}
+        restore-keys: vcpkg-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-
 
     # ccache's changes with every commit, so each run saves its own, starting from the latest.
     - name: Restore ccache's cache
@@ -95,19 +110,25 @@ jobs:
       uses: actions/cache/restore@v6
       with:
         path: .cache/ccache
-        key: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-${{ github.sha }}
-        restore-keys: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}-
+        key: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-${{ github.sha }}
+        restore-keys: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-
 
+    # The variants only build what they check: the tests (no examples, benchmarks or fuzz targets).
     - name: Configure CMake
-      run: >-
-        cmake -G Ninja -B build
-        -DCMAKE_BUILD_TYPE=Debug
-        -DCMAKE_C_COMPILER="$CC"
-        -DCMAKE_CXX_COMPILER="$CXX"
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-        -DBUILD_TESTING=ON
-        -DBUILD_EXAMPLE=ON
+      run: |
+        set -- -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DBUILD_TESTING=ON
+        case "${{ matrix.variant }}" in
+          default) set -- "$@" -DBUILD_EXAMPLE=ON ;;
+          *)       set -- "$@" -DBUILD_EXAMPLE=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_FUZZING=OFF ;;
+        esac
+        case "${{ matrix.variant }}" in
+          tsan)   set -- "$@" "-DCMAKE_C_FLAGS_DEBUG=-g -fsanitize=thread" "-DCMAKE_CXX_FLAGS_DEBUG=-g -fsanitize=thread" ;;
+          no-tls) set -- "$@" -DNET_TLS=OFF ;;
+        esac
+        cmake "$@"
 
     - name: Build
       id: build
@@ -132,8 +153,14 @@ jobs:
         path: .cache/ccache
         key: ${{ steps.ccache-cache.outputs.cache-primary-key }}
 
+    # NOTE: a ThreadSanitizer report fails its test (TSan exits with 66), and a random order shakes out more.
     - name: Test
-      run: ctest --test-dir build --output-on-failure
+      run: |
+        if [ "${{ matrix.variant }}" = tsan ]; then
+          ctest --test-dir build --output-on-failure --schedule-random
+        else
+          ctest --test-dir build --output-on-failure
+        fi
 
     # clang-tidy, with warnings as errors, on the C++ files the change touches: a pull request's against its base, a
     # push's against what it replaced (or, for a new branch, or a force push whose old commit isn't in the clone, its
@@ -141,7 +168,7 @@ jobs:
     # clang-tidy infers from it (a nearby source's, as a header). Once, with Clang on Linux, after the build (which made
     # the compile database), even if the tests failed.
     - name: Lint the changed files
-      if: always() && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang'
+      if: always() && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang' && matrix.variant == 'default'
       env:
         EVENT: ${{ github.event_name }}
         BASE_REF: ${{ github.base_ref }}
