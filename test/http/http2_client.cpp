@@ -32,6 +32,7 @@
 #include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -1266,6 +1267,89 @@ TEST_CASE("a burst of requests to an HTTP/2 host shares the connection being mad
     REQUIRE(results.size() == 11);
     for (std::size_t i = 0; i < 10; ++i) CHECK(results[i] == "2 hello over HTTP/2");
     CHECK(results.back() == "open 1");
+}
+
+namespace
+{
+
+// connect_to connects pool to the server on port, over HTTP/2 (learning that the host speaks it), returning the
+// connection, or nullptr if that failed.
+task<std::shared_ptr<http::detail::http2_client_connection>> connect_to(http::detail::connection_pool* pool,
+                                                                        std::string                    port)
+{
+    auto leased = co_await pool->acquire("http", "127.0.0.1", port, true);
+    if (!leased.has_value()) co_return nullptr;
+    co_return std::move(leased->http2);
+}
+
+}
+
+TEST_CASE("the client's pool knows a host speaks HTTP/2 only while it has connections", "[http][http2][client][limits]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        a{&sched};
+    test_server        b{&sched};
+
+    // NOTE: with prior knowledge (cleartext), which it doesn't need to know them, but learns them all the same.
+    auto pool = std::make_shared<http::detail::connection_pool>(&sched, prior_knowledge());
+
+    const auto port = [](const test_server& s) { return std::to_string(s.server.local_port()); };
+
+    // knows lists the servers the pool knows speak HTTP/2, and how many hosts it knows altogether.
+    const auto knows = [&]
+    {
+        std::string out;
+        for (const auto& [name, s] : {
+                 std::pair{"a"sv, &a},
+                 std::pair{"b"sv, &b}
+        })
+        {
+            if (pool->knows_http2("http", "127.0.0.1", port(*s))) out += name;
+        }
+        return std::format("{} of {}", out.empty() ? "none" : out, pool->known_http2_hosts());
+    };
+
+    // drop closes a kept connection to the server on port, and waits for it to be gone.
+    const auto drop = [&](std::shared_ptr<http::detail::http2_client_connection> conn, std::string on) -> task<bool>
+    {
+        conn->close();
+        conn.reset();
+        const auto deadline = net::io::clock::now() + 5s;
+        while (pool->stats("127.0.0.1", on).open != 0 && net::io::clock::now() < deadline)
+            (void)co_await sched.sleep_until(net::io::clock::now() + 5ms);
+        co_return pool->stats("127.0.0.1", on).open == 0;
+    };
+
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> out;
+
+        // a's connection is kept, while b's comes and goes.
+        auto conn_a = co_await connect_to(pool.get(), port(a));
+        REQUIRE(conn_a != nullptr);
+        out.push_back(knows());
+
+        auto conn_b = co_await connect_to(pool.get(), port(b));
+        REQUIRE(conn_b != nullptr);
+        out.push_back(knows());
+        const bool dropped_b = co_await drop(std::move(conn_b), port(b));
+        REQUIRE(dropped_b);
+        out.push_back(knows());
+
+        const bool dropped_a = co_await drop(std::move(conn_a), port(a));
+        REQUIRE(dropped_a);
+        out.push_back(knows());
+
+        // learned again with its next connection.
+        auto conn = co_await connect_to(pool.get(), port(a));
+        REQUIRE(conn != nullptr);
+        out.push_back(knows());
+        conn->close();
+        co_return out;
+    };
+
+    CHECK(sched.run_to_completion(test())
+          == std::vector<std::string>{"a of 1", "ab of 2", "a of 1", "none of 0", "a of 1"});
 }
 
 TEST_CASE("with idle_timeout 0, an HTTP/2 connection closes once its last stream is done", "[http][http2][client]")

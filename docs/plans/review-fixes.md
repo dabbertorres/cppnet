@@ -123,7 +123,9 @@ HTTP/2.
 - **A burst opens a connection each (C14).** The pool remembers which hosts agreed on HTTP/2; for those, while a
   connection is being made, other requests wait for it (on `released`, within `connect_timeout`) rather than each
   connecting. (The very first burst to a host still connects in parallel: nothing can know it speaks HTTP/2 until its
-  first handshake.)
+  first handshake.) As Go's pool keeps nothing of a host but its connections, the pool forgets a host once its last
+  connection goes, so what it remembers is bounded by the connections, and a burst to a host with none connects in
+  parallel.
 - **A body reader that returns nothing spins (C16).** `{0, no error}` fails with `io::errc::no_progress`, as
   HTTP/1.1's.
 - **HTTP/2 by default (R4).** A request without a body whose connection drops (without GOAWAY) before any head is

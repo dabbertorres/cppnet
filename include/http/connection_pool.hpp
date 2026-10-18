@@ -125,8 +125,8 @@ namespace detail
         // acquire returns an idle connection to host (if allow_idle, and one is still open), or a stream of an HTTP/2
         // connection (other than skip, e.g. one that refused the request), or connects a new one if the limits allow,
         // waiting for one to be free if not, and for https, runs a TLS handshake over it. To a host known to speak
-        // HTTP/2, a request waits for a connection being made rather than making its own. It fails with
-        // std::errc::timed_out if connecting takes longer than connect_timeout (or the handshake
+        // HTTP/2 (see speaks_http2), a request waits for a connection being made rather than making its own. It fails
+        // with std::errc::timed_out if connecting takes longer than connect_timeout (or the handshake
         // tls_handshake_timeout), as tcp_socket::connect does, or with TLS's errors (e.g. a certificate that couldn't
         // be verified). scheme is "http" or "https" (or with NET_HAS_TLS undefined, only "http").
         coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
@@ -147,6 +147,11 @@ namespace detail
         [[nodiscard]] connection_stats stats(const std::string& host, const std::string& port) const;
 
         [[nodiscard]] const client_options& options() const noexcept { return config; }
+
+        // For the tests: how many hosts the pool remembers speak HTTP/2, and whether it remembers that one does.
+        [[nodiscard]] std::size_t known_http2_hosts() const;
+        [[nodiscard]] bool
+        knows_http2(const std::string& scheme, const std::string& host, const std::string& port) const;
 
     private:
         using connections = std::vector<std::unique_ptr<connection>>;
@@ -187,9 +192,12 @@ namespace detail
         std::shared_ptr<http2_client_connection> available_http2(const std::string&             key,
                                                                  const http2_client_connection* skip);
 
-        // speaks_http2 is whether host is known to speak HTTP/2: it agreed on it before (and not since disagreed), or
-        // it's cleartext, with prior knowledge (holding mu).
+        // speaks_http2 is whether host is known to speak HTTP/2 (holding mu): it's cleartext, with prior knowledge, or
+        // one of its connections agreed on HTTP/2 and it has had connections since (see http2_hosts).
         [[nodiscard]] bool speaks_http2(const std::string& key, bool tls) const;
+
+        // host_gone forgets what the pool knew of host, whose last connection has gone (holding mu).
+        void host_gone(const std::string& key);
 
         // idle_count is how many of a host's connections are idle (holding mu).
         static std::size_t idle_count(const host_connections& conns);
@@ -226,9 +234,13 @@ namespace detail
 
         mutable std::mutex                                mu;
         std::unordered_map<std::string, host_connections> hosts;
-        std::unordered_set<std::string>                   http2_hosts; // the hosts that agreed on HTTP/2
         std::size_t                                       open    = 0;
         bool                                              reaping = false;
+
+        // the hosts one of whose connections agreed on HTTP/2, forgotten once they have none (as Go's pool keeps
+        // nothing of a host but its connections): so it's bounded by the connections, and a burst of requests to a host
+        // with none connects in parallel, while one to a host with some waits for a connection being made.
+        std::unordered_set<std::string> http2_hosts;
 
         // Bumped whenever a connection is released, for wait_on(); and how many requests wait on it.
         std::atomic<std::uint64_t> released = 0;

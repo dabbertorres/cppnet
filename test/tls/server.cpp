@@ -120,7 +120,11 @@ struct log_watch
 struct https_server
 {
     https_server(net::io::scheduler* sched, const http::server_config& cfg)
-        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), router(), cfg}
+        : https_server{sched, cfg, router()}
+    {}
+
+    https_server(net::io::scheduler* sched, const http::server_config& cfg, http::router r)
+        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), std::move(r), cfg}
     {
         REQUIRE(sched->spawn(server.serve()));
     }
@@ -277,27 +281,40 @@ TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][h
           == "HTTP/2 hello over TLS");
 }
 
-TEST_CASE("a burst of requests to a host that agreed on HTTP/2 shares the connection being made",
+TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 shares the connection being made",
           "[tls][http][client][http2]")
 {
     net::io::scheduler sched{make_pool()};
-    https_server       server{&sched, tls_config()};
-    http::client       client{&sched, trusting_options()};
+    test::gate         g{&sched};
 
-    const auto test =
-        [](net::io::scheduler* sched, http::client* client, std::string url) -> task<std::vector<std::string>>
+    // responses whose bodies are held, to fill a connection's streams.
+    auto r = https_server::router();
+    r.GET("/held",
+          [&g](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK, 4);
+              co_await g.pass();
+              co_await net::io::write_all(*body, "held"sv);
+          });
+
+    auto cfg                         = tls_config();
+    cfg.http2_max_concurrent_streams = 2;
+    https_server server{&sched, cfg, std::move(r)};
+    http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::io::scheduler* sched, http::client* client, test::gate* g, std::string base)
+        -> task<std::vector<std::string>>
     {
-        // the first request learns that the host speaks HTTP/2; then its connection's closed.
-        std::vector<std::string> out{co_await fetch(client, url)};
-        client->close_idle();
+        // the connection agrees on HTTP/2, and its two streams are taken.
+        auto first  = co_await client->get(base + "/held");
+        auto second = co_await client->get(base + "/held");
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        std::vector<std::string> out{std::format("open {}", client->stats().open)};
 
-        const auto deadline = net::io::clock::now() + 5s;
-        while (client->stats().open != 0 && net::io::clock::now() < deadline)
-            (void)co_await sched->sleep_until(net::io::clock::now() + 5ms);
-        REQUIRE(client->stats().open == 0);
-
-        // then a burst, with no connection.
-        constexpr int              n = 10;
+        // then a burst of two: the first connects, and the second, as the host's known to speak HTTP/2 (its connection
+        // is still there), waits for that connection, rather than making its own.
+        constexpr int              n = 2;
         std::vector<std::string>   results(n);
         std::atomic<std::uint64_t> done{0};
         for (int i = 0; i < n; ++i)
@@ -312,19 +329,25 @@ TEST_CASE("a burst of requests to a host that agreed on HTTP/2 shares the connec
                     *result = co_await fetch(client, url);
                     done->fetch_add(1);
                     sched->notify_all(*done);
-                }(sched, client, url, &results[static_cast<std::size_t>(i)], &done)));
+                }(sched, client, base + "/", &results[static_cast<std::size_t>(i)], &done)));
         }
 
         for (auto seen = done.load(); seen < n; seen = done.load()) (void)co_await sched->wait_on(done, seen);
         out.insert(out.end(), results.begin(), results.end());
         out.push_back(std::format("open {}", client->stats().open));
+
+        g->open();
+        g->open();
+        for (auto* held : {&*first, &*second})
+        {
+            auto body = co_await net::io::read_all(*held->body);
+            out.push_back(body.value_or("error"));
+        }
         co_return out;
     };
 
-    const auto results = sched.run_to_completion(test(&sched, &client, "https://localhost:" + server.port() + "/"));
-    REQUIRE(results.size() == 12);
-    for (std::size_t i = 0; i < 11; ++i) CHECK(results[i] == "hello over TLS");
-    CHECK(results.back() == "open 1");
+    CHECK(sched.run_to_completion(test(&sched, &client, &g, "https://localhost:" + server.port()))
+          == std::vector<std::string>{"open 1", "hello over TLS", "hello over TLS", "open 2", "held", "held"});
 }
 
 TEST_CASE("an HTTPS server closes connections that don't speak TLS", "[tls][http][server]")

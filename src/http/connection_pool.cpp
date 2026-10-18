@@ -6,10 +6,10 @@
 #include <cerrno>
 #include <chrono>
 #include <compare>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -18,6 +18,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <sys/socket.h>
 
@@ -256,6 +257,8 @@ bool connection_pool::speaks_http2(const std::string& key, bool tls) const
     return (!tls && config.http2_prior_knowledge) || http2_hosts.contains(key);
 }
 
+void connection_pool::host_gone(const std::string& key) { http2_hosts.erase(key); }
+
 std::shared_ptr<http2_client_connection> connection_pool::start_http2(const std::string&          key,
                                                                       std::unique_ptr<connection> conn)
 {
@@ -441,12 +444,31 @@ void connection_pool::close_idle() noexcept
             for (auto& idle : conns.idle) closing.push_back(std::move(idle.conn));
             conns.idle.clear();
 
-            it = conns.open == 0 ? hosts.erase(it) : std::next(it);
+            if (conns.open != 0)
+            {
+                ++it;
+                continue;
+            }
+
+            host_gone(it->first);
+            it = hosts.erase(it);
         }
     }
 
     for (const auto& c : idle_http2) c->close();
     freed();
+}
+
+std::size_t connection_pool::known_http2_hosts() const
+{
+    std::scoped_lock lock{mu};
+    return http2_hosts.size();
+}
+
+bool connection_pool::knows_http2(const std::string& scheme, const std::string& host, const std::string& port) const
+{
+    std::scoped_lock lock{mu};
+    return http2_hosts.contains(make_key(scheme, host, port));
 }
 
 connection_stats connection_pool::stats() const
@@ -577,7 +599,11 @@ void connection_pool::forget(const std::string& key, std::unique_ptr<connection>
     --open;
 
     auto it = hosts.find(key);
-    if (it != hosts.end() && --it->second.open == 0) hosts.erase(it);
+    if (it != hosts.end() && --it->second.open == 0)
+    {
+        host_gone(key);
+        hosts.erase(it);
+    }
 }
 
 void connection_pool::connected(const std::string& key) noexcept
@@ -605,7 +631,14 @@ std::optional<io::clock::time_point> connection_pool::close_expired(connections&
 
         if (!idle.empty() && (!next || idle.front().expires < *next)) next = idle.front().expires;
 
-        it = it->second.open == 0 ? hosts.erase(it) : std::next(it);
+        if (it->second.open != 0)
+        {
+            ++it;
+            continue;
+        }
+
+        host_gone(it->first);
+        it = hosts.erase(it);
     }
 
     if (!next) reaping = false;
