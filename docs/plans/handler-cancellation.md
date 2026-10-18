@@ -1,7 +1,8 @@
 # Plan: canceling HTTP server handlers
 
-Status: planned (2026-10-18). Nothing below is implemented yet. The questions below (under Decided questions) were
-decided as recommended.
+Status: planned (2026-10-18). Nothing below is implemented yet, but for what Where things stand describes (HTTP/1.1's
+graceful `close()`, and the `aborting` source the destructor stops). The questions below (under Decided questions)
+were decided as recommended.
 
 ## Goal
 
@@ -93,12 +94,18 @@ gives the request to end early with `std::errc::operation_canceled`; nothing is 
 
 - `server_request` has no token. `request_handler` is `std::function<coro::task<void>(server_request&,
   response_writer&)>`.
-- `server` has a `std::stop_source closing`, which `close()` stops: HTTP/1.1 connections register a callback that
-  calls `shutdown_read()` (so a connection waiting for a request ends, and a body being read finds its end early: a
-  chunked one as `connection_aborted`, but one framed by Content-Length as `io::errc::end_of_stream`, as
-  `limit_reader` passes its parent's end on without checking it reached its limit, so a handler can't tell it from the
-  whole body), and HTTP/2 connections one that begins a graceful drain (GOAWAY, PING, final GOAWAY). Nothing reaches a
-  handler that isn't reading its body.
+- `server` has a `std::stop_source closing`, which `close()` stops, gracefully for both protocols. HTTP/1.1
+  connections register a callback that calls `shutdown_read()` on a connection waiting for a request (its first, or
+  the next), so it ends at once; one in the middle of a request (its head read) finishes it, its response saying
+  `Connection: close` if its head wasn't sent yet (`response_writer` checks `closing`'s token), and then closes,
+  without serving requests pipelined after it. An atomic phase per connection (idle, busy, closing), which the callback
+  and the connection each move, decides which, so a head arriving as `close()` runs is either served whole or not at
+  all. HTTP/2 connections register one that begins a graceful drain (GOAWAY, PING, final GOAWAY). `server` also has
+  `std::stop_source aborting`, which `~server` stops after `close()`: HTTP/1.1 connections register a callback on it
+  that calls `shutdown_read()` whatever they're doing, so a body being read fails, with `connection_aborted` (a body
+  cut short is that, framed by Content-Length as well as chunked: `limit_reader` reports its reader ending before its
+  limit as `connection_aborted`, rather than passing the end on). HTTP/2 connections don't register on `aborting`
+  yet: `~server` waits for their streams. Nothing reaches a handler that isn't reading its body.
 - HTTP/2's streams (`http2_stream_base`) have a `failure` code, set by the client's reset (`on_stream_reset`), a
   timeout (`check_streams`, which only arms a deadline while the handler waits to read or write the stream: a handler
   doing neither never times out), a failed submit, and `end()`; each wakes the stream's `notifier`. Each stream is
@@ -143,16 +150,16 @@ valid after the handler returns (it holds the shared state).
 - **A handler that returns after its token was stopped.** HTTP/2: if the stream failed, it's removed as now (no
   response, no reset: the client's reset or the server's was sent); if the token was stopped by the hard stop and the
   response is incomplete, it's reset with CANCEL. HTTP/1.1: the response, if any, is sent (with `Connection: close`,
-  as `is_serving` is false after a stop) and the connection closed; if the client's gone, nothing is sent. An
-  exception is logged at debug level, without a 500 where the client's gone.
+  as the hard stop closes the server too, whose token `response_writer` checks) and the connection closed; if the
+  client's gone, nothing is sent. An exception is logged at debug level, without a 500 where the client's gone.
 
 ### The server's stops
 
-`server` gets a second source, `aborting` (beside `closing`), stopped by the hard stop. Which calls stop it is Open
-questions (2); the recommendation:
+`server`'s second source, `aborting` (beside `closing`), becomes the hard stop: today only `~server` stops it, and only
+HTTP/1.1 connections register on it (to shut their reading side). Which calls stop it is Decided questions (2):
 
-- `close()` stays graceful: it stops accepting, ends idle connections, and drains HTTP/2 (GOAWAY), but doesn't stop
-  handlers' tokens.
+- `close()` stays graceful: it stops accepting, ends idle connections, lets HTTP/1.1's requests in progress finish,
+  and drains HTTP/2 (GOAWAY), but doesn't stop handlers' tokens.
 - `abort()` (new) does what `close()` does, and stops every handler's token: for a program that drains for a while
   and then gives up, as Go's `Shutdown` then `Close`.
 - `~server` aborts (it must wait for the handlers anyway, and nothing will read their answers).
@@ -208,7 +215,7 @@ So `out.stop = req.stop;` in a handler cancels its outgoing requests with it.
 ### HTTP/1.1: noticing the client leave (stage 4)
 
 The server doesn't read an HTTP/1.1 connection while its handler runs, so a client that closes isn't seen until the
-response is written (EPIPE) or the next request is read. Go reads in the background (see references). Here, Open
+response is written (EPIPE) or the next request is read. Go reads in the background (see references). Here, Decided
 questions (3); the recommended design:
 
 - **A watcher per connection**, not per request (a task per request would be a frame, or two with `async_scope`'s, on
@@ -316,13 +323,13 @@ Each was decided as recommended (2026-10-18); the options are kept for the reaso
    connection's streams then end early, which undoes much of draining). (b) `close()` stays graceful; a new `abort()`
    stops them, as do `~server` and `scheduler::request_stop()` (Go's `Shutdown` and `Close`). (c) `close(grace)`: stops
    them after a grace period, which needs a timer task. **Recommended: (b)**; (c) is a few lines over it, in the
-   application or later. Related, found here: HTTP/1.1's `close()` shuts every connection's reading side at once, so a
-   handler reading a request body finds it cut short (and, framed by Content-Length, can't tell: see Where things
-   stand), while HTTP/2's `close()` lets streams finish. The Content-Length case wants fixing whatever's decided
-   (`limit_reader`, or the request's body reader, reporting an end before the limit as `connection_aborted`, as
-   `chunked_reader` does). Making HTTP/1.1's wait for a handler that's running (shutting only connections waiting for
-   a head, and the others after their response) would make `close()` graceful for both; it could go in stage 2, or be
-   its own fix.
+   application or later. Related, found here, and since fixed: HTTP/1.1's `close()` shut every connection's reading
+   side at once, so a handler reading a request body found it cut short (and, framed by Content-Length, couldn't
+   tell, as `limit_reader` passed its reader's end on as the body's: it now reports it as `connection_aborted`, as
+   `chunked_reader` does), while HTTP/2's `close()` let streams finish. HTTP/1.1's `close()` now shuts only
+   connections waiting for a head, and the others after their request (see Where things stand), so `close()` is
+   graceful for both, and (b)'s line between `close()` and `abort()` is the same for both; `~server` already ends
+   HTTP/1.1's requests in progress (`aborting`), as (b) has it.
 3. **Should HTTP/1.1 notice a client leaving while its handler runs?** (a) No: only the server's stops (and the
    connection ending) stop its token; a client that leaves is seen when the response is written. (b) The watcher of
    stage 4 (Go's background read, through the connection's buffer: exact for TLS too; one frame per connection, a
