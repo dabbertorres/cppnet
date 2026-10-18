@@ -497,3 +497,62 @@ TEST_CASE("an HTTPS server's error responses end with close_notify", "[tls][http
     CHECK(received.starts_with("HTTP/1.1 400 "));
     CHECK(err == net::io::errc::end_of_stream);
 }
+
+TEST_CASE("closing an HTTPS server lets a request in progress finish", "[tls][http][server][close]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // set once the handler's started, before it reads the body.
+    std::atomic<std::uint64_t> started = 0;
+
+    http::router router;
+    router.POST("/",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    started.store(1);
+                    sched.notify_all(started);
+
+                    auto body = co_await net::io::read_all(*req.body);
+
+                    const std::string out = body.has_value() ? "whole: " + *body : "failed: " + body.error().message();
+                    auto*             writer = co_await resp.send(http::status::OK, out.size());
+                    co_await net::io::write_all(*writer, out);
+                });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    // half the body, then the rest once the server's closed, as its handler reads it.
+    const auto test = [&] -> task<std::pair<std::string, std::error_code>>
+    {
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
+
+        (void)co_await net::io::write_all(*s, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello"sv);
+
+        const auto deadline = net::io::clock::now() + 5s;
+        while (started.load() == 0)
+        {
+            if (co_await sched.wait_on(started, 0, deadline)) co_return std::pair{"not started", std::error_code{}};
+        }
+
+        server.close();
+        (void)co_await net::io::write_all(*s, "world"sv);
+        co_return co_await read_to_end(*s);
+    };
+
+    auto [received, err] = sched.run_to_completion(test());
+    CAPTURE(received, err.message());
+
+    // and then close_notify.
+    CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(received.contains("\r\nConnection: close\r\n"));
+    CHECK(received.ends_with("\r\n\r\nwhole: helloworld"));
+    CHECK(err == net::io::errc::end_of_stream);
+}

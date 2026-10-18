@@ -105,12 +105,19 @@ public:
     server(server&&)            = delete;
     server& operator=(server&&) = delete;
 
-    // Closes the server, and blocks until serve() and the connections have finished: so it must not be destroyed
-    // from one of the scheduler's tasks, which might be one of them (or one a worker it needs is running).
+    // Closes the server, ends its HTTP/1.x connections' requests in progress (reads of a request's body fail, with
+    // std::errc::connection_aborted), and blocks until serve() and the connections have finished: so it must not be
+    // destroyed from one of the scheduler's tasks, which might be one of them (or one a worker it needs is running).
+    // HTTP/2 connections end gracefully, as close() ends them. A handler that doesn't finish (e.g. waiting for
+    // something other than its connection) holds it up: the scheduler's request_stop() (or shutdown()) cancels what
+    // the handlers are waiting for.
     ~server();
 
-    // close stops accepting connections, and ends the open ones: those waiting for a request close, and the others
-    // once their response is sent (reads of a request's body find its end).
+    // close stops accepting connections, and ends the open ones gracefully. An HTTP/1.x connection waiting for a
+    // request (its first, or the next) is closed at once (as is a TLS handshake in progress); one in the middle of a
+    // request finishes it (the handler reads the body and sends its response as usual, which says Connection: close
+    // if it wasn't sent yet), then closes, without serving any pipelined after it. HTTP/2 connections send GOAWAY, and
+    // close once their streams are done. Waiting for the connections is the destructor's, or the scheduler's.
     void close();
 
     // serve accepts and serves connections, until the server is closed (or the scheduler stopped).
@@ -140,6 +147,9 @@ private:
     // serve_requests reads and responds to conn's HTTP/1.x requests, until it closes (or should be); or if it starts
     // with HTTP/2's preface (and http2 is on), serves it as HTTP/2.
     coro::task<> serve_requests(detail::connection& conn);
+
+    // serve_prefaced serves conn, which started with HTTP/2's preface, as HTTP/2: unless the server was closed first.
+    coro::task<> serve_prefaced(detail::connection& conn, connection_state& state);
 
     // serve_http2 serves conn as HTTP/2, already_read being what was read of it to tell.
     coro::task<> serve_http2(detail::connection& conn, std::span<const std::byte> already_read);
@@ -185,8 +195,11 @@ private:
     std::optional<tls::server_context> tls_ctx;
 #endif
 
-    // closing is requested by close(), to end the connections (and TLS handshakes) being served.
+    // closing is requested by close(), to end the connections (and TLS handshakes) being served, gracefully.
     std::stop_source closing;
+
+    // aborting is requested by the destructor, to end HTTP/1.x connections' requests in progress too.
+    std::stop_source aborting;
 
     // running counts serve() and the connections (which are the scheduler's tasks), for the destructor to wait for.
     coro::async_scope running;

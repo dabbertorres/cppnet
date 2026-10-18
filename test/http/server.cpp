@@ -16,6 +16,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include <sys/resource.h>
@@ -979,4 +980,397 @@ TEST_CASE("the server backs off when accepting fails, e.g. as it's out of file d
     blocking_client later{server.local_port()};
     later.send("GET /later HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(later.read_some().ends_with("\r\n\r\nlater"));
+}
+
+namespace
+{
+
+// flag is set once, by one task, for others to wait for.
+struct flag
+{
+    void set(net::io::scheduler* sched)
+    {
+        word.store(1);
+        sched->notify_all(word);
+    }
+
+    // wait waits (up to 5s) for the flag to be set, returning whether it was.
+    task<bool> wait(net::io::scheduler* sched)
+    {
+        const auto deadline = net::io::clock::now() + 5s;
+        while (word.load() == 0)
+        {
+            if (co_await sched->wait_on(word, 0, deadline)) co_return word.load() != 0;
+        }
+        co_return true;
+    }
+
+    std::atomic<std::uint64_t> word = 0;
+};
+
+// serving serves with server until it's closed, then sets done.
+task<> serving(net::io::scheduler* sched, http::server* server, flag* done)
+{
+    co_await server->serve();
+    done->set(sched);
+}
+
+// read_to_end reads conn until it ends (or fails), returning what it read and why it stopped.
+task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& conn)
+{
+    std::string                out;
+    std::array<std::byte, 256> buf{};
+    while (true)
+    {
+        auto read = co_await conn.read(buf);
+        out.append(reinterpret_cast<const char*>(buf.data()), read.count);
+        if (read.err) co_return std::pair{out, read.err};
+    }
+}
+
+// read_body answers with what reading the request's body found: all of it, or why it stopped.
+task<void> read_body(http::server_request& req, http::response_writer& resp)
+{
+    auto body = co_await net::io::read_all(*req.body);
+
+    const std::string out    = body.has_value() ? "whole: " + *body : "failed: " + body.error().message();
+    auto*             writer = co_await resp.send(http::status::OK, out.size());
+    co_await net::io::write_all(*writer, out);
+}
+
+}
+
+TEST_CASE("closing the server lets the requests in progress finish, then closes their connections",
+          "[http][server][close]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    flag started;
+    flag release;
+    flag serve_done;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    // reads its body once it's started.
+    router.POST("/read",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    started.set(&sched);
+                    co_await read_body(req, resp);
+                });
+
+    // waits to be released, before reading its body.
+    router.POST("/wait",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    started.set(&sched);
+                    co_await release.wait(&sched);
+                    co_await read_body(req, resp);
+                });
+
+    // sends its response's head, then waits to be released, before sending its body.
+    router.POST("/head-first",
+                [&](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+                {
+                    auto* body = co_await resp.send(http::status::OK, 5);
+                    started.set(&sched);
+                    co_await release.wait(&sched);
+                    co_await net::io::write_all(*body, "hello"sv);
+                });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(serving(&sched, &server, &serve_done)));
+
+    struct outcome
+    {
+        std::string     received;
+        std::error_code err;
+        bool            served_all = false;
+    };
+
+    SECTION("a body still coming is read whole, and the response says the connection closes")
+    {
+        const auto test = [&] -> task<outcome>
+        {
+            auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+            REQUIRE(conn.has_value());
+            conn->set_read_timeout(5s);
+
+            // half the body, then the rest once the server's closed, as its handler reads it.
+            (void)co_await net::io::write_all(*conn,
+                                              "POST /read HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello"sv);
+            const bool handled = co_await started.wait(&sched);
+            server.close();
+            (void)co_await net::io::write_all(*conn, "world"sv);
+
+            auto [received, err] = co_await read_to_end(*conn);
+            const bool done      = co_await serve_done.wait(&sched);
+            co_return outcome{.received = received, .err = err, .served_all = handled && done};
+        };
+
+        auto out = sched.run_to_completion(test());
+        CAPTURE(out.received, out.err.message());
+
+        CHECK(out.received.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.received.contains("\r\nConnection: close\r\n"));
+        CHECK(out.received.ends_with("\r\n\r\nwhole: helloworld"));
+        CHECK(out.err == net::io::errc::end_of_stream);
+        CHECK(out.served_all);
+    }
+
+    SECTION("requests pipelined after it aren't served")
+    {
+        const auto test = [&] -> task<outcome>
+        {
+            auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+            REQUIRE(conn.has_value());
+            conn->set_read_timeout(5s);
+
+            (void)co_await net::io::write_all(*conn,
+                                              "POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+                                              "GET /second HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+            const bool handled = co_await started.wait(&sched);
+            server.close();
+            release.set(&sched);
+
+            auto [received, err] = co_await read_to_end(*conn);
+            const bool done      = co_await serve_done.wait(&sched);
+            co_return outcome{.received = received, .err = err, .served_all = handled && done};
+        };
+
+        auto out = sched.run_to_completion(test());
+        CAPTURE(out.received, out.err.message());
+
+        CHECK(count(out.received, "HTTP/1.1 ") == 1);
+        CHECK(out.received.contains("\r\nConnection: close\r\n"));
+        CHECK(out.received.ends_with("\r\n\r\nwhole: hello"));
+        CHECK_FALSE(out.received.contains("second"));
+        CHECK(out.err == net::io::errc::end_of_stream);
+        CHECK(out.served_all);
+    }
+
+    SECTION("a response whose head was sent before goes on, then the connection closes")
+    {
+        const auto test = [&] -> task<outcome>
+        {
+            auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+            REQUIRE(conn.has_value());
+            conn->set_read_timeout(5s);
+
+            (void)co_await net::io::write_all(*conn,
+                                              "POST /head-first HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+                                              "GET /second HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+            const bool handled = co_await started.wait(&sched);
+            server.close();
+            release.set(&sched);
+
+            auto [received, err] = co_await read_to_end(*conn);
+            const bool done      = co_await serve_done.wait(&sched);
+            co_return outcome{.received = received, .err = err, .served_all = handled && done};
+        };
+
+        auto out = sched.run_to_completion(test());
+        CAPTURE(out.received, out.err.message());
+
+        CHECK(count(out.received, "HTTP/1.1 ") == 1);
+        CHECK_FALSE(out.received.contains("\r\nConnection: close\r\n"));
+        CHECK(out.received.ends_with("\r\n\r\nhello"));
+        CHECK_FALSE(out.received.contains("second"));
+        CHECK(out.err == net::io::errc::end_of_stream);
+        CHECK(out.served_all);
+    }
+}
+
+TEST_CASE("closing the server closes idle connections at once", "[http][server][close]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    // NOTE: a long header_read_timeout, so that only close() ends the idle connections soon.
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .header_read_timeout = 30s}
+    };
+
+    flag serve_done;
+    REQUIRE(sched.spawn(serving(&sched, &server, &serve_done)));
+
+    struct outcome
+    {
+        std::string              silent;
+        std::error_code          silent_err;
+        std::string              kept;
+        std::error_code          kept_err;
+        bool                     served_all = false;
+        std::chrono::nanoseconds took{};
+    };
+
+    const auto test = [&] -> task<outcome>
+    {
+        const auto port = std::to_string(server.local_port());
+
+        // one waits for its first request (accepted before the next, which the server has answered); one for its
+        // next, after one.
+        auto silent = co_await net::tcp_socket::connect(&sched, "127.0.0.1", port);
+        auto kept   = co_await net::tcp_socket::connect(&sched, "127.0.0.1", port);
+        REQUIRE(silent.has_value());
+        REQUIRE(kept.has_value());
+        silent->set_read_timeout(5s);
+        kept->set_read_timeout(5s);
+
+        (void)co_await net::io::write_all(*kept, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+        std::string                answered;
+        std::array<std::byte, 256> buf{};
+        while (!answered.ends_with("\r\n\r\na"))
+        {
+            auto read = co_await kept->read(buf);
+            answered.append(reinterpret_cast<const char*>(buf.data()), read.count);
+            if (read.err) break;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        server.close();
+
+        outcome out;
+        std::tie(out.silent, out.silent_err) = co_await read_to_end(*silent);
+        std::tie(out.kept, out.kept_err)     = co_await read_to_end(*kept);
+        out.served_all                       = co_await serve_done.wait(&sched);
+        out.took                             = std::chrono::steady_clock::now() - start;
+        co_return out;
+    };
+
+    auto out = sched.run_to_completion(test());
+    CAPTURE(out.silent, out.silent_err.message(), out.kept, out.kept_err.message());
+
+    CHECK(out.silent.empty());
+    CHECK(out.silent_err == net::io::status_condition::closed);
+    CHECK(out.kept.empty());
+    CHECK(out.kept_err == net::io::status_condition::closed);
+    CHECK(out.served_all);
+    CHECK(out.took < 1s);
+}
+
+namespace
+{
+
+// close_after closes server after delay, then sets closed.
+task<> close_after(net::io::scheduler* sched, http::server* server, net::io::clock::duration delay, flag* closed)
+{
+    (void)co_await sched->sleep_until(net::io::clock::now() + delay);
+    server->close();
+    closed->set(sched);
+}
+
+// race_close sends a request to the server on port (a kept-alive connection's second), whose body comes in two parts,
+// while the server's closed after close_delay: returning what the client received for it.
+task<std::string> race_close(net::io::scheduler*      sched,
+                             http::server*            server,
+                             net::io::clock::duration close_delay,
+                             net::io::clock::duration body_delay)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(server->local_port()));
+    if (!conn.has_value()) co_return "error: " + conn.error().message();
+    conn->set_read_timeout(5s);
+
+    (void)co_await net::io::write_all(*conn, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+    std::string                answered;
+    std::array<std::byte, 256> buf{};
+    while (!answered.ends_with("\r\n\r\na"))
+    {
+        auto read = co_await conn->read(buf);
+        answered.append(reinterpret_cast<const char*>(buf.data()), read.count);
+        if (read.err) co_return "error: " + read.err.message();
+    }
+
+    flag closed;
+    if (!sched->spawn(close_after(sched, server, close_delay, &closed))) co_return "error: not spawned";
+
+    // NOTE: once the server's closed, these may fail (e.g. reset): it's what the client receives that matters.
+    (void)co_await net::io::write_all(*conn, "POST /read HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello"sv);
+    (void)co_await sched->sleep_until(net::io::clock::now() + body_delay);
+    (void)co_await net::io::write_all(*conn, "world"sv);
+
+    auto [received, err] = co_await read_to_end(*conn);
+    if (!co_await closed.wait(sched)) co_return "error: not closed";
+    co_return received;
+}
+
+}
+
+TEST_CASE("closing the server as a request arrives either serves it whole or not at all", "[http][server][close]")
+{
+    // the server's closed at different points around the request: before its head (the connection's idle, and closed
+    // at once), while its body's coming, or after its response.
+    for (int i = 0; i < 40; ++i)
+    {
+        net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+        http::router router;
+        router.GET("/:name", echo_name);
+        router.POST("/read", read_body);
+
+        http::server server{
+            &sched,
+            std::move(router),
+            {.host = "127.0.0.1", .port = "0"}
+        };
+        REQUIRE(sched.spawn(server.serve()));
+
+        const auto close_delay = std::chrono::microseconds{(i % 10) * 200};
+        auto       received    = sched.run_to_completion(race_close(&sched, &server, close_delay, 1ms));
+        CAPTURE(i, received);
+
+        // nothing (the connection closed), or the whole body read.
+        CHECK_FALSE(received.starts_with("error: "));
+        if (!received.empty())
+        {
+            CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
+            CHECK(received.ends_with("\r\n\r\nwhole: helloworld"));
+        }
+    }
+}
+
+TEST_CASE("destroying a server ends the requests in progress that close() lets finish", "[http][server][lifetime]")
+{
+    running_scheduler running;
+
+    std::atomic<bool> started = false;
+
+    http::router router;
+    router.POST("/read",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    started.store(true);
+                    co_await read_body(req, resp);
+                });
+
+    auto server = std::make_unique<http::server>(&running.sched,
+                                                 std::move(router),
+                                                 http::server_config{.host = "127.0.0.1", .port = "0"});
+    REQUIRE(running.sched.spawn(server->serve()));
+
+    // the body doesn't come (for the default body_read_timeout, a minute).
+    blocking_client conn{server->local_port()};
+    conn.send("POST /read HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello");
+
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    REQUIRE(started.load());
+
+    const auto start = std::chrono::steady_clock::now();
+    server.reset();
+    CHECK(std::chrono::steady_clock::now() - start < 2s);
+
+    // the handler's read failed, and it answered, as the connection could still take it.
+    auto out = conn.read_to_end();
+    CAPTURE(out);
+    CHECK(out.contains("failed: "));
 }

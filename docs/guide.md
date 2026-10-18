@@ -47,8 +47,9 @@ To stop:
   from one of the scheduler's own tasks, which would wait for itself: it throws `std::logic_error` there (and the
   destructor terminates).
 
-A server's `close()` stops it accepting and ends its connections first, which is the graceful order:
-`server.close()`, then `scheduler.shutdown()`.
+A server's `close()` stops it accepting and ends its connections gracefully (those waiting for a request at once, the
+others once their requests are done), so a server is stopped first: `server.close()`, then `scheduler.shutdown()`
+(which cancels what requests still in progress are waiting for).
 
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that, and returns a task of its
@@ -217,8 +218,13 @@ scheduler.spawn(server.serve());
 - **`server_config`** sets the host and port, and limits: header and body read timeouts, the write timeout, the size
   of a request's head, and how many connections are served at once. To handle a failure to listen, give the server a
   listener from `listener::make()` instead of a host and port.
-- **Stopping:** `server.close()` stops accepting and ends the connections, then `scheduler.shutdown()` waits for
-  them.
+- **Stopping:** `server.close()` stops accepting and ends the connections gracefully: a connection waiting for a
+  request (its first, or the next on a kept-alive one) closes at once, and one in the middle of a request finishes it
+  (the handler reads the body and sends its response as usual, which says `Connection: close` if it wasn't sent yet),
+  then closes, without serving requests pipelined after it; HTTP/2 connections are below. `close()` cancels nothing:
+  `scheduler.shutdown()` (or `request_stop()`) cancels what the connections are still waiting for, and destroying
+  the server closes it, ends HTTP/1.1 requests still in progress (reading a body fails), and waits for its
+  connections.
 - **HTTP/2** is served too (unless `server_config::http2` is off), with the same handlers: over TLS to clients that
   agree on `h2` with ALPN (browsers do), and over cleartext to clients that start with HTTP/2's preface (prior
   knowledge, e.g. `curl --http2-prior-knowledge`, or a proxy in front). A request's `version` says which (2.0). Its

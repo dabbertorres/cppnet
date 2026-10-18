@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -277,8 +278,12 @@ namespace detail
 struct response_writer
 {
 public:
-    // An HTTP/1.x response, whose head encoder writes to writer.
-    response_writer(io::writer* writer, server_response* base, response_encoder encoder);
+    // An HTTP/1.x response, whose head encoder writes to writer. Once close_after (if given) is stopped, a final
+    // response not yet sent says the connection closes after it (Connection: close): the server's close() does that.
+    response_writer(io::writer*            writer,
+                    server_response*       base,
+                    response_encoder       encoder,
+                    const std::stop_token* close_after = nullptr);
 
     // An HTTP/2 response, on stream.
     response_writer(detail::http2_stream* stream, const detail::http2_stream_ops* ops, server_response* base) noexcept;
@@ -341,6 +346,7 @@ private:
     {
         io::writer*            writer;
         response_encoder       encode;
+        const std::stop_token* close_after;
         http11::chunked_writer chunked{nullptr};
         bool                   chunked_open = false;
     };

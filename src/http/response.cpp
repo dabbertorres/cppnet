@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <format>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -41,11 +42,14 @@ status parse_status(std::string_view str) noexcept
     return static_cast<status>(v);
 }
 
-response_writer::response_writer(io::writer* writer, server_response* base, response_encoder encode)
+response_writer::response_writer(io::writer*            writer,
+                                 server_response*       base,
+                                 response_encoder       encode,
+                                 const std::stop_token* close_after)
     : resp{
           base
 }
-    , backend{http11_backend{.writer = writer, .encode = encode}}
+    , backend{http11_backend{.writer = writer, .encode = encode, .close_after = close_after}}
 {}
 
 response_writer::response_writer(detail::http2_stream*           stream,
@@ -113,6 +117,11 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
     case framing::chunked: resp->headers.set("Transfer-Encoding"sv, "chunked"sv); break;
     case framing::close: resp->headers.set("Connection"sv, "close"sv); break;
     }
+
+    // the server's closing: the connection closes after this response, which says so (replacing e.g. keep-alive).
+    if (h1.close_after != nullptr && !status_is_information(status_code) && h1.close_after->stop_requested()
+        && !resp->headers.has_token("Connection"sv, "close"sv))
+        resp->headers.set("Connection"sv, "close"sv);
 
     // usually, the head fits in the connection's buffer: then there's no need for a coroutine (see coro::ready_task).
     auto encoding = h1.encode(h1.writer, *resp);
