@@ -116,8 +116,8 @@ std::size_t epoll_loop::wait(std::span<ready_event> events, std::optional<std::c
     {
         if (ev.data.fd == interrupt_fd)
         {
-            std::uint64_t value = 0;
-            [[maybe_unused]] auto _ = ::read(interrupt_fd, &value, sizeof(value));
+            std::uint64_t         value = 0;
+            [[maybe_unused]] auto _     = ::read(interrupt_fd, &value, sizeof(value));
             continue;
         }
 

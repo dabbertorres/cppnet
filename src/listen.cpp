@@ -60,7 +60,7 @@ listener::open(io::scheduler* scheduler, const std::string& host, const std::str
 
     // find first valid addr, and use it
     net::io::handle fd       = invalid_fd;
-    int last_err = 0;
+    int             last_err = 0;
     for (const addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
     {
         fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);

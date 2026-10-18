@@ -12,8 +12,8 @@ constexpr std::size_t fnv1a(std::array<char, N> s) noexcept
 {
     // https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 
-    constexpr std::size_t prime = 0x00000100000001b3;
-    constexpr std::size_t basis = 0xcbf29ce484222325;
+    constexpr std::size_t prime = 0x0000'0100'0000'01b3;
+    constexpr std::size_t basis = 0xcbf2'9ce4'8422'2325;
 
     std::size_t hash = basis;
 

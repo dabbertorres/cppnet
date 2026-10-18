@@ -2,8 +2,6 @@
 
 #ifdef NET_HAS_KQUEUE
 
-#    include "io/kqueue_loop.hpp"
-
 #    include <algorithm>
 #    include <array>
 #    include <cerrno>
@@ -22,6 +20,7 @@
 #    include "exception.hpp"
 #    include "io/event_loop.hpp"
 #    include "io/io.hpp"
+#    include "io/kqueue_loop.hpp"
 #    include "io/poll.hpp"
 
 namespace
@@ -122,17 +121,13 @@ std::size_t kqueue_loop::wait(std::span<ready_event> events, std::optional<std::
     {
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(*timeout);
         wait_for  = timespec{
-             .tv_sec  = static_cast<decltype(timespec::tv_sec)>(secs.count()),
-             .tv_nsec = static_cast<decltype(timespec::tv_nsec)>((*timeout - secs).count()),
+            .tv_sec  = static_cast<decltype(timespec::tv_sec)>(secs.count()),
+            .tv_nsec = static_cast<decltype(timespec::tv_nsec)>((*timeout - secs).count()),
         };
     }
 
-    auto count = ::kevent(descriptor,
-                          nullptr,
-                          0,
-                          kevents.data(),
-                          static_cast<int>(max_events),
-                          wait_for ? &*wait_for : nullptr);
+    auto count =
+        ::kevent(descriptor, nullptr, 0, kevents.data(), static_cast<int>(max_events), wait_for ? &*wait_for : nullptr);
     if (count == -1)
     {
         if (errno == EINTR) return 0;

@@ -361,8 +361,6 @@ std::optional<io::result> socket::try_write(std::span<const std::byte> data, std
     return io::result{.count = written};
 }
 
-
-
 void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept
 {
     // NOTE: not valid(), as that is also false for a socket with a pending error, which must still be closed.

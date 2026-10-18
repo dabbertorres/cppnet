@@ -48,9 +48,9 @@ using net::http::client_request;
 using net::http::client_response;
 using net::http::headers;
 using net::http::parse_method;
+using net::http::parse_request_target;
 using net::http::parse_status;
 using net::http::protocol_version;
-using net::http::parse_request_target;
 using net::http::request_method;
 using net::http::server_request;
 using net::http::status;
@@ -404,8 +404,8 @@ std::expected<request_framing, std::error_code> frame_request(const client_reque
     }
 
     // methods that expect content say there's none (RFC 9110, section 8.6).
-    const bool expects_content = req.method == request_method::POST || req.method == request_method::PUT
-                              || req.method == request_method::PATCH;
+    const bool expects_content =
+        req.method == request_method::POST || req.method == request_method::PUT || req.method == request_method::PATCH;
     return request_framing{.how = none, .length = 0, .field = expects_content ? "Content-Length: 0\r\n"sv : ""sv};
 }
 
@@ -465,7 +465,8 @@ task<std::error_code> copy_chunked(net::io::reader& body, net::io::writer& out)
 
         if (res.count > 0)
         {
-            if (auto written = co_await chunked.write(std::span{buf}.first(res.count)); written.err) co_return written.err;
+            if (auto written = co_await chunked.write(std::span{buf}.first(res.count)); written.err)
+                co_return written.err;
         }
 
         if (res.err == net::io::errc::end_of_stream) break;
@@ -873,7 +874,8 @@ response_decode(io::buffered_reader* reader, request_method method, std::size_t 
 
             if (auto err = parse_status_line(*line, resp); err) co_return std::unexpected(err);
             if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
-        } while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
+        }
+        while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
 
         auto body = make_response_body(reader, resp, method);
         if (!body.has_value()) co_return std::unexpected(body.error());

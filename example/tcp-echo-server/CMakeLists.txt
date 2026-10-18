@@ -5,8 +5,4 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(net-example-tcp-echo-server main.cpp)
 
-target_link_libraries(
-  net-example-tcp-echo-server
-  PRIVATE
-  net
-)
+target_link_libraries(net-example-tcp-echo-server PRIVATE net)

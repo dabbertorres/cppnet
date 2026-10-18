@@ -38,11 +38,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         if (!target) continue;
         (void)target->query_values();
 
-        if (target->kind == net::http::request_target::form::origin || target->kind == net::http::request_target::form::absolute)
+        if (target->kind == net::http::request_target::form::origin
+            || target->kind == net::http::request_target::form::absolute)
         {
             // normalizing is idempotent, and leaves no dot segments.
             auto again = parse_request_target(request_method::GET, target->path);
-            if (!again || again->path != target->path) fail("path normalization is not idempotent", input, target->path);
+            if (!again || again->path != target->path)
+                fail("path normalization is not idempotent", input, target->path);
 
             std::string_view p = target->path;
             if (p.contains("/./") || p.contains("/../") || p.ends_with("/.") || p.ends_with("/.."))
@@ -55,7 +57,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     if (parsed.has_value())
     {
         auto origin = parsed.value().origin_form();
-        if (!parse_request_target(request_method::GET, origin)) fail("origin_form produced an invalid target", input, origin);
+        if (!parse_request_target(request_method::GET, origin))
+            fail("origin_form produced an invalid target", input, origin);
     }
 
     return 0;

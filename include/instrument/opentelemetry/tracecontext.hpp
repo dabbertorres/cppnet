@@ -3,7 +3,6 @@
 #include <optional>
 
 #include "http/headers.hpp"
-
 #include "protocol.hpp"
 
 // W3C Trace Context (https://www.w3.org/TR/trace-context/): the traceparent and tracestate headers, which carry a

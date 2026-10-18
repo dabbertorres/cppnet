@@ -199,7 +199,10 @@ TEST_CASE("the client only sends HTTP/1.x", "[http][client]")
     auto send = [](net::io::scheduler* sched) -> task<std::error_code>
     {
         net::http::client         client{sched};
-        net::http::client_request req{.method = net::http::request_method::GET, .version = {.major = 2, .minor = 0}};
+        net::http::client_request req{
+            .method  = net::http::request_method::GET,
+            .version = {.major = 2, .minor = 0}
+        };
         req.uri.host = "127.0.0.1";
 
         auto resp = co_await client.send(std::move(req));
@@ -279,7 +282,7 @@ struct keepalive_server
             if (when == closing::with_header || when == closing::without_header) break;
         }
 
-    done:
+done:
         --active;
     }
 
@@ -298,7 +301,10 @@ struct keepalive_server
 
 net::http::client_request get_request(const std::string& host, const std::string& port)
 {
-    net::http::client_request req{.method = net::http::request_method::GET, .version = {.major = 1, .minor = 1}};
+    net::http::client_request req{
+        .method  = net::http::request_method::GET,
+        .version = {.major = 1, .minor = 1}
+    };
     req.uri.scheme = "http";
     req.uri.host   = host;
     req.uri.port   = port;
@@ -476,7 +482,8 @@ TEST_CASE("connections per host are limited", "[http][client][pool]")
 
     net::http::client client{&sched, {.max_connections_per_host = 2}};
 
-    auto results = run(sched, server, fetch_all(&sched, &client, std::vector<std::string>(6, "127.0.0.1"), server.port));
+    auto results =
+        run(sched, server, fetch_all(&sched, &client, std::vector<std::string>(6, "127.0.0.1"), server.port));
 
     CHECK(results == std::vector<std::string>(6, "hello"));
     CHECK(server.accepted == 2);
@@ -521,7 +528,10 @@ TEST_CASE("waiting for a connection times out", "[http][client][pool]")
     keepalive_server   server{&sched};
     server.delay = 500ms;
 
-    net::http::client client{&sched, {.connect_timeout = 100ms, .max_connections_per_host = 1}};
+    net::http::client client{
+        &sched,
+        {.connect_timeout = 100ms, .max_connections_per_host = 1}
+    };
 
     auto results = run(sched, server, fetch_all(&sched, &client, {"127.0.0.1", "127.0.0.1"}, server.port));
 
@@ -537,9 +547,9 @@ TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool
 
     net::http::client client{&sched, {.idle_timeout = 100ms}};
 
-    auto test = [](net::io::scheduler*  sched,
-                   net::http::client*   client,
-                   keepalive_server*    server) -> task<std::pair<net::http::connection_stats, int>>
+    auto test = [](net::io::scheduler* sched,
+                   net::http::client*  client,
+                   keepalive_server*   server) -> task<std::pair<net::http::connection_stats, int>>
     {
         co_await fetch(client, "127.0.0.1", server->port);
         (void)co_await sched->sleep_until(net::io::clock::now() + 300ms);
@@ -754,7 +764,6 @@ TEST_CASE("requests with bodies that can't be sent don't use a connection", "[ht
     CHECK(server.accepted == 0);
 }
 
-
 namespace
 {
 
@@ -906,7 +915,10 @@ TEST_CASE("timeouts don't limit what makes progress", "[http][client][timeout]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     echo_server        server{&sched};
-    net::http::client  client{&sched, {.response_header_timeout = 500ms, .io_timeout = 500ms}};
+    net::http::client  client{
+        &sched,
+        {.response_header_timeout = 500ms, .io_timeout = 500ms}
+    };
 
     // big enough to take more than one wait to send and receive.
     std::string big(std::size_t{8} * 1'024 * 1'024, 'x');

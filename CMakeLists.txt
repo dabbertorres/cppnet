@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
-  message(FATAL_ERROR "Do not build in-source. Please remove CMakeCache.txt and the CMakeFiles/ directory. Then build out-of-source.")
+  message(
+    FATAL_ERROR
+      "Do not build in-source. Please remove CMakeCache.txt and the CMakeFiles/ directory. Then build out-of-source."
+  )
 endif()
 
 # for use with clangd and other libclang tools
@@ -28,21 +31,11 @@ endif()
 add_library(net ${sources})
 add_library(net::net ALIAS net)
 
-target_include_directories(
-  net
-  PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/"
-)
+target_include_directories(net PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/")
 
-target_compile_features(
-  net
-  PUBLIC cxx_std_23
-)
+target_compile_features(net PUBLIC cxx_std_23)
 
-target_compile_definitions(
-  net
-  PRIVATE
-  SPDLOG_COMPILED_LIB=1
-)
+target_compile_definitions(net PRIVATE SPDLOG_COMPILED_LIB=1)
 
 target_link_libraries(
   net
@@ -63,8 +56,8 @@ if(NET_TLS)
   target_link_libraries(net PRIVATE ${NET_BOTAN_TARGET})
   target_compile_definitions(net PUBLIC NET_HAS_TLS=1)
 
-  # Botan reads the system's trust store from the keychain on Apple's platforms, which its CMake package doesn't say
-  # needs these when it's a static library.
+  # Botan reads the system's trust store from the keychain on Apple's platforms, which its CMake
+  # package doesn't say needs these when it's a static library.
   if(APPLE)
     target_link_libraries(net PRIVATE "-framework CoreFoundation" "-framework Security")
   endif()
@@ -80,14 +73,19 @@ if(BUILD_TESTING)
   add_subdirectory("test/")
 endif()
 
-# Benchmarks for implementation choices (see bench/CMakeLists.txt). Built with the tests, by default.
+# Benchmarks for implementation choices (see bench/CMakeLists.txt). Built with the tests, by
+# default.
 option(BUILD_BENCHMARKS "Build the benchmarks" ${BUILD_TESTING})
 if(BUILD_BENCHMARKS)
   add_subdirectory("bench/")
 endif()
 
 if(BUILD_EXAMPLE)
-  file(GLOB example_dirs LIST_DIRECTORIES true CONFIGURE_DEPENDS "example/*")
+  file(
+    GLOB example_dirs
+    LIST_DIRECTORIES true
+    CONFIGURE_DEPENDS "example/*"
+  )
   foreach(dir ${example_dirs})
     if(IS_DIRECTORY ${dir})
       add_subdirectory(${dir})
@@ -97,9 +95,13 @@ if(BUILD_EXAMPLE)
   endforeach()
 endif()
 
-# libFuzzer targets for the parsers (see fuzz/CMakeLists.txt): AUTO builds them with the tests, if the compiler supports
-# libFuzzer (LLVM's clang does; Apple's clang and GCC don't). ON requires them, and OFF skips them.
-set(BUILD_FUZZING "AUTO" CACHE STRING "Build the fuzz targets: AUTO, ON, or OFF")
+# libFuzzer targets for the parsers (see fuzz/CMakeLists.txt): AUTO builds them with the tests, if
+# the compiler supports libFuzzer (LLVM's clang does; Apple's clang and GCC don't). ON requires
+# them, and OFF skips them.
+set(BUILD_FUZZING
+    "AUTO"
+    CACHE STRING "Build the fuzz targets: AUTO, ON, or OFF"
+)
 set_property(CACHE BUILD_FUZZING PROPERTY STRINGS AUTO ON OFF)
 
 if(BUILD_FUZZING STREQUAL "ON" OR (BUILD_FUZZING STREQUAL "AUTO" AND BUILD_TESTING))
@@ -119,8 +121,12 @@ if(BUILD_FUZZING STREQUAL "ON" OR (BUILD_FUZZING STREQUAL "AUTO" AND BUILD_TESTI
   if(NET_HAS_LIBFUZZER)
     add_subdirectory("fuzz/")
   elseif(BUILD_FUZZING STREQUAL "ON")
-    message(FATAL_ERROR "BUILD_FUZZING is ON, but ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets")
+    message(
+      FATAL_ERROR "BUILD_FUZZING is ON, but ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets"
+    )
   else()
-    message(STATUS "Skipping the fuzz targets: ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets")
+    message(
+      STATUS "Skipping the fuzz targets: ${CMAKE_CXX_COMPILER_ID} can't build libFuzzer targets"
+    )
   endif()
 endif()

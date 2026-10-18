@@ -81,11 +81,12 @@ using namespace std::string_view_literals;
 using net::coro::task;
 
 // as bench/web/cppnet's, and wrk sends it, with TechEmpower's headers.
-constexpr auto request = "GET /plaintext HTTP/1.1\r\n"
-                         "Host: localhost\r\n"
-                         "Accept: text/plain,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.7\r\n"
-                         "Connection: keep-alive\r\n"
-                         "\r\n"sv;
+constexpr auto request =
+    "GET /plaintext HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Accept: text/plain,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.7\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"sv;
 
 constexpr auto body = "Hello, World!"sv;
 
@@ -187,7 +188,8 @@ task<void> serve(const Router& router, net::io::reader& input, net::io::writer& 
 
         // skips what's left of the body (none, here).
         std::array<std::byte, 64> scratch{};
-        while (!(co_await req.body->read(scratch)).err) {}
+        while (!(co_await req.body->read(scratch)).err)
+        {}
 
         counted.finish += allocations.load(std::memory_order::relaxed) - at;
         ++counted.requests;
@@ -233,7 +235,8 @@ void measure(std::string_view name, const Router& router, MakeInput make_input)
     auto  served = serve(router, in, out, counted);
     served.get_handle().resume();
 
-    const auto per_request = [&](std::size_t n) { return static_cast<double>(n) / static_cast<double>(counted.requests); };
+    const auto per_request = [&](std::size_t n)
+    { return static_cast<double>(n) / static_cast<double>(counted.requests); };
 
     std::println("{}:", name);
     std::println("{:>10.1f} ns per request (best of {})", runs.front(), repeats);

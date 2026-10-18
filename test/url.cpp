@@ -10,7 +10,6 @@
 #include <catch2/catch_tostring.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
-
 using namespace std::string_view_literals;
 
 namespace Catch
@@ -296,8 +295,16 @@ TEST_CASE("url::parse splits at the right delimiters", "[url][parse]")
         // IPv6
         test_case{.input = "http://[::1]:8080/x", .scheme = "http", .host = "::1", .port = "8080", .path = "/x"},
         test_case{.input = "http://[fe80::1]/", .scheme = "http", .host = "fe80::1", .port = "", .path = "/"},
-        test_case{.input = "http://[fe80::1%25en0]/", .scheme = "http", .host = "fe80::1%25en0", .port = "", .path = "/"},
-        test_case{.input = "http://[::ffff:1.2.3.4]/", .scheme = "http", .host = "::ffff:1.2.3.4", .port = "", .path = "/"},
+        test_case{.input  = "http://[fe80::1%25en0]/",
+                  .scheme = "http",
+                  .host   = "fe80::1%25en0",
+                  .port   = "",
+                  .path   = "/"},
+        test_case{.input  = "http://[::ffff:1.2.3.4]/",
+                  .scheme = "http",
+                  .host   = "::ffff:1.2.3.4",
+                  .port   = "",
+                  .path   = "/"},
         // no scheme or "//": starts with the host
         test_case{.input = "example.com/path", .scheme = "", .host = "example.com", .port = "", .path = "/path"},
         test_case{.input = "example.com", .scheme = "", .host = "example.com", .port = "", .path = ""},
@@ -331,7 +338,7 @@ TEST_CASE("url::parse rejects invalid hosts and ports", "[url][parse]")
 {
     struct test_case
     {
-        std::string_view      input;
+        std::string_view     input;
         net::url_parse_state failed_at;
     };
 

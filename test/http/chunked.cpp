@@ -68,18 +68,18 @@ private:
 
 struct read_result
 {
-    std::string          body;
-    std::error_code      err; // other than the end of the body
+    std::string     body;
+    std::error_code err; // other than the end of the body
 };
 
 // read_chunked reads a chunked body from text, and returns it, and what follows it. By default, the text arrives a byte
 // at a time.
 std::pair<read_result, std::string> read_chunked(std::string_view text, bool trickle = true)
 {
-    trickle_reader               trickled{text};
-    net::io::string_reader<char> whole{text};
-    net::io::buffered_reader     buffered{trickle ? static_cast<net::io::reader*>(&trickled) : &whole};
-    net::http::http11::chunked_reader    chunked{&buffered};
+    trickle_reader                    trickled{text};
+    net::io::string_reader<char>      whole{text};
+    net::io::buffered_reader          buffered{trickle ? static_cast<net::io::reader*>(&trickled) : &whole};
+    net::http::http11::chunked_reader chunked{&buffered};
 
     read_result out;
     std::string buf(7, '\0');
@@ -118,10 +118,14 @@ TEST_CASE("chunked bodies are decoded", "[http][1.1][chunked][chunked_reader]")
     };
 
     auto tc = GENERATE(
-        test_case{.name = "hex sizes", .input = "a\r\n0123456789\r\n1A\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\nNEXT", .expect = "0123456789abcdefghijklmnopqrstuvwxyz"},
+        test_case{.name   = "hex sizes",
+                  .input  = "a\r\n0123456789\r\n1A\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\nNEXT",
+                  .expect = "0123456789abcdefghijklmnopqrstuvwxyz"},
         test_case{.name = "leading zeros", .input = "005\r\nhello\r\n000\r\n\r\nNEXT", .expect = "hello"},
         test_case{.name = "extensions", .input = "5;name=value;flag\r\nhello\r\n0;last\r\n\r\nNEXT", .expect = "hello"},
-        test_case{.name = "trailers", .input = "5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other: def\r\n\r\nNEXT", .expect = "hello"},
+        test_case{.name   = "trailers",
+                  .input  = "5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other: def\r\n\r\nNEXT",
+                  .expect = "hello"},
         test_case{.name = "empty", .input = "0\r\n\r\nNEXT", .expect = ""});
 
     CAPTURE(tc.name);
@@ -155,7 +159,8 @@ TEST_CASE("malformed chunked bodies are rejected", "[http][1.1][chunked][chunked
 
 TEST_CASE("chunk size lines are limited in size", "[http][1.1][chunked][chunked_reader]")
 {
-    // (not a byte at a time: that would take a co_await per byte, which GCC doesn't keep off the stack in debug builds.)
+    // (not a byte at a time: that would take a co_await per byte, which GCC doesn't keep off the stack in debug
+    // builds.)
     auto [result, rest] = read_chunked("5;" + std::string(100'000, 'x') + "\r\nhello\r\n0\r\n\r\n", false);
     CHECK(result.err == std::errc::value_too_large);
 }

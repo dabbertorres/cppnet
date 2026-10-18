@@ -256,12 +256,12 @@ namespace net::tls::detail
 
 struct client_state
 {
-    std::shared_ptr<Botan::RandomNumberGenerator>        rng;
-    std::shared_ptr<Botan::Credentials_Manager>          credentials;
-    std::shared_ptr<Botan::TLS::Session_Manager>         sessions;
-    std::shared_ptr<const Botan::TLS::Policy>            policy;
-    bool                                                 skip_verification = false;
-    std::vector<std::string>                             alpn;
+    std::shared_ptr<Botan::RandomNumberGenerator> rng;
+    std::shared_ptr<Botan::Credentials_Manager>   credentials;
+    std::shared_ptr<Botan::TLS::Session_Manager>  sessions;
+    std::shared_ptr<const Botan::TLS::Policy>     policy;
+    bool                                          skip_verification = false;
+    std::vector<std::string>                      alpn;
 };
 
 struct server_state
@@ -273,10 +273,10 @@ struct server_state
     std::vector<std::string>                      alpn;
 };
 
-
 // callbacks are Botan's calls back into a connection. They're only made while the connection's mutex is held (from
 // inside the channel's methods, which are only called holding it), and only touch what it guards.
-// NOLINTNEXTLINE(misc-use-internal-linkage): a member of connection, which the header declares (so mustn't be internal).
+// NOTE: a member of connection, which the header declares, so it mustn't be internal.
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 class callbacks final : public Botan::TLS::Callbacks
 {
 public:
@@ -293,12 +293,12 @@ public:
     // record_verification_failure keeps why the peer's certificate was rejected.
     void record_verification_failure(Botan::Certificate_Status_Code status) noexcept;
 
-    void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate>&                cert_chain,
-                               const std::vector<std::optional<Botan::OCSP::Response>>&   ocsp_responses,
-                               const std::vector<Botan::Certificate_Store*>&              trusted_roots,
-                               Botan::Usage_Type                                          usage,
-                               std::string_view                                           hostname,
-                               const Botan::TLS::Policy&                                  policy) override
+    void tls_verify_cert_chain(const std::vector<Botan::X509_Certificate>&              cert_chain,
+                               const std::vector<std::optional<Botan::OCSP::Response>>& ocsp_responses,
+                               const std::vector<Botan::Certificate_Store*>&            trusted_roots,
+                               Botan::Usage_Type                                        usage,
+                               std::string_view                                         hostname,
+                               const Botan::TLS::Policy&                                policy) override
     {
         if (skip_verification) return;
 
@@ -350,8 +350,8 @@ struct connection
         : socket{std::move(conn)}
     {}
 
-    // take_received moves what's been decrypted (and not read yet) into data, returning how much. Must be called holding
-    // mu.
+    // take_received moves what's been decrypted (and not read yet) into data, returning how much. Must be called
+    // holding mu.
     std::size_t take_received(std::span<std::byte> data) noexcept
     {
         const auto count = std::min(data.size(), received.size() - received_start);
@@ -517,19 +517,19 @@ struct connection
     std::mutex mu;
 
     // Guarded by mu (and only touched by the callbacks, or holding it).
-    std::vector<std::uint8_t> outgoing; // ciphertext to write
-    std::vector<std::uint8_t> received; // decrypted data not read yet, from received_start
-    std::size_t               received_start = 0;
-    bool                      peer_closed    = false; // the peer's close_notify
-    std::error_code           failure;                // a fatal alert, or a broken protocol
+    std::vector<std::uint8_t>                     outgoing; // ciphertext to write
+    std::vector<std::uint8_t>                     received; // decrypted data not read yet, from received_start
+    std::size_t                                   received_start = 0;
+    bool                                          peer_closed    = false; // the peer's close_notify
+    std::error_code                               failure;                // a fatal alert, or a broken protocol
     std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
-    bool                      flushing = false;
-    std::string               alpn;
+    bool                                          flushing = false;
+    std::string                                   alpn;
 
     // what a read of the socket reads into: only one waits at once.
     std::array<std::uint8_t, (std::size_t{16} * 1'024) + 1'024> ciphertext{};
 
-    std::shared_ptr<callbacks>          cb;
+    std::shared_ptr<callbacks>           cb;
     std::unique_ptr<Botan::TLS::Channel> channel;
 };
 
@@ -695,12 +695,11 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
     co_return stream{std::move(c)};
 }
 
-coro::task<std::expected<stream, std::error_code>>
-stream::accept(tcp_socket                              conn,
-               server_context                          ctx,
-               io::clock::time_point                   deadline,
-               std::stop_token                         stop,
-               std::optional<std::vector<std::string>> alpn)
+coro::task<std::expected<stream, std::error_code>> stream::accept(tcp_socket                              conn,
+                                                                  server_context                          ctx,
+                                                                  io::clock::time_point                   deadline,
+                                                                  std::stop_token                         stop,
+                                                                  std::optional<std::vector<std::string>> alpn)
 {
     auto c = std::make_unique<detail::connection>(std::move(conn));
 
@@ -731,7 +730,8 @@ coro::task<io::result> stream::read(std::span<std::byte> data)
         std::scoped_lock lock{conn->mu};
 
         // usually, there's decrypted data already: then there's no need for a coroutine (see coro::ready_task).
-        if (auto count = conn->take_received(data); count > 0) return coro::ready_task<io::result>(io::result{.count = count});
+        if (auto count = conn->take_received(data); count > 0)
+            return coro::ready_task<io::result>(io::result{.count = count});
         if (conn->failure) return coro::ready_task<io::result>(io::result{.err = conn->failure});
         if (conn->peer_closed)
             return coro::ready_task<io::result>(io::result{.err = make_error_code(io::errc::end_of_stream)});

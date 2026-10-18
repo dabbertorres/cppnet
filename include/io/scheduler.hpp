@@ -239,10 +239,7 @@ public:
         ~wait_operation() = default;
 
         [[nodiscard]] bool await_ready() const noexcept { return false; }
-        bool               await_suspend(std::coroutine_handle<> awaiting) noexcept
-        {
-            return sched->suspend(state, awaiting);
-        }
+        bool await_suspend(std::coroutine_handle<> awaiting) noexcept { return sched->suspend(state, awaiting); }
         [[nodiscard]] std::error_code await_resume() const noexcept { return state.result; }
 
     private:
@@ -252,8 +249,8 @@ public:
 
     // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
     explicit scheduler(std::shared_ptr<coro::thread_pool>     workers,
-              const std::shared_ptr<spdlog::logger>& logger
-              = std::make_shared<spdlog::logger>("scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
+                       const std::shared_ptr<spdlog::logger>& logger = std::make_shared<spdlog::logger>(
+                           "scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
 
     scheduler(const scheduler&)            = delete;
     scheduler& operator=(const scheduler&) = delete;

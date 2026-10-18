@@ -1,21 +1,26 @@
 vcpkg_from_github(
-    OUT_SOURCE_PATH SOURCE_PATH
-    REPO randombit/botan
-    REF "${VERSION}"
-    SHA512 33a47e5733aedc29704652bf16704a2cd080cdcebd01c95879b5db3af3186debbef711c53ef131a9cb7defe3dd8ffae49d6efe7e75aef9107473b92dc6b3f101
-    HEAD_REF master
-    PATCHES
-        verbose-install.patch
-        configure-zlib.patch
-        fix_android.patch
-        # cppnet: files that use the standard library without including what they use (e.g. std::fill without
-        # <algorithm>), which libc++ 23 no longer includes along with other headers.
-        libcxx-missing-includes.patch
+  OUT_SOURCE_PATH
+  SOURCE_PATH
+  REPO
+  randombit/botan
+  REF
+  "${VERSION}"
+  SHA512
+  33a47e5733aedc29704652bf16704a2cd080cdcebd01c95879b5db3af3186debbef711c53ef131a9cb7defe3dd8ffae49d6efe7e75aef9107473b92dc6b3f101
+  HEAD_REF
+  master
+  PATCHES
+  verbose-install.patch
+  configure-zlib.patch
+  fix_android.patch
+  # cppnet: files that use the standard library without including what they use (e.g. std::fill
+  # without <algorithm>), which libc++ 23 no longer includes along with other headers.
+  libcxx-missing-includes.patch
 )
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/configure" DESTINATION "${SOURCE_PATH}")
 
 if(VCPKG_TARGET_IS_MINGW)
-    vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
+  vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 endif()
 
 vcpkg_find_acquire_program(PYTHON3)
@@ -25,190 +30,200 @@ include("${cmake_vars_file}")
 
 set(pkgconfig_syntax "")
 if(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(pkgconfig_syntax "--msvc-syntax")
+  set(pkgconfig_syntax "--msvc-syntax")
 endif()
 
-vcpkg_list(SET configure_arguments
-    "--distribution-info=vcpkg ${TARGET_TRIPLET}"
-    --disable-cc-tests
-    --with-pkg-config
-    --with-cmake-config
-    --link-method=copy
-    --with-debug-info
-    --without-include-namespace
-    --includedir=include
-    --bindir=bin
-    --libdir=lib
-    --cmakeconfigdir=share/${PORT}
-    --without-documentation
-    "--with-external-includedir=${CURRENT_INSTALLED_DIR}/include"
+vcpkg_list(
+  SET
+  configure_arguments
+  "--distribution-info=vcpkg ${TARGET_TRIPLET}"
+  --disable-cc-tests
+  --with-pkg-config
+  --with-cmake-config
+  --link-method=copy
+  --with-debug-info
+  --without-include-namespace
+  --includedir=include
+  --bindir=bin
+  --libdir=lib
+  --cmakeconfigdir=share/${PORT}
+  --without-documentation
+  "--with-external-includedir=${CURRENT_INSTALLED_DIR}/include"
 )
 vcpkg_list(SET pkgconfig_requires)
 
 if("amalgamation" IN_LIST FEATURES)
-    vcpkg_list(APPEND configure_arguments --amalgamation)
+  vcpkg_list(APPEND configure_arguments --amalgamation)
 endif()
 
 set(ZLIB_LIBS_RELEASE "")
 set(ZLIB_LIBS_DEBUG "")
 if("zlib" IN_LIST FEATURES)
-    vcpkg_list(APPEND configure_arguments --with-zlib)
-    vcpkg_list(APPEND pkgconfig_requires zlib)
-    x_vcpkg_pkgconfig_get_modules(LIBS PREFIX "ZLIB" MODULES "zlib" ${pkgconfig_syntax})
+  vcpkg_list(APPEND configure_arguments --with-zlib)
+  vcpkg_list(APPEND pkgconfig_requires zlib)
+  x_vcpkg_pkgconfig_get_modules(LIBS PREFIX "ZLIB" MODULES "zlib" ${pkgconfig_syntax})
 endif()
 
 if(VCPKG_TARGET_IS_EMSCRIPTEN)
-    vcpkg_list(APPEND configure_arguments --cpu=wasm)
+  vcpkg_list(APPEND configure_arguments --cpu=wasm)
 elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "x86")
-    vcpkg_list(APPEND configure_arguments --cpu=x86)
+  vcpkg_list(APPEND configure_arguments --cpu=x86)
 elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
-    vcpkg_list(APPEND configure_arguments --cpu=x86_64)
+  vcpkg_list(APPEND configure_arguments --cpu=x86_64)
 elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm")
-    vcpkg_list(APPEND configure_arguments --cpu=arm32)
+  vcpkg_list(APPEND configure_arguments --cpu=arm32)
 elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
-    vcpkg_list(APPEND configure_arguments --cpu=arm64)
+  vcpkg_list(APPEND configure_arguments --cpu=arm64)
 else()
-    message(FATAL_ERROR "Unsupported architecture")
+  message(FATAL_ERROR "Unsupported architecture")
 endif()
 
-# Allow disabling use of WinSock2 by setting BOTAN_USE_WINSOCK2=OFF in triplet
-# for targeting older Windows versions with missing APIs.
-if(VCPKG_TARGET_IS_WINDOWS AND DEFINED BOTAN_USE_WINSOCK2 AND NOT BOTAN_USE_WINSOCK2)
-    vcpkg_list(APPEND configure_arguments --without-os-features=winsock2)
+# Allow disabling use of WinSock2 by setting BOTAN_USE_WINSOCK2=OFF in triplet for targeting older
+# Windows versions with missing APIs.
+if(VCPKG_TARGET_IS_WINDOWS
+   AND DEFINED BOTAN_USE_WINSOCK2
+   AND NOT BOTAN_USE_WINSOCK2
+)
+  vcpkg_list(APPEND configure_arguments --without-os-features=winsock2)
 endif()
 
 if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
-    vcpkg_list(APPEND configure_arguments --os=windows)
+  vcpkg_list(APPEND configure_arguments --os=windows)
 
-    if(VCPKG_DETECTED_CMAKE_CXX_COMPILER MATCHES "clang-cl(\.exe)?$")
-        vcpkg_list(APPEND configure_arguments "--cc=clangcl")
-    elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-        vcpkg_list(APPEND configure_arguments "--cc=msvc")
-    endif()
+  if(VCPKG_DETECTED_CMAKE_CXX_COMPILER MATCHES "clang-cl(\.exe)?$")
+    vcpkg_list(APPEND configure_arguments "--cc=clangcl")
+  elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    vcpkg_list(APPEND configure_arguments "--cc=msvc")
+  endif()
 
-    vcpkg_list(APPEND configure_arguments "--extra-cxxflags=${VCPKG_DETECTED_CMAKE_CXX_FLAGS}")
+  vcpkg_list(APPEND configure_arguments "--extra-cxxflags=${VCPKG_DETECTED_CMAKE_CXX_FLAGS}")
 
-    if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
-        vcpkg_list(APPEND configure_arguments --enable-shared-library --disable-static-library)
-    else()
-        vcpkg_list(APPEND configure_arguments --disable-shared-library --enable-static-library)
-    endif()
+  if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
+    vcpkg_list(APPEND configure_arguments --enable-shared-library --disable-static-library)
+  else()
+    vcpkg_list(APPEND configure_arguments --disable-shared-library --enable-static-library)
+  endif()
 
-    if(VCPKG_CRT_LINKAGE STREQUAL "dynamic")
-        set(BOTAN_MSVC_RUNTIME MD)
-    else()
-        set(BOTAN_MSVC_RUNTIME MT)
-    endif()
+  if(VCPKG_CRT_LINKAGE STREQUAL "dynamic")
+    set(BOTAN_MSVC_RUNTIME MD)
+  else()
+    set(BOTAN_MSVC_RUNTIME MT)
+  endif()
 
-    vcpkg_install_nmake(
-        SOURCE_PATH "${SOURCE_PATH}"
-        PROJECT_NAME "Makefile"
-        PREFER_JOM
-        PRERUN_SHELL_RELEASE
-            "${PYTHON3}" "${SOURCE_PATH}/configure.py"
-            ${configure_arguments}
-            "--prefix=${CURRENT_PACKAGES_DIR}"
-            "--msvc-runtime=${BOTAN_MSVC_RUNTIME}"
-            "--with-external-libdir=${CURRENT_INSTALLED_DIR}/lib"
-        PRERUN_SHELL_DEBUG
-            "${PYTHON3}" "${SOURCE_PATH}/configure.py"
-            ${configure_arguments}
-            "--prefix=${CURRENT_PACKAGES_DIR}/debug"
-            "--msvc-runtime=${BOTAN_MSVC_RUNTIME}d"
-            "--with-external-libdir=${CURRENT_INSTALLED_DIR}/debug/lib"
-            --debug-mode
-        OPTIONS
-            "CXX=\"${VCPKG_DETECTED_CMAKE_CXX_COMPILER}\""
-            "LINKER=\"${VCPKG_DETECTED_CMAKE_LINKER}\""
-            "AR=\"${VCPKG_DETECTED_CMAKE_AR}\""
-            "EXE_LINK_CMD=\"${VCPKG_DETECTED_CMAKE_LINKER}\" ${VCPKG_LINKER_FLAGS}"
-        OPTIONS_RELEASE
-            "ZLIB_LIBS=${ZLIB_LIBS_RELEASE}"
-        OPTIONS_DEBUG
-            "ZLIB_LIBS=${ZLIB_LIBS_DEBUG}"
-    )
-    vcpkg_copy_tools(TOOL_NAMES botan-cli AUTO_CLEAN)
-    vcpkg_copy_pdbs()
+  vcpkg_install_nmake(
+    SOURCE_PATH
+    "${SOURCE_PATH}"
+    PROJECT_NAME
+    "Makefile"
+    PREFER_JOM
+    PRERUN_SHELL_RELEASE
+    "${PYTHON3}"
+    "${SOURCE_PATH}/configure.py"
+    ${configure_arguments}
+    "--prefix=${CURRENT_PACKAGES_DIR}"
+    "--msvc-runtime=${BOTAN_MSVC_RUNTIME}"
+    "--with-external-libdir=${CURRENT_INSTALLED_DIR}/lib"
+    PRERUN_SHELL_DEBUG
+    "${PYTHON3}"
+    "${SOURCE_PATH}/configure.py"
+    ${configure_arguments}
+    "--prefix=${CURRENT_PACKAGES_DIR}/debug"
+    "--msvc-runtime=${BOTAN_MSVC_RUNTIME}d"
+    "--with-external-libdir=${CURRENT_INSTALLED_DIR}/debug/lib"
+    --debug-mode
+    OPTIONS
+    "CXX=\"${VCPKG_DETECTED_CMAKE_CXX_COMPILER}\""
+    "LINKER=\"${VCPKG_DETECTED_CMAKE_LINKER}\""
+    "AR=\"${VCPKG_DETECTED_CMAKE_AR}\""
+    "EXE_LINK_CMD=\"${VCPKG_DETECTED_CMAKE_LINKER}\" ${VCPKG_LINKER_FLAGS}"
+    OPTIONS_RELEASE
+    "ZLIB_LIBS=${ZLIB_LIBS_RELEASE}"
+    OPTIONS_DEBUG
+    "ZLIB_LIBS=${ZLIB_LIBS_DEBUG}"
+  )
+  vcpkg_copy_tools(TOOL_NAMES botan-cli AUTO_CLEAN)
+  vcpkg_copy_pdbs()
 else()
-    if(VCPKG_TARGET_IS_ANDROID)
-        vcpkg_list(APPEND configure_arguments --os=android)
-    elseif(VCPKG_TARGET_IS_EMSCRIPTEN)
-        vcpkg_list(APPEND configure_arguments --os=emscripten)
-    elseif(VCPKG_TARGET_IS_MINGW)
-        vcpkg_list(APPEND configure_arguments --os=mingw)
+  if(VCPKG_TARGET_IS_ANDROID)
+    vcpkg_list(APPEND configure_arguments --os=android)
+  elseif(VCPKG_TARGET_IS_EMSCRIPTEN)
+    vcpkg_list(APPEND configure_arguments --os=emscripten)
+  elseif(VCPKG_TARGET_IS_MINGW)
+    vcpkg_list(APPEND configure_arguments --os=mingw)
+  endif()
+
+  if(VCPKG_TARGET_IS_EMSCRIPTEN)
+    vcpkg_list(APPEND configure_arguments --cc=emcc)
+  elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    vcpkg_list(APPEND configure_arguments --cc=gcc)
+
+    # cppnet: GCC on macOS can't compile what's left out here: - the keychain's trust store, as
+    # Apple's headers use blocks, which only Clang supports. Botan's system trust store reads
+    # /etc/ssl/cert.pem (Apple's bundle of the system's roots) instead, which configure.py finds. -
+    # on Apple Silicon, the ARMv8 SM3 code (which TLS doesn't use), as GCC writes SM3's instructions
+    # (e.g. "sm3tt1a v30.4s, v29.4s, v31.4s[0]") in a form Apple's assembler rejects.
+    if(VCPKG_TARGET_IS_OSX)
+      set(cppnet_disabled_modules certstor_system_macos)
+      if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+        list(APPEND cppnet_disabled_modules sm3_armv8)
+      endif()
+
+      list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
+      vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
     endif()
+  elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    vcpkg_list(APPEND configure_arguments --cc=clang)
+  endif()
 
-    if(VCPKG_TARGET_IS_EMSCRIPTEN)
-        vcpkg_list(APPEND configure_arguments --cc=emcc)
-    elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        vcpkg_list(APPEND configure_arguments --cc=gcc)
+  if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
+    vcpkg_list(APPEND configure_arguments --build-targets=shared,cli)
+  else()
+    vcpkg_list(APPEND configure_arguments --build-targets=static,cli)
+  endif()
 
-        # cppnet: GCC on macOS can't compile what's left out here:
-        # - the keychain's trust store, as Apple's headers use blocks, which only Clang supports. Botan's system trust
-        #   store reads /etc/ssl/cert.pem (Apple's bundle of the system's roots) instead, which configure.py finds.
-        # - on Apple Silicon, the ARMv8 SM3 code (which TLS doesn't use), as GCC writes SM3's instructions (e.g.
-        #   "sm3tt1a v30.4s, v29.4s, v31.4s[0]") in a form Apple's assembler rejects.
-        if(VCPKG_TARGET_IS_OSX)
-            set(cppnet_disabled_modules certstor_system_macos)
-            if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
-                list(APPEND cppnet_disabled_modules sm3_armv8)
-            endif()
-
-            list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
-            vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
-        endif()
-    elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        vcpkg_list(APPEND configure_arguments --cc=clang)
-    endif()
-
-    if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
-        vcpkg_list(APPEND configure_arguments --build-targets=shared,cli)
-    else()
-        vcpkg_list(APPEND configure_arguments --build-targets=static,cli)
-    endif()
-
-    # botan's install.py doesn't handle DESTDIR on windows host,
-    # so we must avoid the standard '--prefix' and 'DESTDIR' install.
-    vcpkg_configure_make(
-        SOURCE_PATH "${SOURCE_PATH}"
-        DISABLE_VERBOSE_FLAGS
-        NO_ADDITIONAL_PATHS
-        OPTIONS
-            "${PYTHON3}" "${SOURCE_PATH}/configure.py"
-            ${configure_arguments}
-        OPTIONS_RELEASE
-            "--prefix=${CURRENT_PACKAGES_DIR}"
-            "--with-external-libdir=${CURRENT_INSTALLED_DIR}/lib"
-        OPTIONS_DEBUG
-            --debug-mode
-            "--prefix=${CURRENT_PACKAGES_DIR}/debug"
-            "--with-external-libdir=${CURRENT_INSTALLED_DIR}/debug/lib"
-    )
-    vcpkg_build_make(
-        BUILD_TARGET install
-        OPTIONS
-            "ZLIB_LIBS_RELEASE=${ZLIB_LIBS_RELEASE}"
-            "ZLIB_LIBS_DEBUG=${ZLIB_LIBS_DEBUG}"
-    )
-    if(NOT VCPKG_TARGET_IS_EMSCRIPTEN)
-        vcpkg_copy_tools(TOOL_NAMES botan AUTO_CLEAN)
-    endif()
+  # botan's install.py doesn't handle DESTDIR on windows host, so we must avoid the standard
+  # '--prefix' and 'DESTDIR' install.
+  vcpkg_configure_make(
+    SOURCE_PATH
+    "${SOURCE_PATH}"
+    DISABLE_VERBOSE_FLAGS
+    NO_ADDITIONAL_PATHS
+    OPTIONS
+    "${PYTHON3}"
+    "${SOURCE_PATH}/configure.py"
+    ${configure_arguments}
+    OPTIONS_RELEASE
+    "--prefix=${CURRENT_PACKAGES_DIR}"
+    "--with-external-libdir=${CURRENT_INSTALLED_DIR}/lib"
+    OPTIONS_DEBUG
+    --debug-mode
+    "--prefix=${CURRENT_PACKAGES_DIR}/debug"
+    "--with-external-libdir=${CURRENT_INSTALLED_DIR}/debug/lib"
+  )
+  vcpkg_build_make(
+    BUILD_TARGET install OPTIONS "ZLIB_LIBS_RELEASE=${ZLIB_LIBS_RELEASE}"
+    "ZLIB_LIBS_DEBUG=${ZLIB_LIBS_DEBUG}"
+  )
+  if(NOT VCPKG_TARGET_IS_EMSCRIPTEN)
+    vcpkg_copy_tools(TOOL_NAMES botan AUTO_CLEAN)
+  endif()
 endif()
 
 vcpkg_cmake_config_fixup()
 
 if(pkgconfig_requires)
-    list(JOIN pkgconfig_requires ", " pkgconfig_requires)
-    file(APPEND "${CURRENT_PACKAGES_DIR}/lib/pkgconfig/botan-3.pc" "Requires.private: ${pkgconfig_requires}")
-    if(NOT VCPKG_BUILD_TYPE)
-        file(APPEND "${CURRENT_PACKAGES_DIR}/debug/lib/pkgconfig/botan-3.pc" "Requires.private: ${pkgconfig_requires}")
-    endif()
+  list(JOIN pkgconfig_requires ", " pkgconfig_requires)
+  file(APPEND "${CURRENT_PACKAGES_DIR}/lib/pkgconfig/botan-3.pc"
+       "Requires.private: ${pkgconfig_requires}"
+  )
+  if(NOT VCPKG_BUILD_TYPE)
+    file(APPEND "${CURRENT_PACKAGES_DIR}/debug/lib/pkgconfig/botan-3.pc"
+         "Requires.private: ${pkgconfig_requires}"
+    )
+  endif()
 endif()
 vcpkg_fixup_pkgconfig()
 
-file(REMOVE_RECURSE
-    "${CURRENT_PACKAGES_DIR}/debug/include"
-    "${CURRENT_PACKAGES_DIR}/debug/share"
-)
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include" "${CURRENT_PACKAGES_DIR}/debug/share")
 
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/license.txt")

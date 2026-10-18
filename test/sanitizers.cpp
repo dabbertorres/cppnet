@@ -3,7 +3,6 @@
 
 extern "C"
 {
-
 #if defined(__APPLE__) && !defined(__apple_build_version__)
 // LeakSanitizer is on by default on Linux, but not on macOS, where LLVM's clang supports it, but Apple's doesn't: its
 // ASan fails to start if asked for it.
@@ -20,5 +19,4 @@ extern "C"
     return "leak:_gai_nat64_second_pass\n"
            "leak:nw_path_libinfo_path_check\n";
 }
-
 }

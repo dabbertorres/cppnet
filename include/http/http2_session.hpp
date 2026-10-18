@@ -163,7 +163,7 @@ public:
     void ping(std::span<const std::byte, 8> opaque);
 
     // take_output swaps what's to be written with out (which it clears first), so a writer can reuse its buffer.
-    void               take_output(std::vector<std::byte>& out);
+    void                      take_output(std::vector<std::byte>& out);
     [[nodiscard]] bool        has_output() const noexcept { return !output.empty(); }
     [[nodiscard]] std::size_t output_size() const noexcept { return output.size(); }
 

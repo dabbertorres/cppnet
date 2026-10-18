@@ -10,9 +10,10 @@
 #include <utility>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
 
 #include "http/request.hpp"
 #include "url.hpp"
@@ -29,10 +30,7 @@ using net::http::request_target;
 
 constexpr bool is_alpha(char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
-constexpr bool is_hex_digit(char c) noexcept
-{
-    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
+constexpr bool is_hex_digit(char c) noexcept { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
 constexpr bool is_unreserved(char c) noexcept
 {

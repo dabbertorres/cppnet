@@ -192,7 +192,7 @@ private:
     bool                    polling    = false;
     bool                    poll_woken = false;
     bool                    standby    = false; // whether a sleeping worker is the standby (see worker())
-    std::condition_variable polled; // notified when a poll ends, for detach()
+    std::condition_variable polled;             // notified when a poll ends, for detach()
 };
 
 }

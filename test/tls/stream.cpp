@@ -46,7 +46,10 @@ namespace
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
-std::string as_string(std::span<const std::byte> data) { return {reinterpret_cast<const char*>(data.data()), data.size()}; }
+std::string as_string(std::span<const std::byte> data)
+{
+    return {reinterpret_cast<const char*>(data.data()), data.size()};
+}
 
 // read_to_end reads s until it ends (or fails), returning what it read and why it stopped.
 task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& s)
@@ -394,7 +397,7 @@ TEST_CASE("a handshake that doesn't finish by its deadline fails", "[tls]")
     listener.listen(8);
 
     // a server that accepts the connection, but never answers.
-    std::atomic<bool> done = false;
+    std::atomic<bool> done   = false;
     const auto        silent = [](net::listener* listener, std::atomic<bool>* done, net::io::scheduler* sched) -> task<>
     {
         auto accepted = co_await listener->accept();
@@ -408,7 +411,10 @@ TEST_CASE("a handshake that doesn't finish by its deadline fails", "[tls]")
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
         if (!conn.has_value()) co_return conn.error();
 
-        auto s = co_await tls::stream::connect(std::move(*conn), trusting_client(), "localhost", net::io::clock::now() + 200ms);
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client(),
+                                               "localhost",
+                                               net::io::clock::now() + 200ms);
         done->store(true);
         co_return s.has_value() ? std::error_code{} : s.error();
     };

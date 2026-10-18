@@ -106,8 +106,8 @@ coro::task<std::expected<tcp_socket, std::error_code>>
 tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options)
 {
     // getaddrinfo() blocks, so keep it off the worker threads.
-    auto addresses = co_await scheduler->run_blocking([host, port, proto = options.proto]
-                                                      { return resolve(host, port, proto); });
+    auto addresses =
+        co_await scheduler->run_blocking([host, port, proto = options.proto] { return resolve(host, port, proto); });
     if (!addresses.has_value()) co_return std::unexpected(addresses.error());
 
     const auto deadline = io::clock::now() + options.timeout;

@@ -55,7 +55,7 @@ private:
     // NOTE: each bucket counts only the observations that belong in it, rather than also those in the buckets before
     //       it (as the output does), so an observation is one atomic increment, and the output adds them up: then its
     //       buckets never decrease, and the +Inf bucket always equals the count.
-    std::vector<double>                           bounds;
+    std::vector<double> bounds;
     // NOLINTNEXTLINE(*-avoid-c-arrays): std::atomic can't be moved, so a std::vector can't hold them.
     std::unique_ptr<std::atomic<std::uint64_t>[]> counts;
     std::atomic<double>                           sum = 0.0;

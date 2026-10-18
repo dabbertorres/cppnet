@@ -21,5 +21,4 @@ public:
 // make_gai_error_code converts an error from getaddrinfo(). EAI_SYSTEM is reported as errno.
 [[nodiscard]] std::error_code make_gai_error_code(int err) noexcept;
 
-
 }

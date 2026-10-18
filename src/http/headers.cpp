@@ -243,10 +243,8 @@ void headers::for_each_element(std::string_view key, F visit) const
 
         for (std::size_t i = 0; i < value.size(); ++i)
         {
-            if (quoted && value[i] == '\\')
-                ++i; // skip what's escaped
-            else if (value[i] == '"')
-                quoted = !quoted;
+            if (quoted && value[i] == '\\') ++i; // skip what's escaped
+            else if (value[i] == '"') quoted = !quoted;
             else if (!quoted && value[i] == ',' && !element(i)) return;
         }
 

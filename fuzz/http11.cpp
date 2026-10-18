@@ -76,8 +76,8 @@ std::string transcript(net::io::reader* conn)
         }
 
         out += std::string{net::http::method_string(req->method)} + " " + req->target.path + "?" + req->target.query
-             + " " + std::to_string(req->version.major) + "." + std::to_string(req->version.minor) + " host=" + req->host
-             + "\n";
+             + " " + std::to_string(req->version.major) + "." + std::to_string(req->version.minor)
+             + " host=" + req->host + "\n";
 
         for (const auto& [name, values] : req->headers)
         {

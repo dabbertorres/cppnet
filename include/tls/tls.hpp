@@ -25,8 +25,8 @@ namespace net::tls
 // client_options configures a client_context.
 struct client_options
 {
-    // The certificate authorities to trust: the system's (by default), or those in this PEM file instead (e.g. a private
-    // CA's).
+    // The certificate authorities to trust: the system's (by default), or those in this PEM file instead (e.g. a
+    // private CA's).
     std::optional<std::filesystem::path> trusted_ca_file{};
 
     // Skip verifying the server's certificate (and its name): for testing against self-signed servers only. Named so
@@ -45,9 +45,9 @@ struct client_options
 namespace detail
 {
 
-struct client_state;
-struct server_state;
-struct connection;
+    struct client_state;
+    struct server_state;
+    struct connection;
 
 }
 

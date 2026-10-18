@@ -57,7 +57,7 @@ public:
     ~pooled_body() override { finish(false); }
 
     [[nodiscard]] net::http::detail::connection* connection() const noexcept { return leased.conn.get(); }
-    [[nodiscard]] net::io::buffered_reader* buffered() const noexcept { return reader.get(); }
+    [[nodiscard]] net::io::buffered_reader*      buffered() const noexcept { return reader.get(); }
 
     // attach sets the body that's read from the connection. length is how long it is, if it's known up front.
     void attach(std::unique_ptr<net::io::reader> decoded, bool reuse, std::optional<std::size_t> length)
@@ -245,8 +245,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
         }
 
         // the server didn't get all of the request, so the connection is no use for another.
-        const bool reuse =
-            !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
+        const bool reuse = !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
         body->attach(std::move(resp->body), reuse, known_length(*resp, request.method));
         resp->body = std::move(body);
 

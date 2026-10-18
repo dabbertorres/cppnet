@@ -42,11 +42,15 @@ TEST_CASE("valid request targets", "[http][request_target]")
     };
 
     auto tc = GENERATE(
-        test_case{.target = "/", .expect = {.path = "/"}},
+        test_case{
+            .target = "/",
+            .expect = {.path = "/"}
+    },
         test_case{.target = "/a/b?x=1&y", .expect = {.path = "/a/b", .query = "x=1&y"}},
         // nothing is decoded, and colons and '@' are just path characters.
         test_case{.target = "/a%2Fb/x:run", .expect = {.path = "/a%2Fb/x:run"}},
-        test_case{.target = "/search?q=a:b&email=a@b.com", .expect = {.path = "/search", .query = "q=a:b&email=a@b.com"}},
+        test_case{.target = "/search?q=a:b&email=a@b.com",
+                  .expect = {.path = "/search", .query = "q=a:b&email=a@b.com"}},
         test_case{.target = "/?a?b", .expect = {.path = "/", .query = "a?b"}},
         // dot segments, encoded or not, can't go above the root.
         test_case{.target = "/a/./b", .expect = {.path = "/a/b"}},
@@ -59,8 +63,10 @@ TEST_CASE("valid request targets", "[http][request_target]")
             .target = "http://Example.com:8080/p?q",
             .expect = {.kind = form::absolute, .path = "/p", .query = "q", .host = "Example.com", .port = "8080"},
         },
-        test_case{.target = "https://example.com", .expect = {.kind = form::absolute, .path = "/", .host = "example.com"}},
-        test_case{.target = "http://[::1]:80/", .expect = {.kind = form::absolute, .path = "/", .host = "::1", .port = "80"}},
+        test_case{.target = "https://example.com",
+                  .expect = {.kind = form::absolute, .path = "/", .host = "example.com"}},
+        test_case{.target = "http://[::1]:80/",
+                  .expect = {.kind = form::absolute, .path = "/", .host = "::1", .port = "80"}},
         test_case{
             .method = request_method::CONNECT,
             .target = "example.com:443",
@@ -124,8 +130,8 @@ TEST_CASE("query values are decoded", "[http][request_target]")
     CHECK(result->query_values()
           == net::url::query_values{
               {"a", {"1", "x y&z"}},
-              {"b", {}},
-              {"c", {""}},
+              {"b",             {}},
+              {"c",           {""}},
     });
 }
 
@@ -134,8 +140,18 @@ TEST_CASE("the router matches decoded segments", "[http][router]")
     std::string matched;
 
     net::http::router router;
-    router.GET("/x/y", [&](const auto&, auto&) -> net::coro::task<> { matched = "/x/y"; co_return; });
-    router.GET("/x/a b", [&](const auto&, auto&) -> net::coro::task<> { matched = "/x/a b"; co_return; });
+    router.GET("/x/y",
+               [&](const auto&, auto&) -> net::coro::task<>
+               {
+                   matched = "/x/y";
+                   co_return;
+               });
+    router.GET("/x/a b",
+               [&](const auto&, auto&) -> net::coro::task<>
+               {
+                   matched = "/x/a b";
+                   co_return;
+               });
 
     const auto route = [&](std::string_view target)
     {
@@ -147,8 +163,11 @@ TEST_CASE("the router matches decoded segments", "[http][router]")
         req.target = *parsed;
 
         net::io::string_writer<char> out;
-        net::http::server_response   resp{.version = {.major = 1, .minor = 1}, .body = &out};
-        net::http::response_writer   rw{&out, &resp, net::http::http11::response_encode};
+        net::http::server_response   resp{
+            .version = {.major = 1, .minor = 1},
+            .body    = &out
+        };
+        net::http::response_writer rw{&out, &resp, net::http::http11::response_encode};
         test::sync_wait(router(req, rw));
 
         return matched.empty() ? out.build().substr(0, 12) : matched;

@@ -468,8 +468,8 @@ public:
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
 
     template<typename Y>
-        requires((is_reference && std::is_constructible_v<T, Y &&>)
-                 || (!is_reference && std::is_constructible_v<stored_type, Y &&>))
+        requires((is_reference && std::is_constructible_v<T, Y&&>)
+                 || (!is_reference && std::is_constructible_v<stored_type, Y&&>))
     void return_value(Y&& new_value) noexcept
     {
         if constexpr (is_reference)

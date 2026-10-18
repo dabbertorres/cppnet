@@ -14,20 +14,9 @@ if(NOT NET_TLS)
 endif()
 add_executable(tests ${test_sources})
 
-target_include_directories(
-  tests
-  PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  Catch2::Catch2
-)
+target_include_directories(tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" Catch2::Catch2)
 
-target_link_libraries(
-  tests
-  PRIVATE
-  Catch2::Catch2
-  Catch2::Catch2WithMain
-  net
-)
+target_link_libraries(tests PRIVATE Catch2::Catch2 Catch2::Catch2WithMain net)
 
 # the TLS tests make their certificates with Botan.
 if(NET_TLS)

@@ -77,7 +77,7 @@ public:
     [[nodiscard]] handle native_handle() const noexcept override { return 0; }
 
 private:
-    std::string               content;
+    std::string         content;
     string_reader<char> impl;
 };
 

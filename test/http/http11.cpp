@@ -55,7 +55,10 @@ TEST_CASE("just a request line", "[http][1.1][request_decode]")
         CHECK(request.method == net::http::request_method::GET);
         CHECK(request.version == net::http::protocol_version{.major = 1, .minor = 1});
         CHECK(request.target == expected_route);
-        CHECK(request.headers == net::http::headers{{"Host", {"a"}}});
+        CHECK(request.headers
+              == net::http::headers{
+                  {"Host", {"a"}}
+        });
     }
 }
 
@@ -339,9 +342,9 @@ TEST_CASE("malformed requests are rejected", "[http][1.1][request_decode][strict
 {
     struct test_case
     {
-        std::string_view   name;
-        std::string_view   request;
-        std::errc          expect = std::errc::invalid_argument;
+        std::string_view name;
+        std::string_view request;
+        std::errc        expect = std::errc::invalid_argument;
     };
 
     auto tc = GENERATE(
@@ -353,7 +356,9 @@ TEST_CASE("malformed requests are rejected", "[http][1.1][request_decode][strict
         test_case{.name = "trailing space", .request = "GET / HTTP/1.1 \r\nHost: a\r\n\r\n"},
         test_case{.name = "double space", .request = "GET  / HTTP/1.1\r\nHost: a\r\n\r\n"},
         test_case{.name = "method isn't a token", .request = "G(T / HTTP/1.1\r\nHost: a\r\n\r\n"},
-        test_case{.name = "unknown method", .request = "BREW / HTTP/1.1\r\nHost: a\r\n\r\n", .expect = std::errc::not_supported},
+        test_case{.name    = "unknown method",
+                  .request = "BREW / HTTP/1.1\r\nHost: a\r\n\r\n",
+                  .expect  = std::errc::not_supported},
         // field lines
         test_case{.name = "no colon", .request = "GET / HTTP/1.1\r\nHost: a\r\nX-Nothing\r\n\r\n"},
         test_case{.name = "empty name", .request = "GET / HTTP/1.1\r\nHost: a\r\n: x\r\n\r\n"},
@@ -370,20 +375,34 @@ TEST_CASE("malformed requests are rejected", "[http][1.1][request_decode][strict
         test_case{.name = "invalid Host", .request = "GET / HTTP/1.1\r\nHost: a/b\r\n\r\n"},
         test_case{.name = "invalid Host port", .request = "GET / HTTP/1.1\r\nHost: a:http\r\n\r\n"},
         // the body's length
-        test_case{.name = "Content-Length with junk", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5x\r\n\r\n"},
-        test_case{.name = "negative Content-Length", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n"},
-        test_case{.name = "signed Content-Length", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n"},
+        test_case{.name    = "Content-Length with junk",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5x\r\n\r\n"},
+        test_case{.name    = "negative Content-Length",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n"},
+        test_case{.name    = "signed Content-Length",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n"},
         test_case{.name = "empty Content-Length", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length:\r\n\r\n"},
-        test_case{.name = "huge Content-Length", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n"},
-        test_case{.name = "different Content-Lengths", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"},
-        test_case{.name = "different Content-Lengths in one line", .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 6\r\n\r\n"},
-        test_case{.name = "Transfer-Encoding and Content-Length", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"},
-        test_case{.name = "chunked isn't last", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"},
+        test_case{.name    = "huge Content-Length",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 99999999999999999999999\r\n\r\n"},
+        test_case{.name    = "different Content-Lengths",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"},
+        test_case{.name    = "different Content-Lengths in one line",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 6\r\n\r\n"},
+        test_case{.name    = "Transfer-Encoding and Content-Length",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"},
+        test_case{.name    = "chunked isn't last",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"},
         test_case{.name = "no chunked", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n"},
-        test_case{.name = "not quite chunked", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n"},
-        test_case{.name = "chunked twice", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"},
-        test_case{.name = "Transfer-Encoding in HTTP/1.0", .request = "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"},
-        test_case{.name = "unsupported coding", .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", .expect = std::errc::not_supported});
+        test_case{.name    = "not quite chunked",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n"},
+        test_case{.name = "chunked twice",
+                  .request =
+                      "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"},
+        test_case{.name    = "Transfer-Encoding in HTTP/1.0",
+                  .request = "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"},
+        test_case{.name    = "unsupported coding",
+                  .request = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                  .expect  = std::errc::not_supported});
 
     CAPTURE(tc.name);
 
@@ -441,7 +460,8 @@ TEST_CASE("the head of a request is limited in size", "[http][1.1][request_decod
     const std::string long_value(100, 'v');
 
     CHECK(decode("GET " + long_target + " HTTP/1.1\r\nHost: a\r\n\r\n", 64).error() == std::errc::value_too_large);
-    CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\nX: " + long_value + "\r\n\r\n", 64).error() == std::errc::value_too_large);
+    CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\nX: " + long_value + "\r\n\r\n", 64).error()
+          == std::errc::value_too_large);
 
     // many small lines add up.
     std::string many = "GET / HTTP/1.1\r\nHost: a\r\n";
@@ -449,7 +469,8 @@ TEST_CASE("the head of a request is limited in size", "[http][1.1][request_decod
     CHECK(decode(many + "\r\n", 64).error() == std::errc::value_too_large);
 
     // a line without an end doesn't buffer forever.
-    CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(10'000, 'v'), 64).error() == std::errc::value_too_large);
+    CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(10'000, 'v'), 64).error()
+          == std::errc::value_too_large);
 
     CHECK(decode("GET / HTTP/1.1\r\nHost: a\r\n\r\n", 64).has_value());
 }
@@ -553,7 +574,10 @@ TEST_CASE("unsafe header fields aren't encoded", "[http][1.1][response_encode][s
     CAPTURE(name, value);
 
     net::io::string_writer<char> out;
-    net::http::server_response   resp{.version = {.major = 1, .minor = 1}, .status_code = net::http::status::OK};
+    net::http::server_response   resp{
+        .version     = {.major = 1, .minor = 1},
+        .status_code = net::http::status::OK
+    };
     resp.headers.set(name, value);
 
     auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
@@ -585,8 +609,7 @@ public:
 net::http::response_decoder_result decode_response(std::string_view          text,
                                                    net::http::request_method method = net::http::request_method::GET)
 {
-    return test::sync_wait(
-        net::http::http11::response_decode(std::make_unique<owning_buffered_reader>(text), method));
+    return test::sync_wait(net::http::http11::response_decode(std::make_unique<owning_buffered_reader>(text), method));
 }
 
 std::string read_body(net::io::reader& body)
@@ -618,16 +641,44 @@ TEST_CASE("response bodies", "[http][1.1][response_decode]")
         std::string_view expect_body;
     };
 
-    auto tc = GENERATE(
-        test_case{.name = "Content-Length", .response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokextra", .expect_status = status::OK, .expect_body = "ok"},
-        test_case{.name = "chunked", .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n", .expect_status = status::OK, .expect_body = "ok"},
-        test_case{.name = "until closed", .response = "HTTP/1.1 200 OK\r\n\r\nuntil the end", .expect_status = status::OK, .expect_body = "until the end"},
-        test_case{.name = "until closed, after other codings", .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nraw", .expect_status = status::OK, .expect_body = "raw"},
-        test_case{.name = "no reason", .response = "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok", .expect_status = status::OK, .expect_body = "ok"},
-        test_case{.name = "204", .response = "HTTP/1.1 204 No Content\r\n\r\nnot the body", .expect_status = status::NO_CONTENT, .expect_body = ""},
-        test_case{.name = "304", .response = "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n", .expect_status = status::NOT_MODIFIED, .expect_body = ""},
-        test_case{.name = "HEAD", .response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", .method = request_method::HEAD, .expect_status = status::OK, .expect_body = ""},
-        test_case{.name = "100 Continue first", .response = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", .expect_status = status::OK, .expect_body = "ok"});
+    auto tc =
+        GENERATE(test_case{.name          = "Content-Length",
+                           .response      = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokextra",
+                           .expect_status = status::OK,
+                           .expect_body   = "ok"},
+                 test_case{.name          = "chunked",
+                           .response      = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+                           .expect_status = status::OK,
+                           .expect_body   = "ok"},
+                 test_case{.name          = "until closed",
+                           .response      = "HTTP/1.1 200 OK\r\n\r\nuntil the end",
+                           .expect_status = status::OK,
+                           .expect_body   = "until the end"},
+                 test_case{.name          = "until closed, after other codings",
+                           .response      = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nraw",
+                           .expect_status = status::OK,
+                           .expect_body   = "raw"},
+                 test_case{.name          = "no reason",
+                           .response      = "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok",
+                           .expect_status = status::OK,
+                           .expect_body   = "ok"},
+                 test_case{.name          = "204",
+                           .response      = "HTTP/1.1 204 No Content\r\n\r\nnot the body",
+                           .expect_status = status::NO_CONTENT,
+                           .expect_body   = ""},
+                 test_case{.name          = "304",
+                           .response      = "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+                           .expect_status = status::NOT_MODIFIED,
+                           .expect_body   = ""},
+                 test_case{.name          = "HEAD",
+                           .response      = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+                           .method        = request_method::HEAD,
+                           .expect_status = status::OK,
+                           .expect_body   = ""},
+                 test_case{.name     = "100 Continue first",
+                           .response = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                           .expect_status = status::OK,
+                           .expect_body   = "ok"});
 
     CAPTURE(tc.name);
 
@@ -668,7 +719,10 @@ std::string encode_request(const net::http::client_request& req)
 
 net::http::client_request make_request(net::http::request_method method, std::uint32_t minor = 1)
 {
-    net::http::client_request req{.method = method, .version = {.major = 1, .minor = minor}};
+    net::http::client_request req{
+        .method  = method,
+        .version = {.major = 1, .minor = minor}
+    };
     req.uri.host = "example.com";
     req.uri.path = "/";
     return req;
@@ -715,7 +769,8 @@ TEST_CASE("request bodies are encoded", "[http][1.1][request_encode][body]")
         auto req = make_request(request_method::POST);
         req.headers.set("Transfer-Encoding"sv, "chunked"sv);
         req.body = body_of("");
-        CHECK(encode_request(req) == "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+        CHECK(encode_request(req)
+              == "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
     }
 
     SECTION("none, but saying so for methods that expect one")
@@ -786,15 +841,13 @@ TEST_CASE("encoded request bodies decode", "[http][1.1][request_encode][body]")
     CAPTURE(with_length);
 
     auto req = make_request(net::http::request_method::POST);
-    if (with_length)
-        req.set_body(content);
-    else
-        req.body = body_of(content);
+    if (with_length) req.set_body(content);
+    else req.body = body_of(content);
 
     // NOTE: the body reads from the reader, so it's kept here (unlike in decode()).
-    auto                     encoded = encode_request(req);
-    owning_buffered_reader   reader{encoded};
-    auto                     decoded = test::sync_wait(net::http::http11::request_decode(&reader, 8'192));
+    auto                   encoded = encode_request(req);
+    owning_buffered_reader reader{encoded};
+    auto                   decoded = test::sync_wait(net::http::http11::request_decode(&reader, 8'192));
     REQUIRE(decoded.has_value());
     CHECK(decoded->headers.is_chunked() == !with_length);
     CHECK(read_body(*decoded->body) == content);

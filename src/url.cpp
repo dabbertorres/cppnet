@@ -35,10 +35,7 @@ constexpr bool is_unreserved(char c) noexcept
     return is_alpha(c) || is_digit(c) || c == '-' || c == '.' || c == '_' || c == '~';
 }
 
-constexpr bool is_hex_digit(char c) noexcept
-{
-    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
+constexpr bool is_hex_digit(char c) noexcept { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
 // is_valid_zone checks a percent-encoded zone ID, including its "%25" prefix.
 constexpr bool is_valid_zone(std::string_view zone) noexcept
@@ -62,7 +59,10 @@ constexpr bool is_valid_zone(std::string_view zone) noexcept
 }
 
 constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.contains(c); }
-constexpr bool is_scheme_char(char c) noexcept { return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.'; }
+constexpr bool is_scheme_char(char c) noexcept
+{
+    return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.';
+}
 
 // Characters that may appear unencoded in each part (RFC 3986).
 constexpr bool is_userinfo_char(char c) noexcept { return is_unreserved(c) || is_sub_delim(c); }
@@ -179,7 +179,8 @@ std::optional<url_parse_failure> parse_authority(std::string_view authority, std
 
         auto rest = authority.substr(end + 1);
         if (rest.empty()) return std::nullopt;
-        if (rest.front() != ':') return url_parse_failure{.failed_at = url_parse_state::port, .index = offset + end + 1};
+        if (rest.front() != ':')
+            return url_parse_failure{.failed_at = url_parse_state::port, .index = offset + end + 1};
 
         return parse_port(rest.substr(1), offset + end + 2, out);
     }
@@ -200,9 +201,8 @@ url::parse_result parse_url(std::string_view input)
     std::size_t pos = 0;
 
     // scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"
-    if (auto colon = input.find(':');
-        colon != std::string_view::npos && colon > 0 && is_alpha(input.front())
-        && std::ranges::all_of(input.substr(0, colon), is_scheme_char))
+    if (auto colon = input.find(':'); colon != std::string_view::npos && colon > 0 && is_alpha(input.front())
+                                      && std::ranges::all_of(input.substr(0, colon), is_scheme_char))
     {
         out.scheme = input.substr(0, colon);
         pos        = colon + 1;
@@ -220,7 +220,8 @@ url::parse_result parse_url(std::string_view input)
         auto authority_end   = input.find_first_of("/?#"sv, authority_start);
         if (authority_end == std::string_view::npos) authority_end = input.size();
 
-        if (auto err = parse_authority(input.substr(authority_start, authority_end - authority_start), authority_start, out))
+        if (auto err =
+                parse_authority(input.substr(authority_start, authority_end - authority_start), authority_start, out))
             return std::unexpected(*err);
 
         pos = authority_end;
@@ -315,7 +316,7 @@ url::query_values url::parse_query(std::string_view query)
 
         if (pair.empty()) continue;
 
-        auto  eq     = pair.find('=');
+        auto  eq             = pair.find('=');
         auto& values_for_key = values[decode_form(pair.substr(0, eq))];
         if (eq != std::string_view::npos) values_for_key.push_back(decode_form(pair.substr(eq + 1)));
     }

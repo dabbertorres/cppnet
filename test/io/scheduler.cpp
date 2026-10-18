@@ -163,8 +163,8 @@ TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up",
     auto [timed_reader, timed_writer] = make_socket_pair(&sched);
 
     // with only this wait, the loop waits without a timeout.
-    std::error_code      idle_err;
-    std::atomic<bool>    idle_finished = false;
+    std::error_code   idle_err;
+    std::atomic<bool> idle_finished = false;
     REQUIRE(sched.spawn(read_until_failure(&idle_reader, &idle_err, &idle_finished)));
 
     auto timed_read = [](net::socket* sock) -> task<std::pair<net::io::result, net::io::clock::duration>>
@@ -216,8 +216,8 @@ TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][schedul
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    std::error_code      err;
-    std::atomic<bool>    finished = false;
+    std::error_code   err;
+    std::atomic<bool> finished = false;
     REQUIRE(sched.spawn(read_until_failure(&reader, &err, &finished)));
 
     std::thread run_thread{[&] { sched.run(); }};
@@ -234,8 +234,8 @@ TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][schedul
 
 TEST_CASE("a scheduler that never ran can be destroyed", "[io][scheduler]")
 {
-    std::error_code      err;
-    std::atomic<bool>    finished = false;
+    std::error_code   err;
+    std::atomic<bool> finished = false;
 
     // NOTE: a sleep rather than a socket's read, as the socket would be closed first (and the workers poll, whether or
     //       not the scheduler runs).
@@ -292,10 +292,10 @@ TEST_CASE("only one task may wait for each operation on a handle", "[io][schedul
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    std::error_code      first_err;
-    std::error_code      second_err;
-    std::atomic<bool>    first_finished  = false;
-    std::atomic<bool>    second_finished = false;
+    std::error_code   first_err;
+    std::error_code   second_err;
+    std::atomic<bool> first_finished  = false;
+    std::atomic<bool> second_finished = false;
 
     REQUIRE(sched.spawn(read_until_failure(&reader, &first_err, &first_finished)));
     REQUIRE(sched.spawn(read_until_failure(&reader, &second_err, &second_finished)));
@@ -385,8 +385,8 @@ TEST_CASE("shutting down a listener cancels a pending accept", "[io][scheduler][
     net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    std::error_code      accept_err;
-    std::atomic<bool>    finished = false;
+    std::error_code   accept_err;
+    std::atomic<bool> finished = false;
 
     auto accept = [](net::listener* listener, std::error_code* err, std::atomic<bool>* finished) -> task<>
     {

@@ -420,12 +420,10 @@ struct export_trace_partial_success
     std::string  error_message;
 };
 
-
 struct export_trace_service_response
 {
     std::optional<export_trace_partial_success> partial_success;
 };
-
 
 struct export_metrics_service_request
 {
@@ -439,7 +437,6 @@ struct export_metrics_partial_success
     std::int64_t rejected_data_points{};
     std::string  error_message;
 };
-
 
 struct export_metrics_service_response
 {
