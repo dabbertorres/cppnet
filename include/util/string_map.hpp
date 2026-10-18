@@ -370,7 +370,7 @@ public:
 
 #if defined(__cpp_lib_associative_heterogeneous_erasure) && __cpp_lib_associative_heterogeneous_erasure >= 202110L
     template<typename K>
-    inline size_type erase(K&& x)
+    size_type erase(K&& x)
     {
         return values.erase(std::forward<K>(x));
     }
@@ -397,7 +397,7 @@ public:
 
 #if defined(__cpp_lib_associative_heterogeneous_erasure) && __cpp_lib_associative_heterogeneous_erasure >= 202110L
     template<typename K>
-    inline node_type extract(K&& x)
+    node_type extract(K&& x)
     {
         return values.extract(std::forward<K>(x));
     }

@@ -470,6 +470,9 @@ public:
     template<typename Y>
         requires((is_reference && std::is_constructible_v<T, Y&&>)
                  || (!is_reference && std::is_constructible_v<stored_type, Y&&>))
+    // NOTE: noexcept, as a value that can't be stored ends the program (libstdc++'s emplace() has a throw path, for
+    //       bad_variant_access, that the index it's given can't reach).
+    // NOLINTNEXTLINE(bugprone-exception-escape)
     void return_value(Y&& new_value) noexcept
     {
         if constexpr (is_reference)
@@ -483,6 +486,7 @@ public:
         }
     }
 
+    // NOLINTNEXTLINE(bugprone-exception-escape): as above.
     void return_value(stored_type new_value) noexcept
         requires(!is_reference)
     {
