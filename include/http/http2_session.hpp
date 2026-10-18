@@ -103,8 +103,10 @@ struct session_config
     // http::client's is 1 GiB, a server's its streams' (at least 1 MiB).
     std::uint32_t connection_window = std::uint32_t{1} << 20;
 
-    // The most CONTINUATION frames a header block may have (nghttp2's default); its encoded size is limited by
-    // local.max_header_list_size.
+    // The most CONTINUATION frames a header block may have (nghttp2's default), or, if it's more, as many as a block
+    // of local.max_header_list_size takes in 16 KiB frames (the least MAX_FRAME_SIZE, which the peer may send whatever
+    // this side's). Its encoded size is limited by local.max_header_list_size. A block past either ends the connection
+    // (ENHANCE_YOUR_CALM), as it would have to be decoded anyway, to keep HPACK's table in step.
     std::size_t max_continuations = 8;
 
     // The most settings a SETTINGS frame may have (Go's limit).
@@ -210,9 +212,10 @@ private:
     // header_block is a header block arriving in a HEADERS frame and CONTINUATIONs.
     struct header_block
     {
-        stream_id              stream        = 0;
-        bool                   end_stream    = false;
-        std::size_t            continuations = 0;
+        stream_id              stream         = 0;
+        bool                   end_stream     = false;
+        bool                   self_dependent = false; // its priority made the stream depend on itself
+        std::size_t            continuations  = 0;
         std::vector<std::byte> fragment;
     };
 
@@ -306,6 +309,10 @@ private:
     // closed is whether a stream that isn't open has been (rather than being idle).
     [[nodiscard]] bool closed(stream_id stream) const noexcept;
     [[nodiscard]] bool peer_initiated(stream_id stream) const noexcept;
+
+    // ignores is whether the peer's frames on a stream that isn't open are ignored: it's one this side reset recently,
+    // or one of the peer's after the last stream of this side's GOAWAY (a server's).
+    [[nodiscard]] bool ignores(stream_id stream) const noexcept;
 
     // count_reply counts a control frame queued in reply, failing the connection if too many are waiting.
     std::error_code count_reply();

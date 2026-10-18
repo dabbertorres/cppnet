@@ -194,7 +194,8 @@ namespace
             stream.status_text = std::to_string(static_cast<int>(resp.status_code));
             stream.fields.clear();
             stream.fields.push_back({.name = ":status", .value = stream.status_text});
-            append_fields(resp.headers, stream.names, stream.fields);
+            if (auto err = append_fields(resp.headers, stream.names, stream.fields))
+                return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(err));
 
             if (auto err = c.session.submit_headers(stream.id, stream.fields, end))
                 return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(err));

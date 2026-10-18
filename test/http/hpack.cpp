@@ -1,5 +1,6 @@
 #include "http/hpack.hpp"
 
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "encoding/hex.hpp"
+#include "http/hpack_stories.hpp"
 
 namespace hpack = net::http::hpack;
 
@@ -447,6 +449,35 @@ TEST_CASE("the RFC's examples decode as it says, with its dynamic tables", "[htt
             CHECK(table_of(dec.table()) == ex.table);
             CHECK(dec.table().size() == ex.table_size);
         }
+    }
+}
+
+TEST_CASE("hpack-test-case's stories, as other implementations encoded them, decode to their headers",
+          "[http][hpack][decoder]")
+{
+    for (const auto& story : hpack_stories::stories)
+    {
+        CAPTURE(story.name);
+
+        hpack::decoder dec;
+        auto           fields = story.fields;
+        for (const auto& c : story.cases)
+        {
+            CAPTURE(c.wire);
+            REQUIRE(c.fields <= fields.size());
+
+            // SETTINGS_HEADER_TABLE_SIZE, acknowledged.
+            if (c.header_table_size != 0) dec.set_max_table_size(c.header_table_size);
+
+            std::vector<std::pair<std::string, std::string>> want;
+            for (const auto& f : fields.first(c.fields)) want.emplace_back(f.name, f.value);
+            fields = fields.subspan(c.fields);
+
+            const auto got = decode(dec, from_hex(c.wire));
+            CHECK_FALSE(got.err);
+            CHECK(got.fields == want);
+        }
+        CHECK(fields.empty());
     }
 }
 

@@ -114,12 +114,14 @@ public:
 };
 
 // append_fields appends from's fields to fields as HTTP/2 sends them: names lowercased (into names, which fields views,
-// so names mustn't be touched until fields are sent), without connection-specific fields (and, for a request, Host,
-// which :authority replaces, and TE unless it's "trailers"), and with credentials never indexed.
-void append_fields(const headers&             from,
-                   std::vector<std::string>&  names,
-                   std::vector<hpack::field>& fields,
-                   bool                       request = false);
+// so names mustn't be touched until fields are sent), without connection-specific fields (nor those Connection names;
+// and, for a request, Host, which :authority replaces, and TE unless it's "trailers"), and with credentials never
+// indexed. It fails with std::errc::invalid_argument, appending nothing, if a field's name or value isn't valid (see
+// valid_fields), as HTTP/1.1's encoder does.
+[[nodiscard]] std::error_code append_fields(const headers&             from,
+                                            std::vector<std::string>&  names,
+                                            std::vector<hpack::field>& fields,
+                                            bool                       request = false);
 
 // http2_connection_base runs an HTTP/2 connection's session: a reader feeding it what's read, a writer writing its
 // output, and a timer for its streams' timeouts (and the connection's, which a derived class says).

@@ -103,6 +103,25 @@ http::router make_router(net::io::scheduler* sched)
               co_await resp.send(http::status::PROCESSING);
               throw std::runtime_error{"oops"};
           });
+    r.GET("/bad-header",
+          [](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              // a value with a line break can't be sent, over HTTP/2 as over HTTP/1.1.
+              std::string outcome = "sent";
+              resp.headers().set("X-Bad", "a\r\nb");
+              try
+              {
+                  co_await resp.send(http::status::OK, 0);
+              }
+              catch (const std::system_error& e)
+              {
+                  outcome = e.code() == std::errc::invalid_argument ? "threw" : e.what();
+              }
+
+              resp.headers().remove("X-Bad");
+              auto* body = co_await resp.send(http::status::OK, outcome.size());
+              co_await net::io::write_all(*body, outcome);
+          });
     return r;
 }
 
@@ -571,4 +590,24 @@ TEST_CASE("an HTTP/2 client resetting its streams can't run more handlers than i
                                                 CHECK(c.goaway_error == http2::error_code::enhance_your_calm);
                                             }));
     }
+}
+
+TEST_CASE("an HTTP/2 response's field with a line break throws, as over HTTP/1.1", "[http][http2][server]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            const auto id = c.request("GET", "/bad-header");
+                                            REQUIRE(co_await c.wait_for(id));
+
+                                            const auto& r = c.responses[id];
+                                            CAPTURE(r.reset.message());
+                                            CHECK(r.status == "200");
+                                            CHECK(r.body == "threw");
+                                            CHECK(header(r, "x-bad") == "(none)");
+                                        }));
 }

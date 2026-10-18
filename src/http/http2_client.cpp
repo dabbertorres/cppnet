@@ -158,10 +158,8 @@ http2_client_connection::open(const client_request& request)
 
     if (ending() || peer_goaway) return std::unexpected(make_error_code(http2::error_code::refused_stream));
 
-    const auto id = session.open_stream();
-    if (!id.has_value()) return std::unexpected(id.error());
-
-    auto stream           = std::make_shared<http2_client_stream>(this, *id, pool);
+    // the head is made before the stream is opened, as a stream that's opened must be sent.
+    auto stream           = std::make_shared<http2_client_stream>(this, 0, pool);
     stream->read_timeout  = options.io_timeout;
     stream->write_timeout = options.io_timeout;
     stream->authority     = authority_of(request.uri);
@@ -174,7 +172,11 @@ http2_client_connection::open(const client_request& request)
     fields.push_back({.name = ":scheme", .value = is_tls(conn) ? "https" : "http"});
     fields.push_back({.name = ":authority", .value = stream->authority});
     fields.push_back({.name = ":path", .value = stream->path});
-    append_fields(request.headers, stream->names, fields, true);
+    if (auto err = append_fields(request.headers, stream->names, fields, true)) return std::unexpected(err);
+
+    const auto id = session.open_stream();
+    if (!id.has_value()) return std::unexpected(id.error());
+    stream->id = *id;
 
     const bool end = request.body == nullptr;
     if (auto err = session.submit_headers(*id, fields, end))

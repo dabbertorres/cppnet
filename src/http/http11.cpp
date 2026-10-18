@@ -16,7 +16,6 @@
 #include <string_view>
 #include <system_error>
 #include <typeinfo>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -477,17 +476,6 @@ task<std::error_code> copy_chunked(net::io::reader& body, net::io::writer& out)
     co_return (co_await chunked.finish()).err;
 }
 
-// valid_fields checks that every field can be written without changing what's around it.
-bool valid_fields(const headers& fields) noexcept
-{
-    return std::ranges::all_of(fields,
-                               [](const auto& field)
-                               {
-                                   return net::http::is_valid_field_name(field.first)
-                                       && std::ranges::all_of(field.second, net::http::is_valid_field_value);
-                               });
-}
-
 bool is_default_port(std::string_view scheme, std::string_view port) noexcept
 {
     return (port == "80"sv && (scheme.empty() || net::util::equal_ignore_case(scheme, "http"sv)))
@@ -796,7 +784,7 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
 {
     using result = response_encoder_result;
 
-    if (!valid_fields(resp.headers)) return coro::ready_task<result>(std::unexpected(invalid()));
+    if (writer == nullptr || !valid_fields(resp.headers)) return coro::ready_task<result>(std::unexpected(invalid()));
 
     // a status code is three digits, from 100 to 599 (RFC 9110, section 15).
     const auto code = static_cast<std::uint16_t>(resp.status_code);

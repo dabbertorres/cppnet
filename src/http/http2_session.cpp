@@ -16,8 +16,10 @@
 #include <utility>
 #include <vector>
 
+#include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "util/string_util.hpp"
 
 namespace net::http::http2
 {
@@ -72,11 +74,11 @@ namespace
 
     bool valid_name(std::string_view name) noexcept { return !name.empty() && std::ranges::all_of(name, is_name_char); }
 
-    // valid_value is whether a field value has no NUL, CR or LF, and doesn't start or end with whitespace (RFC 9113,
-    // section 8.2.1).
+    // valid_value is whether a field value has no controls but tab (as HTTP/1.1's, which a proxy may pass it on to;
+    // RFC 9113 only forbids NUL, CR and LF), and doesn't start or end with whitespace (RFC 9113, section 8.2.1).
     bool valid_value(std::string_view value) noexcept
     {
-        if (value.find_first_of(std::string_view{"\0\r\n", 3}) != std::string_view::npos) return false;
+        if (!is_valid_field_value(value)) return false;
         if (value.empty()) return true;
 
         const auto space = [](char c) { return c == ' ' || c == '\t'; };
@@ -128,9 +130,33 @@ namespace
         return nullptr;
     }
 
+    // scan_regular checks a regular (not pseudo-) field, adding what scan_fields() looks for to out, and returns
+    // whether it's well-formed.
+    bool scan_regular(const hpack::field& f, scanned_fields& out) noexcept
+    {
+        if (!valid_name(f.name) || connection_specific(f.name)) return false;
+        if (f.name == "te" && f.value != "trailers") return false;
+
+        if (f.name == "host")
+        {
+            // more than one would leave which host is meant to whoever reads them.
+            if (out.host.has_value()) return false;
+            out.host = f.value;
+        }
+
+        if (f.name == "content-length")
+        {
+            const auto length = parse_length(f.value);
+            if (!length.has_value() || out.content_length.value_or(*length) != *length) return false;
+            out.content_length = length;
+        }
+
+        return true;
+    }
+
     // scan_fields checks a header block's fields (RFC 9113, section 8.2): pseudo-headers first (none in trailers),
-    // each once, and only those the side receives; names and values valid; no connection-specific fields; and
-    // Content-Lengths that agree. It returns what it found, or nullopt if they're malformed.
+    // each once, and only those the side receives; names and values valid; no connection-specific fields; at most one
+    // Host; and Content-Lengths that agree. It returns what it found, or nullopt if they're malformed.
     std::optional<scanned_fields> scan_fields(std::span<const hpack::field> fields, role side, bool trailers)
     {
         scanned_fields out;
@@ -149,23 +175,14 @@ namespace
             }
 
             regular = true;
-            if (!valid_name(f.name) || connection_specific(f.name)) return std::nullopt;
-            if (f.name == "te" && f.value != "trailers") return std::nullopt;
-            if (f.name == "host") out.host = f.value;
-
-            if (f.name == "content-length")
-            {
-                const auto length = parse_length(f.value);
-                if (!length.has_value() || out.content_length.value_or(*length) != *length) return std::nullopt;
-                out.content_length = length;
-            }
+            if (!scan_regular(f, out)) return std::nullopt;
         }
 
         return out;
     }
 
     // valid_request is whether a request's pseudo-headers are (RFC 9113, section 8.3.1): CONNECT has only :method and
-    // :authority; others :method, :scheme and a :path; and a Host agrees with :authority.
+    // :authority; others :method, :scheme and a :path; and a Host agrees with :authority (host names ignore case).
     bool valid_request(const scanned_fields& f) noexcept
     {
         if (!f.method.has_value()) return false;
@@ -179,7 +196,15 @@ namespace
             return false;
         }
 
-        return !f.host.has_value() || !f.authority.has_value() || *f.host == *f.authority;
+        return !f.host.has_value() || !f.authority.has_value() || util::equal_ignore_case(*f.host, *f.authority);
+    }
+
+    // ended_short is whether a stream whose body has ended has less than its Content-Length promised (a response to
+    // HEAD, or a 204 or 304, has none, whatever it says).
+    bool ended_short(const auto& stream) noexcept
+    {
+        return stream.content_length.has_value() && stream.received != *stream.content_length && !stream.head_request
+            && !stream.no_body;
     }
 
     std::optional<int> parse_status(std::string_view value) noexcept
@@ -218,6 +243,12 @@ session::session(role r, const session_config& config)
     local.enable_push         = false;
     local.initial_window_size = std::clamp<std::uint32_t>(local.initial_window_size, 65'535, max_window);
     local.max_frame_size      = std::clamp(local.max_frame_size, min_max_frame_size, max_max_frame_size);
+
+    // as many CONTINUATIONs as the largest header block this side takes needs, if that's more (a block's encoded size
+    // is limited by max_header_list_size too), in frames of the least MAX_FRAME_SIZE: the peer may send frames that
+    // small whatever this side's (and does before it has this side's SETTINGS).
+    const auto frames = (std::uint64_t{local.max_header_list_size} + min_max_frame_size - 1) / min_max_frame_size;
+    this->config.max_continuations = std::max(this->config.max_continuations, static_cast<std::size_t>(frames));
 
     if (side == role::client)
     {
@@ -332,7 +363,7 @@ session::on_data(const frame_header& h, std::span<const std::byte> payload, sess
         give_back(h.stream, payload.size());
 
         if (it == streams.end() && !closed(h.stream)) return connection_error(error_code::protocol_error, "idle");
-        if (it == streams.end() && was_reset(h.stream)) return {};
+        if (it == streams.end() && ignores(h.stream)) return {};
         return stream_error(h.stream,
                             it != streams.end() && !it->second.remote_closed ? error_code::protocol_error
                                                                              : error_code::stream_closed,
@@ -348,9 +379,8 @@ session::on_data(const frame_header& h, std::span<const std::byte> payload, sess
     const bool end = (h.flags & flags::end_stream) != 0;
 
     s.received += data->size();
-    const bool too_long = s.content_length.has_value() && s.received > *s.content_length;
-    const bool too_short =
-        end && s.content_length.has_value() && s.received != *s.content_length && !s.head_request && !s.no_body;
+    const bool too_long  = s.content_length.has_value() && s.received > *s.content_length;
+    const bool too_short = end && ended_short(s);
     if (too_long || too_short) return data_error(h.stream, payload.size(), error_code::protocol_error, events, now);
 
     // an empty frame that doesn't end the stream does nothing (CVE-2019-9518, empty frames flood).
@@ -375,20 +405,23 @@ session::on_headers(const frame_header& h, std::span<const std::byte> payload, s
     auto fragment = unpad(payload, h.flags);
     if (!fragment.has_value()) return connection_error(error_code::protocol_error, "padding");
 
-    // RFC 7540's priority, which is deprecated, and ignored.
+    // RFC 7540's priority, which is deprecated, and ignored; but, as in PRIORITY, a stream can't depend on itself.
+    bool self_dependent = false;
     if ((h.flags & flags::priority) != 0)
     {
         if (fragment->size() < 5) return connection_error(error_code::frame_size_error);
-        fragment = fragment->subspan(5);
+        self_dependent = (read32(*fragment) & max_stream_id) == h.stream;
+        fragment       = fragment->subspan(5);
     }
 
     if (fragment->size() > config.local.max_header_list_size)
         return connection_error(error_code::enhance_your_calm, "header block too large");
 
     header_block block{
-        .stream     = h.stream,
-        .end_stream = (h.flags & flags::end_stream) != 0,
-        .fragment   = {fragment->begin(), fragment->end()},
+        .stream         = h.stream,
+        .end_stream     = (h.flags & flags::end_stream) != 0,
+        .self_dependent = self_dependent,
+        .fragment       = {fragment->begin(), fragment->end()},
     };
 
     if ((h.flags & flags::end_headers) != 0) return end_header_block(block, events, now);
@@ -440,6 +473,9 @@ std::error_code session::end_header_block(const header_block& block, session_eve
     auto& s = **stream;
     if (s.remote_closed) return stream_error(id, error_code::stream_closed, &events, now);
 
+    // (only once it's decoded, and its stream found or opened, so HPACK and the streams stay in step.)
+    if (block.self_dependent) return stream_error(id, error_code::protocol_error, &events, now);
+
     // a header list over the limit (or malformed) is refused, as the stream's error.
     if (decoded == std::errc::value_too_large) return stream_error(id, error_code::protocol_error, &events, now);
 
@@ -456,6 +492,12 @@ std::error_code session::end_header_block(const header_block& block, session_eve
         // a head that ends the stream promises no body.
         if (block.end_stream && s.content_length.value_or(0) != 0 && !s.head_request && !s.no_body)
             return stream_error(id, error_code::protocol_error, &events, now);
+    }
+    else if (checked->kind == block_kind::trailers && ended_short(s))
+    {
+        // trailers end the stream, so its body must be as long as its Content-Length said (as on_data checks when
+        // DATA ends it).
+        return stream_error(id, error_code::protocol_error, &events, now);
     }
 
     events.on_headers(id, checked->kind, block_fields, block.end_stream);
@@ -494,24 +536,34 @@ std::expected<session::stream_state*, std::error_code> session::stream_for_block
 {
     if (const auto it = streams.find(id); it != streams.end()) return &it->second;
 
-    if (side == role::client || !peer_initiated(id))
+    // (it's not open, so it's idle or closed.)
+    const bool idle = !closed(id);
+
+    // only a client's request opens a stream.
+    if (idle && (side == role::client || !peer_initiated(id)))
+        return std::unexpected(connection_error(error_code::protocol_error));
+
+    // after this side's GOAWAY, the peer's new streams are ignored (RFC 9113, section 6.8): not processed, nor counted
+    // as glitches (the peer may not have seen the GOAWAY yet), whichever of their frames it is.
+    if (side == role::server && peer_initiated(id) && local_goaway.has_value() && id > *local_goaway)
     {
-        // e.g. what the server sent before it saw this side's reset.
-        if (closed(id) && was_reset(id)) return nullptr;
-        return std::unexpected(connection_error(closed(id) ? error_code::stream_closed : error_code::protocol_error));
+        highest_peer_stream = std::max(highest_peer_stream, id);
+        return nullptr;
     }
 
-    if (id <= highest_peer_stream)
+    if (!idle)
     {
+        // e.g. what the peer sent before it saw this side's reset.
         if (was_reset(id)) return nullptr;
-        return std::unexpected(connection_error(error_code::stream_closed));
+
+        // a stream closed for good, or one whose reset is too old to remember: as it may be the latter, it's the
+        // stream's error rather than the connection's (as Go's).
+        if (auto err = stream_error(id, error_code::stream_closed, nullptr, now)) return std::unexpected(err);
+        return nullptr;
     }
 
     // a new stream (RFC 9113, section 5.1.1).
     highest_peer_stream = id;
-
-    // after this side's GOAWAY, the peer's new streams are ignored (RFC 9113, section 6.8).
-    if (local_goaway.has_value() && id > *local_goaway) return nullptr;
 
     if (open_peer_streams >= config.local.max_concurrent_streams)
     {
@@ -941,7 +993,11 @@ std::error_code session::connection_error(error_code code, std::string_view debu
 {
     if (!connection_failed)
     {
-        encode_goaway(highest_peer_stream, static_cast<std::uint32_t>(code), debug, output);
+        // a GOAWAY this side has sent mustn't be raised (RFC 9113, section 6.8).
+        encode_goaway(std::min(highest_peer_stream, local_goaway.value_or(max_stream_id)),
+                      static_cast<std::uint32_t>(code),
+                      debug,
+                      output);
         connection_failed = true;
         failure           = make_error_code(code);
     }
@@ -988,6 +1044,13 @@ void session::remember_reset(stream_id stream)
 }
 
 bool session::was_reset(stream_id stream) const noexcept { return std::ranges::contains(recently_reset, stream); }
+
+bool session::ignores(stream_id stream) const noexcept
+{
+    if (was_reset(stream)) return true;
+    return side == role::server && peer_initiated(stream) && local_goaway.has_value() && stream > *local_goaway
+        && closed(stream);
+}
 
 bool session::closed(stream_id stream) const noexcept
 {

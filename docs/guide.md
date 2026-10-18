@@ -197,7 +197,9 @@ scheduler.spawn(server.serve());
   `http::static_router` (`http/static_router.hpp`) routes the same way, checked at compile time.
 - **A handler** gets the request (as `const`, or not) and a `response_writer`. `resp.send(status, length)` sends the
   head, and returns the writer for a body of that length; `resp.send(status)` is for a body whose length isn't known
-  (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500.
+  (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500. `send()` throws
+  `std::system_error` (`std::errc::invalid_argument`) if a header can't be sent (e.g. a value with a line break),
+  over HTTP/1.1 and HTTP/2 alike.
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped.
 - **Middleware** wraps a handler: e.g. `instrument::http_metrics{std::move(router)}` (`instrument/middleware.hpp`)
   measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Middleware passes values to

@@ -158,6 +158,10 @@ private:
 // 9110, section 5.5).
 [[nodiscard]] bool is_valid_field_value(std::string_view value) noexcept;
 
+// valid_fields is whether every field's name and values are valid (as above), so that they can be sent without
+// changing what's around them (e.g. a value with a line break, which would start another field).
+[[nodiscard]] bool valid_fields(const headers& fields) noexcept;
+
 // parse_field_line splits a field line ("name: value") into its name and value, without the whitespace around the
 // value. It fails if the line is malformed, including obsolete line folding (a line starting with whitespace).
 [[nodiscard]] std::optional<std::pair<std::string_view, std::string_view>>

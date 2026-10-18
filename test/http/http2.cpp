@@ -1,5 +1,6 @@
 #include "http/http2.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -213,6 +214,35 @@ std::vector<std::byte> u32(std::uint32_t value)
             static_cast<std::byte>(value)};
 }
 
+std::uint32_t read_u32(std::span<const std::byte> in)
+{
+    return (std::to_integer<std::uint32_t>(in[0]) << 24U) | (std::to_integer<std::uint32_t>(in[1]) << 16U)
+         | (std::to_integer<std::uint32_t>(in[2]) << 8U) | std::to_integer<std::uint32_t>(in[3]);
+}
+
+// frames_of lists out's frames of a type, as "stream code" for RST_STREAM, and "last-stream code" for GOAWAY.
+std::vector<std::string> frames_of(std::span<const std::byte> out, http2::frame_type type)
+{
+    // a server's output starts with frames; a client's with the preface.
+    if (as_string(out).starts_with(http2::preface)) out = out.subspan(http2::preface.size());
+
+    std::vector<std::string> found;
+    while (out.size() >= 9)
+    {
+        const auto h       = http2::decode_frame_header(out.first<9>());
+        const auto payload = out.subspan(9, h.length);
+        if (h.type == static_cast<std::uint8_t>(type))
+        {
+            if (type == http2::frame_type::rst_stream)
+                found.push_back(std::format("{} {}", h.stream, read_u32(payload)));
+            else if (type == http2::frame_type::goaway)
+                found.push_back(std::format("{} {}", read_u32(payload), read_u32(payload.subspan(4))));
+        }
+        out = out.subspan(9 + h.length);
+    }
+    return found;
+}
+
 // goaway_code is the error code of the GOAWAY frame in out, or nullopt if there's none.
 std::optional<std::uint32_t> goaway_code(std::span<const std::byte> out)
 {
@@ -223,12 +253,7 @@ std::optional<std::uint32_t> goaway_code(std::span<const std::byte> out)
     {
         const auto h       = http2::decode_frame_header(out.first<9>());
         const auto payload = out.subspan(9, h.length);
-        if (h.type == static_cast<std::uint8_t>(http2::frame_type::goaway))
-        {
-            return (std::to_integer<std::uint32_t>(payload[4]) << 24U)
-                 | (std::to_integer<std::uint32_t>(payload[5]) << 16U)
-                 | (std::to_integer<std::uint32_t>(payload[6]) << 8U) | std::to_integer<std::uint32_t>(payload[7]);
-        }
+        if (h.type == static_cast<std::uint8_t>(http2::frame_type::goaway)) return read_u32(payload.subspan(4));
         out = out.subspan(9 + h.length);
     }
     return std::nullopt;
@@ -583,8 +608,19 @@ TEST_CASE("a malformed request is reset, without the application seeing it", "[h
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\nb"}}},
         test_case{.what   = "a value with leading space",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = " a"}}},
+        test_case{.what   = "a value with a control character",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\x01b"}}},
+        test_case{.what   = "a value with DEL",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\x7f"}}},
         test_case{.what   = "Host disagreeing with :authority",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "host", .value = "other.com"}}},
+        test_case{.what   = "two Hosts",
+                  .fields = {fields[0],
+                             fields[1],
+                             fields[2],
+                             fields[3],
+                             {.name = "host", .value = "example.com"},
+                             {.name = "host", .value = "example.com"}}},
         test_case{.what   = "a response's pseudo-header",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = ":status", .value = "200"}}});
     CAPTURE(tc.what);
@@ -923,4 +959,224 @@ TEST_CASE("a malformed PRIORITY resets an open stream, and only counts against o
         rest = rest.subspan(9 + h.length);
     }
     CHECK(resets == std::vector<std::string>{std::format("1 {}", static_cast<int>(tc.want))});
+}
+
+TEST_CASE("a Host that differs from :authority only in case agrees with it", "[http][http2][session]")
+{
+    connected  c;
+    const auto id     = c.client.s.open_stream().value();
+    auto       fields = request();
+    fields.push_back({.name = "host", .value = "Example.COM"});
+    REQUIRE_FALSE(c.client.s.submit_headers(id, fields, true));
+    pump(c.client, c.server);
+
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/ host=Example.COM"});
+    CHECK(c.client.events.take().empty());
+}
+
+TEST_CASE("a value may have a tab inside it", "[http][http2][session]")
+{
+    connected  c;
+    const auto id     = c.client.s.open_stream().value();
+    auto       fields = request();
+    fields.push_back({.name = "x", .value = "a\tb"});
+    REQUIRE_FALSE(c.client.s.submit_headers(id, fields, true));
+    pump(c.client, c.server);
+
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/ x=a\tb"});
+}
+
+TEST_CASE("trailers that end a body short of its Content-Length reset the stream", "[http][http2][session][malformed]")
+{
+    connected  c;
+    const auto id = c.client.s.open_stream().value();
+
+    auto fields = request("POST");
+    fields.push_back({.name = "content-length", .value = "10"});
+    REQUIRE_FALSE(c.client.s.submit_headers(id, fields, false));
+    REQUIRE(c.client.s.submit_data(id, bytes_of("short"), false) == 5U);
+    const std::vector<hpack::field> trailers{
+        {.name = "checksum", .value = "abc"}
+    };
+    REQUIRE_FALSE(c.client.s.submit_headers(id, trailers, true));
+    pump(c.client, c.server);
+
+    // the trailers aren't reported: the body ended short.
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{
+              "headers 1 head :method=POST :scheme=https :authority=example.com :path=/ content-length=10",
+              "data 1 [short]",
+              "reset 1 protocol error"});
+    CHECK(c.client.events.take() == std::vector<std::string>{"reset 1 protocol error"});
+    CHECK_FALSE(c.server.failure);
+}
+
+TEST_CASE("a connection error's GOAWAY doesn't raise the last stream of one sent before",
+          "[http][http2][session][goaway]")
+{
+    endpoint server{http2::role::server};
+
+    raw r;
+    r.client_start().headers(1, request(), end_both);
+    server.deliver(r.bytes);
+    server.s.goaway(1, http2::error_code::no_error);
+
+    // a stream after the GOAWAY's last (ignored), then a connection error.
+    raw more;
+    more.headers(3, request(), end_both).frame(http2::frame_type::window_update, 0, 0, u32(0));
+    server.deliver(more.bytes);
+    REQUIRE(server.failure == http2::error_code::protocol_error);
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::goaway)
+          == std::vector<std::string>{"1 0", std::format("1 {}", static_cast<int>(http2::error_code::protocol_error))});
+}
+
+TEST_CASE("the frames of streams after this side's GOAWAY are ignored, not counted as errors",
+          "[http][http2][session][goaway]")
+{
+    // no glitches allowed, and a connection window that what's ignored would use up if it weren't given back.
+    http2::session_config config;
+    config.glitches          = {.burst = 0, .rate = 0};
+    config.connection_window = 65'535;
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start().headers(1, request("POST"), http2::flags::end_headers);
+    server.deliver(r.bytes);
+    server.s.goaway(1, http2::error_code::no_error);
+    server.events.take();
+
+    // stream 3's head adds a field to HPACK's dynamic table (a literal with incremental indexing: "x: y"), and its body
+    // and trailers follow; then stream 1's trailers refer to the field, which they can only if stream 3's head was
+    // decoded.
+    raw more;
+    more.frame(http2::frame_type::headers,
+               http2::flags::end_headers,
+               3,
+               std::vector<std::byte>{std::byte{0x40}, std::byte{1}, std::byte{'x'}, std::byte{1}, std::byte{'y'}});
+    const std::vector<std::byte> data(16'384, std::byte{'x'});
+    for (int i = 0; i < 5; ++i) more.frame(http2::frame_type::data, 0, 3, data);
+    more.headers(3,
+                 std::vector<hpack::field>{
+                     {.name = "checksum", .value = "abc"}
+    },
+                 end_both);
+    more.frame(http2::frame_type::headers, end_both, 1, std::vector<std::byte>{std::byte{0xbe}});
+    server.deliver(more.bytes);
+
+    CHECK_FALSE(server.failure);
+    CHECK(server.events.take() == std::vector<std::string>{"headers 1 trailers end x=y"});
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream).empty());
+}
+
+TEST_CASE("HEADERS on a stream whose reset is too old to remember is the stream's error, not the connection's",
+          "[http][http2][session][malformed]")
+{
+    http2::session_config config;
+    config.local.max_concurrent_streams = 200;
+    endpoint server{http2::role::server, config};
+
+    // 130 streams opened, and reset by the server: stream 1's reset is forgotten.
+    raw r;
+    r.client_start();
+    for (http2::stream_id id = 1; id < 260; id += 2) r.headers(id, request("POST"), http2::flags::end_headers);
+    server.deliver(r.bytes);
+    for (http2::stream_id id = 1; id < 260; id += 2) server.s.reset(id, http2::error_code::cancel);
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    server.events.take();
+
+    raw more;
+    more.headers(1,
+                 std::vector<hpack::field>{
+                     {.name = "checksum", .value = "abc"}
+    },
+                 end_both);
+    server.deliver(more.bytes);
+
+    CHECK_FALSE(server.failure);
+    CHECK(server.events.take().empty());
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream)
+          == std::vector<std::string>{std::format("1 {}", static_cast<int>(http2::error_code::stream_closed))});
+}
+
+TEST_CASE("HEADERS whose priority depends on its own stream resets it, keeping HPACK in step",
+          "[http][http2][session][malformed]")
+{
+    endpoint server{http2::role::server};
+
+    // stream 1's head, with a priority depending on stream 1, adds "x: y" to HPACK's dynamic table (a literal with
+    // incremental indexing); stream 3's head refers to it.
+    std::vector<std::byte> payload{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}, std::byte{16}};
+    hpack::encoder         encoder;
+    encoder.encode(request(), payload);
+    payload.insert(payload.end(), {std::byte{0x40}, std::byte{1}, std::byte{'x'}, std::byte{1}, std::byte{'y'}});
+
+    std::vector<std::byte> block;
+    encoder.encode(request(), block);
+    block.push_back(std::byte{0xbe});
+
+    raw r;
+    r.client_start()
+        .frame(http2::frame_type::headers, end_both | http2::flags::priority, 1, payload)
+        .frame(http2::frame_type::headers, end_both, 3, block);
+    server.deliver(r.bytes);
+
+    CHECK_FALSE(server.failure);
+    CHECK(
+        server.events.take()
+        == std::vector<std::string>{"settings",
+                                    "headers 3 head end :method=GET :scheme=https :authority=example.com :path=/ x=y"});
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream)
+          == std::vector<std::string>{std::format("1 {}", static_cast<int>(http2::error_code::protocol_error))});
+}
+
+TEST_CASE("a header block may have as many CONTINUATIONs as the largest one this side takes needs",
+          "[http][http2][session][limits]")
+{
+    // a list of up to 1 MiB, in frames of 16 KiB (which the peer may send, however large this side's may be): 64.
+    http2::session_config config;
+    config.local.max_header_list_size = std::uint32_t{1} << 20;
+    config.local.max_frame_size       = std::uint32_t{1} << 20;
+    endpoint server{http2::role::server, config};
+
+    const std::string long_value(std::size_t{40} * 1'024, 'a');
+    auto              fields = request();
+    fields.push_back({.name = "x", .value = long_value});
+    std::vector<std::byte> block;
+    hpack::encoder{}.encode(fields, block);
+
+    // in 1 KiB frames: more than 8 CONTINUATIONs.
+    raw r;
+    r.client_start();
+    constexpr std::size_t frame = 1'024;
+    for (std::size_t at = 0; at < block.size(); at += frame)
+    {
+        const auto first = at == 0;
+        const auto last  = at + frame >= block.size();
+        const auto part  = std::span{block}.subspan(at, std::min(frame, block.size() - at));
+        r.frame(
+            first ? http2::frame_type::headers : http2::frame_type::continuation,
+            static_cast<std::uint8_t>((first ? http2::flags::end_stream : 0) | (last ? http2::flags::end_headers : 0)),
+            1,
+            part);
+    }
+    server.deliver(r.bytes);
+
+    CHECK_FALSE(server.failure);
+    CHECK(server.events.take().back().starts_with("headers 1 head end"));
 }

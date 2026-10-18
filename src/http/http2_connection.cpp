@@ -60,20 +60,24 @@ namespace
 
 }
 
-void append_fields(const headers&             from,
-                   std::vector<std::string>&  names,
-                   std::vector<hpack::field>& fields,
-                   bool                       request)
+std::error_code
+append_fields(const headers& from, std::vector<std::string>& names, std::vector<hpack::field>& fields, bool request)
 {
     using namespace std::string_view_literals;
+
+    // as HTTP/1.1's encoder checks them: a peer may pass them on over HTTP/1.1.
+    if (!valid_fields(from)) return std::make_error_code(std::errc::invalid_argument);
 
     // NOTE: reserved, as fields view the names, which mustn't move.
     names.clear();
     names.reserve(from.size());
 
+    // the fields Connection names are this connection's too (RFC 9113, section 8.2.2).
+    const bool has_connection = from.get_all("Connection"sv).has_value();
+
     for (const auto& [name, values] : from)
     {
-        if (connection_specific(name)) continue;
+        if (connection_specific(name) || (has_connection && from.has_token("Connection"sv, name))) continue;
         if (request && util::equal_ignore_case(std::string_view{name}, "host"sv)) continue;
 
         auto& lowered = names.emplace_back(name);
@@ -85,6 +89,8 @@ void append_fields(const headers&             from,
             fields.push_back({.name = lowered, .value = value, .never_indexed = hpack::sensitive(lowered)});
         }
     }
+
+    return {};
 }
 
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)

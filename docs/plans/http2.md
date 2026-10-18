@@ -196,7 +196,9 @@ stream:
   HEADERS frame; a body writer framing DATA under flow control; END_STREAM on `finish()`). Its rules carry over: 1xx
   responses (HEADERS without END_STREAM), none for 204 and 304, Content-Length limiting the body, and `send(status)`
   for a body of unknown length (which HTTP/2 frames without anything special). Connection-specific fields a handler
-  sets (Connection, Transfer-Encoding, ...) are dropped, and names lowercased, when encoding.
+  sets (Connection, Transfer-Encoding, ..., and those Connection names) are dropped, and names lowercased, when
+  encoding; names and values are checked as HTTP/1.1's encoder does (so `send()` throws for a value with a line break,
+  over either).
 - **What's left of a request body** when its handler returns isn't read: the stream is reset (RST_STREAM(NO_ERROR)),
   or its remaining DATA ignored, with the connection's window still credited. (After review:) a peer's
   RST_STREAM(NO_ERROR) means the same, so if what the peer sent has ended (e.g. a client's response), it stands, and
@@ -233,7 +235,7 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
 | Attack | Defense (default) |
 |---|---|
 | Rapid Reset, MadeYouReset | A token bucket for streams reset by the client (nghttp2: burst 1000, 33/s) and one for protocol errors the server resets streams for (nghttp2: burst 10000, 330/s); handlers started but unfinished bounded (Go: 4x MAX_CONCURRENT_STREAMS) |
-| CONTINUATION flood, HPACK bomb, zero-length fields | MAX_HEADER_LIST_SIZE enforced as the block arrives, on both the encoded and decoded size (an HPACK bomb expands about 4096:1), and the number of CONTINUATION frames per block (nghttp2: 8) |
+| CONTINUATION flood, HPACK bomb, zero-length fields | MAX_HEADER_LIST_SIZE enforced as the block arrives, on both the encoded and decoded size (an HPACK bomb expands about 4096:1), and the number of CONTINUATION frames per block (nghttp2: 8; or, if it's more, as many as a block of MAX_HEADER_LIST_SIZE takes in 16 KiB frames, the least MAX_FRAME_SIZE). A block over the encoded size or the CONTINUATIONs ends the connection, as it would have to be decoded anyway, to keep HPACK's table in step; one whose decoded list is over the limit only resets its stream |
 | Ping and settings floods | Queued control-frame replies capped (nghttp2: 1000), and settings per SETTINGS frame (Go: 100) |
 | Data dribble, empty frames, internal buffering | Empty frames budgeted (h2: 100); per-stream send buffers capped (h2: about 400 KB), and the whole connection's queue |
 | Slow peers | The timeouts above; the preface and first SETTINGS within `header_read_timeout` |
@@ -265,15 +267,19 @@ RST_STREAM on an idle stream would be a connection error for the peer.
 
 ### Testing
 
-- HPACK: RFC 7541 Appendix C's examples, hpack-test-case's corpora, Huffman round trips, and the limits (oversized
+- HPACK: RFC 7541 Appendix C's examples, some of hpack-test-case's stories (a series of requests and one of responses,
+  as encoded without Huffman coding, with it, and with the table's size changing between blocks; generated into
+  `test/http/hpack_stories.hpp` by `tools/hpack/gen_stories.py`), Huffman round trips, and the limits (oversized
   integers, padding that isn't EOS's prefix, table-size updates).
 - The frame codec and the connection's state machine on bytes, without sockets: every frame type, and the errors the
   RFC requires.
 - Loopback: the client and server over TLS and cleartext; many concurrent streams; flow control with a handler that
   doesn't read; per-stream timeouts leaving the other streams alone; GOAWAY and REFUSED_STREAM retries; the client
   opening a second connection at the stream limit; each limit (a test per attack, sending its frames).
-- Fuzzing: the frame decoder, HPACK decoding (and that what the encoder makes decodes the same), and the connection
-  fed a byte at a time decoding as it does all at once, as `fuzz_http11` does.
+- Fuzzing: the frame decoder, HPACK decoding (a connection's blocks, with table size changes between them; and that
+  what the encoder makes decodes the same), and the connection fed a byte at a time decoding as it does all at once,
+  as `fuzz_http11` does: the input is a script, of frames to receive, and what the application does between them
+  (a client's requests, a server's responses, data, resets, consuming, PING, GOAWAY) and time passing.
 - Interop, by hand (and perhaps in CI): h2spec against the server, h2load for load, curl against the server and the
   client against public servers.
 - `bench_request` and `bench/web/run.sh` with HTTP/2 (h2load), against the same servers as now; and the primitives'
@@ -309,14 +315,22 @@ RST_STREAM on an idle stream would be a connection error for the peer.
   token bucket for the peer's resets (Rapid Reset) and one for "glitches" (stream errors it causes, empty frames,
   refused streams: MadeYouReset); CONTINUATIONs per block and the block's encoded size; control-frame replies waiting
   to be written; settings per SETTINGS frame. Each fails the connection with ENHANCE_YOUR_CALM.
-- It validates header blocks by RFC 9113's rules (lowercase, valid names and values, pseudo-headers first and only
-  the right ones, no connection-specific fields, TE only `trailers`, Host agreeing with `:authority`, a request's or
-  response's required pseudo-headers, Content-Lengths that agree), and checks DATA against Content-Length (except for
-  responses to HEAD, 204 and 304). A malformed block, or one over MAX_HEADER_LIST_SIZE, resets its stream with
-  PROTOCOL_ERROR (the server could answer 431 instead, later).
+- It validates header blocks by RFC 9113's rules (lowercase, valid names and values (no controls but tab, as
+  HTTP/1.1's: RFC 9113 only forbids NUL, CR and LF, but a proxy may pass them on over HTTP/1.1), pseudo-headers first
+  and only the right ones, no connection-specific fields, TE only `trailers`, at most one Host, agreeing with
+  `:authority` but for case, a request's or response's required pseudo-headers, Content-Lengths that agree), and
+  checks DATA, and trailers that end the stream, against Content-Length (except for responses to HEAD, 204 and 304).
+  A malformed block (or HEADERS whose priority depends on its own stream), or one whose decoded list is over
+  MAX_HEADER_LIST_SIZE, resets its stream with PROTOCOL_ERROR (the server could answer 431 instead, later), once it's
+  decoded. A block whose encoded size or CONTINUATIONs are over their limits ends the connection (ENHANCE_YOUR_CALM),
+  as it would have to be decoded anyway, to keep HPACK's table in step.
 - Closed streams are told from idle ones by the highest ids each side has opened, without keeping them; the last 128
   streams this side reset are remembered, so that what the peer sent before it saw the reset is ignored rather than an
-  error (RFC 9113, section 5.1).
+  error (RFC 9113, section 5.1). HEADERS on a closed stream that isn't remembered is a stream error (STREAM_CLOSED),
+  not the connection's, as its reset may just have been forgotten (as Go's). After a server's GOAWAY, the frames of
+  the client's streams past its last are ignored, without counting them as glitches (the client may not have seen
+  it): DATA gives its length back to the connection, and HEADERS is decoded, to keep HPACK in step. A connection
+  error's GOAWAY never raises the last stream of one sent before.
 - Until the server's SETTINGS arrive, a client opens at most 100 streams (as Go and Chromium assume). A session's own
   INITIAL_WINDOW_SIZE is at least 65535, as the peer may send that much before it has seen this side's SETTINGS.
 - `util/packed.hpp` went with the stub: nothing else packed structs.

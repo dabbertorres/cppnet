@@ -13,12 +13,16 @@
 #include <utility>
 #include <vector>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <spdlog/spdlog.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/connection.hpp"
+#include "http/headers.hpp"
+#include "http/hpack.hpp"
 #include "http/http2.hpp"
 #include "http/http2_session.hpp"
 #include "io/io.hpp"
@@ -27,6 +31,7 @@
 #include "tcp.hpp"
 
 namespace http2  = net::http::http2;
+namespace hpack  = net::http::hpack;
 namespace detail = net::http::detail;
 
 using net::coro::task;
@@ -124,4 +129,52 @@ TEST_CASE("an HTTP/2 stream's buffer stays bounded when its reader never catches
     // what's been read is dropped once it's half the buffer, so it holds at most about twice the window (rather than
     // all that's arrived: 2 MiB).
     CHECK(sched.run_to_completion(test(&sched, std::to_string(listener.local_port()))) <= std::size_t{2} * 65'535);
+}
+
+TEST_CASE("HTTP/2 sends neither connection-specific fields, nor those Connection names", "[http][http2][connection]")
+{
+    const net::http::headers from{
+        {       "Connection", {"keep-alive, X-Hop"}},
+        {            "X-Hop",                 {"1"}},
+        {       "Keep-Alive",         {"timeout=5"}},
+        {"Transfer-Encoding",           {"chunked"}},
+        {          "Upgrade",               {"h2c"}},
+        {     "Content-Type",        {"text/plain"}},
+        {          "X-Other",            {"a", "b"}},
+    };
+
+    std::vector<std::string>  names;
+    std::vector<hpack::field> fields;
+    REQUIRE_FALSE(detail::append_fields(from, names, fields));
+
+    std::vector<std::string> got;
+    got.reserve(fields.size());
+    for (const auto& f : fields) got.push_back(std::string{f.name} + ": " + std::string{f.value});
+    CHECK(got == std::vector<std::string>{"content-type: text/plain", "x-other: a", "x-other: b"});
+}
+
+TEST_CASE("HTTP/2 doesn't send fields that HTTP/1.1 couldn't", "[http][http2][connection]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        std::string_view value;
+    };
+
+    const auto tc = GENERATE(test_case{.name = "X-Bad", .value = "a\r\nb"},
+                             test_case{.name = "X-Bad", .value = "a\x01b"},
+                             test_case{.name = "Bad Name", .value = "a"},
+                             test_case{.name = "", .value = "a"});
+    CAPTURE(tc.name, tc.value);
+
+    net::http::headers from;
+    from.set("Content-Type", "text/plain");
+    from.set(tc.name, tc.value);
+
+    std::vector<std::string>  names;
+    std::vector<hpack::field> fields{
+        {.name = ":status", .value = "200"}
+    };
+    CHECK(detail::append_fields(from, names, fields) == std::errc::invalid_argument);
+    CHECK(fields.size() == 1);
 }

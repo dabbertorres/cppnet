@@ -375,6 +375,14 @@ bool is_valid_field_value(std::string_view value) noexcept
                                 });
 }
 
+bool valid_fields(const headers& fields) noexcept
+{
+    return std::ranges::all_of(
+        fields,
+        [](const auto& field)
+        { return is_valid_field_name(field.first) && std::ranges::all_of(field.second, is_valid_field_value); });
+}
+
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
 std::optional<std::pair<std::string_view, std::string_view>> parse_field_line(std::string_view line) noexcept
 {
