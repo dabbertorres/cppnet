@@ -7,8 +7,10 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -271,7 +273,12 @@ struct keepalive_server
             pending.erase(0, pending.find("\r\n\r\n") + 4);
             ++requests;
 
-            if (when == closing::on_second && ++on_connection == 2) break;
+            if (when == closing::on_second && ++on_connection == 2)
+            {
+                // NOTE: before closing, so the client sees its request canceled whenever it sees the close.
+                if (stop_on_second != nullptr) stop_on_second->request_stop();
+                break;
+            }
 
             if (delay > 0ms) (void)co_await sched->sleep_until(net::io::clock::now() + delay);
 
@@ -292,8 +299,9 @@ done:
     net::listener       listener;
     std::string         port;
 
-    closing                   when  = closing::never;
-    std::chrono::milliseconds delay = 0ms;
+    closing                   when           = closing::never;
+    std::chrono::milliseconds delay          = 0ms;
+    std::stop_source*         stop_on_second = nullptr; // stopped by closing::on_second as it closes
 
     std::atomic<int> accepted{0};
     std::atomic<int> active{0};
@@ -948,4 +956,318 @@ TEST_CASE("timeouts don't limit what makes progress", "[http][client][timeout]")
     REQUIRE(sched.spawn(server.serve()));
     auto result = sched.run_to_completion(post(&client, std::move(req)));
     CHECK(result == "200 " + big);
+}
+
+namespace
+{
+
+std::string canceled() { return "error: " + std::make_error_code(std::errc::operation_canceled).message(); }
+
+// stop_after requests stop after delay (as one of the scheduler's tasks, holding none of its locks).
+task<> stop_after(net::io::scheduler* sched, std::stop_source source, net::io::clock::duration delay)
+{
+    (void)co_await sched->sleep_until(net::io::clock::now() + delay);
+    source.request_stop();
+}
+
+// fetch_until sends a GET, canceled by stop, and reads its body to the end. It returns the body (and the error that
+// ended it, if any), or the error.
+task<std::string> fetch_until(net::http::client* client, std::string host, std::string port, std::stop_token stop)
+{
+    auto req = get_request(host, port);
+    req.stop = std::move(stop);
+
+    auto resp = co_await client->send(std::move(req));
+    if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+    co_return co_await read_all(resp->body.get());
+}
+
+}
+
+TEST_CASE("a request stopped before it's sent fails without a connection", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    keepalive_server   server{&sched};
+    net::http::client  client{&sched};
+
+    std::stop_source source;
+    source.request_stop();
+
+    CHECK(run(sched, server, fetch_until(&client, "127.0.0.1", server.port, source.get_token())) == canceled());
+    CHECK(server.accepted == 0);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a request canceled while it waits for a connection gives up its place", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    keepalive_server   server{&sched};
+    server.delay = 300ms;
+
+    net::http::client client{
+        &sched,
+        {.connect_timeout = 10s, .max_connections_per_host = 1}
+    };
+
+    const auto test = [](net::io::scheduler* sched,
+                         net::http::client*  client,
+                         keepalive_server*   server) -> task<std::vector<std::string>>
+    {
+        // the one connection is busy (its response delayed), so the next request waits for it, until it's canceled.
+        std::string                busy;
+        std::atomic<std::uint64_t> done{0};
+        REQUIRE(sched->spawn(
+            [](net::http::client*          client,
+               std::string                 port,
+               std::string*                out,
+               std::atomic<std::uint64_t>* done,
+               net::io::scheduler*         sched) -> task<>
+            {
+                *out = co_await fetch(client, "127.0.0.1", port);
+                done->store(1);
+                sched->notify_all(*done);
+            }(client, server->port, &busy, &done, sched)));
+
+        while (server->requests.load() == 0) (void)co_await sched->sleep_until(net::io::clock::now() + 1ms);
+
+        std::stop_source source;
+        REQUIRE(sched->spawn(stop_after(sched, source, 50ms)));
+        std::vector<std::string> out{co_await fetch_until(client, "127.0.0.1", server->port, source.get_token())};
+
+        // canceled before the busy one finished.
+        out.emplace_back(done.load() == 0 ? "first still busy" : "first done");
+        while (done.load() == 0) (void)co_await sched->wait_on(done, 0);
+        out.push_back(busy);
+
+        // and the connection's free for the next.
+        out.push_back(co_await fetch(client, "127.0.0.1", server->port));
+        co_return out;
+    };
+
+    const auto results = run(sched, server, test(&sched, &client, &server));
+    CHECK(results == std::vector<std::string>{canceled(), "first still busy", "hello", "hello"});
+    CHECK(server.accepted == 1);
+    CHECK(client.stats() == net::http::connection_stats{.open = 1, .idle = 1});
+}
+
+TEST_CASE("a request canceled while it connects counts its connection out", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    net::http::client  client{&sched};
+
+    std::stop_source source;
+    REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
+
+    // a non-routable address: depending on the network, connecting either hangs (until stop is requested), or fails
+    // straight away.
+    const auto start   = net::io::clock::now();
+    const auto result  = sched.run_to_completion(fetch_until(&client, "10.255.255.1", "81", source.get_token()));
+    const auto elapsed = net::io::clock::now() - start;
+
+    CAPTURE(result);
+    CHECK(result.starts_with("error: "));
+    CHECK(elapsed < 5s);
+    if (result == canceled()) CHECK(elapsed >= 100ms);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("an HTTP/1.1 request canceled closes its connection", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    SECTION("waiting for the response's head")
+    {
+        stalling_server   server{&sched, stalling_server::stall::before_responding};
+        net::http::client client{&sched};
+
+        std::stop_source source;
+        REQUIRE(sched.spawn(server.serve()));
+        REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
+        auto [result, elapsed] = timed(sched, fetch_until(&client, "127.0.0.1", server.port, source.get_token()));
+
+        CHECK(result == canceled());
+        CHECK(elapsed >= 100ms);
+        CHECK(elapsed < 5s);
+        CHECK(client.stats() == net::http::connection_stats{});
+    }
+
+    SECTION("reading the response's body")
+    {
+        stalling_server   server{&sched, stalling_server::stall::in_the_body};
+        net::http::client client{&sched};
+
+        const auto test =
+            [](net::io::scheduler* sched, net::http::client* client, std::string port) -> task<std::string>
+        {
+            std::stop_source source;
+            auto             req = get_request("127.0.0.1", port);
+            req.stop             = source.get_token();
+
+            auto resp = co_await client->send(std::move(req));
+            if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+            // the token still cancels the body's reads, after send() returned: what arrived, then why the rest
+            // didn't, and again for the read after.
+            REQUIRE(sched->spawn(stop_after(sched, source, 100ms)));
+            auto out = co_await read_all(resp->body.get());
+
+            std::array<std::byte, 16> buf{};
+            const auto                again = co_await resp->body->read(buf);
+            co_return out + " " + again.err.message();
+        };
+
+        REQUIRE(sched.spawn(server.serve()));
+        auto [result, elapsed] = timed(sched, test(&sched, &client, server.port));
+
+        const auto message = std::make_error_code(std::errc::operation_canceled).message();
+        CHECK(result == std::format("hello [{}] {}", message, message));
+        CHECK(elapsed >= 100ms);
+        CHECK(elapsed < 5s);
+        CHECK(client.stats() == net::http::connection_stats{});
+    }
+
+    SECTION("with its body arrived, but not read")
+    {
+        keepalive_server  server{&sched};
+        net::http::client client{&sched};
+
+        const auto test =
+            [](net::io::scheduler* sched, net::http::client* client, std::string port) -> task<std::string>
+        {
+            std::stop_source source;
+            auto             req = get_request("127.0.0.1", port);
+            req.stop             = source.get_token();
+
+            auto resp = co_await client->send(std::move(req));
+            if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+            // (time for all of it to arrive.)
+            (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
+            source.request_stop();
+            co_return co_await read_all(resp->body.get());
+        };
+
+        const auto result = run(sched, server, test(&sched, &client, server.port));
+        CHECK(result == " [" + std::make_error_code(std::errc::operation_canceled).message() + "]");
+        CHECK(client.stats() == net::http::connection_stats{});
+    }
+
+    SECTION("sending the request's body")
+    {
+        stalling_server   server{&sched, stalling_server::stall::before_reading};
+        net::http::client client{&sched};
+
+        std::stop_source source;
+        auto             req = post_request(server.port);
+        req.body             = std::make_unique<endless_reader>();
+        req.stop             = source.get_token();
+
+        REQUIRE(sched.spawn(server.serve()));
+        REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
+        auto [result, elapsed] = timed(sched, post(&client, std::move(req)));
+
+        CHECK(result == canceled());
+        CHECK(elapsed >= 100ms);
+        CHECK(elapsed < 30s);
+        CHECK(client.stats() == net::http::connection_stats{});
+    }
+}
+
+TEST_CASE("a response read to its end before its request's canceled keeps its connection", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    keepalive_server   server{&sched};
+    net::http::client  client{&sched};
+
+    const auto test = [](net::http::client* client, std::string port) -> task<std::vector<std::string>>
+    {
+        std::stop_source source;
+        auto             req = get_request("127.0.0.1", port);
+        req.stop             = source.get_token();
+
+        auto resp = co_await client->send(std::move(req));
+        if (!resp.has_value()) co_return std::vector{"error: " + resp.error().message()};
+
+        std::vector<std::string> out{co_await read_all(resp->body.get())};
+
+        // its end was read: stopping now changes nothing.
+        source.request_stop();
+        std::array<std::byte, 16> buf{};
+        const auto                again = co_await resp->body->read(buf);
+        out.push_back(again.err.message());
+
+        out.push_back(co_await fetch(client, "127.0.0.1", port));
+        co_return out;
+    };
+
+    const auto results = run(sched, server, test(&client, server.port));
+    CHECK(results
+          == std::vector<std::string>{"hello", make_error_code(net::io::errc::end_of_stream).message(), "hello"});
+    CHECK(server.accepted == 1);
+    CHECK(client.stats() == net::http::connection_stats{.open = 1, .idle = 1});
+}
+
+TEST_CASE("a canceled request isn't sent again", "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    keepalive_server   server{&sched};
+    server.when = keepalive_server::closing::on_second;
+
+    // the second request's connection is closed without a response (which would be sent again, on another), as its
+    // token's stopped.
+    std::stop_source source;
+    server.stop_on_second = &source;
+
+    net::http::client client{&sched};
+
+    const auto test =
+        [](net::http::client* client, std::string port, std::stop_token stop) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> out{co_await fetch(client, "127.0.0.1", port)};
+        out.push_back(co_await fetch_until(client, "127.0.0.1", port, std::move(stop)));
+        co_return out;
+    };
+
+    const auto results = run(sched, server, test(&client, server.port, source.get_token()));
+    CHECK(results == std::vector<std::string>{"hello", canceled()});
+    CHECK(server.accepted == 1);
+    CHECK(server.requests == 2);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a request racing its cancellation ends once, and keeps its connection only if it's complete",
+          "[http][client][cancel]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    keepalive_server   server{&sched};
+    net::http::client  client{&sched};
+
+    const auto test =
+        [](net::io::scheduler* sched, net::http::client* client, std::string port) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> unexpected;
+        const auto               aborted = " [" + std::make_error_code(std::errc::operation_canceled).message() + "]";
+
+        for (int round = 0; round < 300; ++round)
+        {
+            // stop before, during, or after the request (the delays straddle a round trip).
+            std::stop_source source;
+            const auto       delay = std::chrono::microseconds{(round % 10) * 30};
+            if (round % 10 == 0) source.request_stop();
+            else if (!sched->spawn(stop_after(sched, source, delay))) co_return std::vector<std::string>{"stopped"};
+
+            auto result = co_await fetch_until(client, "127.0.0.1", port, source.get_token());
+            if (result != "hello" && result != canceled() && result != aborted) unexpected.push_back(result);
+
+            // whatever happened, the pool holds the connection only if it's idle, and only one.
+            const auto stats = client->stats();
+            if (stats.open != stats.idle || stats.open > 1)
+                unexpected.push_back(std::format("{} open, {} idle", stats.open, stats.idle));
+        }
+        co_return unexpected;
+    };
+
+    const auto unexpected = run(sched, server, test(&sched, &client, server.port));
+    CHECK(unexpected.empty());
 }

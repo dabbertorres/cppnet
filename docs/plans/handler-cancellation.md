@@ -1,7 +1,7 @@
 # Plan: canceling HTTP server handlers
 
 Status: stage 1 (waits that take a token) done (2026-10-18); stage 2 (the server's token), with stage 5's 499/503, done
-(2026-10-18); stages 3 and 4 planned. Where things stand describes what was there before (HTTP/1.1's graceful
+(2026-10-18); stage 3 (the client) done (2026-10-18); stage 4 planned. Where things stand describes what was there before (HTTP/1.1's graceful
 `close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they added. The
 questions below (under Decided questions) were decided as recommended.
 
@@ -279,6 +279,42 @@ Done as above, with these details settled in the code:
   connection stays in the pool. Reading the body after `send()` returns is covered the same way.
 
 So `out.stop = req.stop;` in a handler cancels its outgoing requests with it.
+
+Done as above (stage 3), with these details settled in the code:
+
+- **HTTP/1.1 uses the socket's token** (stage 1's `set_stop_token()`, as its note anticipated), rather than a callback
+  shutting the connection down: `send_http11` sets the request's token on the connection's socket with its deadlines,
+  so the read or write waiting when stop's requested fails with `operation_canceled` itself, and a stopped token fails
+  the next wait at once. A callback is registered only while a read or write waits (by the socket's operation, so
+  nothing's allocated), and nothing shuts down a connection that may meanwhile have gone back to the pool. The body
+  reader (`pooled_body`) keeps the token: a read once stop's requested fails at once (what's buffered isn't read, as
+  it wouldn't wait), unless the body was done with (read to its end, or failed), and the connection's closed rather
+  than released; releasing a connection clears its socket's token. A failed read's error is returned again by the
+  reads after it (they returned `end_of_stream` before, which looked like a whole body), for any failure.
+- **HTTP/2's callback** (`http2_client_connection::canceler`, `{connection*, stream id}`) is registered in `send()`'s
+  frame once the stream's open, then (from the response's head) in `http2_response_body`; neither is registered nor
+  destroyed holding `mu`, as `cancel()` takes it (so `wait_for_head` makes the body after unlocking). `cancel()` looks
+  the stream up by id (gone after `done()`: nothing to do), fails it with `operation_canceled` (`fail_stream()`; the
+  client's streams have no stop source, so nothing's queued), resets it (CANCEL, unless the session's done with it),
+  and wakes its waits (`changed`, and `output_drained`); if the session's done with the stream, it tells the pool, as
+  `after_receive()` would. The body, given a token, fails reads once stop's requested, as HTTP/1.1's; without one, its
+  read is the stream reader's task as before.
+- **The pool's accounting.** `acquire(..., stop)` fails at once with a stopped token (rather than claim something to
+  give back), waits with the stoppable `wait_on`, and connects with it (`connect_options::stop`, and the TLS
+  handshake's): a connection being made for a canceled request is counted out as a failed one is (`unsettled`), and
+  requests waiting for it (to an HTTP/2 host) connect their own. Once it returns a lease, the request owns it: HTTP/2's
+  reserved stream is always taken by `send()`'s `open()`, which (after taking the reservation) fails with
+  `operation_canceled` if stop's requested, sending nothing, so it's given back on the path a refused stream takes;
+  HTTP/1.1's connection, untouched if stop came before anything was sent, goes back to the pool as reusable,
+  otherwise it's closed.
+- **`send()` returns `operation_canceled`** if stop was requested by the time it returns, whatever the attempt came to
+  (a response that arrived as stop was requested is dropped, closing its connection or resetting its stream; an error
+  the cancellation caused, e.g. a TLS read cut short, is reported as the cancellation), and doesn't retry.
+- **No cost without a token:** no allocation, and no callback registered; what's added is a few null checks of empty
+  tokens, an empty token set on the socket per request, and the stoppable `wait_on` in `acquire`'s frame (used only
+  when it waits). `bench_request`'s HTTP/2 test (cppnet's client, a stream at a time): 51.8 allocations per request
+  before and after, and the same time within noise (76-87 us before, 79-83 after, three runs each); its HTTP/1.1
+  socket test doesn't use the client.
 
 ### HTTP/1.1: noticing the client leave (stage 4)
 

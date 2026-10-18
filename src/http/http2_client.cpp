@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -43,16 +44,26 @@ namespace
 {
 
     // http2_response_body reads a response's body from its stream, which it holds (and its connection): destroying it
-    // before the body's end resets the stream.
+    // before the body's end resets the stream. Given a stop token that can be stopped, it cancels the stream when stop
+    // is requested, and its reads fail with std::errc::operation_canceled once it is, unless the body had already
+    // ended (or failed): what's buffered isn't read.
     class http2_response_body final : public io::reader
     {
     public:
+        // NOTE: not holding the connection's lock: the stop callback is registered here, and runs at once (taking the
+        //       lock) if stop was requested already.
         http2_response_body(std::shared_ptr<http2_client_connection> conn,
-                            std::shared_ptr<http2_client_stream>     stream) noexcept
+                            std::shared_ptr<http2_client_stream>     stream,
+                            const std::stop_token&                   stop)
             : conn{std::move(conn)}
             , stream{std::move(stream)}
             , reader{this->stream.get()}
-        {}
+        {
+            if (!stop.stop_possible()) return;
+
+            this->stop = stop;
+            on_stop.emplace(stop, http2_client_connection::canceler{.conn = this->conn.get(), .id = this->stream->id});
+        }
 
         http2_response_body(const http2_response_body&)            = delete;
         http2_response_body& operator=(const http2_response_body&) = delete;
@@ -60,17 +71,53 @@ namespace
         http2_response_body& operator=(http2_response_body&&)      = delete;
 
         // NOLINTNEXTLINE(bugprone-exception-escape): done() only throws if it can't allocate, when terminating is fine.
-        ~http2_response_body() override { conn->done(stream->id); }
+        ~http2_response_body() override
+        {
+            // NOTE: first, and not holding the lock, which a callback running meanwhile (that this waits for) takes.
+            on_stop.reset();
+            conn->done(stream->id);
+        }
 
-        coro::task<io::result> read(std::span<std::byte> data) override { return reader.read(data); }
+        coro::task<io::result> read(std::span<std::byte> data) override
+        {
+            // NOTE: without a token, the stream's reader's task as it is (it often needn't wait, nor a coroutine).
+            if (!stop.stop_possible()) return reader.read(data);
+            return read_stoppable(data);
+        }
         using io::reader::read;
 
         [[nodiscard]] io::handle native_handle() const noexcept override { return conn->native_handle(); }
 
     private:
+        coro::task<io::result> read_stoppable(std::span<std::byte> data)
+        {
+            if (finished) co_return io::result{.err = finished};
+
+            // NOTE: checked first, as what's buffered would be read without waiting (so without seeing the stream
+            //       fail).
+            const auto canceled = std::make_error_code(std::errc::operation_canceled);
+            if (stop.stop_requested())
+            {
+                finished = canceled;
+                co_return io::result{.err = finished};
+            }
+
+            auto res = co_await reader.read(data);
+            if (res.err)
+            {
+                if (res.err != io::errc::end_of_stream && stop.stop_requested()) res.err = canceled;
+                finished = res.err;
+            }
+            co_return res;
+        }
+
         std::shared_ptr<http2_client_connection> conn;
         std::shared_ptr<http2_client_stream>     stream;
         stream_reader                            reader;
+
+        std::stop_token                                           stop;
+        std::optional<http2_client_connection::stop_registration> on_stop;
+        std::error_code                                           finished; // what ended it, given a token
     };
 
     // authority_of is a request's :authority: the caller's Host, if it has one (RFC 9113, section 8.3.1, as it isn't
@@ -180,7 +227,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     wake_writer();
 
     // the stream is done with unless the response's body takes it: whether the request fails (refused, reset, timed
-    // out), or this coroutine is destroyed while it waits.
+    // out, canceled), or this coroutine is destroyed while it waits.
     const auto id    = stream->id;
     bool       taken = false;
     // NOTE: done() checks on.freed before calling it, and only throws if it can't allocate, when terminating is fine.
@@ -189,6 +236,11 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
                         {
                             if (!taken) done(id);
                         }};
+
+    // canceled from now until the response's head (its body then takes over): stop requested since open() looked
+    // resets the stream at once. Destroyed before done(), not holding the lock.
+    std::optional<stop_registration> on_stop;
+    if (request.stop.stop_possible()) on_stop.emplace(request.stop, canceler{.conn = this, .id = id});
 
     // a server may answer before it's read all of the body (e.g. 413 Content Too Large), and reset the stream, failing
     // the rest: the response is still worth having.
@@ -203,7 +255,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
         if (sent.err) body_error = sent.err;
     }
 
-    auto resp = co_await wait_for_head(std::move(stream), body_error, state);
+    auto resp = co_await wait_for_head(std::move(stream), body_error, state, request.stop);
     taken     = resp.has_value();
     co_return resp;
 }
@@ -214,6 +266,7 @@ http2_client_connection::open(const client_request& request, bool end_stream)
     // the stream reserved for it (if it was), whether or not it can be opened.
     if (reserved > 0) --reserved;
 
+    if (request.stop.stop_requested()) return std::unexpected(std::make_error_code(std::errc::operation_canceled));
     if (ending() || peer_goaway || draining) return std::unexpected(make_error_code(http2::error_code::refused_stream));
 
     // the head is made before the stream is opened, as a stream that's opened must be sent.
@@ -315,9 +368,13 @@ void http2_client_connection::abandon(http2_client_stream& stream, std::error_co
     wake_writer();
 }
 
-coro::task<std::expected<client_response, std::error_code>> http2_client_connection::wait_for_head(
-    std::shared_ptr<http2_client_stream> stream, std::optional<std::error_code> body_error, send_state* state)
+coro::task<std::expected<client_response, std::error_code>>
+http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stream,
+                                       std::optional<std::error_code>       body_error,
+                                       send_state*                          state,
+                                       const std::stop_token&               stop)
 {
+    client_response resp;
     while (true)
     {
         std::uint64_t seen = 0;
@@ -327,12 +384,10 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
 
             if (s.head_received)
             {
-                client_response resp;
                 resp.version     = {.major = 2, .minor = 0};
                 resp.status_code = s.status_code;
                 resp.headers     = std::move(s.headers);
-                resp.body        = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream));
-                co_return resp;
+                break;
             }
 
             if (s.failure)
@@ -358,6 +413,10 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
 
         (void)co_await stream->changed.wait(seen);
     }
+
+    // NOTE: made without the lock, as it registers stop's callback, which takes it.
+    resp.body = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream), stop);
+    co_return resp;
 }
 
 void http2_client_connection::done(http2::stream_id id)
@@ -382,6 +441,37 @@ void http2_client_connection::done(http2::stream_id id)
     wake_writer();
     wake_timer();
     if (on.freed) on.freed();
+}
+
+void http2_client_connection::cancel(http2::stream_id id)
+{
+    bool freed = false;
+    {
+        std::scoped_lock lock{mu};
+        const auto       it = streams.find(id);
+        if (it == streams.end()) return;
+
+        // its waits (for the response's head, its body, or a window to send the request's body) see it fail; the
+        // server, its reset (unless it's done with the stream already).
+        auto& s = *it->second;
+        fail_stream(s, std::make_error_code(std::errc::operation_canceled));
+        session.reset(id, http2::error_code::cancel);
+        s.read_deadline.reset();
+        s.write_deadline.reset();
+        s.changed.notify();
+
+        // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
+        output_drained().notify();
+
+        // the session's done with the stream, so a request waiting for one may have it, though the request's response
+        // hasn't been dropped yet (as after_receive() tells).
+        const auto open_now = session.open_streams();
+        freed               = open_now < open_seen;
+        open_seen           = open_now;
+    }
+
+    wake_writer();
+    if (freed && on.freed) on.freed();
 }
 
 void http2_client_connection::close()

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <ratio>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -101,8 +102,13 @@ std::string connection_pool::make_key(const std::string& scheme, const std::stri
     return key + " " + port;
 }
 
-coro::task<std::expected<connection_pool::lease, std::error_code>> connection_pool::acquire(
-    std::string scheme, std::string host, std::string port, bool allow_idle, const http2_client_connection* skip)
+coro::task<std::expected<connection_pool::lease, std::error_code>>
+connection_pool::acquire(std::string                    scheme,
+                         std::string                    host,
+                         std::string                    port,
+                         bool                           allow_idle,
+                         const http2_client_connection* skip,
+                         std::stop_token                stop)
 {
 #ifdef NET_HAS_TLS
     const bool tls = scheme == "https";
@@ -111,6 +117,9 @@ coro::task<std::expected<connection_pool::lease, std::error_code>> connection_po
     constexpr bool tls = false;
     if (scheme != "http") co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
 #endif
+
+    // NOTE: or it might take a connection (or reserve a stream) it then has to give back.
+    if (stop.stop_requested()) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
 
     const auto key      = make_key(scheme, host, port);
     const auto deadline = io::clock::now() + config.connect_timeout;
@@ -142,7 +151,8 @@ coro::task<std::expected<connection_pool::lease, std::error_code>> connection_po
         const util::defer waited{[this] noexcept { waiting.fetch_sub(1, std::memory_order::relaxed); }};
         if (released.load(std::memory_order::seq_cst) != seen) continue;
 
-        auto err = co_await scheduler->wait_on(released, seen, deadline);
+        // NOTE: a token that can't be stopped is as none (nothing's registered).
+        auto err = co_await scheduler->wait_on(released, seen, deadline, stop);
         if (err) co_return std::unexpected(err);
     }
 
@@ -164,7 +174,7 @@ coro::task<std::expected<connection_pool::lease, std::error_code>> connection_po
                               freed();
                           }};
 
-    auto conn = co_await connect(tls, std::move(host), std::move(port), deadline);
+    auto conn = co_await connect(tls, std::move(host), std::move(port), deadline, std::move(stop));
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
     // a connection that speaks HTTP/2 is shared by the host's requests, from now on.
@@ -338,8 +348,8 @@ std::shared_ptr<http2_client_connection> connection_pool::available_http2(const 
     return nullptr;
 }
 
-coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
-connection_pool::connect(bool tls, std::string host, std::string port, io::clock::time_point deadline)
+coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connection_pool::connect(
+    bool tls, std::string host, std::string port, io::clock::time_point deadline, std::stop_token stop)
 {
     // connect within what's left of the timeout.
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - io::clock::now());
@@ -349,6 +359,7 @@ connection_pool::connect(bool tls, std::string host, std::string port, io::clock
                                                   {
                                                       .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
                                                       .keepalive = config.tcp_keepalive,
+                                                      .stop      = stop,
                                                   });
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
@@ -363,7 +374,11 @@ connection_pool::connect(bool tls, std::string host, std::string port, io::clock
                                      ? io::clock::duration{config.tls_handshake_timeout}
                                      : io::clock::duration{std::chrono::hours{24} * 365};
 
-    auto stream = co_await tls::stream::connect(std::move(*conn), *ctx, host, io::clock::now() + handshake_timeout);
+    auto stream = co_await tls::stream::connect(std::move(*conn),
+                                                *ctx,
+                                                host,
+                                                io::clock::now() + handshake_timeout,
+                                                std::move(stop));
     if (!stream.has_value()) co_return std::unexpected(stream.error());
 
     co_return std::make_unique<connection>(std::move(*stream));

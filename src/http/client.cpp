@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -40,15 +41,21 @@ using namespace std::string_view_literals;
 constexpr std::size_t max_response_header_bytes = std::size_t{1'024} * 1'024;
 
 // pooled_body reads a response's body from a leased connection, which it returns to the pool once the body has been
-// read to its end (or closes, if it's destroyed before then).
+// read to its end (or closes, if it's destroyed before then, or a read fails).
+//
+// Its request's stop token (set on the connection's socket, so a read waiting for it is canceled) fails the reads once
+// stop is requested, unless the body was done with before: the connection is then closed, as what's left of the
+// response is unknown. A failed read's error is returned again by the reads after it.
 class pooled_body final : public net::io::reader
 {
 public:
     pooled_body(std::shared_ptr<net::http::detail::connection_pool> pool,
-                net::http::detail::connection_pool::lease           leased)
+                net::http::detail::connection_pool::lease           leased,
+                std::stop_token                                     stop)
         : pool{std::move(pool)}
         , leased{std::move(leased)}
         , reader{std::make_unique<net::io::buffered_reader>(&net::http::detail::as_reader(*this->leased.conn))}
+        , stop{std::move(stop)}
     {}
 
     pooled_body(const pooled_body&)            = delete;
@@ -73,13 +80,26 @@ public:
 
     net::coro::task<net::io::result> read(std::span<std::byte> data) override
     {
-        if (body == nullptr) co_return {.err = make_error_code(net::io::errc::end_of_stream)};
+        if (body == nullptr) co_return {.err = failed ? failed : make_error_code(net::io::errc::end_of_stream)};
+
+        // NOTE: checked first, as what's buffered would be read without waiting (so without the socket's token).
+        if (stop.stop_requested())
+        {
+            failed = std::make_error_code(std::errc::operation_canceled);
+            finish(false);
+            co_return {.err = failed};
+        }
 
         auto res = co_await body->read(data);
 
         if (res.err)
         {
-            finish(res.err == net::io::errc::end_of_stream);
+            const bool complete = res.err == net::io::errc::end_of_stream;
+
+            // whatever the cancellation caused (e.g. a TLS read cut short), it's reported as what it was.
+            if (!complete && stop.stop_requested()) res.err = std::make_error_code(std::errc::operation_canceled);
+            if (!complete) failed = res.err;
+            finish(complete);
         }
         else if (remaining.has_value())
         {
@@ -107,6 +127,9 @@ private:
         // nothing is pipelined, so anything after the body is the server misbehaving.
         const bool reuse = complete && reusable && reader->buffered().empty();
 
+        // an idle connection holds no request's token.
+        net::http::detail::socket_of(*leased.conn).set_stop_token({});
+
         body   = nullptr;
         reader = nullptr;
         pool->release(std::move(leased), reuse);
@@ -118,6 +141,8 @@ private:
     std::unique_ptr<net::io::reader>                    body;
     bool                                                reusable = false;
     std::optional<std::size_t>                          remaining;
+    std::stop_token                                     stop;
+    std::error_code                                     failed; // a read failed (see read())
 };
 
 // limit is a timeout from client_options, where 0 is no limit.
@@ -207,15 +232,24 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     namespace http11 = net::http::http11;
     namespace detail = net::http::detail;
 
+    // canceled before anything of it was sent: the connection is as it was, so it may be used for another.
+    if (request.stop.stop_requested())
+    {
+        pool->release(std::move(leased), true);
+        co_return sent{.response = std::unexpected(std::make_error_code(std::errc::operation_canceled))};
+    }
+
     const bool reused = leased.reused;
-    auto       body   = std::make_unique<pooled_body>(pool, std::move(leased));
+    auto       body   = std::make_unique<pooled_body>(pool, std::move(leased), request.stop);
     auto*      conn   = body->connection();
 
-    // NOTE: set every time, as a reused connection has whatever its last request left.
+    // NOTE: set every time, as a reused connection has whatever its last request left. The token cancels the reads and
+    //       writes that wait (a canceled request's connection is closed: the body's destructor, or its failed read).
     const auto& options = pool->options();
     auto&       sock    = detail::socket_of(*conn);
     sock.set_deadline(std::nullopt);
     sock.set_timeout(limit(options.io_timeout));
+    sock.set_stop_token(request.stop);
 
     // NOTE: not with a body, which has been read.
     const auto retry = [&](std::error_code err)
@@ -284,26 +318,34 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
     // a request that closes its connection can't be followed by another (over HTTP/1.x: HTTP/2 has no such thing).
     const bool reusable_request = request.version.minor >= 1 && !has_close(request.headers);
 
+    // a canceled request fails with that, whatever its cancellation caused (e.g. a connection shut part way through a
+    // TLS record), or happened meanwhile; and it isn't sent again.
+    const auto canceled = [&request] { return request.stop.stop_requested(); };
+    const auto cancel   = [] { return std::unexpected(std::make_error_code(std::errc::operation_canceled)); };
+
     // the HTTP/2 connection the last attempt was on: a retry is on another.
     std::shared_ptr<detail::http2_client_connection> tried;
 
     for (int attempt = 0;; ++attempt)
     {
         // a retry is because a reused connection had been closed, so the others may have been too.
-        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0, tried.get());
-        if (!leased.has_value()) co_return std::unexpected(leased.error());
+        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0, tried.get(), request.stop);
+        if (!leased.has_value()) co_return canceled() ? cancel() : std::unexpected(leased.error());
 
         // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the response's
-        // body is read.
+        // body is read. Either gives up what it took, if it was canceled (HTTP/2's stream reserved for it, too).
         tried       = leased->http2;
         auto result = leased->http2 != nullptr
                         ? co_await send_http2(std::move(*leased), request, attempt == 0)
                         : co_await send_http11(pool, std::move(*leased), request, attempt == 0, reusable_request);
+
+        // NOTE: a response that arrived as stop was requested is dropped, with its connection (HTTP/1.x) or stream.
+        if (canceled()) co_return cancel();
         if (!result.retry) co_return std::move(result.response);
     }
 }
 
-coro::task<std::expected<client_response, std::error_code>> client::get(std::string_view url)
+coro::task<std::expected<client_response, std::error_code>> client::get(std::string_view url, std::stop_token stop)
 {
     // NOTE: not a coroutine, so url is parsed before this returns, rather than when the task starts (when it might be
     //       gone).
@@ -314,7 +356,7 @@ coro::task<std::expected<client_response, std::error_code>> client::get(std::str
             std::unexpected(std::make_error_code(std::errc::invalid_argument)));
     }
 
-    return send(client_request{.uri = std::move(parsed).value()});
+    return send(client_request{.uri = std::move(parsed).value(), .stop = std::move(stop)});
 }
 
 void client::close_idle() noexcept { pool->close_idle(); }

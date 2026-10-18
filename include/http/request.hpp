@@ -91,6 +91,19 @@ struct client_request
     // it, so it can only be sent once.
     std::unique_ptr<io::reader> body = nullptr;
 
+    // stop cancels the request: requesting stop ends it wherever it is, failing with std::errc::operation_canceled,
+    // whether it's waiting for a connection (or an HTTP/2 stream), connecting, sending the request, or waiting for the
+    // response's head; and once send() has returned the response, reading its body fails the same way (unless it was
+    // read to its end before). A canceled HTTP/1.x request's connection is closed, as it may be part way through the
+    // request or the response; an HTTP/2 request's stream is reset (RST_STREAM with CANCEL), and its connection kept. A
+    // canceled request isn't sent again. Resolving the host can't be interrupted, so stop requested meanwhile is seen
+    // once it's done; nor can reading the request's body, which is seen once that read returns. A token that can't be
+    // stopped (the default) costs nothing.
+    //
+    // E.g. a server's handler passes its request's token (server_request::stop) on, so its outgoing requests are
+    // canceled with it: out.stop = req.stop.
+    std::stop_token stop{};
+
     // set_body sets the body to content, and the Content-Length to match.
     void set_body(std::string content)
     {

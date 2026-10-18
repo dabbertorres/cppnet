@@ -289,6 +289,43 @@ struct gate
     std::atomic<std::uint64_t> opened{0};
 };
 
+// stop_probe records how handlers' waits on their requests' tokens end.
+struct stop_probe
+{
+    std::atomic<std::uint64_t> started{0};
+    std::atomic<std::uint64_t> woke{0};
+    std::atomic<std::uint64_t> canceled{0}; // of those that woke, how many were stopped
+
+    // wait waits for a minute, or until stop is requested, returning whether it was.
+    net::coro::task<bool> wait(net::io::scheduler* sched, std::stop_token stop)
+    {
+        bump(sched, started);
+        const auto err = co_await sched->sleep_until(net::io::clock::now() + std::chrono::seconds{60}, std::move(stop));
+        const bool stopped = err == std::errc::operation_canceled;
+        if (stopped) canceled.fetch_add(1);
+        bump(sched, woke);
+        co_return stopped;
+    }
+
+    // reach waits (up to 5 seconds) for word to reach n, returning whether it did.
+    static net::coro::task<bool>
+    reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t n)
+    {
+        const auto deadline = net::io::clock::now() + std::chrono::seconds{5};
+        for (auto seen = word.load(); seen < n; seen = word.load())
+        {
+            if (co_await sched->wait_on(word, seen, deadline)) co_return word.load() >= n;
+        }
+        co_return true;
+    }
+
+    static void bump(net::io::scheduler* sched, std::atomic<std::uint64_t>& word)
+    {
+        word.fetch_add(1);
+        sched->notify_all(word);
+    }
+};
+
 // header is a response's field's value, or "(none)".
 inline std::string header(const h2_client::response& r, std::string_view name)
 {

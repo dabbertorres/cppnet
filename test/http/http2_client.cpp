@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -138,10 +139,10 @@ http::client_options prior_knowledge()
     return options;
 }
 
-// fetch GETs url, returning the response's version and body, or the error.
-task<std::string> fetch(http::client* client, std::string url)
+// fetch GETs url (canceled by stop), returning the response's version and body, or the error.
+task<std::string> fetch(http::client* client, std::string url, std::stop_token stop = {})
 {
-    auto resp = co_await client->get(url);
+    auto resp = co_await client->get(url, std::move(stop));
     if (!resp.has_value()) co_return "error: " + resp.error().message();
 
     auto body = co_await net::io::read_all(*resp->body);
@@ -1483,4 +1484,438 @@ TEST_CASE("an HTTP/2 request refused before it's sent says so, and leaves its bo
     };
 
     sched.run_to_completion(test(&sched));
+}
+
+namespace
+{
+
+std::error_code canceled() { return std::make_error_code(std::errc::operation_canceled); }
+
+// stop_when requests stop once word reaches n (or after 5 seconds).
+task<> stop_when(net::io::scheduler* sched, std::stop_source source, const std::atomic<std::uint64_t>* word, int n)
+{
+    (void)co_await test::stop_probe::reach(sched, *word, static_cast<std::uint64_t>(n));
+    source.request_stop();
+}
+
+// cancel_router is make_router's, with handlers that wait on their request's token (see test::stop_probe):
+// - /wait waits, then answers "waited" if it wasn't stopped;
+// - /partial sends a head (with a Content-Length of 100) and some of its body, then waits.
+http::router cancel_router(net::io::scheduler* sched, test::stop_probe* probe)
+{
+    auto r = make_router(sched);
+    r.GET("/wait",
+          [sched, probe](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              if (co_await probe->wait(sched, req.stop)) co_return;
+              auto* body = co_await resp.send(http::status::OK, 6);
+              co_await net::io::write_all(*body, "waited"sv);
+          });
+    r.GET("/partial",
+          [sched, probe](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK, 100);
+              co_await net::io::write_all(*body, "partial"sv);
+              (void)co_await probe->wait(sched, req.stop);
+          });
+    return r;
+}
+
+}
+
+TEST_CASE("an HTTP/2 request canceled resets its stream, not the connection", "[http][http2][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    fake_host          host{&sched};
+    http::client       client{&sched, prior_knowledge()};
+
+    enum class where : std::uint8_t
+    {
+        head,         // waiting for the response's head
+        body,         // reading the response's body, after send() returned
+        request_body, // sending the request's body, waiting for the stream's window
+    };
+    const auto at = GENERATE(where::head, where::body, where::request_body);
+    CAPTURE(static_cast<int>(at));
+
+    const auto test = [](net::io::scheduler* sched, http::client* client, fake_host* host, where at) -> task<>
+    {
+        std::stop_source           source;
+        std::atomic<std::uint64_t> head{0}; // the client has the response's head, and read the body's first part
+        outcome                    out;
+
+        auto req =
+            request(at == where::request_body ? http::request_method::POST : http::request_method::GET, host->url("/"));
+        req.stop = source.get_token();
+        if (at == where::request_body) req.body = std::make_unique<endless>();
+
+        // NOTE: made outside REQUIRE, whose loop would have req used after it was moved.
+        auto sending = [](net::io::scheduler*         sched,
+                          http::client*               client,
+                          http::client_request        req,
+                          outcome*                    out,
+                          std::atomic<std::uint64_t>* head) -> task<>
+        {
+            auto resp = co_await client->send(std::move(req));
+            if (resp.has_value())
+            {
+                std::array<std::byte, 16> buf{};
+                const auto                first = co_await resp->body->read(buf);
+                out->body.append(reinterpret_cast<const char*>(buf.data()), first.count);
+                test::stop_probe::bump(sched, *head);
+            }
+            co_await record(sched, std::move(resp), out);
+        }(sched, client, std::move(req), &out, &head);
+        const bool spawned = sched->spawn(std::move(sending));
+        REQUIRE(spawned);
+
+        auto  conn   = co_await accept(host);
+        auto& server = conn->server;
+        auto  pumped = co_await server.pump([&] { return server.responses.contains(1); });
+        REQUIRE(pumped);
+
+        if (at == where::body)
+        {
+            server.respond(1, "200", "part", false);
+            pumped = co_await server.pump([] { return true; }); // (just written)
+            REQUIRE(pumped);
+            const auto read = co_await test::stop_probe::reach(sched, head, 1);
+            REQUIRE(read);
+        }
+        else if (at == where::request_body)
+        {
+            // not reading, so the client's stuck once the stream's window is used up.
+            (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+        }
+
+        source.request_stop();
+        pumped = co_await server.pump([&] { return static_cast<bool>(server.responses[1].reset); });
+        REQUIRE(pumped);
+        CHECK(server.responses[1].reset == http2::error_code::cancel);
+
+        const auto finished = co_await out.wait(sched);
+        REQUIRE(finished);
+        CHECK(out.err == canceled());
+        if (at == where::body) CHECK(out.body == "part");
+
+        // the connection's still there, for the next request.
+        outcome next;
+        REQUIRE(sched->spawn(
+            send_with(sched, client, request(http::request_method::GET, host->url("/")), &next, &host->listener)));
+        pumped = co_await server.pump([&] { return server.responses.contains(3); });
+        REQUIRE(pumped);
+        server.respond(3, "200", "again");
+        pumped = co_await server.pump([] { return true; }); // (just written)
+        REQUIRE(pumped);
+
+        const auto again = co_await next.wait(sched);
+        REQUIRE(again);
+        CHECK(next.body == "again");
+        CHECK_FALSE(server.closed);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, at));
+}
+
+TEST_CASE("an HTTP/2 request canceled stops its handler's token", "[http][http2][client][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use it.
+    test::stop_probe probe;
+
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, cancel_router(&sched, &probe)};
+    http::client       client{&sched, prior_knowledge()};
+
+    const auto path = GENERATE("/wait"sv, "/partial"sv);
+    CAPTURE(path);
+
+    const auto test = [](net::io::scheduler* sched,
+                         http::client*       client,
+                         test_server*        server,
+                         test::stop_probe*   probe,
+                         std::string_view    path) -> task<std::vector<std::string>>
+    {
+        std::stop_source source;
+        REQUIRE(sched->spawn(stop_when(sched, source, &probe->started, 1)));
+
+        // canceled waiting for /wait's head, or reading /partial's body: at once, not when something times out.
+        const auto               start = net::io::clock::now();
+        std::vector<std::string> out{co_await fetch(client, server->url(path), source.get_token())};
+        out.emplace_back(net::io::clock::now() - start < 5s ? "in time" : "too slow");
+
+        const auto woke = co_await test::stop_probe::reach(sched, probe->woke, 1);
+        out.emplace_back(woke && probe->canceled.load() == 1 ? "handler stopped" : "handler not stopped");
+
+        // on the same connection, which is then idle (before the scheduler's stopped, which ends it).
+        out.push_back(co_await fetch(client, server->url("/")));
+        const auto stats = client->stats();
+        out.push_back(std::format("{} open, {} idle", stats.open, stats.idle));
+        co_return out;
+    };
+
+    const auto results = sched.run_to_completion(test(&sched, &client, &server, &probe, path));
+    CHECK(results
+          == std::vector<std::string>{"error: " + canceled().message(),
+                                      "in time",
+                                      "handler stopped",
+                                      "2 hello over HTTP/2",
+                                      "1 open, 1 idle"});
+}
+
+TEST_CASE("an HTTP/2 response's body isn't read once its request's canceled, though it's arrived",
+          "[http][http2][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+    http::client       client{&sched, prior_knowledge()};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, test_server* server) -> task<std::vector<std::string>>
+    {
+        std::stop_source source;
+        auto             resp = co_await client->get(server->url("/"), source.get_token());
+        if (!resp.has_value()) co_return std::vector{"error: " + resp.error().message()};
+
+        // (time for all of it to arrive.)
+        (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
+        source.request_stop();
+
+        std::vector<std::string>  out;
+        std::array<std::byte, 64> buf{};
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto res = co_await resp->body->read(buf);
+            out.push_back(std::format("{} {}", res.count, res.err.message()));
+        }
+        co_return out;
+    };
+
+    const auto message = canceled().message();
+    CHECK(sched.run_to_completion(test(&sched, &client, &server))
+          == std::vector<std::string>{"0 " + message, "0 " + message});
+}
+
+TEST_CASE("an HTTP/2 request canceled while it waits for a stream gives up its place", "[http][http2][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    test::gate         g{&sched};
+
+    auto r = make_router(&sched);
+    r.GET("/held",
+          [&g](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK, 4);
+              co_await g.pass();
+              co_await net::io::write_all(*body, "held"sv);
+          });
+    test_server server{&sched, std::move(r), {.http2_max_concurrent_streams = 1}};
+
+    auto options                          = prior_knowledge();
+    options.strict_max_concurrent_streams = true;
+    options.connect_timeout               = 10s;
+    http::client client{&sched, options};
+
+    const auto test = [](net::io::scheduler* sched, http::client* client, test::gate* g, test_server* server)
+        -> task<std::vector<std::string>>
+    {
+        // the connection, and its limit.
+        std::vector<std::string> out{co_await fetch(client, server->url("/"))};
+
+        // the one stream's busy, so the next request waits for it, until it's canceled.
+        auto held = co_await client->get(server->url("/held"));
+        REQUIRE(held.has_value());
+
+        std::stop_source source;
+        REQUIRE(sched->spawn(
+            [](net::io::scheduler* sched, std::stop_source source) -> task<>
+            {
+                (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+                source.request_stop();
+            }(sched, source)));
+        const auto start = net::io::clock::now();
+        out.push_back(co_await fetch(client, server->url("/"), source.get_token()));
+        out.emplace_back(net::io::clock::now() - start < 5s ? "in time" : "too slow");
+
+        g->open();
+        auto body = co_await net::io::read_all(*held->body);
+        out.push_back(body.value_or("error"));
+        held = std::unexpected(std::error_code{}); // (done with)
+
+        // on the same connection, which is then idle (before the scheduler's stopped, which ends it): nothing's
+        // left reserved.
+        out.push_back(co_await fetch(client, server->url("/")));
+        const auto stats = client->stats();
+        out.push_back(std::format("{} open, {} idle", stats.open, stats.idle));
+        co_return out;
+    };
+
+    const auto results = sched.run_to_completion(test(&sched, &client, &g, &server));
+    CHECK(results
+          == std::vector<std::string>{"2 hello over HTTP/2",
+                                      "error: " + canceled().message(),
+                                      "in time",
+                                      "held",
+                                      "2 hello over HTTP/2",
+                                      "1 open, 1 idle"});
+}
+
+TEST_CASE("an HTTP/2 request stopped before its stream's opened sends nothing, and gives its stream back",
+          "[http][http2][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched) -> task<>
+    {
+        auto            fake = co_await connect_fake(sched, {});
+        test::h2_client server{&fake.socket, &fake.socket, &fake.socket, http2::role::server};
+
+        // as the pool does: a stream reserved for the request, which send() takes.
+        const auto reserved = fake.conn->reserve();
+        REQUIRE(reserved);
+        CHECK_FALSE(fake.conn->idle());
+
+        std::stop_source source;
+        source.request_stop();
+        auto req = request(http::request_method::GET, "http://127.0.0.1/");
+        req.stop = source.get_token();
+
+        auto resp = co_await fake.conn->send(req);
+        REQUIRE_FALSE(resp.has_value());
+        CHECK(resp.error() == canceled());
+        CHECK(fake.conn->idle());
+
+        // the server got nothing of it.
+        const auto synced = co_await server.sync();
+        REQUIRE(synced);
+        CHECK(server.responses.empty());
+        fake.conn->close();
+    };
+
+    sched.run_to_completion(test(&sched));
+}
+
+TEST_CASE("an HTTP/2 request racing its cancellation ends once, and frees its stream", "[http][http2][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+    http::client       client{&sched, prior_knowledge()};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, test_server* server) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> unexpected;
+        const auto               url = server->url("/");
+
+        for (int round = 0; round < 300; ++round)
+        {
+            // stop before, during, or after the request (the delays straddle a round trip).
+            std::stop_source source;
+            const auto       delay = std::chrono::microseconds{(round % 10) * 30};
+            if (round % 10 == 0)
+            {
+                source.request_stop();
+            }
+            else if (!sched->spawn(
+                         [](net::io::scheduler* sched, std::stop_source source, std::chrono::microseconds delay)
+                             -> task<>
+                         {
+                             (void)co_await sched->sleep_until(net::io::clock::now() + delay);
+                             source.request_stop();
+                         }(sched, source, delay)))
+            {
+                co_return std::vector<std::string>{"stopped"};
+            }
+
+            auto result = co_await fetch(client, url, source.get_token());
+            if (result != "2 hello over HTTP/2" && result != "error: " + canceled().message())
+                unexpected.push_back(result);
+
+            // whatever happened, the stream's given back: the connection's idle (and the only one).
+            // (none, if the first requests were canceled as they connected.)
+            const auto stats = client->stats();
+            if (stats.open != stats.idle || stats.open > 1)
+                unexpected.push_back(std::format("{} open, {} idle", stats.open, stats.idle));
+        }
+        co_return unexpected;
+    };
+
+    const auto unexpected = sched.run_to_completion(test(&sched, &client, &server));
+    for (const auto& u : unexpected) UNSCOPED_INFO(u);
+    CHECK(unexpected.empty());
+}
+
+TEST_CASE("a handler's outgoing requests given its token are canceled with it", "[http][http2][client][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use them.
+    test::stop_probe probe; // the upstream's handlers
+
+    struct proxied
+    {
+        std::atomic<std::uint64_t> done{0};
+        std::error_code            err; // what the outgoing request came to
+    } proxy;
+
+    net::io::scheduler sched{make_pool()};
+
+    // the upstream: its handler waits until it's stopped.
+    test_server upstream{&sched, cancel_router(&sched, &probe)};
+
+    // the server in front: its handler sends the request on, with its token, over HTTP/2 or HTTP/1.1.
+    const bool http2_upstream = GENERATE(true, false);
+    CAPTURE(http2_upstream);
+
+    auto options  = prior_knowledge();
+    options.http2 = http2_upstream;
+    http::client outgoing{&sched, options};
+
+    http::router r;
+    r.GET("/proxy",
+          [&](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              auto out = request(http::request_method::GET, upstream.url("/wait"));
+              out.stop = req.stop;
+
+              auto answer = co_await outgoing.send(std::move(out));
+              proxy.err   = answer.has_value() ? std::error_code{} : answer.error();
+              test::stop_probe::bump(&sched, proxy.done);
+
+              if (answer.has_value()) (void)co_await resp.send(answer->status_code, 0);
+          });
+    test_server front{&sched, std::move(r)};
+
+    http::client client{&sched, prior_knowledge()};
+
+    const auto test = [](net::io::scheduler* sched,
+                         http::client*       client,
+                         test_server*        front,
+                         test::stop_probe*   probe,
+                         proxied*            proxy,
+                         bool                http2_upstream) -> task<std::vector<std::string>>
+    {
+        // the client gives up once the upstream's handler is waiting: resetting its stream to the server in front,
+        // whose handler's token stops, canceling its request.
+        std::stop_source source;
+        REQUIRE(sched->spawn(stop_when(sched, source, &probe->started, 1)));
+        const auto               start = net::io::clock::now();
+        std::vector<std::string> out{co_await fetch(client, front->url("/proxy"), source.get_token())};
+
+        // at once, not when something times out.
+        const auto proxied = co_await test::stop_probe::reach(sched, proxy->done, 1);
+        out.push_back(proxied ? "outgoing: " + proxy->err.message() : "outgoing not done");
+        out.emplace_back(net::io::clock::now() - start < 5s ? "in time" : "too slow");
+
+        // over HTTP/2, the upstream's handler is stopped too (its stream's reset); over HTTP/1.1, the connection's
+        // closed, which its server doesn't notice while the handler runs.
+        if (http2_upstream)
+        {
+            const auto woke = co_await test::stop_probe::reach(sched, probe->woke, 1);
+            out.emplace_back(woke && probe->canceled.load() == 1 ? "upstream stopped" : "upstream not stopped");
+        }
+        co_return out;
+    };
+
+    auto expected =
+        std::vector<std::string>{"error: " + canceled().message(), "outgoing: " + canceled().message(), "in time"};
+    if (http2_upstream) expected.emplace_back("upstream stopped");
+    CHECK(sched.run_to_completion(test(&sched, &client, &front, &probe, &proxy, http2_upstream)) == expected);
 }

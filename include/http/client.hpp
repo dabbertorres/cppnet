@@ -2,6 +2,7 @@
 
 #include <expected>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -57,11 +58,14 @@ public:
     // It fails with std::errc::timed_out if connecting takes longer than connect_timeout, the response's head longer
     // than response_header_timeout, or sending the request stalls for io_timeout. Reading the body fails the same way
     // if it stalls for io_timeout.
+    //
+    // It fails with std::errc::operation_canceled once request.stop is requested (see client_request::stop), whatever
+    // else went wrong meanwhile: if stop is requested before it returns, it returns that, rather than the response.
     coro::task<std::expected<client_response, std::error_code>> send(client_request request);
 
-    // get sends a GET request for url (e.g. "http://example.com/path"), as send() does. It fails with
-    // std::errc::invalid_argument if url isn't valid.
-    coro::task<std::expected<client_response, std::error_code>> get(std::string_view url);
+    // get sends a GET request for url (e.g. "http://example.com/path"), as send() does, canceled by stop (see
+    // client_request::stop). It fails with std::errc::invalid_argument if url isn't valid.
+    coro::task<std::expected<client_response, std::error_code>> get(std::string_view url, std::stop_token stop = {});
 
     // close_idle closes the connections that are waiting to be reused.
     void close_idle() noexcept;

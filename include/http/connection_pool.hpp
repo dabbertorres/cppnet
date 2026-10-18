@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -129,11 +130,16 @@ namespace detail
         // with std::errc::timed_out if connecting takes longer than connect_timeout (or the handshake
         // tls_handshake_timeout), as tcp_socket::connect does, or with TLS's errors (e.g. a certificate that couldn't
         // be verified). scheme is "http" or "https" (or with NET_HAS_TLS undefined, only "http").
+        //
+        // Requesting stop ends it (waiting, connecting, or the handshake), failing with std::errc::operation_canceled;
+        // a connection that was being made for it is closed (and counted out). Once it's returned a lease, stop isn't
+        // its business: an HTTP/2 lease's stream stays reserved until its send(), which then fails (giving it back).
         coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
                                                                   std::string                    host,
                                                                   std::string                    port,
                                                                   bool                           allow_idle,
-                                                                  const http2_client_connection* skip = nullptr);
+                                                                  const http2_client_connection* skip = nullptr,
+                                                                  std::stop_token                stop = {});
 
         // release returns a leased connection: kept idle if it's reusable (it's at the start of a response, with
         // nothing unread), and closed otherwise.
@@ -175,9 +181,9 @@ namespace detail
 
         static std::string make_key(const std::string& scheme, const std::string& host, const std::string& port);
 
-        // connect connects to host, within deadline, and for https, runs a TLS handshake.
+        // connect connects to host, within deadline, and for https, runs a TLS handshake: either ended by stop.
         coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
-        connect(bool tls, std::string host, std::string port, io::clock::time_point deadline);
+        connect(bool tls, std::string host, std::string port, io::clock::time_point deadline, std::stop_token stop);
 
         // wants_http2 is whether a new connection is to speak HTTP/2: it agreed on h2 (or it's cleartext, with prior
         // knowledge).

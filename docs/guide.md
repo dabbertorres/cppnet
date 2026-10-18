@@ -59,7 +59,8 @@ One wait can be canceled alone, with a `std::stop_token`: the scheduler's waits 
 `std::errc::operation_canceled` when stop is requested (at once, if it already was), unless they've ended already.
 Sockets take one with `set_stop_token()` (see TCP). A token that can't be stopped (e.g. a default-constructed one) is
 as none. The callback that cancels a wait takes the scheduler's lock for it, and runs on whoever requests stop. An
-HTTP server's handler gets one with its request (`req.stop`), stopped once the request is no longer wanted.
+HTTP server's handler gets one with its request (`req.stop`), stopped once the request is no longer wanted, and an
+HTTP client's request takes one (`client_request::stop`).
 
 ```cpp
 // sleeps for a minute, unless stop is requested first.
@@ -115,7 +116,8 @@ if (res.err == net::io::errc::end_of_stream) { /* only the clean end of the stre
 
 - The end of a stream is `io::errc::end_of_stream`, possibly with the last bytes read. `io::status_condition::closed`
   matches that, the connection being reset or aborted, and TLS's `stream_truncated`.
-- Timeouts are `std::errc::timed_out`, and stopping the scheduler `std::errc::operation_canceled`.
+- Timeouts are `std::errc::timed_out`, and stopping the scheduler (or a stop token given to a wait, a socket or a
+  request) `std::errc::operation_canceled`.
 - `error.message()` says what happened, for logs.
 
 Exceptions are for programming errors (e.g. a second final response to a request, or an invalid metric name), and
@@ -202,6 +204,20 @@ body, whose connection dropped (without GOAWAY) before its response. The request
 `max_connections` as others do (one without streams is idle, and may be closed to make room for another host's), close
 once idle for `idle_timeout` (at once, if it's 0), and fail if their writes stall for `io_timeout`. Destroying the
 client lets the bodies being read finish.
+
+A request is canceled by its `stop` token (`client_request::stop`, or `get(url, stop)`): requesting stop ends it
+wherever it is (waiting for a connection or an HTTP/2 stream, connecting and the TLS handshake, sending the request,
+waiting for the response's head), failing with `std::errc::operation_canceled`, and once `send()` has returned, the
+response's body reads fail the same way, unless it was read to its end first. A canceled HTTP/1.1 request's connection
+is closed, as it may be part way through a request or a response; an HTTP/2 request's stream is reset (CANCEL), and
+the connection goes on. A canceled request isn't sent again. Resolving the host, and reading the request's body, can't
+be interrupted: stop requested meanwhile is seen once they return. A handler passes its own request's token on, so its
+outgoing requests end with it:
+
+```cpp
+net::http::client_request out{.uri = net::url::parse("http://backend/items").value(), .stop = req.stop};
+auto resp = co_await client.send(std::move(out));   // operation_canceled, once req.stop is stopped
+```
 
 For `https://`, the server's certificate is verified against the system's trusted certificate authorities, or those
 in `client_options::tls` (e.g. `options.tls.trusted_ca_file = "ca.pem"`, for a private CA). A failed verification

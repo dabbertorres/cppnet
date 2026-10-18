@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -108,7 +109,10 @@ public:
     // send sends a request, returning the response once its head has arrived. It fails with refused_stream (in
     // http2::category()) if the server didn't process the request, so it may be sent again; state (if given) says how
     // far it got. A request with a Content-Length sends exactly that much of its body, failing with
-    // std::errc::invalid_argument if the body's shorter.
+    // std::errc::invalid_argument if the body's shorter. It takes the stream reserve() reserved, whatever happens.
+    //
+    // request.stop cancels it (and then the response's body): the stream is reset (CANCEL), failing its waits with
+    // std::errc::operation_canceled, and the connection goes on. Stopped before the stream's opened, nothing's sent.
     coro::task<std::expected<client_response, std::error_code>> send(client_request& request,
                                                                      send_state*     state = nullptr);
 
@@ -122,6 +126,28 @@ public:
     // done is a request being done with its stream: its response's body, or send() if the request failed (resetting
     // it if it's not finished, and telling the pool it's free).
     void done(http2::stream_id id);
+
+    // cancel fails a request's stream with std::errc::operation_canceled (unless it's failed already), and resets it
+    // (CANCEL), if it's still there: a request's stop callback (see canceler), so it takes the lock, and must not be
+    // called holding it. The stream stays the request's until done().
+    void cancel(http2::stream_id id);
+
+    // canceler is a request's std::stop_callback: it cancels its stream. Its connection must outlive it.
+    struct canceler
+    {
+        http2_client_connection* conn;
+        http2::stream_id         id;
+
+        // NOTE: cancel() calls on.freed only if it's set, and only throws if it can't allocate, when terminating is
+        //       fine.
+        // NOLINTNEXTLINE(bugprone-exception-escape)
+        void operator()() const noexcept { conn->cancel(id); }
+    };
+
+    // NOTE: the callback runs on whichever thread requests stop (inline, if it was already), and destroying it waits
+    // for
+    //       it if it's running elsewhere: so it's never registered nor destroyed holding the lock, which it takes.
+    using stop_registration = std::stop_callback<canceler>;
 
 protected:
     // the session's events, and the base's hooks: protected, as they're declared.
@@ -138,7 +164,8 @@ protected:
 
 private:
     // open opens a stream for request, sending its head (and ending the stream there, if end_stream), holding the
-    // lock.
+    // lock: unless its stop was requested (failing with std::errc::operation_canceled). Either way, it takes the
+    // stream reserved for it, if there was one.
     std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request& request,
                                                                               bool                  end_stream);
 
@@ -160,10 +187,13 @@ private:
     // idle_now is whether it has no streams, nor any reserved (holding the lock).
     [[nodiscard]] bool idle_now() const noexcept { return streams.empty() && reserved == 0; }
 
-    // wait_for_head waits for the response's head, returning the response (with its body), or why it didn't come
-    // (and in state, whether the connection dropped first).
-    coro::task<std::expected<client_response, std::error_code>> wait_for_head(
-        std::shared_ptr<http2_client_stream> stream, std::optional<std::error_code> body_error, send_state* state);
+    // wait_for_head waits for the response's head, returning the response (with its body, canceled by stop), or why
+    // it didn't come (and in state, whether the connection dropped first).
+    coro::task<std::expected<client_response, std::error_code>>
+    wait_for_head(std::shared_ptr<http2_client_stream> stream,
+                  std::optional<std::error_code>       body_error,
+                  send_state*                          state,
+                  const std::stop_token&               stop);
 
     static coro::task<> run_owned(std::shared_ptr<http2_client_connection> self);
 

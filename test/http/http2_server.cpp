@@ -53,6 +53,7 @@ using net::coro::task;
 using test::gate;
 using test::h2_client;
 using test::header;
+using test::stop_probe;
 
 namespace hpack = net::http::hpack;
 
@@ -787,42 +788,6 @@ TEST_CASE("an HTTP/2 response's field with a line break throws, as over HTTP/1.1
 
 namespace
 {
-
-// stop_probe records how handlers' waits on their requests' tokens end.
-struct stop_probe
-{
-    std::atomic<std::uint64_t> started{0};
-    std::atomic<std::uint64_t> woke{0};
-    std::atomic<std::uint64_t> canceled{0}; // of those that woke, how many were stopped
-
-    // wait waits for a minute, or until stop is requested, returning whether it was.
-    task<bool> wait(net::io::scheduler* sched, std::stop_token stop)
-    {
-        bump(sched, started);
-        const auto err     = co_await sched->sleep_until(net::io::clock::now() + 60s, std::move(stop));
-        const bool stopped = err == std::errc::operation_canceled;
-        if (stopped) canceled.fetch_add(1);
-        bump(sched, woke);
-        co_return stopped;
-    }
-
-    // reach waits (up to 5 seconds) for word to reach n, returning whether it did.
-    static task<bool> reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t n)
-    {
-        const auto deadline = net::io::clock::now() + 5s;
-        for (auto seen = word.load(); seen < n; seen = word.load())
-        {
-            if (co_await sched->wait_on(word, seen, deadline)) co_return word.load() >= n;
-        }
-        co_return true;
-    }
-
-    static void bump(net::io::scheduler* sched, std::atomic<std::uint64_t>& word)
-    {
-        word.fetch_add(1);
-        sched->notify_all(word);
-    }
-};
 
 // probe_router is make_router's, with handlers that wait on their request's token:
 // - /wait waits, then answers 200 "waited" if it wasn't stopped, or 503 "aborted" if the server was aborted, or

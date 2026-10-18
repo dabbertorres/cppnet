@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -249,6 +250,49 @@ TEST_CASE("a TLS handshake that doesn't finish times out", "[tls][http][client]"
     CAPTURE(err.message());
     CHECK(err == std::errc::timed_out);
     CHECK(elapsed < 5s);
+}
+
+TEST_CASE("a request canceled during its TLS handshake fails, and counts its connection out",
+          "[tls][http][client][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    // accepts the connection, but never answers the handshake.
+    const auto silent = [](net::listener* listener, net::io::scheduler* sched) -> task<>
+    {
+        auto accepted = co_await listener->accept();
+        while (!co_await sched->sleep_until(net::io::clock::now() + 10ms))
+        {}
+    };
+    REQUIRE(sched.spawn(silent(&*listener, &sched)));
+
+    net::http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::io::scheduler* sched,
+                         net::http::client*  client,
+                         std::string         port) -> task<std::pair<std::error_code, net::io::clock::duration>>
+    {
+        std::stop_source source;
+        REQUIRE(sched->spawn(
+            [](net::io::scheduler* sched, std::stop_source source) -> task<>
+            {
+                (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+                source.request_stop();
+            }(sched, source)));
+
+        const auto start = net::io::clock::now();
+        auto       resp  = co_await client->get("https://localhost:" + port + "/", source.get_token());
+        co_return std::pair{resp.has_value() ? std::error_code{} : resp.error(), net::io::clock::now() - start};
+    };
+
+    auto [err, elapsed] = sched.run_to_completion(test(&sched, &client, std::to_string(listener->local_port())));
+    CAPTURE(err.message());
+    CHECK(err == std::errc::operation_canceled);
+    CHECK(elapsed >= 100ms);
+    CHECK(elapsed < 5s); // well before tls_handshake_timeout
+    CHECK(client.stats() == net::http::connection_stats{});
 }
 
 TEST_CASE("https requests to a public server", "[tls][http][client][network]")
