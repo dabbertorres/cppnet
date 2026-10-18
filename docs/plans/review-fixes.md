@@ -1,8 +1,8 @@
 # Plan: fixing what the TLS and HTTP/2 reviews found
 
-Status: planned (2026-10-18); groups 1 and 2 done. Six groups, each its own branch and pull request, in order. Each fix comes with a test
-that fails without it. Findings are labelled as the reviews' were: TLS (T), the HTTP/2 protocol (P), server (S),
-client (C), and the effects on what existed before (R).
+Status: done (2026-10-18): all six groups merged (#13 to #18); handlers' cancellation (below) is next. Six groups, each
+its own branch and pull request, in order. Each fix comes with a test that fails without it. Findings are labelled as
+the reviews' were: TLS (T), the HTTP/2 protocol (P), server (S), client (C), and the effects on what existed before (R).
 
 ## 1. HTTP/2 flow control and buffers
 
