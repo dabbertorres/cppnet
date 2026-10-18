@@ -43,6 +43,7 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
+#include "io/util.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
@@ -514,6 +515,63 @@ TEST_CASE("the server skips bodies handlers don't read, and closes connections i
         CHECK(out.contains("\r\nConnection: close\r\n"));
         CHECK_FALSE(out.contains("never"));
     }
+}
+
+TEST_CASE("a request body cut short by the client fails to read, rather than ending", "[http][server][body]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    // the handler answers with what reading the body found: all of it, or what of it came, and why it stopped.
+    const auto read_body = [](http::server_request& req, http::response_writer& resp) -> task<void>
+    {
+        auto body = co_await net::io::read_all(*req.body);
+
+        std::string out = body.has_value() ? "whole: " + *body : "failed: " + body.error().message();
+        if (!body.has_value() && body.error() == std::errc::connection_aborted) out = "cut short";
+
+        auto* writer = co_await resp.send(http::status::OK, out.size());
+        co_await net::io::write_all(*writer, out);
+    };
+
+    http::router router;
+    router.POST("/", read_body);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // the client sends 5 of the body's 10 bytes, and ends its side of the connection (still reading the response).
+    const auto send_short = [](net::io::scheduler* sched, std::uint16_t port) -> task<std::string>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+        if (!conn.has_value()) co_return "error: " + conn.error().message();
+        conn->set_read_timeout(5s);
+
+        auto res =
+            co_await net::io::write_all(*conn, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello"sv);
+        if (res.err) co_return "error: " + res.err.message();
+        conn->shutdown_write();
+
+        std::string                out;
+        std::array<std::byte, 256> buf{};
+        while (true)
+        {
+            auto read = co_await conn->read(buf);
+            out.append(reinterpret_cast<const char*>(buf.data()), read.count);
+            if (read.err) break;
+        }
+        co_return out;
+    };
+
+    auto out = sched.run_to_completion(send_short(&sched, server.local_port()));
+    CAPTURE(out);
+
+    // and the server closed the connection after the response (which the read above waited for).
+    CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(out.ends_with("\r\n\r\ncut short"));
 }
 
 TEST_CASE("the server follows the request's version and Connection header", "[http][server]")

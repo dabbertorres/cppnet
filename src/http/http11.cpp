@@ -261,6 +261,7 @@ std::error_code set_request_body(buffered_reader* reader, server_request& req)
         length = *parsed;
     }
 
+    // NOTE: a body that ends before its length fails (std::errc::connection_aborted), so it isn't taken for all of it.
     reuse_or_make<net::io::limit_reader>(req.body, static_cast<net::io::reader*>(reader), length);
     return {};
 }
@@ -309,10 +310,16 @@ make_response_body(buffered_reader* reader, const client_response& resp, request
     case response_framing::none: return std::make_unique<net::io::limit_reader>(parent, 0);
     case response_framing::chunked: return std::make_unique<net::http::http11::chunked_reader>(reader);
     case response_framing::length:
+        // NOTE: a body that ends before its length fails (std::errc::connection_aborted), so it isn't taken for all of
+        // it (nor its connection reused).
         // NOLINTNEXTLINE(bugprone-unchecked-optional-access): only chosen when there's a valid Content-Length.
         return std::make_unique<net::io::limit_reader>(parent, *resp.headers.get_content_length());
     case response_framing::connection:
-        return std::make_unique<net::io::limit_reader>(parent, std::numeric_limits<std::size_t>::max());
+        // the connection's end is the body's: it can only be cut short as far as the connection can tell (e.g. TLS's
+        // stream_truncated).
+        return std::make_unique<net::io::limit_reader>(parent,
+                                                       std::numeric_limits<std::size_t>::max(),
+                                                       net::io::limit_reader::mode::up_to);
     }
 
     std::unreachable();

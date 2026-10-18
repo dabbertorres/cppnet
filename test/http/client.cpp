@@ -226,6 +226,7 @@ struct keepalive_server
         with_header,    // "Connection: close" on each response, then close
         without_header, // close after each response, as a server might when its own idle timeout passes
         on_second,      // close on a connection's second request, without responding
+        short_body,     // close after half of each response's body
     };
 
     explicit keepalive_server(net::io::scheduler* sched)
@@ -274,12 +275,13 @@ struct keepalive_server
 
             if (delay > 0ms) (void)co_await sched->sleep_until(net::io::clock::now() + delay);
 
-            auto response = when == closing::with_header
-                              ? "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"sv
-                              : "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv;
+            auto response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv;
+            if (when == closing::with_header)
+                response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"sv;
+            else if (when == closing::short_body) response = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello"sv;
             co_await conn.write(std::as_bytes(std::span{response}));
 
-            if (when == closing::with_header || when == closing::without_header) break;
+            if (when == closing::with_header || when == closing::without_header || when == closing::short_body) break;
         }
 
 done:
@@ -445,6 +447,23 @@ TEST_CASE("connections aren't reused if they can't be", "[http][client][pool]")
         CHECK(server.accepted == 2);
         CHECK(client.stats() == net::http::connection_stats{});
     }
+}
+
+TEST_CASE("a response body cut short by the server fails to read, and its connection isn't reused",
+          "[http][client][pool]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    keepalive_server   server{&sched};
+    server.when = keepalive_server::closing::short_body;
+    net::http::client client{&sched};
+
+    auto test = [](net::http::client* client, std::string port) -> task<std::string>
+    { co_return co_await fetch(client, "127.0.0.1", port); };
+
+    // read_all marks a body that failed, rather than ended, with its error.
+    const auto expected = "hello [" + std::make_error_code(std::errc::connection_aborted).message() + "]";
+    CHECK(run(sched, server, test(&client, server.port)) == expected);
+    CHECK(client.stats() == net::http::connection_stats{});
 }
 
 TEST_CASE("idle connections the server closed aren't reused", "[http][client][pool]")

@@ -255,8 +255,10 @@ coro::task<http2_client_connection::body_result> http2_client_connection::send_b
                                                                                     http2_client_stream&       stream,
                                                                                     std::optional<std::size_t> length)
 {
-    // no more than its Content-Length: the server would take what's past it as malformed.
-    io::limit_reader body{request.body.get(), length.value_or(std::numeric_limits<std::size_t>::max())};
+    // no more than its Content-Length: the server would take what's past it as malformed. (Less is checked below.)
+    io::limit_reader body{request.body.get(),
+                          length.value_or(std::numeric_limits<std::size_t>::max()),
+                          io::limit_reader::mode::up_to};
 
     std::vector<std::byte> buffer(std::size_t{16} * 1'024);
     std::size_t            sent = 0;

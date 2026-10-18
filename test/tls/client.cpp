@@ -420,3 +420,44 @@ TEST_CASE("an https body without Content-Length ends with close_notify, and is c
     if (notify) CHECK(err == net::io::errc::end_of_stream);
     else CHECK(err == tls::errc::stream_truncated);
 }
+
+TEST_CASE("an https body with Content-Length cut short fails to read, even with close_notify, and isn't reused",
+          "[tls][http][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const bool notify = GENERATE(true, false);
+    CAPTURE(notify);
+
+    // half of the body, then the connection ends: with close_notify, or without it.
+    const auto respond = [notify](tls::stream& s, int /*n*/) -> task<bool>
+    {
+        co_await net::io::write_all(s, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello"sv);
+        if (!notify) s.socket().shutdown_write();
+        co_return false;
+    };
+    scripted_server   server{&sched, respond};
+    net::http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::http::client* client, std::string url) -> task<std::pair<std::string, std::error_code>>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return std::pair{"error", resp.error()};
+
+        std::string                  body;
+        std::array<std::byte, 1'024> buf{};
+        while (true)
+        {
+            auto res = co_await resp->body->read(buf);
+            body.append(reinterpret_cast<const char*>(buf.data()), res.count);
+            if (res.err) co_return std::pair{body, res.err};
+        }
+    };
+
+    auto [body, err] = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CAPTURE(err.message());
+    CHECK(body == "hello");
+    if (notify) CHECK(err == std::errc::connection_aborted);
+    else CHECK(err == tls::errc::stream_truncated);
+    CHECK(client.stats() == net::http::connection_stats{});
+}

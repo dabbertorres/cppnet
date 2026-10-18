@@ -158,7 +158,8 @@ auto resp = co_await client.send(std::move(req));
 ```
 
 A response's connection is reused once its body has been read to the end, and closed if the response is destroyed
-first.
+first. A body cut short (the connection ending before all of its Content-Length, or its last chunk, came) fails, with
+`std::errc::connection_aborted`, rather than ending: `io::errc::end_of_stream` means it was all read.
 
 HTTP/2 is used over TLS with servers that agree on it with ALPN (unless `client_options::http2` is off), and over
 cleartext only when `client_options::http2_prior_knowledge` says the server speaks it. A response's `version` says
@@ -207,7 +208,9 @@ scheduler.spawn(server.serve());
   (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500. `send()` throws
   `std::system_error` (`std::errc::invalid_argument`) if a header can't be sent (e.g. a value with a line break),
   over HTTP/1.1 and HTTP/2 alike.
-- **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped.
+- **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
+  ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
+  `std::errc::connection_aborted`, if the connection ends first).
 - **Middleware** wraps a handler: e.g. `instrument::http_metrics{std::move(router)}` (`instrument/middleware.hpp`)
   measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Middleware passes values to
   handlers in `req.extensions`.

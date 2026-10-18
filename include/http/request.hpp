@@ -129,6 +129,8 @@ struct server_request
     // Values for handling the request, which middleware passes to handlers: e.g. instrument::trace.
     util::type_map extensions{};
 
+    // The body, which ends (io::errc::end_of_stream) only once all of it has been read: one cut short fails (with
+    // std::errc::connection_aborted, if the connection ends first).
     std::unique_ptr<io::reader> body = nullptr;
 
     // path_value is the value of the route's parameter name: e.g. "42" for "id", for the route "/users/:id" and the

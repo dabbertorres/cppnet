@@ -201,9 +201,12 @@ constexpr bool status_is_server_error(status s) noexcept { return status::INTERN
 // client_response represents an incoming HTTP response from a server to a client.
 struct client_response
 {
-    protocol_version            version{};
-    status                      status_code = status::NONE;
-    net::http::headers          headers{};
+    protocol_version   version{};
+    status             status_code = status::NONE;
+    net::http::headers headers{};
+
+    // The body, which ends (io::errc::end_of_stream) only once all of it has been read: one cut short fails (with
+    // std::errc::connection_aborted, if the connection ends first).
     std::unique_ptr<io::reader> body = nullptr;
 
     client_response() noexcept = default;

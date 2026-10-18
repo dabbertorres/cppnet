@@ -1,8 +1,8 @@
 #include "io/limit_reader.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <span>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -17,20 +17,22 @@ coro::task<result> limit_reader::read(std::span<std::byte> data)
 
     // the reader often finishes without a coroutine (e.g. a buffered one, with enough buffered): then so can this.
     auto inner = parent->read(data.first(std::min(data.size(), limit - progress)));
-    if (inner.finished_without_coroutine())
-    {
-        auto res = std::move(inner).result();
-        progress += res.count;
-        return coro::ready_task<result>(res);
-    }
+    if (inner.finished_without_coroutine()) return coro::ready_task<result>(counted(std::move(inner).result()));
 
     return count_after(std::move(inner));
 }
 
-coro::task<result> limit_reader::count_after(coro::task<result> inner)
+coro::task<result> limit_reader::count_after(coro::task<result> inner) { co_return counted(co_await std::move(inner)); }
+
+result limit_reader::counted(result res) noexcept
 {
-    auto res = co_await std::move(inner);
     progress += res.count;
-    co_return res;
+
+    // NOTE: exactly the end of the stream: any other failure is reported as it is.
+    if (how == mode::exact && progress < limit && res.err == errc::end_of_stream)
+        res.err = std::make_error_code(std::errc::connection_aborted);
+
+    return res;
 }
+
 }
