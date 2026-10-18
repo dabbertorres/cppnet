@@ -36,7 +36,7 @@ gives the request to end early with `std::errc::operation_canceled`; nothing is 
   ENHANCE_YOUR_CALM, a failed write, the client closing, the idle or preface timeouts). Both versions: the server's
   hard stop (see Decided questions (2): the destructor, `scheduler::request_stop()`, and an explicit call), and for
   HTTP/1.1, the client leaving while the handler runs, once stage 4 notices it. The peer's GOAWAY doesn't (streams up
-  to its last stream go on), nor does graceful `close()` (Open questions (2)).
+  to its last stream go on), nor does graceful `close()` (Decided questions (2)).
 - **Stop requests never run under the connection's lock.** `std::stop_source::request_stop()` runs the callbacks
   registered on it inline, and those are anyone's (a handler's, a scheduler wait's, a client request's, taking their
   own locks); HTTP/2's session events, `check_streams` and `end()` all run holding the connection's `mu`. So where a
@@ -51,7 +51,7 @@ gives the request to end early with `std::errc::operation_canceled`; nothing is 
   - To the handler: `req.stop.stop_requested()`; a wait given the token fails with `std::errc::operation_canceled`
     (as `request_stop()`'s do); an HTTP/2 body read or write fails with the stream's failure, as now
     (`connection_reset` for a reset, `timed_out`, `connection_aborted` for the connection ending). The reason isn't
-    otherwise exposed (Open questions (4)).
+    otherwise exposed (Decided questions (4)).
   - To the client: nothing new for HTTP/2 (its reset, or the server's RST_STREAM(CANCEL) for a timeout, or the
     connection's end, already happened); for the server's hard stop, the handler may still answer (e.g. a 503), and a
     response it leaves incomplete is reset with CANCEL rather than INTERNAL_ERROR. For HTTP/1.1, the connection's
@@ -120,7 +120,7 @@ gives the request to end early with `std::errc::operation_canceled`; nothing is 
 
 ### The request's token
 
-`server_request` gets a public field, `std::stop_token stop` (Open questions (1)), documented with what stops it and
+`server_request` gets a public field, `std::stop_token stop` (Decided questions (1)), documented with what stops it and
 how to use it: check `stop.stop_requested()` between steps of a long computation; register a `std::stop_callback`
 (quick, non-blocking, as it may run on the connection's reader) to interrupt something else; or pass it to the waits
 that take one (below), and to `client_request::stop` for outgoing requests. A token copied out of the request stays
@@ -179,7 +179,7 @@ client resets the stream.
   suspending. If it already completed, there's nothing to do. `await_resume` resets the callback, whose destructor
   waits for one still running on another thread (which, having completed the wait, only has the pool's resume left).
 - **Sockets.** `io::reader`/`io::writer` have no room for a token in `read`/`write`, so a socket takes one as it takes
-  deadlines: `socket::set_stop_token(std::stop_token)` (Open questions (6)), which its `read_operation` and
+  deadlines: `socket::set_stop_token(std::stop_token)` (Decided questions (6)), which its `read_operation` and
   `write_operation` register a callback on while they wait (the callback in the operation, which is per socket, so
   nothing's allocated), completing the wait with `operation_canceled` under the shard's lock. A wait canceled before
   `perform()` read anything loses nothing (both run under that lock), so the socket stays usable. `tcp_socket::connect`
@@ -191,7 +191,7 @@ client resets the stream.
 
 ### Outgoing requests (`http::client`)
 
-`client_request` gets `std::stop_token stop` (Open questions (5)), and `client::get(url, stop)`. A request canceled:
+`client_request` gets `std::stop_token stop` (Decided questions (5)), and `client::get(url, stop)`. A request canceled:
 
 - **while it waits for a connection or stream** (`connection_pool`'s `wait_on`): the stoppable `wait_on`.
 - **while connecting**: the socket's token (`connect` options), and TLS's handshake (which takes one already).
