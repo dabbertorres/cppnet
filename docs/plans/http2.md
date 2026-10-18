@@ -114,12 +114,12 @@ connection's machinery (streams, the handlers' tasks, `response_writer`'s back e
   unlimited (advisory; a field counts its name, value and 32).
 - **Streams.** Clients open odd ids, servers even ones (only for push), always increasing. A stream is idle, open,
   half-closed (one side has sent END_STREAM) or closed; RST_STREAM ends one at once.
-- **Messages.** A HEADERS frame (and CONTINUATION frames, with nothing else in between, until END_HEADERS), DATA
-  frames, and optionally trailers (a second HEADERS frame); END_STREAM on the last. Pseudo-headers come first:
-  `:method`, `:scheme`, `:path` and `:authority` for requests (CONNECT: `:method` and `:authority`), `:status` for
-  responses. Names are lowercase; Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding and Upgrade are
-  malformed, and TE may only be `trailers`. Content-Length must match the DATA's length. Cookie may arrive in pieces,
-  to be joined with `"; "`.
+- **Messages.** A HEADERS frame (and CONTINUATION frames, with nothing else in between, until END_HEADERS), DATA frames,
+  and optionally trailers (a second HEADERS frame); END_STREAM on the last. Pseudo-headers come first: `:method`,
+  `:scheme`, `:path` and `:authority` for requests (CONNECT: `:method` and `:authority`), `:status` for responses. Names
+  are lowercase; values mustn't start or end with a space or tab; Connection, Keep-Alive, Proxy-Connection,
+  Transfer-Encoding and Upgrade are malformed, and TE may only be `trailers`. Content-Length must match the DATA's
+  length. Cookie may arrive in pieces, to be joined with `"; "`.
 - **Flow control.** Only DATA counts. Each stream has a window, and so does the connection (65535, changed only by
   WINDOW_UPDATE): a sender may send as much as the smaller of them allows. A change of INITIAL_WINDOW_SIZE moves every
   open stream's window by the difference (so it may go negative). Windows top out at 2^31-1.
@@ -196,9 +196,11 @@ stream:
   HEADERS frame; a body writer framing DATA under flow control; END_STREAM on `finish()`). Its rules carry over: 1xx
   responses (HEADERS without END_STREAM), none for 204 and 304, Content-Length limiting the body, and `send(status)`
   for a body of unknown length (which HTTP/2 frames without anything special). Connection-specific fields a handler
-  sets (Connection, Transfer-Encoding, ..., and those Connection names) are dropped, and names lowercased, when
-  encoding; names and values are checked as HTTP/1.1's encoder does (so `send()` throws for a value with a line break,
-  over either).
+  sets (Connection, Transfer-Encoding, ..., and those Connection names) are dropped, names lowercased, and values
+  trimmed of the spaces and tabs around them (HTTP/1.1's optional whitespace, which HTTP/2 forbids; a view of the
+  value, so nothing's copied), when encoding; names and values are checked as HTTP/1.1's encoder does (so `send()`
+  throws for a value with a line break, over either). The client does the same for requests (and the Host it makes
+  the `:authority`).
 - **What's left of a request body** when its handler returns isn't read: the stream is reset (RST_STREAM(NO_ERROR)),
   or its remaining DATA ignored, with the connection's window still credited. (After review:) a peer's
   RST_STREAM(NO_ERROR) means the same, so if what the peer sent has ended (e.g. a client's response), it stands, and
@@ -326,15 +328,15 @@ idle stream would be a connection error for the peer.
   token bucket for the peer's resets (Rapid Reset) and one for "glitches" (stream errors it causes, empty frames,
   refused streams: MadeYouReset); CONTINUATIONs per block and the block's encoded size; control-frame replies waiting
   to be written; settings per SETTINGS frame. Each fails the connection with ENHANCE_YOUR_CALM.
-- It validates header blocks by RFC 9113's rules (lowercase, valid names and values (no controls but tab, as
-  HTTP/1.1's: RFC 9113 only forbids NUL, CR and LF, but a proxy may pass them on over HTTP/1.1), pseudo-headers first
-  and only the right ones, no connection-specific fields, TE only `trailers`, at most one Host, agreeing with
-  `:authority` but for case, a request's or response's required pseudo-headers, Content-Lengths that agree), and
-  checks DATA, and trailers that end the stream, against Content-Length (except for responses to HEAD, 204 and 304).
-  A malformed block (or HEADERS whose priority depends on its own stream), or one whose decoded list is over
+- It validates header blocks by RFC 9113's rules (lowercase, valid names and values (no controls but tab, as HTTP/1.1's:
+  RFC 9113 only forbids NUL, CR and LF, but a proxy may pass them on over HTTP/1.1; nor a space or tab at either end),
+  pseudo-headers first and only the right ones, no connection-specific fields, TE only `trailers`, at most one Host,
+  agreeing with `:authority` but for case, a request's or response's required pseudo-headers, Content-Lengths that
+  agree), and checks DATA, and trailers that end the stream, against Content-Length (except for responses to HEAD, 204
+  and 304). A malformed block (or HEADERS whose priority depends on its own stream), or one whose decoded list is over
   MAX_HEADER_LIST_SIZE, resets its stream with PROTOCOL_ERROR (the server could answer 431 instead, later), once it's
-  decoded. A block whose encoded size or CONTINUATIONs are over their limits ends the connection (ENHANCE_YOUR_CALM),
-  as it would have to be decoded anyway, to keep HPACK's table in step.
+  decoded. A block whose encoded size or CONTINUATIONs are over their limits ends the connection (ENHANCE_YOUR_CALM), as
+  it would have to be decoded anyway, to keep HPACK's table in step.
 - Closed streams are told from idle ones by the highest ids each side has opened, without keeping them; the last 128
   streams this side reset are remembered, so that what the peer sent before it saw the reset is ignored rather than an
   error (RFC 9113, section 5.1). HEADERS on a closed stream that isn't remembered is a stream error (STREAM_CLOSED),

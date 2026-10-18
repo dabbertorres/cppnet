@@ -74,12 +74,13 @@ namespace
     };
 
     // authority_of is a request's :authority: the caller's Host, if it has one (RFC 9113, section 8.3.1, as it isn't
-    // sent as a field); otherwise the URI's host and port, without the scheme's default port, as HTTP/1.1's Host.
+    // sent as a field; without whitespace around it, as other fields); otherwise the URI's host and port, without the
+    // scheme's default port, as HTTP/1.1's Host.
     std::string authority_of(const client_request& request)
     {
         using namespace std::string_view_literals;
 
-        if (const auto host = request.headers.get("Host"sv); host.has_value()) return std::string{*host};
+        if (const auto host = request.headers.get("Host"sv); host.has_value()) return std::string{trim_value(*host)};
 
         const auto& uri = request.uri;
 

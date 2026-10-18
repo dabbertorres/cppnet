@@ -22,6 +22,7 @@
 
 #include "encoding/hex.hpp"
 #include "http/hpack.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 
 namespace http2 = net::http::http2;
@@ -608,6 +609,16 @@ TEST_CASE("a malformed request is reset, without the application seeing it", "[h
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\nb"}}},
         test_case{.what   = "a value with leading space",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = " a"}}},
+        test_case{.what   = "a value with trailing space",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a "}}},
+        test_case{.what   = "a value with a leading tab",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "\ta"}}},
+        test_case{.what   = "a value with a trailing tab",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\t"}}},
+        test_case{.what   = "a value of only a space",
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = " "}}},
+        test_case{.what   = "a pseudo-header's value with trailing space",
+                  .fields = {fields[0], fields[1], fields[2], {.name = ":path", .value = "/ "}}},
         test_case{.what   = "a value with a control character",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\x01b"}}},
         test_case{.what   = "a value with DEL",
@@ -976,18 +987,20 @@ TEST_CASE("a Host that differs from :authority only in case agrees with it", "[h
     CHECK(c.client.events.take().empty());
 }
 
-TEST_CASE("a value may have a tab inside it", "[http][http2][session]")
+TEST_CASE("a value may have spaces and tabs inside it", "[http][http2][session]")
 {
     connected  c;
     const auto id     = c.client.s.open_stream().value();
     auto       fields = request();
     fields.push_back({.name = "x", .value = "a\tb"});
+    fields.push_back({.name = "y", .value = "a b  c"});
     REQUIRE_FALSE(c.client.s.submit_headers(id, fields, true));
     pump(c.client, c.server);
 
     CHECK(c.server.events.take()
           == std::vector<std::string>{
-              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/ x=a\tb"});
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/ x=a\tb y=a b  c"});
+    CHECK(c.client.events.take().empty());
 }
 
 TEST_CASE("trailers that end a body short of its Content-Length reset the stream", "[http][http2][session][malformed]")

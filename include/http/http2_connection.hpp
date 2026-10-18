@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <vector>
@@ -114,11 +115,15 @@ public:
     stream_writer writer{this};
 };
 
+// trim_value is value without the spaces and tabs around it, which HTTP/2 doesn't allow (RFC 9113, section 8.2.1),
+// where HTTP/1.1 has them as optional whitespace (which its parsers strip, so they mean nothing).
+[[nodiscard]] std::string_view trim_value(std::string_view value) noexcept;
+
 // append_fields appends from's fields to fields as HTTP/2 sends them: names lowercased (into names, which fields views,
-// so names mustn't be touched until fields are sent), without connection-specific fields (nor those Connection names;
-// and, for a request, Host, which :authority replaces, and TE unless it's "trailers"), and with credentials never
-// indexed. It fails with std::errc::invalid_argument, appending nothing, if a field's name or value isn't valid (see
-// valid_fields), as HTTP/1.1's encoder does.
+// so names mustn't be touched until fields are sent), values without the whitespace around them (see trim_value),
+// without connection-specific fields (nor those Connection names; and, for a request, Host, which :authority replaces,
+// and TE unless it's "trailers"), and with credentials never indexed. It fails with std::errc::invalid_argument,
+// appending nothing, if a field's name or value isn't valid (see valid_fields), as HTTP/1.1's encoder does.
 [[nodiscard]] std::error_code append_fields(const headers&             from,
                                             std::vector<std::string>&  names,
                                             std::vector<hpack::field>& fields,

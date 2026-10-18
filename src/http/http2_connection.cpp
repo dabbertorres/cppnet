@@ -65,6 +65,16 @@ namespace
 
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.
+std::string_view trim_value(std::string_view value) noexcept
+{
+    constexpr std::string_view whitespace = " \t";
+
+    const auto first = value.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) return {};
+    return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
+}
+
 std::error_code
 append_fields(const headers& from, std::vector<std::string>& names, std::vector<hpack::field>& fields, bool request)
 {
@@ -90,8 +100,10 @@ append_fields(const headers& from, std::vector<std::string>& names, std::vector<
 
         for (const auto& value : values)
         {
-            if (request && lowered == "te" && value != "trailers") continue;
-            fields.push_back({.name = lowered, .value = value, .never_indexed = hpack::sensitive(lowered)});
+            // NOTE: a view of the value, so trimming it copies nothing.
+            const auto trimmed = trim_value(value);
+            if (request && lowered == "te" && trimmed != "trailers") continue;
+            fields.push_back({.name = lowered, .value = trimmed, .never_indexed = hpack::sensitive(lowered)});
         }
     }
 

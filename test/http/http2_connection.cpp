@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,7 @@
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
@@ -151,6 +153,36 @@ TEST_CASE("HTTP/2 sends neither connection-specific fields, nor those Connection
     got.reserve(fields.size());
     for (const auto& f : fields) got.push_back(std::string{f.name} + ": " + std::string{f.value});
     CHECK(got == std::vector<std::string>{"content-type: text/plain", "x-other: a", "x-other: b"});
+}
+
+TEST_CASE("HTTP/2 sends values without the whitespace around them", "[http][http2][connection]")
+{
+    net::http::headers from;
+    from.add("X-Leading", " a");
+    from.add("X-Trailing", "a\t ");
+    from.add("X-Both", "\t a b \t");
+    from.add("X-Inside", "a \t b");
+    from.add("X-Blank", " \t ");
+    from.add("TE", " trailers ");
+
+    std::vector<std::string>  names;
+    std::vector<hpack::field> fields;
+    REQUIRE_FALSE(detail::append_fields(from, names, fields, true));
+
+    std::vector<std::string> got;
+    got.reserve(fields.size());
+    for (const auto& f : fields) got.push_back(std::format("{}=[{}]", f.name, f.value));
+    CHECK(got
+          == std::vector<std::string>{"x-leading=[a]",
+                                      "x-trailing=[a]",
+                                      "x-both=[a b]",
+                                      "x-inside=[a \t b]",
+                                      "x-blank=[]",
+                                      "te=[trailers]"});
+
+    CHECK(detail::trim_value("").empty());
+    CHECK(detail::trim_value("a") == "a");
+    CHECK(detail::trim_value(" a b ") == "a b");
 }
 
 TEST_CASE("HTTP/2 doesn't send fields that HTTP/1.1 couldn't", "[http][http2][connection]")

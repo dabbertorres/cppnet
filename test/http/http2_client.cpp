@@ -1070,6 +1070,7 @@ TEST_CASE("a request's Host is its :authority over HTTP/2", "[http][http2][clien
 
     const auto tc = GENERATE(
         test_case{.uri = "http://example.com/", .host = "other.example:8080", .authority = "other.example:8080"},
+        test_case{.uri = "http://example.com/", .host = " other.example:8080\t", .authority = "other.example:8080"},
         test_case{.uri = "http://example.com:80/", .host = "", .authority = "example.com"},
         test_case{.uri = "http://example.com:8080/", .host = "", .authority = "example.com:8080"},
         test_case{.uri = "https://example.com:443/", .host = "", .authority = "example.com"},
@@ -1105,6 +1106,46 @@ TEST_CASE("a request's Host is its :authority over HTTP/2", "[http][http2][clien
     };
 
     sched.run_to_completion(test(&sched, tc));
+}
+
+TEST_CASE("field values' whitespace around them is dropped over HTTP/2, both ways", "[http][http2][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // a handler that answers with values that work over HTTP/1.1 (whose parsers strip the whitespace), and says what
+    // it received.
+    auto r = make_router(&sched);
+    r.GET("/padded",
+          [](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const auto received = std::format("[{}]", req.headers.get("X-Sent"sv).value_or("(none)"));
+              resp.headers().set("X-Padded", "value \t");
+              resp.headers().set("X-Inside", " a b ");
+              auto* body = co_await resp.send(http::status::OK, received.size());
+              co_await net::io::write_all(*body, received);
+          });
+    test_server  server{&sched, std::move(r)};
+    http::client client{&sched, prior_knowledge()};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::string>
+    {
+        http::client_request req{.method = http::request_method::GET, .uri = net::url::parse(url).value()};
+        req.headers.set("X-Sent", "\tsent ");
+
+        auto resp = co_await client->send(std::move(req));
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        co_return std::format("HTTP/{} {} [{}] [{}] {}",
+                              resp->version.major,
+                              static_cast<int>(resp->status_code),
+                              resp->headers.get("X-Padded"sv).value_or("(none)"),
+                              resp->headers.get("X-Inside"sv).value_or("(none)"),
+                              *body);
+    };
+
+    CHECK(sched.run_to_completion(test(&client, server.url("/padded"))) == "HTTP/2 200 [value] [a b] [sent]");
 }
 
 TEST_CASE("an HTTP/2 request's body is sent to its Content-Length", "[http][http2][client][body]")
