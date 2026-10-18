@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <exception> // IWYU pragma: keep
@@ -19,10 +20,12 @@
 
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <sys/time.h> // IWYU pragma: keep (timeval, on Linux)
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <netinet/in.h>
 #include <spdlog/details/log_msg.h>
@@ -780,6 +783,31 @@ TEST_CASE("the server closes connections that make no progress", "[http][server]
         CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
         CHECK(out.size() < long_body.size());
     }
+}
+
+TEST_CASE("a cleartext connection that sends nothing is closed at header_read_timeout", "[http][server][timeout]")
+{
+    running_scheduler running;
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    // NOTE: with HTTP/2 on (the default), the server first looks for its preface, within the same deadline.
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .header_read_timeout = 1s}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(conn.read_to_end().empty());
+
+    const auto took = std::chrono::steady_clock::now() - start;
+    CHECK(took >= 900ms);
+    CHECK(took < 1'800ms);
 }
 
 TEST_CASE("the server serves at most max_connections at once", "[http][server][limits]")

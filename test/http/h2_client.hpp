@@ -68,10 +68,11 @@ struct h2_client final : http2::session_events
     std::map<http2::stream_id, response> responses;
     bool                                 goaway = false;
     std::error_code                      goaway_error;
-    bool                                 closed    = false;
-    bool                                 timed_out = false; // the last pump() reached its deadline
-    int                                  finished  = 0;
-    int                                  pings     = 0; // acknowledged
+    http2::stream_id                     goaway_last = 0; // the last GOAWAY's last stream
+    bool                                 closed      = false;
+    bool                                 timed_out   = false; // the last pump() reached its deadline
+    int                                  finished    = 0;
+    int                                  pings       = 0; // acknowledged
 
     void
     on_headers(http2::stream_id id, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
@@ -105,10 +106,11 @@ struct h2_client final : http2::session_events
 
     void on_window_update(http2::stream_id /*stream*/) override {}
     void on_settings(const http2::settings& /*peer*/) override {}
-    void on_goaway(http2::stream_id /*last*/, std::error_code err, std::string_view /*debug*/) override
+    void on_goaway(http2::stream_id last, std::error_code err, std::string_view /*debug*/) override
     {
         goaway       = true;
         goaway_error = err;
+        goaway_last  = last;
     }
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override { ++pings; }
 
@@ -118,18 +120,22 @@ struct h2_client final : http2::session_events
         r.order = ++finished;
     }
 
-    // request opens a stream, and sends a request's head (and body, if any).
-    http2::stream_id
-    request(std::string_view method, std::string_view path, std::string_view body = {}, bool end = true)
+    // request opens a stream, and sends a request's head (with fields, if any) and body (if any).
+    http2::stream_id request(std::string_view              method,
+                             std::string_view              path,
+                             std::string_view              body   = {},
+                             bool                          end    = true,
+                             std::span<const hpack::field> fields = {})
     {
         const auto id = s.open_stream().value();
 
-        const std::vector<hpack::field> head{
+        std::vector<hpack::field> head{
             {   .name = ":method",      .value = method},
             {   .name = ":scheme",      .value = "http"},
             {.name = ":authority", .value = "localhost"},
             {     .name = ":path",        .value = path}
         };
+        head.insert(head.end(), fields.begin(), fields.end());
         REQUIRE_FALSE(s.submit_headers(id, head, body.empty() && end));
         if (!body.empty()) send(id, body, end);
         return id;

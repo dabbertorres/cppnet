@@ -162,8 +162,9 @@ public:
 
 protected:
     // run runs the connection until it ends (when the peer closes it, or it fails, or end() is called): already_read
-    // is what was read of it before. Once the reader's done, it awaits finish_streams() (e.g. the server's handlers),
-    // then lets the writer write what's left, and waits for it and the timer.
+    // is what was read of it before. Once the reader's done, it lets the writer write what's left, and waits for it and
+    // the timer; then shuts the connection down (shutdown(): close_notify over TLS, then FIN), so the peer sees it end
+    // at once, and only then awaits finish_streams() (e.g. the server's handlers, which may take a while).
     coro::task<> run(std::span<const std::byte> already_read);
 
     // add_stream and remove_stream register a stream for the events and timeouts (holding the lock). remove_stream

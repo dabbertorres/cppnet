@@ -222,8 +222,10 @@ scheduler.spawn(server.serve());
   streams are served at once, each handler in a task of its own, up to `http2_max_concurrent_streams` at a time
   (more wait for others to finish); the timeouts apply to each stream (one that times out is reset, and the
   connection's others go on), and `close()` ends HTTP/2 connections gracefully (GOAWAY, then once their streams are
-  done). A handler that throws once its response is under way has its stream reset, so the client doesn't take what
-  it got as the whole response.
+  done). A connection that ends otherwise (the client closing it, or an error) is closed at once, while its handlers
+  (which can't be cancelled) still run, and hold its place among `max_connections` until they return. A handler that
+  throws once its response is under way has its stream reset, so the client doesn't take what it got as the whole
+  response.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

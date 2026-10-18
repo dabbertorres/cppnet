@@ -140,19 +140,41 @@ net::coro::task<> linger_before_close(net::http::detail::connection& conn) noexc
     }
 }
 
+// preface_known is whether what's buffered starts with HTTP/2's preface, if it's enough to tell.
+std::optional<bool> preface_known(std::span<const std::byte> buffered)
+{
+    const auto preface = std::as_bytes(std::span{net::http::http2::preface});
+    const auto n       = std::min(buffered.size(), preface.size());
+    if (!std::ranges::equal(buffered.first(n), preface.first(n))) return false;
+    if (n == preface.size()) return true;
+    return std::nullopt;
+}
+
+// preface_after finishes starts_with_preface, once filling reader (which needed a coroutine) does.
+net::coro::task<bool> preface_after(net::io::buffered_reader& reader, net::coro::task<std::error_code> filling)
+{
+    if (co_await std::move(filling)) co_return false;
+
+    while (true)
+    {
+        if (const auto known = preface_known(reader.buffered())) co_return *known;
+        if (co_await reader.fill()) co_return false;
+    }
+}
+
 // starts_with_preface reads (into reader's buffer, without consuming it) until it can tell whether the connection
 // starts with HTTP/2's preface.
 net::coro::task<bool> starts_with_preface(net::io::buffered_reader& reader)
 {
-    const auto preface = std::as_bytes(std::span{net::http::http2::preface});
+    // usually, the client's first bytes have arrived, so the reads don't wait: then there's no need for a coroutine
+    // (see net::coro::ready_task).
     while (true)
     {
-        const auto buffered = reader.buffered();
-        const auto n        = std::min(buffered.size(), preface.size());
-        if (!std::ranges::equal(buffered.first(n), preface.first(n))) co_return false;
-        if (n == preface.size()) co_return true;
+        if (const auto known = preface_known(reader.buffered())) return net::coro::ready_task<bool>(*known);
 
-        if (co_await reader.fill()) co_return false;
+        auto filling = reader.fill();
+        if (!filling.finished_without_coroutine()) return preface_after(reader, std::move(filling));
+        if (std::move(filling).result()) return net::coro::ready_task<bool>(false);
     }
 }
 
@@ -163,9 +185,12 @@ net::http::http2::session_config http2_session_config(const net::http::server_co
 {
     net::http::http2::session_config config;
     config.local.max_concurrent_streams = cfg.http2_max_concurrent_streams;
-    config.local.max_header_list_size =
-        static_cast<std::uint32_t>(std::min<std::size_t>(cfg.max_header_bytes + (32 * net::http::http11::max_fields),
-                                                         net::http::http2::unlimited - 1));
+
+    // NOTE: saturating, as max_header_bytes may be near SIZE_MAX (no limit, in effect).
+    constexpr std::size_t field_overhead = 32 * net::http::http11::max_fields;
+    constexpr std::size_t most           = net::http::http2::unlimited - 1;
+    config.local.max_header_list_size    = static_cast<std::uint32_t>(
+        cfg.max_header_bytes >= most - field_overhead ? most : cfg.max_header_bytes + field_overhead);
 
     const auto streams       = std::uint64_t{config.local.max_concurrent_streams} * config.local.initial_window_size;
     config.connection_window = static_cast<std::uint32_t>(
@@ -442,10 +467,14 @@ coro::task<> server::serve_requests(detail::connection& conn)
     const auto shut_down = [&conn] noexcept { detail::socket_of(conn).shutdown_read(); };
     std::optional<std::stop_callback<decltype(shut_down)>> on_close{std::in_place, closing.get_token(), shut_down};
 
+    // the first request's head has header_read_timeout from now, whether or not it's looked at first for HTTP/2's
+    // preface (once, rather than again after it); the next requests' from when they're waited for.
+    auto deadline = head_deadline();
+
     // a cleartext client may start with HTTP/2's preface, knowing the server speaks it (RFC 9113, section 3.3).
     if (http2_enabled && !req.tls)
     {
-        detail::socket_of(conn).set_read_deadline(head_deadline());
+        detail::socket_of(conn).set_read_deadline(deadline);
         if (co_await starts_with_preface(state.reader))
         {
             on_close.reset();
@@ -460,7 +489,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
     while (is_serving.load(std::memory_order::acquire))
     {
         // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
-        detail::socket_of(conn).set_read_deadline(head_deadline());
+        detail::socket_of(conn).set_read_deadline(deadline);
 
         auto err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
 
@@ -478,7 +507,8 @@ coro::task<> server::serve_requests(detail::connection& conn)
                       req.version.major,
                       req.version.minor);
 
-        // Only HTTP/1.x is implemented. In particular, http2::response_encode is a stub.
+        // a request line may claim any version (e.g. 2.0, or 3.0), but only HTTP/1.x is served this way: HTTP/2 is
+        // chosen before any request is read (by ALPN, or its preface).
         if (req.version.major != 1)
         {
             logger->trace("unsupported http version: {}.{}", req.version.major, req.version.minor);
@@ -539,6 +569,9 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
         // the client, or the handler, asked for the connection to close after this response.
         if (has_close(resp.headers)) break;
+
+        // the next request's head, from now.
+        deadline = head_deadline();
     }
 
     co_await state.writer.flush();

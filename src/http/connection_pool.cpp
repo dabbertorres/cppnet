@@ -122,6 +122,12 @@ coro::task<std::expected<connection_pool::lease, std::error_code>> connection_po
 
         closing.clear();
 
+        // counted as waiting before looking again, so that either freed() sees it waiting (and wakes it), or it sees
+        // what freed() released (both seq_cst).
+        waiting.fetch_add(1, std::memory_order::seq_cst);
+        const util::defer waited{[this] noexcept { waiting.fetch_sub(1, std::memory_order::relaxed); }};
+        if (released.load(std::memory_order::seq_cst) != seen) continue;
+
         auto err = co_await scheduler->wait_on(released, seen, deadline);
         if (err) co_return std::unexpected(err);
     }
@@ -595,8 +601,10 @@ std::optional<io::clock::time_point> connection_pool::close_expired(connections&
 
 void connection_pool::freed() noexcept
 {
-    released.fetch_add(1, std::memory_order::release);
-    scheduler->notify_all(released);
+    released.fetch_add(1, std::memory_order::seq_cst);
+
+    // e.g. each HTTP/2 stream that ends: the scheduler's waiters (behind its lock) are woken only if there are any.
+    if (waiting.load(std::memory_order::seq_cst) > 0) scheduler->notify_all(released);
 }
 
 }

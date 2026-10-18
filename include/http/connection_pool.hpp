@@ -230,8 +230,9 @@ namespace detail
         std::size_t                                       open    = 0;
         bool                                              reaping = false;
 
-        // Bumped whenever a connection is released, for wait_on().
+        // Bumped whenever a connection is released, for wait_on(); and how many requests wait on it.
         std::atomic<std::uint64_t> released = 0;
+        std::atomic<std::size_t>   waiting  = 0;
 
 #ifdef NET_HAS_TLS
         // tls_context returns the TLS context for https connections, made (once) the first time one is needed: e.g.

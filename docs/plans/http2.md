@@ -241,12 +241,19 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
 | Slow peers | The timeouts above; the preface and first SETTINGS within `header_read_timeout` |
 | Concurrency | MAX_CONCURRENT_STREAMS 100 (nginx's default; Go's is 250), and `max_connections` as now |
 
-(After review:) handlers are bounded as Go's are (its fix for CVE-2023-44487): at MAX_CONCURRENT_STREAMS running, a
-new stream's handler waits for one to finish (and isn't started if its stream is reset meanwhile); past 4 times as
-many running and waiting, the connection ends with GOAWAY(ENHANCE_YOUR_CALM). It's closed once its handlers have
-finished, as any connection is. A malformed PRIORITY (the wrong size, or a stream depending on itself) resets an open
-stream, as a stream error the application is told of; on a stream that isn't open, it only counts as a glitch, as
-RST_STREAM on an idle stream would be a connection error for the peer.
+(After review:) handlers are bounded as Go's are (its fix for CVE-2023-44487): at MAX_CONCURRENT_STREAMS running, a new
+stream's handler waits for one to finish (and isn't started if its stream is reset meanwhile); past 4 times as many
+running and waiting, the connection ends with GOAWAY(ENHANCE_YOUR_CALM), whose last stream is the last whose handler was
+started (so the client may retry the rest), and the stream that tripped it is dropped. A connection that ends with
+streams in flight (that GOAWAY, any other connection error, a failed write, or the client closing) is shut down
+(close_notify over TLS, then FIN) once the writer has flushed what's left, before its handlers finish: RFC 9113 (section
+5.4.1) says it MUST be closed after a connection error, and a client waits for the streams GOAWAY says may have been
+processed until it is. Its fd, and its `max_connections` slot, are still held until the handlers return, deliberately:
+as handlers can't be cancelled, that bounds those left running to `max_connections` times `max_concurrent_streams`
+(freeing the slot would let a client reconnect and pile up more), and HTTP/1.1 holds its slot the same way. Graceful
+`close()` is unchanged. A malformed PRIORITY (the wrong size, or a stream depending on itself) resets an open stream, as
+a stream error the application is told of; on a stream that isn't open, it only counts as a glitch, as RST_STREAM on an
+idle stream would be a connection error for the peer.
 
 ### Client
 
@@ -358,13 +365,15 @@ RST_STREAM on an idle stream would be a connection error for the peer.
   for a kept-alive connection's next request does). The socket's read timeout is cleared for HTTP/2: its reader waits
   as long as the connection's open.
 - The server's MAX_HEADER_LIST_SIZE is `max_header_bytes` plus 32 bytes for each of up to 100 fields (HTTP/1.1's
-  limit on fields), as HPACK counts 32 more per field than the text.
+  limit on fields), as HPACK counts 32 more per field than the text (saturating, for a `max_header_bytes` near
+  SIZE_MAX).
 - `close()` is graceful: GOAWAY with the highest stream id and a PING, then the final GOAWAY once the PING's
   acknowledged (or after a second), and the connection ends once its streams are done.
-- Over cleartext, `serve_requests` peeks for the preface before reading a request; HTTP/1.1's `close()` callback
-  (which ends reads) is removed before handing the connection to HTTP/2, which registers its own (graceful) one. Over
-  TLS, `tls::stream::accept()` now takes the server's ALPN protocols, so the server offers `h2` whatever its context's
-  options say.
+- Over cleartext, `serve_requests` peeks for the preface before reading a request (without a coroutine when what's
+  buffered, or a read that doesn't wait, tells; within the first request's `header_read_timeout`, not one of its own);
+  HTTP/1.1's `close()` callback (which ends reads) is removed before handing the connection to HTTP/2, which registers
+  its own (graceful) one. Over TLS, `tls::stream::accept()` now takes the server's ALPN protocols, so the server offers
+  `h2` whatever its context's options say.
 - Request trailers end the body, but aren't passed on (there's no API for them yet).
 - h2spec and h2load weren't run (they aren't installed here); curl (built with nghttp2) was, over cleartext and TLS.
 
@@ -413,7 +422,10 @@ RST_STREAM on an idle stream would be a connection error for the peer.
 - (After review:) the public headers don't include HTTP/2's internals: what the configurations hold (`settings`,
   `token_bucket`, `session_config`, and the server's and client's options) is in `http/http2_config.hpp`, which
   `http/server.hpp` and `http/connection_pool.hpp` (so `http/client.hpp`) include, forward-declaring the connections;
-  `http/http2.hpp` and `http/http2_session.hpp` include it too, so what used them from there still builds.
+  `http/http2.hpp` and `http/http2_session.hpp` include it too, so what used them from there still builds. The pool
+  counts the requests waiting for a connection (or stream) to be freed, so a stream ending wakes the scheduler's
+  waiters (behind its lock) only if there are any. The client's extra frame per request (`send_http11`'s, an
+  allocation, against a network round trip) stays.
 - No public servers in the tests: the HTTPS test is against the loopback server, which agrees on `h2`.
 
 ## Stages

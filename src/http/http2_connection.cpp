@@ -268,12 +268,19 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
         end();
     }
 
-    co_await finish_streams();
-
     // the writer writes what's left (e.g. GOAWAY), then finishes; and so does the timer.
     writer_wakeup.close();
     wake_timer();
     co_await workers.join();
+
+    // the connection's shut down before the streams are done (e.g. the server's handlers, which can't be cancelled, so
+    // may take a while): after a connection error, it MUST be closed (RFC 9113, section 5.4.1), and the peer would wait
+    // for the streams GOAWAY says may have been processed until it is. Over TLS, after close_notify.
+    // NOTE: the connection itself (its fd, and a server's max_connections slot) is held until they're done,
+    //       deliberately: that bounds the handlers left running to max_connections * max_concurrent_streams, where
+    //       freeing it would let a client reconnect, and pile up more. HTTP/1.1 holds its slot the same way.
+    (void)co_await shutdown(conn);
+    co_await finish_streams();
 }
 
 bool http2_connection_base::receive(std::vector<std::byte>& pending)

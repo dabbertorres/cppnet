@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <map>
@@ -22,6 +24,7 @@
 #include "coro/thread_pool.hpp"
 #include "http/h2_client.hpp"
 #include "http/headers.hpp"
+#include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/http2_session.hpp"
@@ -46,6 +49,8 @@ using net::coro::task;
 using test::gate;
 using test::h2_client;
 using test::header;
+
+namespace hpack = net::http::hpack;
 
 namespace
 {
@@ -543,7 +548,12 @@ TEST_CASE("an HTTP/2 client resetting its streams can't run more handlers than i
               co_await resp.send(http::status::OK, 0);
           });
 
-    test_server server{&sched, std::move(r), {.http2_max_concurrent_streams = 2}};
+    // NOTE: one connection at a time, so a second client waits for the first's slot.
+    test_server server{
+        &sched,
+        std::move(r),
+        {.max_connections = 1, .http2_max_concurrent_streams = 2}
+    };
 
     SECTION("past the limit, a stream's handler waits for another to finish")
     {
@@ -571,25 +581,117 @@ TEST_CASE("an HTTP/2 client resetting its streams can't run more handlers than i
                                             }));
     }
 
-    SECTION("too many waiting, the connection's ended")
+    SECTION("too many waiting, the connection's ended at once, though its handlers hold its slot")
     {
+        const auto port = server.port();
         sched.run_to_completion(with_client(&sched,
-                                            server.port(),
-                                            [](h2_client& c) -> task<>
+                                            port,
+                                            [&g, &sched, port](h2_client& c) -> task<>
                                             {
-                                                // streams opened and reset at once, whose handlers never finish.
+                                                // streams opened and reset at once, whose handlers never finish: the
+                                                // first two run, the rest wait, until the ninth is one too many.
                                                 for (int i = 0; i < 20; ++i)
                                                 {
                                                     const auto id = c.request("GET", "/hold");
                                                     c.s.reset(id, http2::error_code::cancel);
                                                 }
 
-                                                // NOTE: the connection's closed once its handlers have finished,
-                                                //       which these never do.
-                                                REQUIRE(co_await c.pump([&] { return c.goaway; }, 3s));
+                                                // the connection's closed, though its handlers are held (RFC 9113,
+                                                // section 5.4.1).
+                                                const bool closed = co_await c.pump([&] { return c.closed; }, 3s);
+                                                REQUIRE(closed);
+                                                CHECK(c.goaway);
                                                 CHECK(c.goaway_error == http2::error_code::enhance_your_calm);
+
+                                                // the streams after the last started (3) never will be, so they may be
+                                                // retried.
+                                                CHECK(c.goaway_last == 3);
+
+                                                // the handlers still hold its slot (max_connections), until they
+                                                // finish.
+                                                co_await with_client(
+                                                    &sched,
+                                                    port,
+                                                    [&g](h2_client& next) -> task<>
+                                                    {
+                                                        const auto id    = next.request("GET", "/");
+                                                        const bool early = co_await next.wait_for(id, 300ms);
+                                                        CHECK_FALSE(early);
+
+                                                        g.open();
+                                                        g.open();
+                                                        const bool answered = co_await next.wait_for(id);
+                                                        REQUIRE(answered);
+                                                        CHECK(next.responses[id].body == "hello over HTTP/2");
+                                                    });
                                             }));
     }
+}
+
+TEST_CASE("an HTTP/2 client that closes its side gets the server's FIN at once while a handler is held",
+          "[http][http2][server]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+    r.GET("/hold",
+          [&g](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              co_await g.pass();
+              co_await resp.send(http::status::OK, 0);
+          });
+
+    test_server server{&sched, std::move(r)};
+
+    const auto test = [](net::io::scheduler* sched, std::string port) -> task<>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+        REQUIRE(conn.has_value());
+
+        h2_client  c{&*conn, &*conn, &*conn};
+        const auto id     = c.request("GET", "/hold");
+        const bool synced = co_await c.sync(); // the server has the request (and nothing's left to send)
+        REQUIRE(synced);
+
+        conn->shutdown_write();
+
+        const auto start  = std::chrono::steady_clock::now();
+        const bool closed = co_await c.pump([&] { return c.closed; }, 3s);
+        CHECK(closed);
+        CHECK(std::chrono::steady_clock::now() - start < 1s);
+        CHECK_FALSE(c.responses[id].done);
+    };
+
+    sched.run_to_completion(test(&sched, server.port()));
+}
+
+TEST_CASE("HTTP/2's header list limit doesn't wrap with max_header_bytes near SIZE_MAX",
+          "[http][http2][server][limits]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, {.max_header_bytes = SIZE_MAX}};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            // more than 32 bytes a field for HTTP/1.1's most fields (3,200), which
+                                            // is all a limit that wrapped would allow.
+                                            const std::string                 value(5'000, 'v');
+                                            const std::array<hpack::field, 1> fields{
+                                                hpack::field{.name = "x-large", .value = value}
+                                            };
+
+                                            const auto id   = c.request("GET", "/", {}, true, fields);
+                                            const bool done = co_await c.wait_for(id);
+                                            REQUIRE(done);
+
+                                            const auto& resp = c.responses[id];
+                                            CAPTURE(resp.reset.message());
+                                            CHECK(resp.status == "200");
+                                            CHECK(resp.body == "hello over HTTP/2");
+                                        }));
 }
 
 TEST_CASE("an HTTP/2 response's field with a line break throws, as over HTTP/1.1", "[http][http2][server]")

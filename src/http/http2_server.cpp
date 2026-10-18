@@ -143,7 +143,8 @@ namespace
         void refuse(http2::stream_id id, status code, bool request_ended);
 
         // schedule starts a stream's handler, or queues it if max_concurrent_streams handlers are running (holding
-        // the lock); promote starts queued handlers as running ones finish (skipping streams reset meanwhile).
+        // the lock), or ends the connection if too many are queued (removing the stream); promote starts queued
+        // handlers as running ones finish (skipping streams reset meanwhile).
         void schedule(http2_stream& stream);
         void promote();
 
@@ -168,10 +169,11 @@ namespace
         std::unordered_map<http2::stream_id, std::unique_ptr<http2_stream>> streams;
         std::vector<http2_stream*>                                          started; // to start once unlocked
         std::deque<http2_stream*>                                           queued;  // to start once others finish
-        std::size_t                                                         running     = 0; // handlers started
-        bool                                                                draining    = false;
-        bool                                                                final_sent  = false; // the final GOAWAY
-        bool                                                                peer_goaway = false;
+        std::size_t                                                         running      = 0; // handlers started
+        http2::stream_id                                                    last_started = 0; // the highest started
+        bool                                                                draining     = false;
+        bool                                                                final_sent   = false; // the final GOAWAY
+        bool                                                                peer_goaway  = false;
         std::optional<io::clock::time_point>                                drain_deadline;
         std::optional<io::clock::time_point>                                idle_since;
         io::clock::time_point                                               started_at = io::clock::now();
@@ -282,11 +284,19 @@ namespace
         // As Go's (its fix for CVE-2023-44487): a client resetting streams can open new ones while the handlers of
         // those it reset go on running, so handlers are limited as streams are; past the limit, they wait for others
         // to finish; and a client that keeps opening streams regardless is told to calm down.
+        //
+        // The connection's ended then: its GOAWAY's last stream is the last whose handler was started, as those queued
+        // (and this one) never will be, so the client may retry them. It's shut down at once, though the handlers
+        // still running hold the connection (and its max_connections slot) until they return (see run()).
         const auto limit = std::max<std::size_t>(options.session.local.max_concurrent_streams, 1);
         if (running + queued.size() >= 4 * limit)
         {
             logger.debug("HTTP/2 client opened too many streams while their handlers ran");
-            session.goaway(session.last_peer_stream(), http2::error_code::enhance_your_calm, "too many handlers");
+            session.goaway(last_started, http2::error_code::enhance_your_calm, "too many handlers");
+
+            const auto id = stream.id;
+            remove_stream(id);
+            streams.erase(id); // stream, too
             end();
             return;
         }
@@ -312,6 +322,7 @@ namespace
             }
 
             ++running;
+            last_started = std::max(last_started, s->id);
             started.push_back(s);
         }
     }
