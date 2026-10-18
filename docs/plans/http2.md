@@ -1,8 +1,8 @@
 # Plan: HTTP/2
 
-Status: stage 1 (HPACK) implemented (2026-10-17): `include/http/hpack.hpp`, `src/http/hpack.cpp`,
-`test/http/hpack.cpp`, `fuzz/hpack.cpp`. The rest isn't: `include/http/http2.hpp` and `src/http/http2.cpp` are a
-parked stub, to be replaced (see Where things stand).
+Status: stages 1 and 2 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with its tests and `fuzz_hpack`), and the
+frames and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`).
+The server (stage 3) and client (stage 4) are next.
 
 ## Goal
 
@@ -273,6 +273,30 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
 - A decoder starts with its dynamic table at the size it's given, as both sides start with the same
   SETTINGS_HEADER_TABLE_SIZE (4096, unless the RFC's examples say otherwise); `set_max_table_size()` lowers the limit
   once the peer has acknowledged this side's, and then the next block must start with a size update.
+
+## Learned in stage 2
+
+- `http2::session` is the protocol without I/O: `receive()` takes what's been read and uses only whole frames
+  (returning how much, so the rest is passed again with what's read next), reporting to a `session_events`
+  interface; the application's side is `open_stream()`, `submit_headers()`, `submit_data()` (as far as the windows
+  allow), `reset()`, `consume()` (giving windows back), `goaway()` and `ping()`; and what's to be written is
+  `take_output()`'s. It isn't thread-safe: the server and client serialize calls into it (stage 3). Fuzzing checks it
+  receives frames the same at once or a byte at a time.
+- The defenses that count frames live in the session, where they're tested on bytes, rather than in the server: a
+  token bucket for the peer's resets (Rapid Reset) and one for "glitches" (stream errors it causes, empty frames,
+  refused streams: MadeYouReset); CONTINUATIONs per block and the block's encoded size; control-frame replies waiting
+  to be written; settings per SETTINGS frame. Each fails the connection with ENHANCE_YOUR_CALM.
+- It validates header blocks by RFC 9113's rules (lowercase, valid names and values, pseudo-headers first and only
+  the right ones, no connection-specific fields, TE only `trailers`, Host agreeing with `:authority`, a request's or
+  response's required pseudo-headers, Content-Lengths that agree), and checks DATA against Content-Length (except for
+  responses to HEAD, 204 and 304). A malformed block, or one over MAX_HEADER_LIST_SIZE, resets its stream with
+  PROTOCOL_ERROR (the server could answer 431 instead, later).
+- Closed streams are told from idle ones by the highest ids each side has opened, without keeping them; the last 128
+  streams this side reset are remembered, so that what the peer sent before it saw the reset is ignored rather than an
+  error (RFC 9113, section 5.1).
+- Until the server's SETTINGS arrive, a client opens at most 100 streams (as Go and Chromium assume). A session's own
+  INITIAL_WINDOW_SIZE is at least 65535, as the peer may send that much before it has seen this side's SETTINGS.
+- `util/packed.hpp` went with the stub: nothing else packed structs.
 
 ## Stages
 

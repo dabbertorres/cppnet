@@ -1,260 +1,196 @@
 #include "http/http2.hpp"
 
-#include <array>
+#include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
-#include <memory>
+#include <cstring>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
-#include <unordered_map>
-
-#include "coro/task.hpp"
-#include "http/request.hpp"
-#include "http/response.hpp"
-#include "io/buffered_reader.hpp"
-#include "io/writer.hpp"
-#include "util/packed.hpp"
+#include <utility>
+#include <vector>
 
 namespace
 {
 
-// https://httpwg.org/specs/rfc9113.html#ErrorCodes
-// Unknown or unsupported error codes MUST NOT trigger any special behavior.
-// These MAY be treated by an implementation as being equivalent to INTERNAL_ERROR.
-// NOLINTNEXTLINE(performance-enum-size, "size defined by RFC")
-enum class error_code : std::uint32_t
+class category_impl final : public std::error_category
 {
-    NO_ERROR            = 0x00,
-    PROTOCOL_ERROR      = 0x01,
-    INTERNAL_ERROR      = 0x02,
-    FLOW_CONTROL_ERROR  = 0x03,
-    SETTINGS_TIMEOUT    = 0x04,
-    STREAM_CLOSED       = 0x05,
-    FRAME_SIZE_ERROR    = 0x06,
-    REFUSED_STREAM      = 0x07,
-    CANCEL              = 0x08,
-    COMPRESSION_ERROR   = 0x09,
-    CONNECT_ERROR       = 0x0a,
-    ENHANCE_YOUR_CALM   = 0x0b,
-    INADEQUATE_SECURITY = 0x0c,
-    HTTP_1_1_REQUIRED   = 0x0d,
+public:
+    [[nodiscard]] const char* name() const noexcept override { return "http2"; }
+
+    [[nodiscard]] std::string message(int value) const override
+    {
+        using enum net::http::http2::error_code;
+        switch (static_cast<net::http::http2::error_code>(value))
+        {
+        case no_error: return "no error";
+        case protocol_error: return "protocol error";
+        case internal_error: return "internal error";
+        case flow_control_error: return "flow-control error";
+        case settings_timeout: return "settings timeout";
+        case stream_closed: return "stream closed";
+        case frame_size_error: return "frame size error";
+        case refused_stream: return "refused stream";
+        case cancel: return "cancel";
+        case compression_error: return "compression error";
+        case connect_error: return "connect error";
+        case enhance_your_calm: return "enhance your calm";
+        case inadequate_security: return "inadequate security";
+        case http_1_1_required: return "HTTP/1.1 required";
+        }
+        return "unknown HTTP/2 error " + std::to_string(static_cast<std::uint32_t>(value));
+    }
 };
 
-enum class frame_type : std::uint8_t
+const category_impl the_category;
+
+// put appends value's lowest n octets to out, most significant first (as HTTP/2 is big-endian).
+void put(std::uint32_t value, int n, std::vector<std::byte>& out)
 {
-    DATA          = 0x0,
-    HEADERS       = 0x1,
-    PRIORITY      = 0x2,
-    RST_STREAM    = 0x3,
-    SETTINGS      = 0x4,
-    PUSH_PROMISE  = 0x5,
-    PING          = 0x6,
-    GOAWAY        = 0x7,
-    WINDOW_UPDATE = 0x8,
-    CONTINUATION  = 0x9,
-};
+    for (int i = n - 1; i >= 0; --i) out.push_back(static_cast<std::byte>(value >> (i * 8)));
+}
 
-enum class frame_flags : std::uint8_t
+void put_header(std::uint32_t                length,
+                net::http::http2::frame_type type,
+                std::uint8_t                 frame_flags,
+                net::http::http2::stream_id  stream,
+                std::vector<std::byte>&      out)
 {
-    END_STREAM  = 0x01,
-    ACK         = 0x01,
-    END_HEADERS = 0x04,
-    PADDED      = 0x08,
-    PRIORITY    = 0x20,
-};
-
-struct NET_PACKED frame_header
-{
-    std::uint32_t length : 24;
-    frame_type    type;
-    frame_flags   flags;
-    std::uint32_t _                 : 1;
-    std::uint32_t stream_identifier : 31;
-};
-
-static_assert(sizeof(frame_header) == 9);
-
-struct NET_PACKED data_frame
-{
-    std::uint8_t pad_length; // only present if PADDED is set.
-    // data...
-    // ...padding;
-};
-
-struct NET_PACKED headers_frame
-{
-    std::uint8_t  pad_length;             // only present if PADDED is set.
-    std::uint32_t exclusive         : 1;  // only present if PRIORITY is set.
-    std::uint32_t stream_dependency : 31; // only present if PRIORITY is set.
-    std::uint8_t  weight;                 // only present if PRIORITY is set.
-    // field_block_fragment fragment;
-    // padding...
-};
-
-// NOTE: priority_frame is deprecated.
-struct NET_PACKED priority_frame
-{
-    std::uint32_t exclusive         : 1;
-    std::uint32_t stream_dependency : 31;
-    std::uint8_t  weight;
-};
-
-struct NET_PACKED rst_stream_frame
-{
-    enum error_code error_code;
-};
-
-// From: https://httpwg.org/specs/rfc9113.html#SettingValues
-// NOTE: unknown ids must be ignored
-// NOLINTNEXTLINE(performance-enum-size, "size defined by RFC")
-enum class setting_id : std::uint16_t
-{
-    SETTINGS_HEADER_TABLE_SIZE      = 0x01,
-    SETTINGS_ENABLE_PUSH            = 0x02,
-    SETTINGS_MAX_CONCURRENT_STREAMS = 0x03,
-    SETTINGS_INITIAL_WINDOW_SIZE    = 0x04,
-    SETTINGS_MAX_FRAME_SIZE         = 0x05,
-    SETTINGS_MAX_HEADER_LIST_SIZE   = 0x06,
-};
-
-struct NET_PACKED setting
-{
-    setting_id    identifier;
-    std::uint32_t value;
-};
-
-struct NET_PACKED settings_frame
-{
-    std::span<setting> settings;
-};
-
-struct NET_PACKED push_promise_frame
-{
-    std::uint8_t  pad_length;             // only present if PADDED is set.
-    std::uint32_t _                 : 1;  // RESERVED
-    std::uint32_t stream_dependency : 31; // only present if PRIORITY is set.
-    // field_block_fragment_id fragment_id;
-    // padding...
-};
-
-struct NET_PACKED ping_frame
-{
-    std::array<std::byte, 8> opaque_data;
-};
-
-struct NET_PACKED goaway_frame
-{
-    std::uint32_t   _              : 1;
-    std::uint32_t   last_stream_id : 31;
-    enum error_code error_code;
-    // additional debug data
-};
-
-struct NET_PACKED window_update_frame
-{
-    std::uint32_t _                     : 1;
-    std::uint32_t window_size_increment : 31;
-};
-
-struct NET_PACKED continuation_frame{
-    // field_block_fragment fragment;
-};
-
-// TODO: psuedo-headers
-
-// https://httpwg.org/specs/rfc9113.html#StreamStates
-// idle:
-//   recv PUSH_PROMISE -> reserved (remote)
-//   send PUSH_PROMISE -> reserved (local)
-//   send HEADERS -> open
-//   recv HEADERS -> open
-//
-// reserved (remote):
-//   recv HEADERS -> half-closed (local)
-//   send RST_STREAM -> closed
-//   recv RST_STREAM -> closed
-//
-// reserved (local):
-//   send HEADERS -> half-closed (remote)
-//   send RST_STREAM -> closed
-//   recv RST_STREAM -> closed
-//
-// open:
-//   send END_STREAM -> half-closed (local)
-//   recv END_STREAM -> half-closed (remote)
-//   send RST_STREAM -> closed
-//   recv RST_STREAM -> closed
-//
-// half-closed (remote):
-//   send END_STREAM -> closed
-//   send RST_STREAM -> closed
-//   recv RST_STREAM -> closed
-//
-// half-closed (local):
-//   recv END_STREAM -> closed
-//   send RST_STREAM -> closed
-//   recv RST_STREAM -> closed
-//
-// closed:
-//   terminal
-enum class stream_state : std::uint8_t
-{
-    idle,
-    reserved_local,
-    reserved_remote,
-    open,
-    half_closed_local,
-    half_closed_remote,
-    closed,
-};
-
-struct stream
-{
-    stream_state state;
-    std::int64_t window;
-};
-
-struct connection
-{
-    std::unordered_map<std::uint32_t, stream> streams;
-
-    // The following are from: https://httpwg.org/specs/rfc9113.html#SettingValues
-    std::uint32_t header_table_size; // Default is 4096.
-    bool          push_enabled;
-    std::uint32_t max_concurrent_streams; // Default is no limit. Should be no smaller than 100. 0 is not special.
-    std::uint32_t initial_window_size;    // Default is 65535.
-    std::uint32_t max_frame_size;         // Default is 16384. Must be between that and 16777215.
-    std::uint32_t max_header_list_size;   // Default is unlimited.
-};
+    net::http::http2::encode_frame_header(
+        {.length = length, .type = static_cast<std::uint8_t>(type), .flags = frame_flags, .stream = stream},
+        out);
+}
 
 }
 
 namespace net::http::http2
 {
 
-using coro::task;
+const std::error_category& category() noexcept { return the_category; }
 
-task<request_encoder_result> request_encode(io::writer* /*writer*/, const client_request& /*req*/) noexcept
+std::error_code make_error_code(error_code err) noexcept { return {static_cast<int>(err), the_category}; }
+
+std::uint32_t wire_code(std::error_code err) noexcept
 {
-    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
+    if (err.category() == the_category) return static_cast<std::uint32_t>(err.value());
+    return static_cast<std::uint32_t>(error_code::internal_error);
 }
 
-task<response_encoder_result> response_encode(io::writer* /*writer*/, const server_response& /*resp*/) noexcept
+frame_header decode_frame_header(std::span<const std::byte, frame_header_size> in) noexcept
 {
-    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
+    // the length is 24 bits: loaded as the first 4 octets, the type's octet shifted out.
+    std::uint32_t first = 0;
+    std::memcpy(&first, in.data(), sizeof(first));
+    std::uint32_t stream = 0;
+    std::memcpy(&stream, in.data() + 5, sizeof(stream));
+    if constexpr (std::endian::native == std::endian::little)
+    {
+        first  = std::byteswap(first);
+        stream = std::byteswap(stream);
+    }
+
+    return {
+        .length = first >> 8U,
+        .type   = std::to_integer<std::uint8_t>(in[3]),
+        .flags  = std::to_integer<std::uint8_t>(in[4]),
+        .stream = stream & max_stream_id,
+    };
 }
 
-task<request_decoder_result> request_decode(io::buffered_reader* /*reader*/, std::size_t /*max_header_bytes*/) noexcept
+void encode_frame_header(const frame_header& header, std::vector<std::byte>& out)
 {
-    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
+    put(header.length, 3, out);
+    out.push_back(static_cast<std::byte>(header.type));
+    out.push_back(static_cast<std::byte>(header.flags));
+    put(header.stream & max_stream_id, 4, out);
 }
 
-task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> /*reader*/,
-                                              request_method /*method*/,
-                                              std::size_t /*max_header_bytes*/) noexcept
+void encode_settings(const settings& values, const settings& defaults, std::vector<std::byte>& out)
 {
-    co_return std::unexpected(std::make_error_code(std::errc::function_not_supported)); // TODO
+    std::vector<std::pair<setting_id, std::uint32_t>> changed;
+    const auto add = [&](setting_id id, std::uint32_t value, std::uint32_t initial)
+    {
+        if (value != initial) changed.emplace_back(id, value);
+    };
+
+    add(setting_id::header_table_size, values.header_table_size, defaults.header_table_size);
+    add(setting_id::enable_push, values.enable_push ? 1 : 0, defaults.enable_push ? 1 : 0);
+    add(setting_id::max_concurrent_streams, values.max_concurrent_streams, defaults.max_concurrent_streams);
+    add(setting_id::initial_window_size, values.initial_window_size, defaults.initial_window_size);
+    add(setting_id::max_frame_size, values.max_frame_size, defaults.max_frame_size);
+    add(setting_id::max_header_list_size, values.max_header_list_size, defaults.max_header_list_size);
+
+    put_header(static_cast<std::uint32_t>(changed.size() * 6), frame_type::settings, 0, 0, out);
+    for (const auto& [id, value] : changed)
+    {
+        put(static_cast<std::uint32_t>(id), 2, out);
+        put(value, 4, out);
+    }
+}
+
+void encode_settings_ack(std::vector<std::byte>& out) { put_header(0, frame_type::settings, flags::ack, 0, out); }
+
+void encode_ping(std::span<const std::byte, 8> opaque, bool ack, std::vector<std::byte>& out)
+{
+    put_header(8, frame_type::ping, ack ? flags::ack : 0, 0, out);
+    out.insert(out.end(), opaque.begin(), opaque.end());
+}
+
+void encode_goaway(stream_id last_stream, std::uint32_t code, std::string_view debug, std::vector<std::byte>& out)
+{
+    put_header(static_cast<std::uint32_t>(8 + debug.size()), frame_type::goaway, 0, 0, out);
+    put(last_stream & max_stream_id, 4, out);
+    put(code, 4, out);
+    const auto bytes = std::as_bytes(std::span{debug});
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
+void encode_rst_stream(stream_id stream, std::uint32_t code, std::vector<std::byte>& out)
+{
+    put_header(4, frame_type::rst_stream, 0, stream, out);
+    put(code, 4, out);
+}
+
+void encode_window_update(stream_id stream, std::uint32_t increment, std::vector<std::byte>& out)
+{
+    put_header(4, frame_type::window_update, 0, stream, out);
+    put(increment & max_stream_id, 4, out);
+}
+
+void encode_data(stream_id stream, std::span<const std::byte> data, bool end_stream, std::vector<std::byte>& out)
+{
+    put_header(static_cast<std::uint32_t>(data.size()),
+               frame_type::data,
+               end_stream ? flags::end_stream : 0,
+               stream,
+               out);
+    out.insert(out.end(), data.begin(), data.end());
+}
+
+void encode_headers(stream_id                  stream,
+                    std::span<const std::byte> block,
+                    bool                       end_stream,
+                    std::uint32_t              max_frame_size,
+                    std::vector<std::byte>&    out)
+{
+    auto type        = frame_type::headers;
+    auto frame_flags = end_stream ? flags::end_stream : std::uint8_t{0};
+
+    do
+    {
+        const auto fragment = block.first(std::min<std::size_t>(block.size(), max_frame_size));
+        block               = block.subspan(fragment.size());
+        if (block.empty()) frame_flags |= flags::end_headers;
+
+        put_header(static_cast<std::uint32_t>(fragment.size()), type, frame_flags, stream, out);
+        out.insert(out.end(), fragment.begin(), fragment.end());
+
+        type        = frame_type::continuation;
+        frame_flags = 0;
+    }
+    while (!block.empty());
 }
 
 }

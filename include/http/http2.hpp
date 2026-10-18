@@ -1,33 +1,152 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
-#include <memory>
+#include <span>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <vector>
 
-#include "coro/task.hpp"
-#include "http/request.hpp"
-#include "http/response.hpp"
-#include "io/buffered_reader.hpp"
-#include "io/writer.hpp"
-
-// HTTP/2 is parked, not implemented: these encoders and decoders are stubs (the server answers HTTP/2 requests with
-// 505 HTTP Version Not Supported, and the client refuses to send them).
+// HTTP/2's framing (RFC 9113): what HTTP/2's session is built from, not for applications (see docs/plans/http2.md).
 namespace net::http::http2
 {
 
-using coro::task;
+using stream_id = std::uint32_t;
 
-task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept;
+// max_stream_id is the largest stream id (31 bits), and the largest window.
+inline constexpr std::uint32_t max_stream_id = 0x7fff'ffff;
+inline constexpr std::int64_t  max_window    = 0x7fff'ffff;
 
-task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
+// preface is what a client sends first (RFC 9113, section 3.4), before its SETTINGS frame.
+inline constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-task<request_decoder_result>
-request_decode(io::buffered_reader* reader,
-               std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+// error_code is HTTP/2's error codes (RFC 9113, section 7): what RST_STREAM and GOAWAY carry, as std::error_codes in
+// category().
+// NOLINTNEXTLINE(performance-enum-size): a 32-bit field on the wire, whose unknown values are kept.
+enum class error_code : std::uint32_t
+{
+    no_error            = 0x0,
+    protocol_error      = 0x1,
+    internal_error      = 0x2,
+    flow_control_error  = 0x3,
+    settings_timeout    = 0x4,
+    stream_closed       = 0x5,
+    frame_size_error    = 0x6,
+    refused_stream      = 0x7,
+    cancel              = 0x8,
+    compression_error   = 0x9,
+    connect_error       = 0xa,
+    enhance_your_calm   = 0xb,
+    inadequate_security = 0xc,
+    http_1_1_required   = 0xd,
+};
 
-task<response_decoder_result>
-response_decode(std::unique_ptr<io::buffered_reader> reader,
-                request_method                       method           = request_method::GET,
-                std::size_t                          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+// category is HTTP/2's error codes. A code the RFC doesn't define is kept as it is.
+[[nodiscard]] const std::error_category& category() noexcept;
+
+[[nodiscard]] std::error_code make_error_code(error_code err) noexcept;
+
+// wire_code is err's code on the wire: its value if it's in category(), and INTERNAL_ERROR otherwise.
+[[nodiscard]] std::uint32_t wire_code(std::error_code err) noexcept;
+
+enum class frame_type : std::uint8_t
+{
+    data          = 0x0,
+    headers       = 0x1,
+    priority      = 0x2,
+    rst_stream    = 0x3,
+    settings      = 0x4,
+    push_promise  = 0x5,
+    ping          = 0x6,
+    goaway        = 0x7,
+    window_update = 0x8,
+    continuation  = 0x9,
+};
+
+// Frames' flags (each meaningful only on some types).
+namespace flags
+{
+    inline constexpr std::uint8_t end_stream  = 0x01; // DATA, HEADERS
+    inline constexpr std::uint8_t ack         = 0x01; // SETTINGS, PING
+    inline constexpr std::uint8_t end_headers = 0x04; // HEADERS, PUSH_PROMISE, CONTINUATION
+    inline constexpr std::uint8_t padded      = 0x08; // DATA, HEADERS, PUSH_PROMISE
+    inline constexpr std::uint8_t priority    = 0x20; // HEADERS
+}
+
+// frame_header is a frame's first 9 octets. type is kept as it was sent: unknown types must be ignored.
+struct frame_header
+{
+    std::uint32_t length = 0; // of the payload: 24 bits
+    std::uint8_t  type   = 0;
+    std::uint8_t  flags  = 0;
+    stream_id     stream = 0; // 31 bits (the reserved bit is dropped)
+
+    bool operator==(const frame_header&) const = default;
+};
+
+inline constexpr std::size_t frame_header_size = 9;
+
+[[nodiscard]] frame_header decode_frame_header(std::span<const std::byte, frame_header_size> in) noexcept;
+
+// encode_frame_header appends a frame's header to out.
+void encode_frame_header(const frame_header& header, std::vector<std::byte>& out);
+
+// setting_id is a SETTINGS parameter's identifier (RFC 9113, section 6.5.2; and RFC 8441 and 9218's).
+// NOLINTNEXTLINE(performance-enum-size): a 16-bit field on the wire.
+enum class setting_id : std::uint16_t
+{
+    header_table_size       = 0x1,
+    enable_push             = 0x2,
+    max_concurrent_streams  = 0x3,
+    initial_window_size     = 0x4,
+    max_frame_size          = 0x5,
+    max_header_list_size    = 0x6,
+    enable_connect_protocol = 0x8,
+    no_rfc7540_priorities   = 0x9,
+};
+
+inline constexpr std::uint32_t unlimited = std::numeric_limits<std::uint32_t>::max();
+
+// min_max_frame_size and max_max_frame_size are MAX_FRAME_SIZE's bounds.
+inline constexpr std::uint32_t min_max_frame_size = 16'384;
+inline constexpr std::uint32_t max_max_frame_size = 16'777'215;
+
+// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2).
+struct settings
+{
+    std::uint32_t header_table_size      = 4'096;
+    bool          enable_push            = true;
+    std::uint32_t max_concurrent_streams = unlimited;
+    std::uint32_t initial_window_size    = 65'535;
+    std::uint32_t max_frame_size         = min_max_frame_size;
+    std::uint32_t max_header_list_size   = unlimited;
+
+    bool operator==(const settings&) const = default;
+};
+
+// Encoding frames: each appends a whole frame (header and payload) to out.
+
+// encode_settings encodes the settings that differ from defaults (an empty SETTINGS if none do).
+void encode_settings(const settings& values, const settings& defaults, std::vector<std::byte>& out);
+void encode_settings_ack(std::vector<std::byte>& out);
+void encode_ping(std::span<const std::byte, 8> opaque, bool ack, std::vector<std::byte>& out);
+void encode_goaway(stream_id last_stream, std::uint32_t code, std::string_view debug, std::vector<std::byte>& out);
+void encode_rst_stream(stream_id stream, std::uint32_t code, std::vector<std::byte>& out);
+void encode_window_update(stream_id stream, std::uint32_t increment, std::vector<std::byte>& out);
+void encode_data(stream_id stream, std::span<const std::byte> data, bool end_stream, std::vector<std::byte>& out);
+
+// encode_headers encodes a header block as a HEADERS frame and as many CONTINUATIONs as it needs to keep each frame's
+// payload within max_frame_size.
+void encode_headers(stream_id                  stream,
+                    std::span<const std::byte> block,
+                    bool                       end_stream,
+                    std::uint32_t              max_frame_size,
+                    std::vector<std::byte>&    out);
 
 }
+
+template<>
+struct std::is_error_code_enum<net::http::http2::error_code> : std::true_type
+{};
