@@ -65,7 +65,8 @@ struct server_config
 
 #ifdef NET_HAS_TLS
     // Serve HTTPS: each connection starts with a TLS handshake, with this context's certificate and key (see
-    // tls::server_context::make()), which has header_read_timeout to finish. The server offers h2 (if http2 is on) and
+    // tls::server_context::make()), which has header_read_timeout to finish (and whose waits for the client are each
+    // limited by body_read_timeout and write_timeout, as a body's are). The server offers h2 (if http2 is on) and
     // http/1.1 with ALPN, whatever the context's options say.
     std::optional<tls::server_context> tls{};
 #endif

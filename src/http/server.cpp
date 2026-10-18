@@ -423,7 +423,9 @@ coro::task<std::optional<detail::connection>> server::open_connection(tcp_socket
 #ifdef NET_HAS_TLS
 coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn, tls::server_context ctx)
 {
-    // NOTE: the handshake needs a deadline: without header_read_timeout, only close() ends one that doesn't finish.
+    // NOTE: the handshake needs a deadline: without header_read_timeout, only body_read_timeout and write_timeout (set
+    //       on the socket above: each wait for the client, while it makes no progress) and close() end one that
+    //       doesn't finish.
     const auto deadline = head_deadline().value_or(io::clock::now() + std::chrono::hours{24} * 365);
 
     // the server decides what it speaks, whatever the context's options say.

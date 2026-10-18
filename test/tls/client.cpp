@@ -3,8 +3,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
+#include <filesystem>
+#include <format>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,17 +17,22 @@
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/connection_pool.hpp"
+#include "http/request.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "listen.hpp"
+#include "tcp.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
+#include "url.hpp"
 
 namespace tls = net::tls;
 
@@ -83,6 +92,62 @@ struct https_server
                     co_await net::io::write_all(*s, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv);
                 }
             }
+        }
+    }
+};
+
+// scripted_server answers requests over TLS as respond says, one connection at a time: respond is given the stream,
+// and the request's number (from 0, over all of the connections), and returns whether to keep reading the connection.
+template<typename Respond>
+struct scripted_server
+{
+    net::io::scheduler* sched;
+    net::listener       listener;
+    Respond             respond;
+    std::atomic<int>    accepted{0};
+    std::atomic<int>    requests{0};
+
+    scripted_server(net::io::scheduler* sched, Respond respond)
+        : sched{sched}
+        , listener{net::listener::make(sched, "127.0.0.1", "0").value()}
+        , respond{std::move(respond)}
+    {
+        REQUIRE(sched->spawn(serve(this)));
+    }
+
+    [[nodiscard]] std::string port() const { return std::to_string(listener.local_port()); }
+
+    static task<> serve(scripted_server* self)
+    {
+        while (true)
+        {
+            auto conn = co_await self->listener.accept();
+            if (!conn.has_value()) co_return;
+            ++self->accepted;
+
+            auto s = co_await tls::stream::accept(std::move(*conn),
+                                                  server_with(pki().localhost_chain, pki().localhost_key),
+                                                  net::io::clock::now() + 5s);
+            if (!s.has_value()) continue;
+
+            std::string                  head;
+            std::array<std::byte, 1'024> buf{};
+            bool                         more = true;
+            while (more)
+            {
+                auto res = co_await s->read(buf);
+                head.append(reinterpret_cast<const char*>(buf.data()), res.count);
+                if (res.err) break;
+
+                // NOTE: the requests have no bodies.
+                while (more && head.contains("\r\n\r\n"))
+                {
+                    head.erase(0, head.find("\r\n\r\n") + 4);
+                    more = co_await self->respond(*s, self->requests++);
+                }
+            }
+
+            co_await s->close();
         }
     }
 };
@@ -203,4 +268,155 @@ TEST_CASE("https requests to a public server", "[tls][http][client][network]")
     };
 
     CHECK(sched.run_to_completion(test(&client)) == "200");
+}
+
+TEST_CASE("a response the server sends after another's body isn't taken as the next request's", "[tls][http][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // the first response (2 KiB, twice the client's buffer, so its body's end is read past the buffer, straight from
+    // the stream) is followed by another, in the same write (and TLS record), which the client mustn't take as its next
+    // request's.
+    const auto respond = [](tls::stream& s, int n) -> task<bool>
+    {
+        std::string out;
+        if (n == 0)
+        {
+            constexpr auto head = "HTTP/1.1 200 OK\r\nContent-Length: 0000\r\n\r\n"sv;
+            const auto     body = std::string(2'048 - head.size(), 'a');
+            out                 = std::format("HTTP/1.1 200 OK\r\nContent-Length: {:04}\r\n\r\n{}", body.size(), body)
+                                + "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nINJECT";
+        }
+        else
+        {
+            out = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal";
+        }
+
+        auto res = co_await net::io::write_all(s, std::string_view{out});
+        co_return !res.err;
+    };
+    scripted_server   server{&sched, respond};
+    net::http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::http::client* client, std::string url) -> task<std::pair<std::string, std::string>>
+    {
+        auto first = co_await fetch(client, url);
+        co_return std::pair{first, co_await fetch(client, url)};
+    };
+
+    auto [first, second] = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CHECK(first == std::string(2'048 - "HTTP/1.1 200 OK\r\nContent-Length: 0000\r\n\r\n"sv.size(), 'a'));
+    CHECK(second == "real");
+
+    // the first connection wasn't reused.
+    CHECK(server.accepted == 2);
+}
+
+TEST_CASE("a connection whose server sent close_notify with a body's end isn't reused", "[tls][http][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // the response and close_notify in one write: queued together, before either's flushed.
+    const auto respond = [](tls::stream& s, int /*n*/) -> task<bool>
+    {
+        auto write = s.write(std::as_bytes(std::span{"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv}));
+        (void)co_await s.shutdown();
+        (void)co_await std::move(write);
+        co_return false;
+    };
+    scripted_server   server{&sched, respond};
+    net::http::client client{&sched, trusting_options()};
+
+    // NOTE: POSTs, which aren't sent again if a reused connection turns out to have been closed.
+    const auto test = [](net::http::client* client, std::string url) -> task<std::pair<std::string, std::string>>
+    {
+        const auto post = [](net::http::client* client, std::string url) -> task<std::string>
+        {
+            auto uri = net::url::parse(url);
+            if (!uri.has_value()) co_return "error: bad URL";
+
+            auto resp = co_await client->send({.method = net::http::request_method::POST, .uri = std::move(*uri)});
+            if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+            auto body = co_await net::io::read_all(*resp->body);
+            co_return body.has_value() ? *body : "error: " + body.error().message();
+        };
+
+        auto first = co_await post(client, url);
+        co_return std::pair{first, co_await post(client, url)};
+    };
+
+    auto [first, second] = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CHECK(first == "hello");
+    CHECK(second == "hello");
+    CHECK(server.accepted == 2);
+}
+
+TEST_CASE("a request on an idle connection the server closes with close_notify is sent again", "[tls][http][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // the first request is answered; the second, on the same connection, isn't: the server closes it instead (as one
+    // does an idle connection, just as the client reuses it).
+    const auto respond = [](tls::stream& s, int n) -> task<bool>
+    {
+        if (n == 1) co_return false;
+
+        auto res = co_await net::io::write_all(s, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv);
+        co_return !res.err;
+    };
+    scripted_server   server{&sched, respond};
+    net::http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::http::client* client, std::string url) -> task<std::pair<std::string, std::string>>
+    {
+        auto first = co_await fetch(client, url);
+        co_return std::pair{first, co_await fetch(client, url)};
+    };
+
+    auto [first, second] = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CHECK(first == "hello");
+    CHECK(second == "hello");
+    CHECK(server.accepted == 2);
+    CHECK(server.requests == 3);
+}
+
+TEST_CASE("an https body without Content-Length ends with close_notify, and is cut short without it",
+          "[tls][http][client]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const bool notify = GENERATE(true, false);
+    CAPTURE(notify);
+
+    // the body runs until the connection ends: with close_notify, or (cut short) without it.
+    const auto respond = [notify](tls::stream& s, int /*n*/) -> task<bool>
+    {
+        co_await net::io::write_all(s, "HTTP/1.1 200 OK\r\n\r\npartial"sv);
+        if (!notify) s.socket().shutdown_write();
+        co_return false;
+    };
+    scripted_server   server{&sched, respond};
+    net::http::client client{&sched, trusting_options()};
+
+    const auto test = [](net::http::client* client, std::string url) -> task<std::pair<std::string, std::error_code>>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return std::pair{"error", resp.error()};
+
+        std::string                  body;
+        std::array<std::byte, 1'024> buf{};
+        while (true)
+        {
+            auto res = co_await resp->body->read(buf);
+            body.append(reinterpret_cast<const char*>(buf.data()), res.count);
+            if (res.err) co_return std::pair{body, res.err};
+        }
+    };
+
+    auto [body, err] = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CAPTURE(err.message());
+    CHECK(body == "partial");
+    if (notify) CHECK(err == net::io::errc::end_of_stream);
+    else CHECK(err == tls::errc::stream_truncated);
 }

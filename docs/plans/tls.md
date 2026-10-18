@@ -182,8 +182,13 @@ const std::error_category& category() noexcept;
 - The pool makes its `tls::client_context` the first time it needs one (`std::call_once`), as loading the system's
   trust store isn't worth it for a client that never uses https; it offers ALPN `http/1.1` (the client's own, rather
   than whatever `client_options::tls` says).
-- Checking that an idle connection is still open (peeking at its socket) works for TLS too: a server that has closed
-  it has sent close_notify (or closed the socket), either of which the peek sees.
+- Checking that an idle connection is still open by peeking at its socket isn't enough for TLS (as first thought, and
+  a review found): what the stream has already read from the socket isn't there to peek at. A read takes up to 17 KiB
+  of ciphertext, so it can take, with the end of a response, the start of whatever the server sent after it (e.g. an
+  unasked-for response, which the next request would read as its own), or its close_notify. So the pool also checks the
+  stream itself (`tls::detail::idle_clean()`): nothing decrypted and unread, no part of a record fed to Botan (the
+  stream follows the records' framing itself, as `received_data()`'s hint can't say: TLS 1.3's is 5 both between
+  records and with 5 bytes of one to come), no close_notify, and no failure.
 
 ## Learned in stage 3
 
@@ -195,8 +200,8 @@ const std::error_category& category() noexcept;
   handlers which it is.
 - `server::close()` ended connections by shutting down the reading side of each one's socket, from a set of socket
   pointers. During a TLS handshake, the socket is inside `stream::accept()` (moved to the stream's state), out of the
-  server's reach, so `close()` couldn't end one (and `~server` would wait out its deadline, or for ever without
-  `header_read_timeout`). `stream::connect()` and `accept()` now take a `std::stop_token`, whose callback shuts the
+  server's reach, so `close()` couldn't end one (and `~server` would wait out its deadline, or without
+  `header_read_timeout`, until `body_read_timeout` or `write_timeout` passed without progress). `stream::connect()` and `accept()` now take a `std::stop_token`, whose callback shuts the
   socket's reading side during the handshake; and the server's connections use the same (a `std::stop_source` that
   `close()` requests, and a `std::stop_callback` per connection), instead of the mutex-guarded set. Requesting stop
   runs callbacks registered later straight away, so a connection that starts after `close()` ends at once.
@@ -210,6 +215,23 @@ const std::error_category& category() noexcept;
   could agree on it; until HTTP/2 is served, the server closes a connection that agreed on anything but `http/1.1`.
 - A plain HTTP request to an HTTPS port fails the handshake (Botan sends an alert, which e.g. curl reports as an
   HTTP/0.9 response); answering it with a plaintext 400, as Go does, was decided against for now.
+
+## Learned in the review
+
+- Writes from several tasks at once (HTTP/2's writer, and a reader's replies) took turns flushing: one that found
+  another flushing returned at once, leaving its ciphertext to it. So a write returned before its data had gone, without
+  backpressure (what was queued could grow without bound behind a slow peer), its deadline and timeout, or its errors;
+  and `shutdown()` could end the socket's outgoing side before close_notify had gone. Now flushing is a queue: a flush
+  that finds one in progress waits for it (a `coro::notifier`, resumed on the socket's scheduler's pool) as far as its
+  own ciphertext, so the socket's write deadline and timeout limit it as well; the flush in progress writes what's
+  queued until nothing is, or hands on to those waiting once its own has gone. A read's replies (e.g. an alert) don't
+  wait for a flush in progress, but leave it to write them: a reader that waited for a writer stuck on a peer that's
+  itself waiting for its writes to be read would never read them.
+- A write that fails may have sent part of a record, after which nothing more can be sent: the failure is kept, and
+  every later write (and flush) returns it.
+- A read into an empty span returns at once (as `io::reader` says), rather than waiting for data.
+- `server_context::make()` fails (`invalid_argument`) if the key isn't the certificate's (comparing their public keys,
+  as Botan encodes them), rather than every handshake failing.
 
 ## Stages
 

@@ -236,9 +236,10 @@ scheduler.spawn(server.serve());
   net::http::server server{&scheduler, std::move(*listener), std::move(router), {.tls = std::move(*ctx)}};
   ```
 
-  Each connection's handshake has `header_read_timeout` to finish, and `req.tls` tells a handler its request came
-  over TLS. The server offers `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off).
-  `example/http-server` serves HTTPS with `--cert` and `--key`.
+  Each connection's handshake has `header_read_timeout` to finish (and each of its waits for the client is limited by
+  `body_read_timeout` and `write_timeout`), and `req.tls` tells a handler its request came over TLS. The server offers
+  `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off). `example/http-server` serves HTTPS with
+  `--cert` and `--key`.
 
 ## TLS
 
@@ -253,8 +254,8 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 // tls->read(), tls->write(), ..., and co_await tls->close() to end it with close_notify.
 ```
 
-- The server's certificate is verified against the host name. `client_options::insecure_skip_verification` turns
-  that off, for testing.
+- The server's certificate is verified against the host name. `tls::client_options::insecure_skip_verification` (the
+  HTTP client's `client_options::tls.insecure_skip_verification`) turns that off, for testing.
 - Errors compare with `tls::alert` conditions (e.g. `err == tls::alert::bad_certificate`), whichever side sent the
   alert; `tls::from_peer(err)` says which. A certificate that failed verification says why in its message (e.g.
   "Certificate does not match provided name").
@@ -262,6 +263,10 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   `http::server` does).
 - `stream::connect()` and `stream::accept()` take an optional `std::stop_token`: requesting stop ends a handshake that's
   waiting, with `std::errc::operation_canceled`.
+- A read and writes may run at once (e.g. HTTP/2's reader and writer), but only one read. A write returns once what it
+  wrote has gone to the socket (after what was queued before it, e.g. another write, or a read's reply to the peer), so
+  the socket's write deadline and timeout limit it; a write that fails fails every write after it (part of a record
+  may have gone).
 - `co_await tls->shutdown()` sends close_notify without closing the socket, so what the peer sent before its own
   close_notify can still be read. The peer's close_notify ends the stream (`io::errc::end_of_stream`), and is answered
   with close_notify, so nothing more can be written either.

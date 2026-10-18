@@ -44,8 +44,10 @@
 #include <botan/x509cert.h>
 #include <botan/x509path.h>
 
+#include "coro/notifier.hpp"
 #include "coro/task.hpp"
 #include "io/io.hpp"
+#include "io/scheduler.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
 #include "util/defer.hpp"
@@ -348,6 +350,7 @@ struct connection
 {
     explicit connection(tcp_socket conn) noexcept
         : socket{std::move(conn)}
+        , flushed{socket.get_scheduler()->pool()}
     {}
 
     // take_received moves what's been decrypted (and not read yet) into data, returning how much. Must be called
@@ -370,6 +373,8 @@ struct connection
     // feed passes ciphertext read from the socket to the channel. Must be called holding mu.
     void feed(std::span<const std::uint8_t> ciphertext) noexcept
     {
+        track_records(ciphertext);
+
         try
         {
             channel->received_data(ciphertext);
@@ -383,45 +388,184 @@ struct connection
                             : sent_alert(ex.type());
             }
         }
+        catch (const Botan::Invalid_Authentication_Tag&)
+        {
+            // a record that couldn't be decrypted, for which Botan sent bad_record_mac.
+            if (!failure) failure = sent_alert(Botan::TLS::Alert::BadRecordMac);
+        }
         catch (const std::exception&)
         {
             if (!failure) failure = make_error_code(errc::protocol_error);
         }
     }
 
-    // flush writes what the channel has emitted (handshake messages, records, alerts) to the socket. If another call
-    // is flushing already, that one writes it (so writes go out in the order they were emitted), and this returns.
-    coro::task<std::error_code> flush()
+    // track_records follows TLS's record framing (the same in every version: a 5-byte header, ending with the
+    // fragment's length) through the ciphertext fed to the channel, so idle_clean() knows whether the channel holds
+    // part of a record. NOTE: received_data()'s hint can't say: TLS 1.3's is 5 both between records and with 5 bytes of
+    // one to come. Must be called holding mu.
+    void track_records(std::span<const std::uint8_t> ciphertext) noexcept
     {
-        std::vector<std::uint8_t> pending;
+        while (!ciphertext.empty())
+        {
+            if (record_left > 0)
+            {
+                const auto n = std::min(record_left, ciphertext.size());
+                record_left -= n;
+                ciphertext = ciphertext.subspan(n);
+                continue;
+            }
 
+            const auto n = std::min(record_header.size() - header_have, ciphertext.size());
+            std::ranges::copy(ciphertext.first(n), record_header.begin() + static_cast<std::ptrdiff_t>(header_have));
+            header_have += n;
+            ciphertext = ciphertext.subspan(n);
+
+            if (header_have == record_header.size())
+            {
+                record_left = (std::size_t{record_header[3]} << 8U) | record_header[4];
+                header_have = 0;
+            }
+        }
+    }
+
+    // flush_step is what a flush does next: return (with err), write pending (having taken the flush on), or wait
+    // for the flush in progress (whose notifier's value was seen).
+    struct flush_step
+    {
+        enum class action : std::uint8_t
+        {
+            done,
+            write,
+            wait,
+        };
+
+        action                    what = action::done;
+        std::error_code           err;
+        std::vector<std::uint8_t> pending;
+        std::uint64_t             seen = 0;
+    };
+
+    // next_flush_step decides what a flush that's done once emitted reaches target does next. Must be called holding
+    // mu.
+    flush_step next_flush_step(std::uint64_t target, bool wait)
+    {
+        flush_step step;
+        if (write_failure)
+        {
+            step.err = write_failure;
+            return step;
+        }
+
+        // nothing that's queued is left behind: a flush in progress writes until nothing is, or hands on to those
+        // waiting, the first of which writes the rest (whether its own has gone or not).
+        if (!flushing && !outgoing.empty())
+        {
+            flushing  = true;
+            step.what = flush_step::action::write;
+            step.pending.swap(outgoing);
+            return step;
+        }
+
+        if (written >= target || !wait) return step;
+
+        ++flush_waiters;
+        step.what = flush_step::action::wait;
+        step.seen = flushed.value();
+        return step;
+    }
+
+    // flush writes what the channel has emitted (handshake messages, records, alerts) to the socket, returning once
+    // emitted reaches target. One call writes at a time (so they go out in the order they were emitted); the others
+    // wait for it (if wait), as far as their own: so each is limited by the socket's write deadline and timeout, and
+    // the writes it waits for fail it. Without wait (a reader's replies), it leaves what it emitted to a flush in
+    // progress: a reader that waited for a writer stuck on a peer that's waiting for its writes to be read would never
+    // read them.
+    coro::task<std::error_code> flush(std::uint64_t target, bool wait)
+    {
+        flush_step step;
         {
             std::scoped_lock lock{mu};
-            if (flushing || outgoing.empty()) co_return std::error_code{};
-
-            flushing = true;
-            pending.swap(outgoing);
+            step = next_flush_step(target, wait);
         }
+
+        while (true)
+        {
+            switch (step.what)
+            {
+            case flush_step::action::done: co_return step.err;
+            case flush_step::action::write: co_return co_await write_queued(std::move(step.pending), target);
+            case flush_step::action::wait: (void)co_await flushed.wait(step.seen); break;
+            }
+
+            std::scoped_lock lock{mu};
+            --flush_waiters;
+            step = next_flush_step(target, wait);
+        }
+    }
+
+    // flush_emitted flushes everything emitted so far.
+    coro::task<std::error_code> flush_emitted(bool wait)
+    {
+        std::uint64_t target = 0;
+        {
+            std::scoped_lock lock{mu};
+            target = emitted;
+        }
+
+        return flush(target, wait);
+    }
+
+    // write_queued writes pending, having taken the flush on, then what's queued meanwhile: until nothing is, or (once
+    // emitted has reached target) others wait to take it on.
+    coro::task<std::error_code> write_queued(std::vector<std::uint8_t> pending, std::uint64_t target)
+    {
+        // if this is destroyed while it writes (its task was), the rest of a record may never go, so nothing more can.
+        bool        ended = false;
+        util::defer abandoned{[this, &ended] noexcept
+                              {
+                                  if (ended) return;
+                                  {
+                                      std::scoped_lock lock{mu};
+                                      if (!write_failure)
+                                          write_failure = std::make_error_code(std::errc::operation_canceled);
+                                      flushing = false;
+                                  }
+                                  flushed.notify();
+                              }};
 
         while (true)
         {
             auto res = co_await io::write_all(socket, std::as_bytes(std::span{pending}));
 
-            std::scoped_lock lock{mu};
-            if (res.err)
             {
-                flushing = false;
-                co_return res.err;
+                std::scoped_lock lock{mu};
+                if (res.err)
+                {
+                    // part of a record may have gone.
+                    write_failure = res.err;
+                    flushing      = false;
+                    ended         = true;
+                }
+                else
+                {
+                    written += pending.size();
+                    pending.clear();
+
+                    if (outgoing.empty() || (written >= target && flush_waiters > 0))
+                    {
+                        flushing = false;
+                        ended    = true;
+                    }
+                    else
+                    {
+                        pending.swap(outgoing);
+                    }
+                }
             }
 
-            pending.clear();
-            if (outgoing.empty())
-            {
-                flushing = false;
-                co_return std::error_code{};
-            }
-
-            pending.swap(outgoing);
+            // those whose writes have gone return; and those waiting take the rest on, if this has stopped.
+            flushed.notify();
+            if (ended) co_return res.err;
         }
     }
 
@@ -433,13 +577,19 @@ struct connection
 
         if (res.count > 0)
         {
+            bool replied = false;
             {
                 std::scoped_lock lock{mu};
+                const auto       before = emitted;
                 feed(std::span{ciphertext}.first(res.count));
+                replied = emitted != before;
             }
 
             // e.g. handshake messages, or an alert, in reply.
-            if (auto err = co_await flush(); err && !res.err) res.err = err;
+            if (replied)
+            {
+                if (auto err = co_await flush_emitted(false); err && !res.err) res.err = err;
+            }
         }
 
         co_return res.err;
@@ -463,7 +613,7 @@ struct connection
     coro::task<std::error_code> handshake_steps()
     {
         // e.g. the client's hello.
-        if (auto err = co_await flush(); err) co_return err;
+        if (auto err = co_await flush_emitted(true); err) co_return err;
 
         while (true)
         {
@@ -517,14 +667,30 @@ struct connection
     std::mutex mu;
 
     // Guarded by mu (and only touched by the callbacks, or holding it).
-    std::vector<std::uint8_t>                     outgoing; // ciphertext to write
     std::vector<std::uint8_t>                     received; // decrypted data not read yet, from received_start
     std::size_t                                   received_start = 0;
     bool                                          peer_closed    = false; // the peer's close_notify
     std::error_code                               failure;                // a fatal alert, or a broken protocol
     std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
-    bool                                          flushing = false;
     std::string                                   alpn;
+
+    // the record the channel has been fed part of: the part of its header (header_have bytes of it) or how much of its
+    // fragment is still to come.
+    std::array<std::uint8_t, 5> record_header{};
+    std::size_t                 header_have = 0;
+    std::size_t                 record_left = 0;
+
+    // ciphertext to write, emitted counting all there has been, and written how much of that has been written. One
+    // flush writes at a time (flushing), which flush_waiters wait for.
+    std::vector<std::uint8_t> outgoing;
+    std::uint64_t             emitted       = 0;
+    std::uint64_t             written       = 0;
+    bool                      flushing      = false;
+    std::size_t               flush_waiters = 0;
+    std::error_code           write_failure; // a write that failed, which may have sent part of a record
+
+    // notified when a flush has written some, or stopped.
+    coro::notifier flushed;
 
     // what a read of the socket reads into: only one waits at once.
     std::array<std::uint8_t, (std::size_t{16} * 1'024) + 1'024> ciphertext{};
@@ -536,6 +702,7 @@ struct connection
 void callbacks::tls_emit_data(std::span<const std::uint8_t> data)
 {
     conn->outgoing.insert(conn->outgoing.end(), data.begin(), data.end());
+    conn->emitted += data.size();
 }
 
 void callbacks::tls_record_received(std::uint64_t /*seq_no*/, std::span<const std::uint8_t> data)
@@ -637,6 +804,12 @@ std::expected<server_context, std::error_code> server_context::make(const server
         std::shared_ptr<Botan::Private_Key> key = Botan::PKCS8::load_key(**key_source);
         if (!key) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
+        // the certificate must be the key's: otherwise every handshake would fail, saying only that it had.
+        // NOTE: both encoded by Botan, so a key encoded differently in the certificate (e.g. a compressed point)
+        //       still matches.
+        if (chain->front().subject_public_key()->subject_public_key() != key->subject_public_key())
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
         auto rng   = std::make_shared<Botan::System_RNG>();
         auto state = std::make_shared<detail::server_state>(detail::server_state{
             .rng         = rng,
@@ -726,6 +899,9 @@ coro::task<std::expected<stream, std::error_code>> stream::accept(tcp_socket    
 
 coro::task<io::result> stream::read(std::span<std::byte> data)
 {
+    // as io::reader says: rather than waiting for data that couldn't be taken.
+    if (data.empty()) return coro::ready_task<io::result>(io::result{});
+
     {
         std::scoped_lock lock{conn->mu};
 
@@ -742,9 +918,11 @@ coro::task<io::result> stream::read(std::span<std::byte> data)
 
 coro::task<io::result> stream::write(std::span<const std::byte> data)
 {
+    std::uint64_t target = 0;
     {
         std::scoped_lock lock{conn->mu};
         if (conn->failure) return coro::ready_task<io::result>(io::result{.err = conn->failure});
+        if (conn->write_failure) return coro::ready_task<io::result>(io::result{.err = conn->write_failure});
         if (conn->channel->is_closed_for_writing())
             return coro::ready_task<io::result>(io::result{.err = make_error_code(io::errc::end_of_stream)});
 
@@ -756,19 +934,22 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
         {
             return coro::ready_task<io::result>(io::result{.err = make_error_code(errc::protocol_error)});
         }
+
+        target = conn->emitted;
     }
 
     // NOTE: a coroutine of its own (rather than this one), so the lock above is released before it suspends.
     const auto written = data.size();
-    return [](detail::connection* conn, std::size_t written) -> coro::task<io::result>
+    return [](detail::connection* conn, std::uint64_t target, std::size_t written) -> coro::task<io::result>
     {
-        if (auto err = co_await conn->flush(); err) co_return io::result{.err = err};
+        if (auto err = co_await conn->flush(target, true); err) co_return io::result{.err = err};
         co_return io::result{.count = written};
-    }(conn.get(), written);
+    }(conn.get(), target, written);
 }
 
 coro::task<std::error_code> stream::shutdown()
 {
+    std::uint64_t target = 0;
     {
         std::scoped_lock lock{conn->mu};
 
@@ -780,9 +961,12 @@ coro::task<std::error_code> stream::shutdown()
         {
             co_return make_error_code(errc::protocol_error);
         }
+
+        target = conn->emitted;
     }
 
-    auto err = co_await conn->flush();
+    // what's queued, and close_notify, go first.
+    auto err = co_await conn->flush(target, true);
     conn->socket.shutdown_write();
     co_return err;
 }
@@ -798,4 +982,14 @@ std::string_view stream::alpn() const noexcept { return conn->alpn; }
 tcp_socket& stream::socket() noexcept { return conn->socket; }
 
 io::handle stream::native_handle() const noexcept { return conn->socket.native_handle(); }
+
+bool detail::idle_clean(const stream& s) noexcept
+{
+    auto& c = *s.conn;
+
+    std::scoped_lock lock{c.mu};
+    return c.received_start == c.received.size() && !c.peer_closed && !c.failure && !c.write_failure
+        && c.header_have == 0 && c.record_left == 0;
+}
+
 }

@@ -210,6 +210,53 @@ TEST_CASE("an HTTPS server serves requests over TLS", "[tls][http][server]")
     CHECK(out.stats == http::connection_stats{.open = 1, .idle = 1});
 }
 
+TEST_CASE("an HTTPS server serves HTTP/1.1 to clients that don't speak HTTP/2", "[tls][http][server][client]")
+{
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+
+    auto options  = trusting_options();
+    options.http2 = false;
+    http::client client{&sched, options};
+
+    struct outcome
+    {
+        std::vector<std::string> responses;
+        http::connection_stats   stats;
+    };
+
+    const auto test = [](http::client* client, std::string url) -> task<outcome>
+    {
+        outcome out;
+        for (int i = 0; i < 2; ++i)
+        {
+            auto resp = co_await client->get(url);
+            if (!resp.has_value())
+            {
+                out.responses.push_back("error: " + resp.error().message());
+                continue;
+            }
+
+            auto body = co_await net::io::read_all(*resp->body);
+            out.responses.push_back(std::format("HTTP/{}.{} {}",
+                                                resp->version.major,
+                                                resp->version.minor,
+                                                body.has_value() ? *body : "error: " + body.error().message()));
+        }
+
+        out.stats = client->stats();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    REQUIRE(out.responses.size() == 2);
+    CHECK(out.responses[0] == "HTTP/1.1 hello over TLS");
+    CHECK(out.responses[1] == "HTTP/1.1 hello over TLS");
+
+    // the connection was kept for the second request.
+    CHECK(out.stats == http::connection_stats{.open = 1, .idle = 1});
+}
+
 TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][http][client][http2]")
 {
     net::io::scheduler sched{make_pool()};

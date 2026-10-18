@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
@@ -42,12 +43,19 @@ struct client_options
     bool require_extended_master_secret = false;
 };
 
+class stream;
+
 namespace detail
 {
 
     struct client_state;
     struct server_state;
     struct connection;
+
+    // idle_clean is whether s holds nothing that a read hasn't taken: no data decrypted and unread, nor part of a
+    // record; and neither the peer's close_notify nor a failure. For a pool of idle connections (whose sockets it
+    // doesn't see into), deciding whether one may be reused.
+    [[nodiscard]] bool idle_clean(const stream& s) noexcept;
 
 }
 
@@ -100,13 +108,17 @@ private:
 
 // stream is a TLS connection over a TCP socket, which it owns: it reads and writes the application's data.
 //
-// A read and a write may run at once (e.g. on different threads), as with a socket; and as with a socket, only one of
-// each. The socket's deadlines and timeouts (see socket()) limit them.
+// A read and a write may run at once (e.g. on different threads), as with a socket; and as with a socket, only one
+// read. Writes may, too: each is sent whole, in the order they were called. The socket's deadlines and timeouts (see
+// socket()) limit them. A write returns once what it wrote has gone to the socket, after anything queued before it
+// (e.g. another write, or a read's reply to the peer, which another task may be writing): so the socket's write
+// deadline and timeout limit it, whichever task does the writing.
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends
 // the stream (io::errc::end_of_stream), and is answered with close_notify, so nothing more can be written either. Both
-// compare equal to io::status_condition::closed.
+// compare equal to io::status_condition::closed. A write that fails (e.g. times out) may have sent part of a record, so
+// every write after it fails the same way.
 class stream final
     : public io::reader
     , public io::writer
@@ -160,6 +172,8 @@ public:
     [[nodiscard]] io::handle native_handle() const noexcept override;
 
 private:
+    friend bool detail::idle_clean(const stream& s) noexcept;
+
     explicit stream(std::unique_ptr<detail::connection> conn) noexcept;
 
     // NOTE: on the heap, so that the socket (whose reads and writes the scheduler may be waiting on) doesn't move with

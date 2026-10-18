@@ -60,6 +60,9 @@ public:
 
     [[nodiscard]] io::handle native_handle() const noexcept override { return fd; }
 
+    // get_scheduler is the scheduler the socket waits with (e.g. for its pool, to resume what waits alongside it).
+    [[nodiscard]] io::scheduler* get_scheduler() const noexcept { return scheduler; }
+
     // close closes the socket, cancelling any reads and writes waiting for it. The kernel still sends what's been
     // written, after it's closed. If graceful, close waits (up to graceful_timeout) for that to be acknowledged:
     // NOTE: blocking the calling thread, even though the socket is non-blocking (as Linux's close() does), so not

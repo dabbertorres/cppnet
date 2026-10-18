@@ -28,6 +28,12 @@
 #include "tcp.hpp"
 #include "util/defer.hpp"
 
+#ifdef NET_HAS_TLS
+#    include <variant>
+
+#    include "tls/tls.hpp"
+#endif
+
 namespace
 {
 
@@ -35,6 +41,13 @@ namespace
 // is common: servers close idle connections after their own timeouts.
 bool still_open(const net::http::detail::connection& conn) noexcept
 {
+#ifdef NET_HAS_TLS
+    // NOTE: what TLS has already read from the socket isn't there to peek at: e.g. the end of the last response's
+    //       record, after its body, or close_notify.
+    if (const auto* tls = std::get_if<net::tls::stream>(&conn); tls != nullptr && !net::tls::detail::idle_clean(*tls))
+        return false;
+#endif
+
     char byte = 0;
     // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): MSG_DONTWAIT, so it doesn't block.
     auto n = ::recv(net::http::detail::native_handle(conn), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
