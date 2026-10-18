@@ -43,6 +43,7 @@ To stop:
 
 - **`scheduler.request_stop()`** refuses new tasks, and cancels what tasks are waiting for (their waits fail with
   `std::errc::operation_canceled`), so they finish by themselves. It may be called from anywhere, including a task.
+  Then it stops `scheduler.stop_token()`, for work that should end with the scheduler but isn't waiting on it.
 - **`scheduler.shutdown()`** also waits for the tasks to finish. It's called by the destructor. It can't be called
   from one of the scheduler's own tasks, which would wait for itself: it throws `std::logic_error` there (and the
   destructor terminates).
@@ -51,9 +52,23 @@ A server's `close()` stops it accepting and ends its connections gracefully (tho
 others once their requests are done), so a server is stopped first: `server.close()`, then `scheduler.shutdown()`
 (which cancels what requests still in progress are waiting for).
 
+One wait can be canceled alone, with a `std::stop_token`: the scheduler's waits take one as a last argument
+(`sleep_until(deadline, stop)`, `wait_on(word, expected, deadline, stop)`, `wait(fd, op, stop)`, ...), and end with
+`std::errc::operation_canceled` when stop is requested (at once, if it already was), unless they've ended already.
+Sockets take one with `set_stop_token()` (see TCP). A token that can't be stopped (e.g. a default-constructed one) is
+as none. The callback that cancels a wait takes the scheduler's lock for it, and runs on whoever requests stop.
+
+```cpp
+// sleeps for a minute, unless stop is requested first.
+auto err = co_await scheduler->sleep_until(net::io::clock::now() + std::chrono::minutes{1}, stop);
+if (err == std::errc::operation_canceled) { /* stopped */ }
+```
+
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that, and returns a task of its
-result.
+result. `run_blocking(func, stop)` doesn't run `func` if stop was requested before it starts (its result, a
+`std::expected`, is then `operation_canceled`), and passes the token to a `func` that takes one; nothing interrupts
+`func` once it has started.
 
 ## Lifetimes
 
@@ -123,15 +138,19 @@ if (!listener) { /* e.g. listener.error() == std::errc::address_in_use */ }
 
 auto conn = co_await listener->accept();          // std::expected<tcp_socket, std::error_code>
 
-// a client's side: resolves the host, and connects, within connect_options' timeout (10s).
+// a client's side: resolves the host, and connects, within connect_options' timeout (10s), until its stop token (if
+// any) is stopped.
 auto sock = co_await net::tcp_socket::connect(&scheduler, "example.com", "80");
 ```
 
 A socket's reads and writes can be limited by a **deadline** (a time by which they must finish:
 `set_read_deadline()`, `set_write_deadline()`, `set_deadline()`) or a **timeout** (how long each may go without
-progress: `set_read_timeout()`, ...), and fail with `std::errc::timed_out` if it passes. `shutdown_write()` ends the
-outgoing side (the peer reads the end of the stream). `dns_lookup(host)` (`dns.hpp`) resolves a name's addresses, and
-blocks: call it with `run_blocking` from a task.
+progress: `set_read_timeout()`, ...), and fail with `std::errc::timed_out` if it passes. `set_stop_token(stop)` makes
+them fail with `std::errc::operation_canceled` when stop is requested; as with a deadline, only reads and writes that
+have to wait for the socket are affected. A read canceled while it waits has read nothing, so the socket can be read
+again; a canceled write's result counts what it wrote. `shutdown_write()` ends the outgoing side (the peer reads the
+end of the stream). `dns_lookup(host)` (`dns.hpp`) resolves a name's addresses, and blocks: call it with
+`run_blocking` from a task.
 
 ## HTTP client
 
@@ -275,7 +294,8 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 - A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()` (as
   `http::server` does).
 - `stream::connect()` and `stream::accept()` take an optional `std::stop_token`: requesting stop ends a handshake that's
-  waiting, with `std::errc::operation_canceled`.
+  waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does the same for reads and writes (as a
+  socket's): a canceled read can be tried again, but a canceled write fails the writes after it, as any failed write.
 - A read and writes may run at once (e.g. HTTP/2's reader and writer), but only one read. A write returns once what it
   wrote has gone to the socket (after what was queued before it, e.g. another write, or a read's reply to the peer), so
   the socket's write deadline and timeout limit it; a write that fails fails every write after it (part of a record

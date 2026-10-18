@@ -166,6 +166,12 @@ public:
     // alpn is the protocol the handshake agreed on: empty if none.
     [[nodiscard]] std::string_view alpn() const noexcept;
 
+    // set_stop_token makes reads and writes that wait for the socket end when stop is requested, failing with
+    // std::errc::operation_canceled (see socket::set_stop_token(), which this calls). A canceled read leaves the
+    // stream as it was, so it can be read again. A canceled write may have sent part of a record, so (as any write that
+    // fails) it fails every write after it.
+    void set_stop_token(std::stop_token stop) noexcept;
+
     // socket is the TCP socket the stream runs over: e.g. for its deadlines and timeouts. Don't read or write it.
     [[nodiscard]] tcp_socket& socket() noexcept;
 

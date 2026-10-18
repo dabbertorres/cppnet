@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <compare>
+#include <coroutine>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <system_error>
 #include <utility>
 
@@ -94,8 +96,8 @@ void scheduler::deregister_handle(handle fd) noexcept
         if (it == sh.registrations.end()) return;
 
         auto canceled = std::make_error_code(std::errc::operation_canceled);
-        if (it->second.read.waiting != nullptr) complete_handle_wait(sh, it->second.read, canceled, done);
-        if (it->second.write.waiting != nullptr) complete_handle_wait(sh, it->second.write, canceled, done);
+        if (it->second.read.waiting != nullptr) done.push_back(complete_handle_wait(sh, it->second.read, canceled));
+        if (it->second.write.waiting != nullptr) done.push_back(complete_handle_wait(sh, it->second.write, canceled));
 
         sh.registrations.erase(it);
         loop.remove(fd);
@@ -130,8 +132,8 @@ bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) 
     std::unique_lock lock{sh.mu};
 
     // NOTE: read under the shard's lock: request_stop() sets it before going through the shards, so either this sees
-    //       it, or request_stop() sees this wait.
-    if (stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
+    //       it, or request_stop() sees this wait. Likewise canceled, which stop_wait() sets under the lock.
+    if (state.canceled || stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
 
     auto it = sh.registrations.find(state.fd);
     if (it == sh.registrations.end()) return fail(std::errc::bad_file_descriptor);
@@ -180,7 +182,7 @@ bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) n
 
     std::unique_lock lock{timers_mu};
 
-    if (stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
+    if (state.canceled || stopping.load(std::memory_order::acquire)) return fail(std::errc::operation_canceled);
 
     if (state.word != nullptr && state.word->load(std::memory_order::acquire) != state.expected)
     {
@@ -210,7 +212,7 @@ bool scheduler::suspend_other(waiter& state, std::coroutine_handle<> awaiting) n
     return true;
 }
 
-void scheduler::complete_handle_wait(shard& sh, direction& slot, std::error_code result, completions& done) noexcept
+std::coroutine_handle<> scheduler::complete_handle_wait(shard& sh, direction& slot, std::error_code result) noexcept
 {
     auto* state   = std::exchange(slot.waiting, nullptr);
     state->result = result;
@@ -222,10 +224,10 @@ void scheduler::complete_handle_wait(shard& sh, direction& slot, std::error_code
         sh.update_earliest();
     }
 
-    done.push_back(state->awaiting);
+    return state->awaiting;
 }
 
-void scheduler::complete_other(waiter* state, std::error_code result, completions& done) noexcept
+std::coroutine_handle<> scheduler::complete_other(waiter* state, std::error_code result) noexcept
 {
     if (state->watch)
     {
@@ -240,7 +242,7 @@ void scheduler::complete_other(waiter* state, std::error_code result, completion
     }
 
     state->result = result;
-    done.push_back(state->awaiting);
+    return state->awaiting;
 }
 
 void scheduler::resume(const completions& done) noexcept
@@ -249,6 +251,14 @@ void scheduler::resume(const completions& done) noexcept
 
     logger->warn("thread pool is not running; resuming tasks on the current thread");
     for (auto awaiting : done) awaiting.resume();
+}
+
+void scheduler::resume(std::coroutine_handle<> awaiting) noexcept
+{
+    if (workers->resume(awaiting)) return;
+
+    logger->warn("thread pool is not running; resuming a task on the current thread");
+    awaiting.resume();
 }
 
 void scheduler::run()
@@ -355,7 +365,7 @@ void scheduler::ready_for(shard& sh, direction& slot, completions& done) noexcep
         }
     }
 
-    complete_handle_wait(sh, slot, {}, done);
+    done.push_back(complete_handle_wait(sh, slot, {}));
 }
 
 void scheduler::retime(shard& sh, waiter& state) noexcept
@@ -379,16 +389,22 @@ bool scheduler::handle_operation::begin(scheduler&                       sched,
                                         handle                           fd,
                                         poll_op                          op,
                                         std::optional<clock::time_point> deadline,
-                                        std::coroutine_handle<>          awaiting) noexcept
+                                        std::coroutine_handle<>          awaiting,
+                                        const std::stop_token&           stop) noexcept
 {
     state       = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
     this->sched = &sched;
+
+    // NOTE: registered before the wait takes the shard's lock (see stoppable_wait_operation), and after state is reset
+    //       (above), which would forget that a callback that ran at once canceled it.
+    if (stop.stop_possible()) on_stop.emplace(stop, canceler{.sched = &sched, .state = &state});
     return sched.suspend(state, awaiting);
 }
 
 void scheduler::handle_operation::cancel_wait() noexcept
 {
     if (sched != nullptr) sched->cancel(state);
+    end_wait();
 }
 
 void scheduler::cancel(waiter& state) noexcept
@@ -410,6 +426,42 @@ void scheduler::cancel(waiter& state) noexcept
         state.timer.reset();
         sh.update_earliest();
     }
+}
+
+void scheduler::stop_wait(waiter& state) noexcept
+{
+    const auto canceled = std::make_error_code(std::errc::operation_canceled);
+
+    std::coroutine_handle<> awaiting{nullptr};
+
+    // NOTE: op and fd don't change while the callback is registered, so they're read without the lock.
+    if (state.op == poll_op::none)
+    {
+        std::scoped_lock lock{timers_mu};
+
+        // it's waiting while it's watching its word, or has a timer (complete_other() ends both).
+        if (state.watch || state.timer) awaiting = complete_other(&state, canceled);
+        else state.canceled = true;
+    }
+    else
+    {
+        auto&            sh = shard_for(state.fd);
+        std::scoped_lock lock{sh.mu};
+
+        auto it = sh.registrations.find(state.fd);
+        if (it != sh.registrations.end())
+        {
+            auto& slot = state.op == poll_op::read ? it->second.read : it->second.write;
+            if (slot.waiting == &state) awaiting = complete_handle_wait(sh, slot, canceled);
+        }
+
+        // it hasn't begun waiting (or has finished, when this does nothing).
+        if (!awaiting) state.canceled = true;
+    }
+
+    // NOTE: on the pool, never here: whoever requested stop may hold a lock the coroutine takes. state mustn't be
+    //       touched from here on, as the coroutine may already have finished with it.
+    if (awaiting) resume(awaiting);
 }
 
 void scheduler::expire_timers(completions& done) noexcept
@@ -435,7 +487,8 @@ void scheduler::expire_timers(completions& done) noexcept
                 continue;
             }
 
-            complete_handle_wait(sh, state->op == poll_op::read ? it->second.read : it->second.write, timed_out, done);
+            done.push_back(
+                complete_handle_wait(sh, state->op == poll_op::read ? it->second.read : it->second.write, timed_out));
         }
     }
 
@@ -445,7 +498,7 @@ void scheduler::expire_timers(completions& done) noexcept
         auto* state = timers.begin()->second;
 
         // a sleep that's over isn't an error.
-        complete_other(state, state->word == nullptr ? std::error_code{} : timed_out, done);
+        done.push_back(complete_other(state, state->word == nullptr ? std::error_code{} : timed_out));
     }
 }
 
@@ -478,8 +531,8 @@ void scheduler::request_stop() noexcept
 
         for (auto& [fd, reg] : sh.registrations)
         {
-            if (reg.read.waiting != nullptr) complete_handle_wait(sh, reg.read, canceled, done);
-            if (reg.write.waiting != nullptr) complete_handle_wait(sh, reg.write, canceled, done);
+            if (reg.read.waiting != nullptr) done.push_back(complete_handle_wait(sh, reg.read, canceled));
+            if (reg.write.waiting != nullptr) done.push_back(complete_handle_wait(sh, reg.write, canceled));
         }
     }
 
@@ -487,12 +540,16 @@ void scheduler::request_stop() noexcept
         std::scoped_lock lock{timers_mu};
 
         // then waits for notifications, and (all that's left with a timer) sleeps.
-        while (!watched.empty()) complete_other(watched.begin()->second, canceled, done);
-        while (!timers.empty()) complete_other(timers.begin()->second, canceled, done);
+        while (!watched.empty()) done.push_back(complete_other(watched.begin()->second, canceled));
+        while (!timers.empty()) done.push_back(complete_other(timers.begin()->second, canceled));
     }
 
     scope.close();
     resume(done);
+
+    // NOTE: holding none of the locks, as its callbacks may take them (e.g. stop_wait()'s, which find the waits
+    //       canceled already).
+    stopper.request_stop();
 
     // wake run(), so it notices once the scope has drained.
     loop.interrupt();
@@ -515,7 +572,7 @@ void scheduler::notify(const std::atomic<std::uint64_t>& word, bool all) noexcep
             auto it = watched.lower_bound(&word);
             if (it == watched.end() || it->first != &word) break;
 
-            complete_other(it->second, {}, done);
+            done.push_back(complete_other(it->second, {}));
             if (!all) break;
         }
     }

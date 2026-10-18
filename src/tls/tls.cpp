@@ -979,6 +979,8 @@ coro::task<> stream::close()
 
 std::string_view stream::alpn() const noexcept { return conn->alpn; }
 
+void stream::set_stop_token(std::stop_token stop) noexcept { conn->socket.set_stop_token(std::move(stop)); }
+
 tcp_socket& stream::socket() noexcept { return conn->socket; }
 
 io::handle stream::native_handle() const noexcept { return conn->socket.native_handle(); }

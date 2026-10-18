@@ -857,6 +857,119 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
     }
 }
 
+TEST_CASE("a read canceled by the stream's stop token leaves it to read again", "[tls][stop]")
+{
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // sends nothing until the client's read has been canceled.
+    server_outcome canceled{.sched = &sched, .err = {}};
+    const auto     server = [](server_outcome* canceled)
+    {
+        return [canceled](tls::stream& s) -> task<>
+        {
+            co_await canceled->wait();
+            co_await net::io::write_all(s, "hello"sv);
+            co_await s.close();
+        };
+    };
+    REQUIRE(
+        sched.spawn(serve_once(&listener, server_with(pki().localhost_chain, pki().localhost_key), server(&canceled))));
+
+    const auto stop_soon = [](net::io::scheduler* sched, std::stop_source* source) -> task<>
+    {
+        (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
+        source->request_stop();
+    };
+
+    const auto client = [stop_soon](net::io::scheduler* sched,
+                                    std::uint16_t       port,
+                                    std::stop_source*   source,
+                                    server_outcome*     canceled) -> task<std::pair<net::io::result, std::string>>
+    {
+        auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value()) co_return std::pair{net::io::result{.err = s.error()}, std::string{}};
+
+        s->set_stop_token(source->get_token());
+        if (!sched->spawn(stop_soon(sched, source))) co_return std::pair{net::io::result{}, std::string{}};
+
+        std::array<std::byte, 16> buf{};
+        auto                      first = co_await s->read(buf);
+
+        // NOTE: a deadline, so a read that waits fails, rather than the test waiting for ever.
+        s->set_stop_token({});
+        s->socket().set_read_deadline(net::io::clock::now() + 5s);
+        canceled->finish({});
+
+        auto [received, _] = co_await read_to_end(*s);
+        co_return std::pair{first, received};
+    };
+
+    auto [first, received] = sched.run_to_completion(client(&sched, listener.local_port(), &source, &canceled));
+    CAPTURE(first.err.message());
+    CHECK(first.err == std::errc::operation_canceled);
+    CHECK(first.count == 0);
+    CHECK(received == "hello");
+}
+
+TEST_CASE("a write canceled by the stream's stop token fails the writes after it", "[tls][stop]")
+{
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // reads nothing until the client's done.
+    server_outcome client_done{.sched = &sched, .err = {}};
+    const auto     server = [](server_outcome* client_done)
+    {
+        return [client_done](tls::stream& s) -> task<>
+        {
+            co_await client_done->wait();
+            co_await s.close();
+        };
+    };
+    REQUIRE(sched.spawn(
+        serve_once(&listener, server_with(pki().localhost_chain, pki().localhost_key), server(&client_done))));
+
+    const auto stop_soon = [](net::io::scheduler* sched, std::stop_source* source) -> task<>
+    {
+        (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+        source->request_stop();
+    };
+
+    const auto client = [stop_soon](net::io::scheduler* sched,
+                                    std::uint16_t       port,
+                                    std::stop_source*   source,
+                                    server_outcome* client_done) -> task<std::pair<net::io::result, net::io::result>>
+    {
+        auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value()) co_return std::pair{net::io::result{.err = s.error()}, net::io::result{}};
+
+        s->set_stop_token(source->get_token());
+        if (!sched->spawn(stop_soon(sched, source))) co_return std::pair{net::io::result{}, net::io::result{}};
+
+        // more than both sides' socket buffers hold, so that writing it waits for the peer to read.
+        const std::string lots(std::size_t{12} * 1'024 * 1'024, 'a');
+        auto              first = co_await s->write(std::as_bytes(std::span{lots}));
+
+        // part of a record may have gone, so nothing more can be written.
+        s->set_stop_token({});
+        auto later = co_await s->write(std::as_bytes(std::span{"more"sv}));
+
+        client_done->finish({});
+        co_await s->close();
+        co_return std::pair{first, later};
+    };
+
+    auto [first, later] = sched.run_to_completion(client(&sched, listener.local_port(), &source, &client_done));
+    CAPTURE(first.err.message(), later.err.message());
+    CHECK(first.err == std::errc::operation_canceled);
+    CHECK(later.err == std::errc::operation_canceled);
+}
+
 TEST_CASE("the system's trust store verifies a public server", "[tls][network]")
 {
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be

@@ -9,8 +9,10 @@
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -21,7 +23,9 @@
 #include <sys/socket.h>
 
 #include <arpa/inet.h>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <netinet/in.h>
 
 #include "coro/task.hpp"
@@ -762,4 +766,477 @@ TEST_CASE("a coroutine destroyed while it waits to read a socket is neither resu
 
     CHECK_FALSE(res.err);
     CHECK(received == "x");
+}
+
+namespace
+{
+
+enum class wait_kind : std::uint8_t
+{
+    sleep,
+    wait_on,
+    handle,
+};
+
+// stoppable_wait waits (as kind says) for an hour, for a notification about word, or for fd to be readable, given stop.
+task<std::error_code> stoppable_wait(
+    scheduler* sched, wait_kind kind, std::stop_token stop, net::io::handle fd, std::atomic<std::uint64_t>* word)
+{
+    switch (kind)
+    {
+    case wait_kind::sleep: co_return co_await sched->sleep_until(net::io::clock::now() + 1h, std::move(stop));
+    case wait_kind::wait_on: co_return co_await sched->wait_on(*word, 0, std::nullopt, std::move(stop));
+    case wait_kind::handle: co_return co_await sched->wait(fd, net::io::poll_op::read, std::move(stop));
+    }
+
+    co_return std::make_error_code(std::errc::invalid_argument);
+}
+
+// record_wait waits as stoppable_wait does, and records how it ended, counting each time it's resumed.
+task<> record_wait(scheduler*                  sched,
+                   wait_kind                   kind,
+                   std::stop_token             stop,
+                   net::io::handle             fd,
+                   std::atomic<std::uint64_t>* word,
+                   std::error_code*            err,
+                   std::atomic<int>*           finished)
+{
+    *err = co_await stoppable_wait(sched, kind, std::move(stop), fd, word);
+    finished->fetch_add(1);
+}
+
+}
+
+TEST_CASE("requesting stop ends the wait given its token", "[io][scheduler][stop]")
+{
+    const auto kind = GENERATE(wait_kind::sleep, wait_kind::wait_on, wait_kind::handle);
+    CAPTURE(kind);
+
+    std::stop_source           source;
+    std::atomic<std::uint64_t> word{0};
+    std::error_code            err;
+    std::atomic<int>           finished{0};
+
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    REQUIRE(sched.spawn(record_wait(&sched, kind, source.get_token(), reader.native_handle(), &word, &err, &finished)));
+
+    // it waits until stop is requested.
+    std::this_thread::sleep_for(50ms);
+    CHECK(finished.load() == 0);
+
+    source.request_stop();
+    REQUIRE(eventually([&] { return finished.load() == 1; }));
+    CHECK(err == std::errc::operation_canceled);
+}
+
+TEST_CASE("a wait whose token was stopped already fails at once", "[io][scheduler][stop]")
+{
+    const auto kind = GENERATE(wait_kind::sleep, wait_kind::wait_on, wait_kind::handle);
+    CAPTURE(kind);
+
+    std::stop_source           source;
+    std::atomic<std::uint64_t> word{0};
+    source.request_stop();
+
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    // even with something to read, or a notification that came already: the token comes first.
+    REQUIRE(::send(writer.native_handle(), "x", 1, 0) == 1);
+    if (kind == wait_kind::wait_on) word = 1;
+
+    auto start = net::io::clock::now();
+    auto err = sched.run_to_completion(stoppable_wait(&sched, kind, source.get_token(), reader.native_handle(), &word));
+
+    CHECK(err == std::errc::operation_canceled);
+    CHECK(net::io::clock::now() - start < test_timeout);
+}
+
+TEST_CASE("a token that can't be stopped is as none", "[io][scheduler][stop]")
+{
+    scheduler sched{make_pool()};
+
+    std::optional<std::stop_source> gone{std::in_place};
+    auto                            orphaned = gone->get_token();
+    gone.reset();
+    REQUIRE_FALSE(orphaned.stop_possible());
+
+    const auto token = GENERATE_COPY(std::stop_token{}, orphaned);
+
+    const auto sleep = [](scheduler*      sched,
+                          std::stop_token stop) -> task<std::pair<std::error_code, net::io::clock::duration>>
+    {
+        auto start = net::io::clock::now();
+        auto err   = co_await sched->sleep_until(start + 20ms, std::move(stop));
+        co_return std::pair{err, net::io::clock::now() - start};
+    };
+
+    auto [err, slept] = sched.run_to_completion(sleep(&sched, token));
+    CHECK_FALSE(err);
+    CHECK(slept >= 20ms);
+}
+
+TEST_CASE("requesting stop ends only the waits given its token", "[io][scheduler][stop]")
+{
+    std::stop_source           stopped;
+    std::stop_source           other;
+    std::atomic<std::uint64_t> word{0};
+    std::error_code            stopped_err;
+    std::error_code            other_err;
+    std::error_code            none_err;
+    std::atomic<int>           stopped_finished{0};
+    std::atomic<int>           others_finished{0};
+
+    scheduler sched{make_pool()};
+
+    REQUIRE(sched.spawn(
+        record_wait(&sched, wait_kind::wait_on, stopped.get_token(), -1, &word, &stopped_err, &stopped_finished)));
+    REQUIRE(sched.spawn(
+        record_wait(&sched, wait_kind::wait_on, other.get_token(), -1, &word, &other_err, &others_finished)));
+    REQUIRE(sched.spawn(record_wait(&sched, wait_kind::wait_on, {}, -1, &word, &none_err, &others_finished)));
+    std::this_thread::sleep_for(50ms);
+
+    stopped.request_stop();
+    REQUIRE(eventually([&] { return stopped_finished.load() == 1; }));
+    CHECK(stopped_err == std::errc::operation_canceled);
+
+    // the others wait on, until they're notified.
+    std::this_thread::sleep_for(50ms);
+    CHECK(others_finished.load() == 0);
+
+    word = 1;
+    sched.notify_all(word);
+    REQUIRE(eventually([&] { return others_finished.load() == 2; }));
+    CHECK_FALSE(other_err);
+    CHECK_FALSE(none_err);
+}
+
+namespace
+{
+
+// race_after waits for started, and then a little longer (a different time each round, so stop comes before a wait
+// begins, while it waits, and after it has ended), and runs func.
+template<typename F>
+void race_after(const std::atomic<bool>& started, int round, F func)
+{
+    while (!started.load())
+    {}
+
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds{round % 64};
+    while (std::chrono::steady_clock::now() < until)
+    {}
+
+    func();
+}
+
+// racing_wait waits as stoppable_wait does (but its sleep is about to end), and records how it ended, counting each
+// time it's resumed.
+task<> racing_wait(scheduler*                  sched,
+                   wait_kind                   kind,
+                   std::stop_token             stop,
+                   net::io::handle             fd,
+                   std::atomic<std::uint64_t>* word,
+                   std::atomic<bool>*          started,
+                   std::error_code*            err,
+                   std::atomic<int>*           finished)
+{
+    started->store(true);
+    if (kind == wait_kind::sleep) *err = co_await sched->sleep_until(net::io::clock::now() + 30us, std::move(stop));
+    else *err = co_await stoppable_wait(sched, kind, std::move(stop), fd, word);
+    finished->fetch_add(1);
+}
+
+// complete ends a racing_wait as kind would besides stop: with a notification, or something to read. (A sleep ends by
+// itself.)
+void complete(wait_kind kind, scheduler& sched, std::atomic<std::uint64_t>& word, const net::socket& writer)
+{
+    if (kind == wait_kind::wait_on)
+    {
+        word = 1;
+        sched.notify_all(word);
+    }
+    else if (kind == wait_kind::handle)
+    {
+        (void)::send(writer.native_handle(), "x", 1, 0);
+    }
+}
+
+}
+
+TEST_CASE("a wait racing stop ends once, either way", "[io][scheduler][stop]")
+{
+    const auto kind = GENERATE(wait_kind::sleep, wait_kind::wait_on, wait_kind::handle);
+    CAPTURE(kind);
+
+    constexpr int rounds = 300;
+
+    std::atomic<std::uint64_t> word{0};
+    std::error_code            err;
+    std::atomic<int>           finished{0};
+    std::atomic<bool>          started = false;
+
+    scheduler sched{make_pool()};
+
+    for (int round = 0; round < rounds; ++round)
+    {
+        std::stop_source source;
+        word    = 0;
+        started = false;
+
+        // NOTE: new sockets each round, as a byte that arrives after a wait was canceled leaves the handle ready, so
+        //       the next wait wouldn't wait.
+        auto [reader, writer] = make_socket_pair(&sched);
+
+        REQUIRE(sched.spawn(
+            racing_wait(&sched, kind, source.get_token(), reader.native_handle(), &word, &started, &err, &finished)));
+
+        std::thread completer{[&] { race_after(started, round * 7, [&] { complete(kind, sched, word, writer); }); }};
+        race_after(started, round, [&] { source.request_stop(); });
+        completer.join();
+
+        REQUIRE(eventually([&] { return finished.load() == round + 1; }));
+        CAPTURE(round, err.message());
+        REQUIRE((!err || err == std::errc::operation_canceled));
+    }
+
+    // a wait resumed twice would have counted twice (or crashed).
+    std::this_thread::sleep_for(20ms);
+    CHECK(finished.load() == rounds);
+}
+
+TEST_CASE("a socket's read canceled by its stop token reads nothing, so the next read gets the data",
+          "[io][socket][stop]")
+{
+    std::stop_source source;
+    scheduler        sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    const auto check =
+        [](scheduler* sched, net::socket* reader, net::socket* writer, std::stop_source* source) -> task<std::string>
+    {
+        reader->set_stop_token(source->get_token());
+
+        // stop is requested while the read waits.
+        std::thread stopper{[source]
+                            {
+                                std::this_thread::sleep_for(50ms);
+                                source->request_stop();
+                            }};
+
+        std::string got;
+        auto        res = co_await read_some(reader, &got);
+        stopper.join();
+        if (res.err != std::errc::operation_canceled) co_return "the first read: " + res.err.message();
+        if (res.count != 0 || !got.empty()) co_return "the first read read something";
+
+        // stop requested already fails a read that has to wait, at once.
+        res = co_await read_some(reader, &got);
+        if (res.err != std::errc::operation_canceled) co_return "the second read: " + res.err.message();
+
+        // but a read that needn't wait isn't affected.
+        co_await writer->write(std::as_bytes(std::span{"hello"sv}));
+        res = co_await read_some(reader, &got);
+        if (res.err) co_return "the third read: " + res.err.message();
+
+        // and without the token, a read waits for what comes.
+        reader->set_stop_token({});
+        const auto write_later = [](scheduler* sched, net::socket* writer) -> task<>
+        {
+            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            co_await writer->write(std::as_bytes(std::span{" world"sv}));
+        };
+        if (!sched->spawn(write_later(sched, writer))) co_return "spawn failed";
+
+        res = co_await read_some(reader, &got);
+        if (res.err) co_return "the fourth read: " + res.err.message();
+        co_return got;
+    };
+
+    CHECK(sched.run_to_completion(check(&sched, &reader, &writer, &source)) == "hello world");
+}
+
+TEST_CASE("a socket's read racing stop loses nothing", "[io][socket][stop]")
+{
+    constexpr int rounds = 300;
+
+    std::string       got;
+    std::error_code   err;
+    std::atomic<int>  finished{0};
+    std::atomic<bool> started = false;
+
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    // read_one reads, and if stop canceled it, reads again without the token: either way, it gets the byte.
+    const auto read_one = [](net::socket*       reader,
+                             std::string*       got,
+                             std::atomic<bool>* started,
+                             std::error_code*   err,
+                             std::atomic<int>*  finished) -> task<>
+    {
+        started->store(true);
+        auto res = co_await read_some(reader, got);
+        if (res.err == std::errc::operation_canceled)
+        {
+            reader->set_stop_token({});
+            res = co_await read_some(reader, got);
+        }
+
+        *err = res.err;
+        finished->fetch_add(1);
+    };
+
+    for (int round = 0; round < rounds; ++round)
+    {
+        std::stop_source source;
+        reader.set_stop_token(source.get_token());
+        started = false;
+
+        REQUIRE(sched.spawn(read_one(&reader, &got, &started, &err, &finished)));
+
+        std::thread sender{
+            [&] { race_after(started, round * 7, [&] { (void)::send(writer.native_handle(), "x", 1, 0); }); }};
+        race_after(started, round, [&] { source.request_stop(); });
+        sender.join();
+
+        REQUIRE(eventually([&] { return finished.load() == round + 1; }));
+        CAPTURE(round, err.message());
+        REQUIRE_FALSE(err);
+    }
+
+    CHECK(got == std::string(rounds, 'x'));
+}
+
+TEST_CASE("a socket's write canceled by its stop token reports what it wrote", "[io][socket][stop]")
+{
+    std::stop_source source;
+    scheduler        sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+    writer.set_stop_token(source.get_token());
+
+    // more than the socket's buffers hold, read slowly: the write makes some progress, and then it's stopped.
+    std::atomic<std::size_t> read = 0;
+    std::thread              slow_reader{[&, fd = reader.native_handle()]
+                                         {
+                                std::vector<char> buf(std::size_t{16} * 1'024);
+                                while (true)
+                                {
+                                    // slowly until the write's stopped, then to the end.
+                                    if (!source.stop_requested()) std::this_thread::sleep_for(5ms);
+
+                                    // NOTE: the socket's non-blocking, so this may find nothing yet.
+                                    auto got = ::recv(fd, buf.data(), buf.size(), 0);
+                                    if (got > 0) read += static_cast<std::size_t>(got);
+                                    else if (got == 0) break;
+                                    else std::this_thread::sleep_for(1ms);
+                                }
+                                         }};
+
+    const auto write_lots = [](net::socket* writer) -> task<net::io::result>
+    {
+        std::vector<std::byte> lots(std::size_t{64} * 1'024 * 1'024);
+        co_return co_await writer->write(lots);
+    };
+
+    std::thread stopper{[&]
+                        {
+                            std::this_thread::sleep_for(100ms);
+                            source.request_stop();
+                        }};
+
+    auto res = sched.run_to_completion(write_lots(&writer));
+    stopper.join();
+
+    // the reader then reads what was written, to the end.
+    writer.shutdown_write();
+    slow_reader.join();
+
+    CHECK(res.err == std::errc::operation_canceled);
+    CHECK(res.count > 0);
+    CHECK(res.count == read.load());
+}
+
+TEST_CASE("run_blocking given a stop token", "[io][scheduler][run_blocking][stop]")
+{
+    scheduler sched{make_pool()};
+
+    SECTION("doesn't run func if stop was requested")
+    {
+        std::stop_source source;
+        source.request_stop();
+
+        const auto run = [](scheduler* sched, std::stop_token stop) -> task<std::pair<bool, std::error_code>>
+        {
+            bool ran = false;
+            auto res = co_await sched->run_blocking([&ran] { ran = true; }, std::move(stop));
+            co_return std::pair{ran, res.has_value() ? std::error_code{} : res.error()};
+        };
+
+        auto [ran, err] = sched.run_to_completion(run(&sched, source.get_token()));
+        CHECK_FALSE(ran);
+        CHECK(err == std::errc::operation_canceled);
+    }
+
+    SECTION("returns func's result")
+    {
+        const auto run = [](scheduler* sched) -> task<int>
+        {
+            std::stop_source source;
+            auto             res = co_await sched->run_blocking([] { return 42; }, source.get_token());
+            co_return res.value_or(0);
+        };
+
+        CHECK(sched.run_to_completion(run(&sched)) == 42);
+    }
+
+    SECTION("passes the token to a func that takes one")
+    {
+        std::stop_source source;
+
+        // it runs until stop is requested, which it only sees through the token.
+        const auto run = [](scheduler* sched, std::stop_token stop) -> task<bool>
+        {
+            auto res = co_await sched->run_blocking(
+                [](const std::stop_token& stop)
+                {
+                    const auto give_up_at = std::chrono::steady_clock::now() + test_timeout;
+                    while (!stop.stop_requested())
+                    {
+                        if (std::chrono::steady_clock::now() > give_up_at) return false;
+                        std::this_thread::sleep_for(1ms);
+                    }
+                    return true;
+                },
+                std::move(stop));
+            co_return res.value_or(false);
+        };
+
+        std::thread stopper{[&]
+                            {
+                                std::this_thread::sleep_for(50ms);
+                                source.request_stop();
+                            }};
+        auto        saw_stop = sched.run_to_completion(run(&sched, source.get_token()));
+        stopper.join();
+
+        CHECK(saw_stop);
+    }
+}
+
+TEST_CASE("the scheduler's stop token is stopped by request_stop", "[io][scheduler][stop]")
+{
+    std::atomic<bool> called = false;
+
+    scheduler sched{make_pool()};
+    auto      token = sched.stop_token();
+    REQUIRE(token.stop_possible());
+    REQUIRE_FALSE(token.stop_requested());
+
+    std::stop_callback on_stop{token, [&] { called = true; }};
+
+    sched.request_stop();
+    CHECK(token.stop_requested());
+    CHECK(called.load());
 }

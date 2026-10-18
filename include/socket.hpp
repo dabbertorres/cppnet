@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 
 #include <sys/socket.h>
@@ -51,6 +52,14 @@ public:
     void set_timeout(std::optional<io::clock::duration> timeout) noexcept;
     void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept;
     void set_write_timeout(std::optional<io::clock::duration> timeout) noexcept;
+
+    // set_stop_token makes reads and writes that wait for the socket end, failing with std::errc::operation_canceled,
+    // when stop is requested (as a deadline passing does: so, like a deadline, it applies to the waits that begin after
+    // it's set, and a read or write that needn't wait isn't affected). A read canceled while it waits has read nothing,
+    // so the next read gets what it would have; a write canceled while it waits returns how much it wrote. A
+    // default-constructed token (the default) removes it. Requesting stop must not happen holding one of the
+    // scheduler's locks (see io::scheduler::stoppable_wait_operation).
+    void set_stop_token(std::stop_token stop) noexcept;
 
     coro::task<io::result> read(std::span<std::byte> data) noexcept override;
     coro::task<io::result> write(std::span<const std::byte> data) noexcept override;
@@ -157,6 +166,7 @@ private:
     std::optional<io::clock::time_point> write_deadline;
     std::optional<io::clock::duration>   read_timeout;
     std::optional<io::clock::duration>   write_timeout;
+    std::stop_token                      stop;
 
     // NOTE: not moved with the socket: one mustn't be moved while a read or write waits for it.
     read_operation  reading{this};

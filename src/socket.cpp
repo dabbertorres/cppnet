@@ -10,6 +10,7 @@
 #include <optional>
 #include <ratio>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -114,6 +115,7 @@ socket::socket(socket&& other) noexcept
     , write_deadline{std::exchange(other.write_deadline, std::nullopt)}
     , read_timeout{std::exchange(other.read_timeout, std::nullopt)}
     , write_timeout{std::exchange(other.write_timeout, std::nullopt)}
+    , stop{std::exchange(other.stop, {})}
 {}
 
 socket& socket::operator=(socket&& other) noexcept
@@ -128,6 +130,7 @@ socket& socket::operator=(socket&& other) noexcept
         write_deadline = std::exchange(other.write_deadline, std::nullopt);
         read_timeout   = std::exchange(other.read_timeout, std::nullopt);
         write_timeout  = std::exchange(other.write_timeout, std::nullopt);
+        stop           = std::exchange(other.stop, {});
     }
 
     return *this;
@@ -186,6 +189,8 @@ void socket::set_read_timeout(std::optional<io::clock::duration> timeout) noexce
 
 void socket::set_write_timeout(std::optional<io::clock::duration> timeout) noexcept { write_timeout = timeout; }
 
+void socket::set_stop_token(std::stop_token stop) noexcept { this->stop = std::move(stop); }
+
 // NOTE: read and write try the socket first, without a coroutine (see coro::ready_task), and only wait for it (also
 //       without one: see read_operation) if they have to.
 
@@ -234,7 +239,7 @@ bool socket::read_operation::claim(std::span<std::byte> into) noexcept
 
 bool socket::read_operation::start(std::coroutine_handle<> awaiting) noexcept
 {
-    return begin(*sock->scheduler, sock->fd, io::poll_op::read, deadline, awaiting);
+    return begin(*sock->scheduler, sock->fd, io::poll_op::read, deadline, awaiting, sock->stop);
 }
 
 bool socket::read_operation::perform() noexcept
@@ -248,6 +253,7 @@ bool socket::read_operation::perform() noexcept
 
 io::result socket::read_operation::result() noexcept
 {
+    end_wait();
     auto out = error() ? io::result{.count = 0, .err = error()} : res;
     release();
     return out;
@@ -273,7 +279,7 @@ bool socket::write_operation::claim(std::span<const std::byte> from, std::size_t
 
 bool socket::write_operation::start(std::coroutine_handle<> awaiting) noexcept
 {
-    return begin(*sock->scheduler, sock->fd, io::poll_op::write, deadline, awaiting);
+    return begin(*sock->scheduler, sock->fd, io::poll_op::write, deadline, awaiting, sock->stop);
 }
 
 bool socket::write_operation::perform() noexcept
@@ -299,6 +305,7 @@ bool socket::write_operation::perform() noexcept
 
 io::result socket::write_operation::result() noexcept
 {
+    end_wait();
     auto out = error() ? io::result{.count = written, .err = error()} : res;
     release();
     return out;

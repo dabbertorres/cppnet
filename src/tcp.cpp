@@ -4,6 +4,7 @@
 #include <chrono>
 #include <expected>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <system_error>
 
@@ -63,12 +64,14 @@ std::error_code from_errno(int err) noexcept { return {err, std::system_category
 // The connection is established (or failed) once the socket is writable. The socket may be reported ready before then
 // (e.g. as Linux reports a socket that isn't connected yet as hung up, when it's registered), so that's checked, and it
 // waits again if it's still connecting.
-net::coro::task<std::error_code>
-wait_connected(net::io::scheduler* scheduler, net::io::handle fd, net::io::clock::time_point deadline)
+net::coro::task<std::error_code> wait_connected(net::io::scheduler*        scheduler,
+                                                net::io::handle            fd,
+                                                net::io::clock::time_point deadline,
+                                                std::stop_token            stop)
 {
     while (true)
     {
-        if (auto err = co_await scheduler->wait_until(fd, net::io::poll_op::write, deadline); err) co_return err;
+        if (auto err = co_await scheduler->wait_until(fd, net::io::poll_op::write, deadline, stop); err) co_return err;
 
         int       sock_err = 0;
         socklen_t size     = sizeof(sock_err);
@@ -106,8 +109,15 @@ coro::task<std::expected<tcp_socket, std::error_code>>
 tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options)
 {
     // getaddrinfo() blocks, so keep it off the worker threads.
-    auto addresses =
-        co_await scheduler->run_blocking([host, port, proto = options.proto] { return resolve(host, port, proto); });
+    auto resolved =
+        co_await scheduler->run_blocking([host, port, proto = options.proto] { return resolve(host, port, proto); },
+                                         options.stop);
+    if (!resolved.has_value()) co_return std::unexpected(resolved.error());
+
+    // resolving can't be interrupted, so its result is dropped if stop was requested meanwhile.
+    if (options.stop.stop_requested()) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+
+    auto& addresses = *resolved;
     if (!addresses.has_value()) co_return std::unexpected(addresses.error());
 
     const auto deadline = io::clock::now() + options.timeout;
@@ -141,7 +151,7 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
             continue;
         }
 
-        auto result = co_await wait_connected(scheduler, fd, deadline);
+        auto result = co_await wait_connected(scheduler, fd, deadline, options.stop);
         if (!result) co_return conn;
 
         conn.close(false);

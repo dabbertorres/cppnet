@@ -1,8 +1,8 @@
 # Plan: canceling HTTP server handlers
 
-Status: planned (2026-10-18). Nothing below is implemented yet, but for what Where things stand describes (HTTP/1.1's
-graceful `close()`, and the `aborting` source the destructor stops). The questions below (under Decided questions)
-were decided as recommended.
+Status: stage 1 (waits that take a token) done (2026-10-18); stages 2 to 5 planned. Where things stand describes what
+was there before (HTTP/1.1's graceful `close()`, and the `aborting` source the destructor stops), and stage 1's
+section, what it added. The questions below (under Decided questions) were decided as recommended.
 
 ## Goal
 
@@ -200,6 +200,25 @@ client resets the stream.
   writing (`write_queued` already records `operation_canceled` when abandoned, as part of a record may have gone), so
   a TLS connection whose write was canceled can't be written again: fine for the client, which closes it anyway.
 - **`run_blocking(func, stop)`** as Decided.
+
+Done as above, with these details settled in the code:
+
+- `run_blocking(func, stop)` returns a task of `std::expected<R, std::error_code>` (R being `func`'s result), failing
+  with `operation_canceled` when `func` didn't run.
+- The token-taking `wait_until` takes an `std::optional<clock::time_point>` (there's no separate `time_point`
+  overload); `wait_on`'s token comes after its deadline, which it then has no default for.
+- `waiter`'s `canceled` flag sits in padding, so `wait_operation` (112 bytes) and the token-less paths' frames don't
+  grow; their only addition is reading that flag (a plain `bool`, under the lock they already hold) beside
+  `stopping`. The stop callback completes a registered wait under its lock, and resumes it on the pool after
+  releasing it (one handle, no vector).
+- `handle_operation` holds the callback (`std::optional<std::stop_callback>`), registered in `begin()` after its
+  waiter is reset, and deregistered by `end_wait()` (which the socket's `result()` calls before releasing the
+  operation) or `cancel_wait()`. A socket grows by its token and the two operations' callbacks (520 to 672 bytes).
+- `connect`'s `stop` covers connecting only: the socket returned doesn't take it (the client sets its own in stage 3).
+- `scheduler::stop_token()` is stopped at the end of `request_stop()`, after the waits are canceled and holding none
+  of the scheduler's locks.
+- `bench_request`: unchanged (time within noise, the same allocations per request); `bench_task` doesn't involve the
+  scheduler (its binary is identical).
 
 ### Outgoing requests (`http::client`)
 

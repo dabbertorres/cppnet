@@ -4,9 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <concepts>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <expected>
 #include <functional>
 #include <limits>
 #include <map>
@@ -15,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -37,6 +40,28 @@ namespace net::io
 
 using clock = std::chrono::steady_clock;
 
+namespace detail
+{
+
+    // blocking_result is what scheduler::run_blocking(func, stop) gets from func: given the token, if it takes one.
+    template<typename F>
+    struct blocking_result
+    {
+        using type = std::invoke_result_t<F>;
+    };
+
+    template<typename F>
+        requires std::invocable<F, std::stop_token>
+    struct blocking_result<F>
+    {
+        using type = std::invoke_result_t<F, std::stop_token>;
+    };
+
+    template<typename F>
+    using blocking_result_t = blocking_result<F>::type;
+
+}
+
 // scheduler runs tasks on a thread pool, and resumes them when the handles they wait on are ready.
 //
 // Lifecycle:
@@ -46,7 +71,11 @@ using clock = std::chrono::steady_clock;
 // - run() blocks until the scheduler is stopped and its tasks have finished.
 // - request_stop() refuses new tasks, and cancels every pending (and future) wait (including wait_on() and
 //   sleep_until()) with std::errc::operation_canceled, so tasks can finish by themselves. Code after the waits still
-//   runs (e.g. to clean up), and reads/writes that don't need to wait still work.
+//   runs (e.g. to clean up), and reads/writes that don't need to wait still work. Then it stops stop_token(), for what
+//   isn't waiting on the scheduler.
+// - A wait can also be canceled alone: the overloads that take a std::stop_token end with
+//   std::errc::operation_canceled when stop is requested (see stoppable_wait_operation), as do sockets' reads and
+//   writes given one (socket::set_stop_token()).
 // - shutdown() stops the scheduler, and blocks until its tasks have finished and run() has returned.
 //
 // A scheduler can't be restarted once stopped.
@@ -109,8 +138,13 @@ private:
     // - a sleep, until the deadline (op is none, and word isn't set).
     struct waiter
     {
-        handle                                fd;
-        poll_op                               op;
+        handle  fd;
+        poll_op op;
+
+        // canceled is whether its stop token was stopped before it began waiting, so it mustn't (see stop_wait()).
+        // Guarded by its shard's lock (for a handle's), or timers_mu.
+        bool canceled = false;
+
         std::optional<clock::time_point>      deadline;
         std::coroutine_handle<>               awaiting{nullptr};
         std::error_code                       result{};
@@ -158,6 +192,17 @@ private:
 
     static constexpr std::size_t shard_count = 64;
 
+    // canceler is the stop callback of a wait given a stop token: it cancels the wait (see stop_wait()).
+    struct canceler
+    {
+        scheduler* sched;
+        waiter*    state;
+
+        void operator()() const noexcept { sched->stop_wait(*state); }
+    };
+
+    using stop_registration = std::stop_callback<canceler>;
+
 public:
     // handle_operation is an operation on a handle (e.g. a socket's recv()) that the scheduler performs once the
     // handle's ready, rather than resuming the waiting coroutine to try it again: so that coroutine is only resumed
@@ -180,31 +225,41 @@ public:
         handle_operation() noexcept = default;
         ~handle_operation()         = default;
 
-        // begin waits for fd to be ready for op (read or write), until deadline, and then performs this (as often as it
-        // takes) and resumes awaiting. It returns whether awaiting must suspend: false if the wait failed straight away
-        // (see error()), or the handle was ready, and this has been performed already.
+        // begin waits for fd to be ready for op (read or write), until deadline, or until stop is requested, and then
+        // performs this (as often as it takes) and resumes awaiting. It returns whether awaiting must suspend: false if
+        // the wait failed straight away (see error()), or the handle was ready, and this has been performed already.
+        // Once it's finished, end_wait() must be called before the next begin().
         bool begin(scheduler&                       sched,
                    handle                           fd,
                    poll_op                          op,
                    std::optional<clock::time_point> deadline,
-                   std::coroutine_handle<>          awaiting) noexcept;
+                   std::coroutine_handle<>          awaiting,
+                   const std::stop_token&           stop = {}) noexcept;
+
+        // end_wait forgets the wait's stop token (waiting for its callback, if that's running on another thread): once
+        // the wait has finished, before its result is taken.
+        void end_wait() noexcept { on_stop.reset(); }
 
         // error is why the wait ended without this finishing, if it did: e.g. std::errc::timed_out, or
-        // std::errc::operation_canceled if the scheduler was stopped, or the handle deregistered.
+        // std::errc::operation_canceled if the scheduler was stopped, the handle deregistered, or stop requested. A
+        // wait canceled by its stop token hasn't been performed since it was last tried (both happen under the
+        // scheduler's lock for the handle), so e.g. a read canceled while it waits has read nothing.
         [[nodiscard]] std::error_code error() const noexcept { return state.result; }
 
         // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress.
         void set_deadline(std::optional<clock::time_point> deadline) noexcept { state.deadline = deadline; }
 
-        // cancel_wait stops waiting (if it still is), without resuming the coroutine that began it: for when that's
-        // being destroyed. NOTE: it must not race with the wait finishing (which resumes the coroutine).
+        // cancel_wait stops waiting (if it still is), without resuming the coroutine that began it, and calls
+        // end_wait(): for when that's being destroyed. NOTE: it must not race with the wait finishing (which resumes
+        // the coroutine), as the stop token's callback may make it.
         void cancel_wait() noexcept;
 
     private:
         friend class scheduler;
 
-        waiter     state{};
-        scheduler* sched = nullptr;
+        waiter                           state{};
+        scheduler*                       sched = nullptr;
+        std::optional<stop_registration> on_stop;
     };
 
     // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
@@ -245,6 +300,71 @@ public:
     private:
         scheduler* sched;
         waiter     state;
+    };
+
+    // stoppable_wait_operation is a wait_operation given a stop token: requesting stop ends the wait with
+    // std::errc::operation_canceled, unless it has already ended (then the wait's own result stands). Stop requested
+    // before the wait begins fails it at once. A token that can't be stopped (e.g. a default-constructed one) is as
+    // none. It registers a std::stop_callback while it waits (a few atomic operations, nothing allocated), whose
+    // callback takes the scheduler's lock for the wait: so requesting stop must not happen holding one of the
+    // scheduler's locks (e.g. in a handle_operation's perform()).
+    class [[nodiscard]] stoppable_wait_operation
+    {
+        friend class scheduler;
+
+        stoppable_wait_operation(scheduler*                       sched,
+                                 handle                           fd,
+                                 poll_op                          op,
+                                 std::optional<clock::time_point> deadline,
+                                 std::stop_token                  stop) noexcept
+            : sched{sched}
+            , state{.fd = fd, .op = op, .deadline = deadline}
+            , stop{std::move(stop)}
+        {}
+
+        stoppable_wait_operation(scheduler*                        sched,
+                                 const std::atomic<std::uint64_t>* word,
+                                 std::uint64_t                     expected,
+                                 std::optional<clock::time_point>  deadline,
+                                 std::stop_token                   stop) noexcept
+            : sched{sched}
+            , state{.fd = -1, .op = poll_op::none, .deadline = deadline, .word = word, .expected = expected}
+            , stop{std::move(stop)}
+        {}
+
+    public:
+        stoppable_wait_operation(const stoppable_wait_operation&)            = delete;
+        stoppable_wait_operation& operator=(const stoppable_wait_operation&) = delete;
+
+        stoppable_wait_operation(stoppable_wait_operation&&)            = delete;
+        stoppable_wait_operation& operator=(stoppable_wait_operation&&) = delete;
+
+        ~stoppable_wait_operation() = default;
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> awaiting) noexcept
+        {
+            // NOTE: registered before the wait takes the scheduler's lock, which the callback takes too: so a callback
+            //       that runs first (e.g. here, as stop was already requested) finds it not waiting yet, and marks it
+            //       canceled, which the wait then sees (see stop_wait()).
+            if (stop.stop_possible()) on_stop.emplace(std::move(stop), canceler{.sched = sched, .state = &state});
+            return sched->suspend(state, awaiting);
+        }
+
+        std::error_code await_resume() noexcept
+        {
+            // NOTE: waits for the callback, if it's running on another thread (having ended the wait, it only has to
+            //       return), so it's done with state.
+            on_stop.reset();
+            return state.result;
+        }
+
+    private:
+        scheduler*                       sched;
+        waiter                           state;
+        std::stop_token                  stop;
+        std::optional<stop_registration> on_stop;
     };
 
     // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
@@ -290,6 +410,21 @@ public:
         return {this, fd, op, clock::now() + timeout};
     }
 
+    // These waits also end when stop is requested (see stoppable_wait_operation).
+    stoppable_wait_operation wait(handle fd, poll_op op, std::stop_token stop) noexcept
+    {
+        return {this, fd, op, std::nullopt, std::move(stop)};
+    }
+    stoppable_wait_operation
+    wait_until(handle fd, poll_op op, std::optional<clock::time_point> deadline, std::stop_token stop) noexcept
+    {
+        return {this, fd, op, deadline, std::move(stop)};
+    }
+    stoppable_wait_operation wait_for(handle fd, poll_op op, clock::duration timeout, std::stop_token stop) noexcept
+    {
+        return {this, fd, op, clock::now() + timeout, std::move(stop)};
+    }
+
     // wait_on waits for notify_one() or notify_all() to be called with word, unless word no longer holds expected (so
     // nothing needs to wait for it). It's how a task waits for something another task does: e.g. to wait for a
     // condition, read word, check the condition, and wait unless it holds; and to notify, change the condition and
@@ -305,11 +440,27 @@ public:
         return {this, &word, expected, deadline};
     }
 
+    // wait_on(word, expected, deadline, stop) also ends when stop is requested (see stoppable_wait_operation).
+    stoppable_wait_operation wait_on(const std::atomic<std::uint64_t>& word,
+                                     std::uint64_t                     expected,
+                                     std::optional<clock::time_point>  deadline,
+                                     std::stop_token                   stop) noexcept
+    {
+        return {this, &word, expected, deadline, std::move(stop)};
+    }
+
     void notify_one(const std::atomic<std::uint64_t>& word) noexcept;
     void notify_all(const std::atomic<std::uint64_t>& word) noexcept;
 
     // sleep_until waits until deadline. It fails with std::errc::operation_canceled if the scheduler is stopped first.
     wait_operation sleep_until(clock::time_point deadline) noexcept { return {this, nullptr, 0, deadline}; }
+
+    // sleep_until(deadline, stop) also ends when stop is requested (see stoppable_wait_operation): e.g. a handler's
+    // sleep, given its request's token.
+    stoppable_wait_operation sleep_until(clock::time_point deadline, std::stop_token stop) noexcept
+    {
+        return {this, nullptr, 0, deadline, std::move(stop)};
+    }
 
     // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo()), so it doesn't hold up the
     // worker threads, and then continues on the worker threads. Stopping the scheduler doesn't interrupt func.
@@ -354,6 +505,40 @@ public:
             if (error) std::rethrow_exception(error);
             co_return std::move(*result);
         }
+    }
+
+    // run_blocking(func, stop) is run_blocking(func), unless stop is requested before func starts: then func isn't
+    // run, and it fails with std::errc::operation_canceled. Nothing interrupts func once it has started (that would
+    // leave it running, with what it refers to, after the call returned), but a func that takes a std::stop_token is
+    // given stop, to check as it goes. Once func has run, its result is returned, even if stop was requested meanwhile.
+    template<typename F>
+        requires std::invocable<F, std::stop_token> || std::invocable<F>
+    coro::task<std::expected<detail::blocking_result_t<F>, std::error_code>> run_blocking(F func, std::stop_token stop)
+    {
+        using result_type = detail::blocking_result_t<F>;
+        using expected    = std::expected<result_type, std::error_code>;
+
+        // NOTE: not a coroutine itself, so this adds no frame to run_blocking(func)'s.
+        return run_blocking(
+            [func = std::move(func), stop = std::move(stop)] mutable -> expected
+            {
+                if (stop.stop_requested()) return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+
+                if constexpr (std::is_void_v<result_type>)
+                {
+                    if constexpr (std::invocable<F, std::stop_token>) std::invoke(std::move(func), std::move(stop));
+                    else std::invoke(std::move(func));
+                    return {};
+                }
+                else if constexpr (std::invocable<F, std::stop_token>)
+                {
+                    return std::invoke(std::move(func), std::move(stop));
+                }
+                else
+                {
+                    return std::invoke(std::move(func));
+                }
+            });
     }
 
     void run();
@@ -407,6 +592,10 @@ public:
 
     [[nodiscard]] bool stop_requested() const noexcept;
 
+    // stop_token is stopped by request_stop(), once it has canceled the waits: for what should end with the scheduler
+    // but doesn't wait on it (e.g. work between waits). Its callbacks run on the thread calling request_stop().
+    [[nodiscard]] std::stop_token stop_token() const noexcept { return stopper.get_token(); }
+
     // shutdown stops the scheduler, and blocks until its tasks have finished, and run() has returned (if running). It
     // throws std::logic_error if it's called from one of the pool's workers (e.g. by one of the scheduler's tasks),
     // which would wait for itself: call request_stop() there instead.
@@ -428,14 +617,23 @@ private:
     // cancel stops a handle's waiter waiting (if it still is), without completing it.
     void cancel(waiter& state) noexcept;
 
+    // stop_wait is a waiter's stop callback: it completes the waiter with std::errc::operation_canceled (and resumes
+    // it on the pool) if it's waiting, or marks it canceled, for suspend() to fail it, if it hasn't begun. It takes the
+    // waiter's lock, but is called by whoever requested stop (or the callback's constructor, if stop was requested
+    // already), so never holding it.
+    void stop_wait(waiter& state) noexcept;
+
     // retime replaces the timer of a waiter (whose handle is in sh) for its deadline. Must be called holding sh's lock.
     void retime(shard& sh, waiter& state) noexcept;
 
-    // complete_handle_wait completes a handle's waiter, which slot (in sh) holds. Must be called holding sh's lock.
-    void complete_handle_wait(shard& sh, direction& slot, std::error_code result, completions& done) noexcept;
+    // complete_handle_wait completes a handle's waiter, which slot (in sh) holds, returning the coroutine to resume.
+    // Must be called holding sh's lock.
+    [[nodiscard]] static std::coroutine_handle<>
+    complete_handle_wait(shard& sh, direction& slot, std::error_code result) noexcept;
 
-    // complete_other completes a waiter that isn't for a handle. Must be called holding timers_mu.
-    void complete_other(waiter* state, std::error_code result, completions& done) noexcept;
+    // complete_other completes a waiter that isn't for a handle, returning the coroutine to resume. Must be called
+    // holding timers_mu.
+    [[nodiscard]] std::coroutine_handle<> complete_other(waiter* state, std::error_code result) noexcept;
 
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
     void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;
@@ -448,6 +646,7 @@ private:
     void note_deadline(clock::time_point deadline) noexcept;
 
     void resume(const completions& done) noexcept;
+    void resume(std::coroutine_handle<> awaiting) noexcept;
 
     // poll waits for I/O (if block, until some is ready, the next deadline, or wake() is called), and dispatches it,
     // and the timers that expired, to done.
@@ -473,6 +672,9 @@ private:
     std::atomic<clock::rep> sleeping_until = std::numeric_limits<clock::rep>::max();
 
     std::atomic<bool> stopping = false;
+
+    // stopper is stop_token()'s source.
+    std::stop_source stopper;
 
     std::atomic<bool> running = false;
 

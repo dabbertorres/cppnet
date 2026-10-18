@@ -6,8 +6,10 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include <sys/socket.h>
@@ -144,4 +146,51 @@ TEST_CASE("an unbound Unix socket's address is empty", "[tcp][addr]")
 
     CHECK(a.local_addr().empty());
     CHECK(b.remote_addr().empty());
+}
+
+TEST_CASE("connecting with a stopped token fails without resolving", "[tcp][connect][stop]")
+{
+    std::stop_source source;
+    source.request_stop();
+
+    net::io::scheduler sched{make_pool()};
+
+    // a name that never resolves: had it been looked up, it would have failed to resolve.
+    const auto connect = [](net::io::scheduler* sched, std::stop_token stop) -> net::coro::task<std::error_code>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "nonexistent.invalid", "80", {.stop = std::move(stop)});
+        co_return conn.has_value() ? std::error_code{} : conn.error();
+    };
+
+    CHECK(sched.run_to_completion(connect(&sched, source.get_token())) == std::errc::operation_canceled);
+}
+
+TEST_CASE("requesting stop ends connecting", "[tcp][connect][stop]")
+{
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+
+    // a non-routable address: depending on the network, connecting either hangs (until stop is requested), or fails
+    // straight away.
+    const auto connect = [](net::io::scheduler* sched, std::stop_token stop) -> net::coro::task<std::error_code>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "10.255.255.1", "81", {.stop = std::move(stop)});
+        co_return conn.has_value() ? std::error_code{} : conn.error();
+    };
+
+    std::thread stopper{[&]
+                        {
+                            std::this_thread::sleep_for(100ms);
+                            source.request_stop();
+                        }};
+
+    auto start   = net::io::clock::now();
+    auto err     = sched.run_to_completion(connect(&sched, source.get_token()));
+    auto elapsed = net::io::clock::now() - start;
+    stopper.join();
+
+    CAPTURE(err.message());
+    CHECK(err);
+    CHECK(elapsed < 5s);
+    if (err == std::errc::operation_canceled) CHECK(elapsed >= 100ms);
 }
