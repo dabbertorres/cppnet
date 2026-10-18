@@ -166,8 +166,15 @@ which was used. An HTTP/2 connection is shared by the host's requests, each on a
 server's limit on streams; then another connection is opened (within `max_connections_per_host`), or, with
 `strict_max_concurrent_streams`, requests wait for a stream. Its responses' bodies may be read in any order, or not at
 all: each stream holds at most its window (64 KiB) of a body not yet read, and the connection's window has room for
-every stream's. A response destroyed before its body's end resets just its stream. A request the server refused
-without processing it is sent again, once, if it has no body.
+every stream's. A response destroyed before its body's end resets just its stream. Requests to a host known to speak
+HTTP/2 (it agreed on it before, or with prior knowledge) wait for a connection being made to it, rather than each
+making their own. A request the server refused without processing it is sent again, once, on another connection, if it
+has no body (or if nothing of it was sent yet); so is one safe to repeat, without a body, whose connection dropped
+(without GOAWAY) before its response. The request's `Host`, if it has one, is its `:authority`. A request's version
+and `Connection` field are HTTP/1.x's, and mean nothing over HTTP/2: turn `client_options::http2` off to send HTTP/1.0,
+or close a connection after a request. HTTP/2 connections count against `max_connections` as others do (one without
+streams is idle, and may be closed to make room for another host's), close once idle for `idle_timeout` (at once, if
+it's 0), and fail if their writes stall for `io_timeout`. Destroying the client lets the bodies being read finish.
 
 For `https://`, the server's certificate is verified against the system's trusted certificate authorities, or those
 in `client_options::tls` (e.g. `options.tls.trusted_ca_file = "ca.pem"`, for a private CA). A failed verification

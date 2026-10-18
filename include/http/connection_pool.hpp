@@ -12,6 +12,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "coro/task.hpp"
@@ -42,18 +43,22 @@ struct client_options
     std::size_t max_connections_per_host = 0;
     std::size_t max_connections          = 0;
 
-    // How long a connection is kept idle, waiting to be reused, before it's closed.
+    // How long a connection is kept idle, waiting to be reused, before it's closed: an HTTP/1.x connection between
+    // requests, or an HTTP/2 connection without streams. 0 keeps none: a connection closes once its (last) response
+    // is done.
     std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
 
     // How long to wait for a response's head, once its request has been sent. 0 is no limit.
     std::chrono::milliseconds response_header_timeout = std::chrono::seconds{30};
 
     // How long sending a request, or reading a response's body, may go without progress: each read or write of the
-    // connection may wait this long for it. Slow but steady transfers aren't limited. 0 is no limit.
+    // connection may wait this long for it. Slow but steady transfers aren't limited. 0 is no limit. An HTTP/2
+    // connection whose writes stall this long fails, with its streams.
     std::chrono::milliseconds io_timeout = std::chrono::seconds{30};
 
     // Whether to speak HTTP/2 (each request a stream of a connection that others share) to servers that do: over TLS,
-    // it's offered with ALPN, and used if the server agrees.
+    // it's offered with ALPN, and used if the server agrees. A request's HTTP/1.x version and Connection field mean
+    // nothing over HTTP/2: turning this off is how to send HTTP/1.0, or close a connection after a request.
     bool http2 = true;
 
     // Whether to speak HTTP/2 to http:// URLs, without asking first ("prior knowledge"): only for servers known to.
@@ -88,9 +93,11 @@ namespace detail
 
     // connection_pool keeps connections open for reuse, keyed by scheme, host and port, within client_options' limits.
     //
-    // It's shared (by a client, its copies, and the responses whose bodies are using connections), and closes its idle
-    // connections when the last of them goes. Connections must be released (or their leases destroyed), even if they
-    // aren't reusable, so that their places are free for others.
+    // It's shared (by a client, its copies, and the responses whose bodies are using HTTP/1.x connections), and closes
+    // its idle connections when the last of them goes; HTTP/2 connections with streams get GOAWAY, and close once
+    // their streams are done (their responses' bodies hold them). Connections must be released (or their leases
+    // destroyed), even if they aren't reusable, so that their places are free for others. At max_connections, an
+    // idle connection to another host (HTTP/1.x, or HTTP/2 without streams) is closed to make room.
     class connection_pool : public std::enable_shared_from_this<connection_pool>
     {
     public:
@@ -113,13 +120,18 @@ namespace detail
 
         ~connection_pool();
 
-        // acquire returns an idle connection to host (if allow_idle, and one is still open), or connects a new one if
-        // the limits allow, waiting for one to be free if not, and for https, runs a TLS handshake over it. It fails
-        // with std::errc::timed_out if connecting takes longer than connect_timeout (or the handshake
+        // acquire returns an idle connection to host (if allow_idle, and one is still open), or a stream of an HTTP/2
+        // connection (other than skip, e.g. one that refused the request), or connects a new one if the limits allow,
+        // waiting for one to be free if not, and for https, runs a TLS handshake over it. To a host known to speak
+        // HTTP/2, a request waits for a connection being made rather than making its own. It fails with
+        // std::errc::timed_out if connecting takes longer than connect_timeout (or the handshake
         // tls_handshake_timeout), as tcp_socket::connect does, or with TLS's errors (e.g. a certificate that couldn't
         // be verified). scheme is "http" or "https" (or with NET_HAS_TLS undefined, only "http").
-        coro::task<std::expected<lease, std::error_code>>
-        acquire(std::string scheme, std::string host, std::string port, bool allow_idle);
+        coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
+                                                                  std::string                    host,
+                                                                  std::string                    port,
+                                                                  bool                           allow_idle,
+                                                                  const http2_client_connection* skip = nullptr);
 
         // release returns a leased connection: kept idle if it's reusable (it's at the start of a response, with
         // nothing unread), and closed otherwise.
@@ -145,8 +157,12 @@ namespace detail
 
         struct host_connections
         {
-            std::size_t                                           open = 0;
-            std::deque<idle_connection>                           idle; // oldest first
+            std::size_t                 open       = 0;
+            std::size_t                 connecting = 0; // of open, being connected
+            std::deque<idle_connection> idle;           // oldest first
+
+            // NOTE: one evicted is dropped from here at once (and counted out of open), so that its closed callback,
+            //       finding it gone, doesn't count it out again.
             std::vector<std::shared_ptr<http2_client_connection>> http2;
         };
 
@@ -164,9 +180,14 @@ namespace detail
         // scheduler's stopping.
         std::shared_ptr<http2_client_connection> start_http2(const std::string& key, std::unique_ptr<connection> conn);
 
-        // available_http2 is one of the host's HTTP/2 connections with a stream free, which it reserves for the
-        // request, if there is one (holding mu).
-        std::shared_ptr<http2_client_connection> available_http2(const std::string& key);
+        // available_http2 is one of the host's HTTP/2 connections (other than skip) with a stream free, which it
+        // reserves for the request, if there is one (holding mu).
+        std::shared_ptr<http2_client_connection> available_http2(const std::string&             key,
+                                                                 const http2_client_connection* skip);
+
+        // speaks_http2 is whether host is known to speak HTTP/2: it agreed on it before (and not since disagreed), or
+        // it's cleartext, with prior knowledge (holding mu).
+        [[nodiscard]] bool speaks_http2(const std::string& key, bool tls) const;
 
         // idle_count is how many of a host's connections are idle (holding mu).
         static std::size_t idle_count(const host_connections& conns);
@@ -183,10 +204,15 @@ namespace detail
         };
 
         // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
-        claim try_claim(const std::string& key, bool allow_idle, connections& closing);
+        claim try_claim(const std::string&             key,
+                        bool                           tls,
+                        bool                           allow_idle,
+                        const http2_client_connection* skip,
+                        connections&                   closing);
         bool  has_room(const host_connections& host) const noexcept;
         bool  evict_idle(const std::string& except_key, connections& closing);
         void  forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
+        void  connected(const std::string& key) noexcept; // a connection being made is, or failed
         std::optional<io::clock::time_point> close_expired(connections& closing);
 
         // freed tells waiters that a connection may be free.
@@ -198,6 +224,7 @@ namespace detail
 
         mutable std::mutex                                mu;
         std::unordered_map<std::string, host_connections> hosts;
+        std::unordered_set<std::string>                   http2_hosts; // the hosts that agreed on HTTP/2
         std::size_t                                       open    = 0;
         bool                                              reaping = false;
 

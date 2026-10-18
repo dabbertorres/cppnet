@@ -50,11 +50,12 @@ struct h2_client final : http2::session_events
     static constexpr std::chrono::seconds default_timeout{10};
 
     // sock is the connection's socket, for pump()'s deadlines (none if it's null).
-    h2_client(net::io::reader* in,
-              net::io::writer* out,
-              net::socket*     sock = nullptr,
-              http2::role      side = http2::role::client)
-        : s{side}
+    h2_client(net::io::reader*             in,
+              net::io::writer*             out,
+              net::socket*                 sock   = nullptr,
+              http2::role                  side   = http2::role::client,
+              const http2::session_config& config = {})
+        : s{side, config}
         , in{in}
         , out{out}
         , sock{sock}
@@ -134,6 +135,16 @@ struct h2_client final : http2::session_events
         return id;
     }
 
+    // respond sends a response's head (as a server), and its body, if any (ending the stream, if end).
+    void respond(http2::stream_id id, std::string_view status, std::string_view body = {}, bool end = true)
+    {
+        const std::vector<hpack::field> head{
+            {.name = ":status", .value = status}
+        };
+        REQUIRE_FALSE(s.submit_headers(id, head, body.empty() && end));
+        if (!body.empty()) send(id, body, end);
+    }
+
     // send sends as much of a body as the windows allow (pump() sends the rest as they grow).
     void send(http2::stream_id id, std::string_view body, bool end)
     {
@@ -159,7 +170,6 @@ struct h2_client final : http2::session_events
     net::coro::task<bool> pump(Done done, net::io::clock::duration timeout = default_timeout)
     {
         std::vector<std::byte> buffer(16'384);
-        std::vector<std::byte> pending;
         std::vector<std::byte> output;
 
         timed_out = false;
@@ -224,6 +234,9 @@ struct h2_client final : http2::session_events
 
     std::map<http2::stream_id, std::string> pending_body;
     std::map<http2::stream_id, bool>        pending_end;
+
+    // what's been read but not received (part of a frame): kept from one pump() to the next.
+    std::vector<std::byte> pending;
 };
 
 // gate holds handlers until a test opens it: the n-th to pass waits for the n-th open() (or the scheduler to stop).

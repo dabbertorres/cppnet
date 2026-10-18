@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,10 +28,12 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/io.hpp"
+#include "io/limit_reader.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "url.hpp"
 #include "util/defer.hpp"
+#include "util/string_util.hpp"
 
 namespace net::http::detail
 {
@@ -69,11 +72,22 @@ namespace
         stream_reader                            reader;
     };
 
-    std::string authority_of(const url& uri)
+    // authority_of is a request's :authority: the caller's Host, if it has one (RFC 9113, section 8.3.1, as it isn't
+    // sent as a field); otherwise the URI's host and port, without the scheme's default port, as HTTP/1.1's Host.
+    std::string authority_of(const client_request& request)
     {
+        using namespace std::string_view_literals;
+
+        if (const auto host = request.headers.get("Host"sv); host.has_value()) return std::string{*host};
+
+        const auto& uri = request.uri;
+
         // an IPv6 address is bracketed, as in a URL.
         std::string out = uri.host.contains(':') ? "[" + uri.host + "]" : uri.host;
-        if (!uri.port.empty()) out += ":" + uri.port;
+
+        const bool https        = util::equal_ignore_case(std::string_view{uri.scheme}, "https"sv);
+        const bool default_port = uri.port == (https ? "443"sv : "80"sv);
+        if (!uri.port.empty() && !default_port) out += ":" + uri.port;
         return out;
     }
 
@@ -103,25 +117,62 @@ coro::task<> http2_client_connection::run_owned(std::shared_ptr<http2_client_con
 bool http2_client_connection::reserve()
 {
     std::scoped_lock lock{mu};
-    if (ending() || peer_goaway || !session.can_open_stream(reserved)) return false;
+    if (ending() || peer_goaway || draining || !session.can_open_stream(reserved)) return false;
 
     ++reserved;
+    idle_from.reset();
     return true;
 }
 
 bool http2_client_connection::idle()
 {
     std::scoped_lock lock{mu};
-    return streams.empty();
+    return idle_now();
 }
 
-coro::task<std::expected<client_response, std::error_code>> http2_client_connection::send(client_request& request)
+std::optional<io::clock::time_point> http2_client_connection::idle_since()
 {
+    std::scoped_lock lock{mu};
+    if (!idle_now()) return std::nullopt;
+    return idle_from.value_or(io::clock::now());
+}
+
+bool http2_client_connection::accepting()
+{
+    std::scoped_lock lock{mu};
+    return !ending() && !peer_goaway && !draining && !session.failed();
+}
+
+coro::task<std::expected<client_response, std::error_code>> http2_client_connection::send(client_request& request,
+                                                                                          send_state*     state)
+{
+    // exactly Content-Length bytes of the body are sent, if it's set (as HTTP/1.1's): none, if it's 0.
+    const auto length   = request.body != nullptr ? request.headers.get_content_length() : std::nullopt;
+    const bool has_body = request.body != nullptr && (!length.has_value() || *length > 0);
+
     std::shared_ptr<http2_client_stream> stream;
     {
-        std::scoped_lock lock{mu};
-        auto             opened = open(request);
-        if (!opened.has_value()) co_return std::unexpected(opened.error());
+        std::unique_lock lock{mu};
+        auto             opened = open(request, !has_body);
+        if (!opened.has_value())
+        {
+            // nothing was sent, nor the body read: a refused request may be sent again (on another connection),
+            // whatever it is.
+            if (state != nullptr) state->unsent = opened.error() == http2::error_code::refused_stream;
+
+            // the stream that was reserved for it is free (for another request, or to be idle).
+            if (idle_now())
+            {
+                idle_from = io::clock::now();
+                wake_timer();
+            }
+            maybe_end();
+            lock.unlock();
+
+            wake_writer();
+            if (on.freed) on.freed();
+            co_return std::unexpected(opened.error());
+        }
         stream = std::move(*opened);
     }
     wake_writer();
@@ -140,29 +191,34 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     // a server may answer before it's read all of the body (e.g. 413 Content Too Large), and reset the stream, failing
     // the rest: the response is still worth having.
     std::optional<std::error_code> body_error;
-    if (request.body != nullptr)
+    if (has_body)
     {
-        if (auto err = co_await send_body(request, *stream)) body_error = err;
+        const auto sent = co_await send_body(request, *stream, length);
+
+        // the body couldn't be read, or was shorter than its Content-Length: the request is the caller's mistake (as
+        // over HTTP/1.1), whatever the server made of it.
+        if (sent.body_failed) co_return std::unexpected(sent.err);
+        if (sent.err) body_error = sent.err;
     }
 
-    auto resp = co_await wait_for_head(std::move(stream), body_error);
+    auto resp = co_await wait_for_head(std::move(stream), body_error, state);
     taken     = resp.has_value();
     co_return resp;
 }
 
 std::expected<std::shared_ptr<http2_client_stream>, std::error_code>
-http2_client_connection::open(const client_request& request)
+http2_client_connection::open(const client_request& request, bool end_stream)
 {
     // the stream reserved for it (if it was), whether or not it can be opened.
     if (reserved > 0) --reserved;
 
-    if (ending() || peer_goaway) return std::unexpected(make_error_code(http2::error_code::refused_stream));
+    if (ending() || peer_goaway || draining) return std::unexpected(make_error_code(http2::error_code::refused_stream));
 
     // the head is made before the stream is opened, as a stream that's opened must be sent.
     auto stream           = std::make_shared<http2_client_stream>(this, 0, pool);
     stream->read_timeout  = options.io_timeout;
     stream->write_timeout = options.io_timeout;
-    stream->authority     = authority_of(request.uri);
+    stream->authority     = authority_of(request);
     stream->path          = request.uri.origin_form();
     if (stream->path.empty()) stream->path = "/";
 
@@ -178,46 +234,56 @@ http2_client_connection::open(const client_request& request)
     if (!id.has_value()) return std::unexpected(id.error());
     stream->id = *id;
 
-    const bool end = request.body == nullptr;
-    if (auto err = session.submit_headers(*id, fields, end))
+    if (auto err = session.submit_headers(*id, fields, end_stream))
     {
         session.reset(*id, http2::error_code::internal_error);
         return std::unexpected(err);
     }
 
-    stream->ended = end;
+    stream->ended = end_stream;
     streams.emplace(*id, stream);
     add_stream(*stream);
-    idle_since.reset();
+    idle_from.reset();
 
     // NOTE: counted rather than looked up, so a stream a receive frees meanwhile is still noticed (see after_receive).
     ++open_seen;
     return stream;
 }
 
-coro::task<std::error_code> http2_client_connection::send_body(client_request& request, http2_client_stream& stream)
+coro::task<http2_client_connection::body_result> http2_client_connection::send_body(client_request&            request,
+                                                                                    http2_client_stream&       stream,
+                                                                                    std::optional<std::size_t> length)
 {
+    // no more than its Content-Length: the server would take what's past it as malformed.
+    io::limit_reader body{request.body.get(), length.value_or(std::numeric_limits<std::size_t>::max())};
+
     std::vector<std::byte> buffer(std::size_t{16} * 1'024);
-    while (true)
+    std::size_t            sent = 0;
+    while (!length.has_value() || sent < *length)
     {
-        const auto res = co_await request.body->read(buffer);
+        const auto res = co_await body.read(buffer);
         if (res.count > 0)
         {
             const auto written = co_await stream.writer.write(std::span{buffer}.first(res.count));
-            if (written.err) co_return written.err;
+            if (written.err) co_return body_result{.err = written.err};
+            sent += res.count;
         }
 
-        if (res.err == io::errc::end_of_stream) break;
-        if (res.err)
+        auto err = res.err;
+        if (err == io::errc::end_of_stream)
         {
-            // the request can't be finished: the server mustn't take what it has as all of it.
-            {
-                std::scoped_lock lock{mu};
-                if (!stream.failure) stream.failure = res.err;
-                session.reset(stream.id, http2::error_code::cancel);
-            }
-            wake_writer();
-            co_return res.err;
+            // a body shorter than its Content-Length is the caller's mistake.
+            if (!length.has_value() || sent == *length) break;
+            err = std::make_error_code(std::errc::invalid_argument);
+        }
+
+        // a reader that returns nothing, without failing, would be read forever.
+        if (!err && res.count == 0) err = make_error_code(io::errc::no_progress);
+
+        if (err)
+        {
+            abandon(stream, err);
+            co_return body_result{.err = err, .body_failed = true};
         }
     }
 
@@ -226,16 +292,27 @@ coro::task<std::error_code> http2_client_connection::send_body(client_request& r
         if (!stream.failure && !stream.ended)
         {
             stream.ended = true;
-            if (auto sent = session.submit_data(stream.id, {}, true); !sent.has_value()) stream.failure = sent.error();
+            if (auto ended = session.submit_data(stream.id, {}, true); !ended.has_value())
+                stream.failure = ended.error();
         }
     }
     wake_writer();
-    co_return std::error_code{};
+    co_return body_result{};
 }
 
-coro::task<std::expected<client_response, std::error_code>>
-http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stream,
-                                       std::optional<std::error_code>       body_error)
+void http2_client_connection::abandon(http2_client_stream& stream, std::error_code err)
+{
+    // the request can't be finished: the server mustn't take what it has as all of it.
+    {
+        std::scoped_lock lock{mu};
+        if (!stream.failure) stream.failure = err;
+        session.reset(stream.id, http2::error_code::cancel);
+    }
+    wake_writer();
+}
+
+coro::task<std::expected<client_response, std::error_code>> http2_client_connection::wait_for_head(
+    std::shared_ptr<http2_client_stream> stream, std::optional<std::error_code> body_error, send_state* state)
 {
     while (true)
     {
@@ -262,6 +339,12 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
                 if (err == http2::error_code::refused_stream && s.processed)
                     err = make_error_code(http2::error_code::cancel);
                 if (body_error.has_value() && err != http2::error_code::refused_stream) err = *body_error;
+
+                // the connection ended (not after the server's GOAWAY, which says what it processed) before any
+                // response: the request may or may not have been processed.
+                if (state != nullptr)
+                    state->dropped = !s.processed && !peer_goaway && err == std::errc::connection_aborted;
+
                 co_return std::unexpected(err);
             }
 
@@ -286,7 +369,7 @@ void http2_client_connection::done(http2::stream_id id)
 
             remove_stream(id);
             streams.erase(it);
-            if (streams.empty()) idle_since = io::clock::now();
+            if (idle_now()) idle_from = io::clock::now();
             open_seen = session.open_streams();
             maybe_end();
         }
@@ -304,6 +387,20 @@ void http2_client_connection::close()
         if (ending()) return;
         session.goaway(0, http2::error_code::no_error);
         end();
+    }
+    wake_writer();
+}
+
+void http2_client_connection::drain()
+{
+    {
+        std::scoped_lock lock{mu};
+        if (ending() || draining) return;
+
+        // no more streams (the session opens none after its own GOAWAY), and the connection ends with its last.
+        draining = true;
+        session.goaway(0, http2::error_code::no_error);
+        maybe_end();
     }
     wake_writer();
 }
@@ -361,6 +458,13 @@ void http2_client_connection::after_receive()
         const auto       open_now = session.open_streams();
         freed                     = open_now < open_seen;
         open_seen                 = open_now;
+
+        // after the server's GOAWAY, a request waiting for one of its streams needn't wait any more.
+        if (peer_goaway && !goaway_told)
+        {
+            goaway_told = true;
+            freed       = true;
+        }
     }
 
     if (freed && on.freed) on.freed();
@@ -368,12 +472,13 @@ void http2_client_connection::after_receive()
 
 std::optional<io::clock::time_point> http2_client_connection::check_connection(io::clock::time_point now)
 {
-    // a connection without streams is closed once it's been idle for idle_timeout.
-    const auto timeout = options.idle_timeout;
-    if (timeout <= std::chrono::milliseconds::zero() || !streams.empty()) return std::nullopt;
+    // a connection without streams (nor any reserved) is closed once it's been idle for idle_timeout (at once, if
+    // that's 0).
+    if (!idle_now()) return std::nullopt;
 
-    if (!idle_since.has_value()) idle_since = now;
-    if (now - *idle_since < timeout) return *idle_since + timeout;
+    if (!idle_from.has_value()) idle_from = now;
+    const auto timeout = options.idle_timeout;
+    if (timeout > std::chrono::milliseconds::zero() && now - *idle_from < timeout) return *idle_from + timeout;
 
     session.goaway(0, http2::error_code::no_error);
     end();
@@ -383,7 +488,23 @@ std::optional<io::clock::time_point> http2_client_connection::check_connection(i
 void http2_client_connection::maybe_end()
 {
     if (ending()) return;
-    if (session.failed() || (peer_goaway && streams.empty())) end();
+    if (session.failed())
+    {
+        end();
+        return;
+    }
+
+    // done with its last stream: after either side's GOAWAY, or if no connection's to be kept idle.
+    if (!idle_now()) return;
+    if (draining || peer_goaway)
+    {
+        end();
+    }
+    else if (options.idle_timeout <= std::chrono::milliseconds::zero())
+    {
+        session.goaway(0, http2::error_code::no_error);
+        end();
+    }
 }
 
 }

@@ -175,14 +175,23 @@ struct sent
     bool                                                       retry = false;
 };
 
-// send_http2 sends a request on a stream of an HTTP/2 connection. One the server didn't process (it was refused, or
-// after a GOAWAY's last stream) may be sent again, whatever its method, unless its body's been read.
+// send_http2 sends a request on a stream of an HTTP/2 connection. It may be sent again (on another connection):
+// - whatever it is, if it was refused before anything of it was sent (the connection was ending);
+// - whatever its method, if the server didn't process it (it was refused, or after a GOAWAY's last stream), unless its
+//   body's been read;
+// - if it's safe to repeat, and has no body, if the connection dropped (without GOAWAY) before its response's head: as
+//   HTTP/1.1's are, when a reused connection turns out to have been closed.
 net::coro::task<sent>
 send_http2(net::http::detail::connection_pool::lease leased, net::http::client_request& request, bool first)
 {
-    auto       resp  = co_await leased.http2->send(request);
-    const bool retry = !resp.has_value() && first && request.body == nullptr
-                    && resp.error() == net::http::http2::error_code::refused_stream;
+    net::http::detail::http2_client_connection::send_state state;
+
+    auto resp = co_await leased.http2->send(request, &state);
+    if (resp.has_value() || !first) co_return sent{.response = std::move(resp)};
+
+    const bool refused = resp.error() == net::http::http2::error_code::refused_stream;
+    const bool retry =
+        state.unsent || (request.body == nullptr && (refused || (state.dropped && is_idempotent(request.method))));
     co_return sent{.response = std::move(resp), .retry = retry};
 }
 
@@ -272,17 +281,21 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
     // before taking a connection, which a request that can't be sent would waste.
     if (auto err = http11::check_request(request); err) co_return std::unexpected(err);
 
-    // a request that closes its connection can't be followed by another.
+    // a request that closes its connection can't be followed by another (over HTTP/1.x: HTTP/2 has no such thing).
     const bool reusable_request = request.version.minor >= 1 && !has_close(request.headers);
+
+    // the HTTP/2 connection the last attempt was on: a retry is on another.
+    std::shared_ptr<detail::http2_client_connection> tried;
 
     for (int attempt = 0;; ++attempt)
     {
         // a retry is because a reused connection had been closed, so the others may have been too.
-        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0);
+        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0, tried.get());
         if (!leased.has_value()) co_return std::unexpected(leased.error());
 
         // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the response's
         // body is read.
+        tried       = leased->http2;
         auto result = leased->http2 != nullptr
                         ? co_await send_http2(std::move(*leased), request, attempt == 0)
                         : co_await send_http11(pool, std::move(*leased), request, attempt == 0, reusable_request);

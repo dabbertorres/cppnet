@@ -392,6 +392,21 @@ RST_STREAM on an idle stream would be a connection error for the peer.
 - A request that's refused (REFUSED_STREAM, or after the server's GOAWAY) is sent again once, on another connection,
   if it has no body (whose reader can't be rewound), whatever its method. One the server sent headers for was
   processed, so its refusal is reported as CANCEL, which isn't retried.
+- (After review:) the pool's other edges. A retry goes on another connection than the one that refused it (`acquire`
+  skips it). A request refused before its stream was opened (the connection was ending, or had the server's GOAWAY)
+  was sent nothing of, so it's retried even with a body; and one safe to repeat, without a body, whose connection
+  dropped without GOAWAY before its response's head is retried as HTTP/1.1's are on a reused connection that turns out
+  closed. A reserved stream counts against the connection being idle (for the idle timeout, eviction and stats), and
+  `idle_timeout = 0` closes a connection with its last stream, as HTTP/1.1's are. At `max_connections`, an idle HTTP/2
+  connection to another host may be evicted (counted out at once: it's dropped from its host's list, so its `closed`
+  callback doesn't count it out again). The pool remembers the hosts that agreed on `h2` (or have prior knowledge),
+  and while a connection to one is being made, other requests wait for it rather than each connecting. Strict
+  requests wait only for connections that may still open streams, and the server's GOAWAY wakes them. Destroying the
+  pool drains its connections (GOAWAY, then the end with the last stream) rather than cutting off bodies being read.
+  The pool sets an HTTP/2 connection's socket's write timeout to `io_timeout`, so a writer stuck behind a server that
+  doesn't read fails the connection. `:authority` is the caller's `Host` (which isn't sent as a field), or the URI's
+  without the scheme's default port; a body with a Content-Length is sent to that length (failing if it's shorter),
+  and a body reader that returns nothing fails with `no_progress`, as over HTTP/1.1.
 - `client_options::http2` (on by default) offers `h2` over TLS; `http2_prior_knowledge` speaks it over cleartext.
   Response trailers end the body, but aren't passed on (as with requests' on the server).
 - `server_config::http2_max_concurrent_streams` (100, as nginx's) was added, for the client's stream-limit tests.

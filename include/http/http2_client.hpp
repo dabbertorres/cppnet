@@ -51,9 +51,12 @@ public:
 // http2_client_options are what a client's HTTP/2 connections are made with: client_options'.
 struct http2_client_options
 {
-    std::chrono::milliseconds response_header_timeout{};
-    std::chrono::milliseconds io_timeout{};
-    std::chrono::milliseconds idle_timeout{};
+    std::chrono::milliseconds response_header_timeout{}; // 0: no limit
+    std::chrono::milliseconds io_timeout{};              // 0: no limit
+
+    // How long the connection may be idle (no streams, nor any reserved) before it's closed; 0 closes it as soon as
+    // its last stream is done.
+    std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
 
     http2::session_config session{};
 };
@@ -86,6 +89,19 @@ public:
                             const http2_client_options& options,
                             callbacks                   on);
 
+    // send_state is how far send() got with a request that failed, for deciding whether it may be sent again (on
+    // another connection).
+    struct send_state
+    {
+        // Refused before its stream was opened (the connection was ending, or had the server's GOAWAY): nothing of it
+        // was sent, nor its body read.
+        bool unsent = false;
+
+        // The connection ended, without the server's GOAWAY, before the response's head (or any informational
+        // response): the server may or may not have processed it.
+        bool dropped = false;
+    };
+
     // start runs the connection, as one of the scheduler's tasks, returning false if the scheduler's stopping.
     bool start();
 
@@ -93,15 +109,29 @@ public:
     // (counting those reserved already), returning whether it did. Without one, send() may fail with refused_stream.
     [[nodiscard]] bool reserve();
 
-    // idle is whether it has no streams open.
+    // idle is whether it has no streams open, nor any reserved.
     [[nodiscard]] bool idle();
 
+    // idle_since is when it became idle, if it is.
+    [[nodiscard]] std::optional<io::clock::time_point> idle_since();
+
+    // accepting is whether it may still open streams: it's not ending, nor been sent GOAWAY by the server, nor
+    // draining. (It may still have none free.)
+    [[nodiscard]] bool accepting();
+
     // send sends a request, returning the response once its head has arrived. It fails with refused_stream (in
-    // http2::category()) if the server didn't process the request, so it may be sent again.
-    coro::task<std::expected<client_response, std::error_code>> send(client_request& request);
+    // http2::category()) if the server didn't process the request, so it may be sent again; state (if given) says how
+    // far it got. A request with a Content-Length sends exactly that much of its body, failing with
+    // std::errc::invalid_argument if the body's shorter.
+    coro::task<std::expected<client_response, std::error_code>> send(client_request& request,
+                                                                     send_state*     state = nullptr);
 
     // close ends the connection (GOAWAY), failing the streams still open.
     void close();
+
+    // drain sends GOAWAY, and ends the connection once its streams are done (at once, if it has none): no more are
+    // opened.
+    void drain();
 
     // done is a request being done with its stream: its response's body, or send() if the request failed (resetting
     // it if it's not finished, and telling the pool it's free).
@@ -121,15 +151,33 @@ protected:
     void                                 maybe_end() override;
 
 private:
-    // open opens a stream for request, sending its head (holding the lock).
-    std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request& request);
+    // open opens a stream for request, sending its head (and ending the stream there, if end_stream), holding the
+    // lock.
+    std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request& request,
+                                                                              bool                  end_stream);
 
-    // send_body sends the request's body on the stream, returning the error if it couldn't be.
-    coro::task<std::error_code> send_body(client_request& request, http2_client_stream& stream);
+    // body_result is what sending a request's body came to: why it stopped short, if it did; and whether that's the
+    // body's fault (it failed, or was shorter than its Content-Length), rather than the stream's.
+    struct body_result
+    {
+        std::error_code err;
+        bool            body_failed = false;
+    };
 
-    // wait_for_head waits for the response's head, returning the response (with its body), or why it didn't come.
-    coro::task<std::expected<client_response, std::error_code>>
-    wait_for_head(std::shared_ptr<http2_client_stream> stream, std::optional<std::error_code> body_error);
+    // send_body sends the request's body on the stream: length bytes of it, if that's set.
+    coro::task<body_result>
+    send_body(client_request& request, http2_client_stream& stream, std::optional<std::size_t> length);
+
+    // abandon resets a stream whose request can't be finished, so the server doesn't take what it has as all of it.
+    void abandon(http2_client_stream& stream, std::error_code err);
+
+    // idle_now is whether it has no streams, nor any reserved (holding the lock).
+    [[nodiscard]] bool idle_now() const noexcept { return streams.empty() && reserved == 0; }
+
+    // wait_for_head waits for the response's head, returning the response (with its body), or why it didn't come
+    // (and in state, whether the connection dropped first).
+    coro::task<std::expected<client_response, std::error_code>> wait_for_head(
+        std::shared_ptr<http2_client_stream> stream, std::optional<std::error_code> body_error, send_state* state);
 
     static coro::task<> run_owned(std::shared_ptr<http2_client_connection> self);
 
@@ -140,8 +188,10 @@ private:
     std::unordered_map<http2::stream_id, std::shared_ptr<http2_client_stream>> streams;
     std::size_t                                                                reserved    = 0;
     bool                                                                       peer_goaway = false;
-    std::optional<io::clock::time_point>                                       idle_since  = io::clock::now();
-    std::size_t open_seen = 0; // the session's open streams, when last looked at: fewer now means one's been freed
+    bool                                                                       draining    = false; // drain()ed
+    std::optional<io::clock::time_point> idle_from = io::clock::now(); // when it was last idle (none: not yet looked)
+    std::size_t open_seen   = 0; // the session's open streams, when last looked at: fewer now means one's been freed
+    bool        goaway_told = false; // the pool's been told of the server's GOAWAY (as a stream freed)
 };
 
 }

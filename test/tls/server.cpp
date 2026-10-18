@@ -230,6 +230,56 @@ TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][h
           == "HTTP/2 hello over TLS");
 }
 
+TEST_CASE("a burst of requests to a host that agreed on HTTP/2 shares the connection being made",
+          "[tls][http][client][http2]")
+{
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+    http::client       client{&sched, trusting_options()};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, std::string url) -> task<std::vector<std::string>>
+    {
+        // the first request learns that the host speaks HTTP/2; then its connection's closed.
+        std::vector<std::string> out{co_await fetch(client, url)};
+        client->close_idle();
+
+        const auto deadline = net::io::clock::now() + 5s;
+        while (client->stats().open != 0 && net::io::clock::now() < deadline)
+            (void)co_await sched->sleep_until(net::io::clock::now() + 5ms);
+        REQUIRE(client->stats().open == 0);
+
+        // then a burst, with no connection.
+        constexpr int              n = 10;
+        std::vector<std::string>   results(n);
+        std::atomic<std::uint64_t> done{0};
+        for (int i = 0; i < n; ++i)
+        {
+            REQUIRE(sched->spawn(
+                [](net::io::scheduler*         sched,
+                   http::client*               client,
+                   std::string                 url,
+                   std::string*                result,
+                   std::atomic<std::uint64_t>* done) -> task<>
+                {
+                    *result = co_await fetch(client, url);
+                    done->fetch_add(1);
+                    sched->notify_all(*done);
+                }(sched, client, url, &results[static_cast<std::size_t>(i)], &done)));
+        }
+
+        for (auto seen = done.load(); seen < n; seen = done.load()) (void)co_await sched->wait_on(done, seen);
+        out.insert(out.end(), results.begin(), results.end());
+        out.push_back(std::format("open {}", client->stats().open));
+        co_return out;
+    };
+
+    const auto results = sched.run_to_completion(test(&sched, &client, "https://localhost:" + server.port() + "/"));
+    REQUIRE(results.size() == 12);
+    for (std::size_t i = 0; i < 11; ++i) CHECK(results[i] == "hello over TLS");
+    CHECK(results.back() == "open 1");
+}
+
 TEST_CASE("an HTTPS server closes connections that don't speak TLS", "[tls][http][server]")
 {
     net::io::scheduler sched{make_pool()};
