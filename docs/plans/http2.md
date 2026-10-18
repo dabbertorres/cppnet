@@ -169,7 +169,12 @@ stream:
   connection coroutine adds to as WINDOW_UPDATEs arrive. On the receiving side, the server advertises a window per
   stream and buffers at most that much; as the handler reads the body, the read data is credited back
   (WINDOW_UPDATE), as Rust's h2 does, so a handler that doesn't read stops its client without holding up other
-  streams.
+  streams. (After review:) the connection's window holds every stream's (a server's MAX_CONCURRENT_STREAMS times
+  INITIAL_WINDOW_SIZE, at least 1 MiB; the client's 1 GiB, as Go's), and is given back once half of it has been read,
+  or as much as the peer has left of it, so bodies read one at a time can't wait on each other's data. A WINDOW_UPDATE
+  is written as soon as a read makes one due; a stream's buffer drops what's been read once that's half of it (so it
+  holds about twice the window at most); and what a stream received but nobody read, when it's removed or reset for a
+  DATA frame, is given back to the connection.
 - **Handlers' tasks** are owned by the connection (an `async_scope`, with the server's lease), so closing the
   connection waits for them; the number running is MAX_CONCURRENT_STREAMS (advertised; more are refused with
   REFUSED_STREAM, which a client may retry).

@@ -98,7 +98,9 @@ struct session_config
     };
 
     // The connection's receive window, raised from its initial 65535 with a WINDOW_UPDATE: how much the peer may send
-    // on all streams before this side consumes some.
+    // on all streams before this side consumes some. It's to hold every stream's window (local.initial_window_size
+    // times the streams that may be open), or streams read one at a time may wait for each other's data to be read:
+    // http::client's is 1 GiB, a server's its streams' (at least 1 MiB).
     std::uint32_t connection_window = std::uint32_t{1} << 20;
 
     // The most CONTINUATION frames a header block may have (nghttp2's default); its encoded size is limited by
@@ -271,6 +273,14 @@ private:
     // application's), and counting it as a glitch.
     std::error_code
     stream_error(stream_id stream, error_code code, session_events* events, std::chrono::steady_clock::time_point now);
+
+    // data_error is stream_error for a DATA frame of length the stream can't take, which is given back to the
+    // connection's window.
+    std::error_code data_error(stream_id                             stream,
+                               std::size_t                           length,
+                               error_code                            code,
+                               session_events&                       events,
+                               std::chrono::steady_clock::time_point now);
 
     // glitch counts something suspicious the peer did, failing the connection if it's done too many.
     std::error_code glitch(std::chrono::steady_clock::time_point now);

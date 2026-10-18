@@ -485,6 +485,74 @@ TEST_CASE("a change of INITIAL_WINDOW_SIZE moves open streams' windows", "[http]
     CHECK(c.server.s.send_window(id) == 1'000);
 }
 
+TEST_CASE("the connection's window is given back when the peer has run out, though less than half was read",
+          "[http][http2][session][flow]")
+{
+    // a connection window that holds 4 streams' windows.
+    http2::session_config config;
+    config.connection_window = 4 * 65'535;
+    connected c{config};
+
+    // 4 bodies fill the streams' windows, and so the connection's.
+    const std::string             body(65'535, 'x');
+    std::vector<http2::stream_id> ids;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto id = c.client.s.open_stream().value();
+        REQUIRE_FALSE(c.client.s.submit_headers(id, request("POST"), false));
+        REQUIRE(c.client.s.submit_data(id, bytes_of(body), false) == body.size());
+        ids.push_back(id);
+    }
+    pump(c.client, c.server);
+    c.server.events.take();
+
+    // reading one of them (a quarter of the connection's window) gives it back to the connection too, so the stream
+    // can go on while the others wait to be read.
+    c.server.s.consume(ids.back(), body.size());
+    pump(c.client, c.server);
+    CHECK(c.client.s.send_window(ids.back()) == 65'535);
+    CHECK(c.client.s.send_window(ids.front()) == 0);
+}
+
+TEST_CASE("a stream reset for its DATA gives the connection's window back", "[http][http2][session][flow]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        bool             content_length = false; // too long for its Content-Length, or for the stream's window
+    };
+
+    const auto tc =
+        GENERATE(test_case{.name = "the stream's window"}, test_case{.name = "Content-Length", .content_length = true});
+    CAPTURE(tc.name);
+
+    // frames as large as a stream's window (larger, for flow control), on 20 streams: more than the connection's 1 MiB
+    // window, if what each took of it weren't given back.
+    http2::session_config config;
+    config.local.max_frame_size = std::uint32_t{1} << 17;
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start();
+
+    auto fields = request("POST");
+    if (tc.content_length) fields.push_back({.name = "content-length", .value = "1"});
+    const std::vector<std::byte> data(tc.content_length ? 65'535 : 65'536, std::byte{'x'});
+
+    for (http2::stream_id id = 1; id < 40; id += 2)
+    {
+        r.headers(id, fields, http2::flags::end_headers);
+        r.frame(http2::frame_type::data, 0, id, data);
+    }
+    server.deliver(r.bytes);
+
+    CHECK_FALSE(server.failure);
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(goaway_code(out) == std::nullopt);
+}
+
 TEST_CASE("a malformed request is reset, without the application seeing it", "[http][http2][session][malformed]")
 {
     struct test_case

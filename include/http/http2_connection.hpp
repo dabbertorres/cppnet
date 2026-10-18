@@ -8,7 +8,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <vector>
@@ -92,7 +91,7 @@ public:
     http2_connection_base* conn;
     http2::stream_id       id;
 
-    std::vector<std::byte>               received; // DATA not read yet, from received_start
+    std::vector<std::byte>               received; // DATA not read yet, from received_start (before it, what's read)
     std::size_t                          received_start = 0;
     bool                                 received_end   = false;
     bool                                 ended          = false; // this side has sent END_STREAM
@@ -158,7 +157,8 @@ protected:
     // then lets the writer write what's left, and waits for it and the timer.
     coro::task<> run(std::span<const std::byte> already_read);
 
-    // add_stream and remove_stream register a stream for the events and timeouts (holding the lock).
+    // add_stream and remove_stream register a stream for the events and timeouts (holding the lock). remove_stream
+    // gives the peer back what the stream received but wasn't read.
     void add_stream(http2_stream_base& s);
     void remove_stream(http2::stream_id id);
 

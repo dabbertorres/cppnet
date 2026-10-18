@@ -341,7 +341,8 @@ session::on_data(const frame_header& h, std::span<const std::byte> payload, sess
     }
 
     auto& s = it->second;
-    if (length > s.recv_window) return stream_error(h.stream, error_code::flow_control_error, &events, now);
+    if (length > s.recv_window)
+        return data_error(h.stream, payload.size(), error_code::flow_control_error, events, now);
     s.recv_window -= length;
 
     const bool end = (h.flags & flags::end_stream) != 0;
@@ -350,7 +351,7 @@ session::on_data(const frame_header& h, std::span<const std::byte> payload, sess
     const bool too_long = s.content_length.has_value() && s.received > *s.content_length;
     const bool too_short =
         end && s.content_length.has_value() && s.received != *s.content_length && !s.head_request && !s.no_body;
-    if (too_long || too_short) return stream_error(h.stream, error_code::protocol_error, &events, now);
+    if (too_long || too_short) return data_error(h.stream, payload.size(), error_code::protocol_error, events, now);
 
     // an empty frame that doesn't end the stream does nothing (CVE-2019-9518, empty frames flood).
     if (data->empty() && !end)
@@ -853,9 +854,11 @@ void session::consume(stream_id stream, std::size_t n) { give_back(stream, n); }
 
 void session::give_back(stream_id stream, std::size_t n)
 {
-    // the connection's window, once half of it has been consumed.
+    // the connection's window, once half of it has been consumed, or as much as the peer has left of it (so a stream
+    // being read isn't held up by others' data waiting to be read, which the window is large enough for).
     connection_unconsumed += n;
-    if (connection_unconsumed >= std::max<std::uint32_t>(config.connection_window, 65'535) / 2)
+    if (connection_unconsumed >= std::max<std::uint32_t>(config.connection_window, 65'535) / 2
+        || std::cmp_greater_equal(connection_unconsumed, connection_recv_window))
     {
         encode_window_update(0, static_cast<std::uint32_t>(connection_unconsumed), output);
         connection_recv_window += static_cast<std::int64_t>(connection_unconsumed);
@@ -912,6 +915,16 @@ std::error_code session::stream_error(stream_id stream, error_code code, session
 
     if (known && events != nullptr) events->on_stream_reset(stream, make_error_code(code));
     return {};
+}
+
+std::error_code
+session::data_error(stream_id stream, std::size_t length, error_code code, session_events& events, time_point now)
+{
+    // the stream won't consume the frame: what it took of the connection's window is given back at once, as for a
+    // stream that's gone (once it's forgotten, so only the connection's).
+    auto err = stream_error(stream, code, &events, now);
+    if (!err) give_back(stream, length);
+    return err;
 }
 
 std::error_code session::glitch(time_point now)

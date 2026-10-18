@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <spdlog/logger.h>
@@ -24,7 +27,7 @@
 #include "http/http2_session.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
-#include "io/util.hpp"
+#include "tcp.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http::detail
@@ -89,14 +92,18 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
     auto& c = *stream->conn;
     while (true)
     {
-        std::uint64_t seen = 0;
+        std::uint64_t seen   = 0;
+        bool          took   = false; // what's buffered
+        std::size_t   n      = 0;
+        bool          output = false;
         {
             std::scoped_lock lock{c.mu};
             auto&            s = *stream;
 
             if (s.received_start < s.received.size())
             {
-                const auto n = std::min(data.size(), s.received.size() - s.received_start);
+                took = true;
+                n    = std::min(data.size(), s.received.size() - s.received_start);
                 std::ranges::copy(std::span{s.received}.subspan(s.received_start, n), data.begin());
                 s.received_start += n;
                 if (s.received_start == s.received.size())
@@ -104,18 +111,36 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
                     s.received.clear();
                     s.received_start = 0;
                 }
+                else if (s.received_start >= s.received.size() / 2)
+                {
+                    // a reader that never catches up mustn't keep all it's read: what's left moves to the front, so
+                    // the buffer holds at most about twice the stream's window.
+                    s.received.erase(s.received.begin(),
+                                     s.received.begin() + static_cast<std::ptrdiff_t>(s.received_start));
+                    s.received_start = 0;
+                }
 
                 // the peer may send as much more.
                 c.session.consume(s.id, n);
                 s.deadline.reset();
-                co_return io::result{.count = n};
+                output = c.session.has_output();
             }
+            else
+            {
+                if (s.received_end) co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
+                if (s.failure) co_return io::result{.err = s.failure};
 
-            if (s.received_end) co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
-            if (s.failure) co_return io::result{.err = s.failure};
+                seen = s.changed.value();
+                c.set_deadline(s, s.read_timeout);
+            }
+        }
 
-            seen = s.changed.value();
-            c.set_deadline(s, s.read_timeout);
+        if (took)
+        {
+            // a WINDOW_UPDATE goes now: the peer may be waiting for it, while this reader goes on reading what's
+            // buffered (or stops reading for a while).
+            if (output) c.wake_writer();
+            co_return io::result{.count = n};
         }
 
         c.wake_writer();
@@ -273,7 +298,20 @@ bool http2_connection_base::receive(std::vector<std::byte>& pending)
 
 void http2_connection_base::add_stream(http2_stream_base& s) { active.emplace(s.id, &s); }
 
-void http2_connection_base::remove_stream(http2::stream_id id) { active.erase(id); }
+void http2_connection_base::remove_stream(http2::stream_id id)
+{
+    const auto it = active.find(id);
+    if (it == active.end()) return;
+
+    // what the stream received that no one read is given back, or the connection's window would shrink for good (the
+    // session gives back only the connection's, if it's done with the stream).
+    auto& s = *it->second;
+    if (const auto unread = s.received.size() - s.received_start; unread > 0) session.consume(id, unread);
+    s.received.clear();
+    s.received_start = 0;
+
+    active.erase(it);
+}
 
 void http2_connection_base::on_data(http2::stream_id id, std::span<const std::byte> data, bool end_stream)
 {

@@ -62,6 +62,10 @@ connection_pool::connection_pool(io::scheduler* scheduler, client_options option
 {
     // a response's head may be as large as HTTP/1.1's (1 MiB), plus 32 bytes a field, for 100 of them.
     http2_config.session.local.max_header_list_size = (std::uint32_t{1} << 20) + (32 * 100);
+
+    // the connection's window holds as many streams' windows as a server's likely to allow (as Go's, 1 GiB), so
+    // responses read one at a time don't wait for each other: each stream still has only its own window outstanding.
+    http2_config.session.connection_window = std::uint32_t{1} << 30;
 }
 
 connection_pool::~connection_pool()

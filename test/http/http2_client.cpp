@@ -1,14 +1,20 @@
+#include "http/http2_client.hpp"
+
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <format>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <catch2/catch_message.hpp>
@@ -18,6 +24,7 @@
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
+#include "http/connection.hpp"
 #include "http/connection_pool.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -25,10 +32,12 @@
 #include "http/router.hpp"
 #include "http/server.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "listen.hpp"
+#include "tcp.hpp"
 #include "url.hpp"
 
 namespace http = net::http;
@@ -74,6 +83,13 @@ http::router make_router(net::io::scheduler* sched)
               const std::string big(1'000'000, 'b');
               auto*             body = co_await resp.send(http::status::OK, big.size());
               co_await net::io::write_all(*body, big);
+          });
+    r.GET("/huge",
+          [](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              const std::string huge(4'000'000, 'h');
+              auto*             body = co_await resp.send(http::status::OK, huge.size());
+              co_await net::io::write_all(*body, huge);
           });
     return r;
 }
@@ -232,6 +248,103 @@ TEST_CASE("a response dropped before its end resets its stream, not the connecti
     };
 
     CHECK(sched.run_to_completion(test(&client, &server)) == "2 hello over HTTP/2, open 1");
+}
+
+TEST_CASE("responses dropped partly read give the HTTP/2 connection's window back", "[http][http2][client][flow]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+
+    const auto test = [](net::io::scheduler* sched, std::uint16_t port) -> task<std::string>
+    {
+        auto socket = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+        REQUIRE(socket.has_value());
+
+        // a connection whose window is 4 streams' (the client's is 1 GiB), which 30 responses' unread data (at least a
+        // frame of 16 KiB each) would use up.
+        http::detail::http2_client_options options{.io_timeout = 5s};
+        options.session.connection_window = 4 * 65'535;
+
+        auto conn = std::make_shared<http::detail::http2_client_connection>(
+            sched,
+            std::make_unique<http::detail::connection>(std::move(*socket)),
+            options,
+            http::detail::http2_client_connection::callbacks{});
+        REQUIRE(conn->start());
+
+        const auto big = net::url::parse(std::format("http://127.0.0.1:{}/big", port)).value();
+        for (int i = 0; i < 30; ++i)
+        {
+            http::client_request req{.method = http::request_method::GET, .uri = big};
+            auto                 resp = co_await conn->send(req);
+            REQUIRE(resp.has_value());
+
+            std::array<std::byte, 1> one{};
+            REQUIRE_FALSE((co_await resp->body->read(one)).err);
+            // dropped, mostly unread.
+        }
+
+        // then one read to its end: at once, rather than a byte at a time (all the window that would be left).
+        http::client_request req{.method = http::request_method::GET, .uri = big};
+        auto                 resp = co_await conn->send(req);
+        REQUIRE(resp.has_value());
+
+        const auto             deadline = net::io::clock::now() + 5s;
+        std::size_t            total    = 0;
+        std::vector<std::byte> buffer(65'536);
+        std::error_code        err;
+        while (!err && net::io::clock::now() < deadline)
+        {
+            const auto res = co_await resp->body->read(buffer);
+            total += res.count;
+            err = res.err;
+        }
+        resp->body.reset();
+        conn->close();
+
+        if (err && err != net::io::errc::end_of_stream) co_return "error: " + err.message();
+        co_return std::format("read {}", total);
+    };
+
+    CHECK(sched.run_to_completion(test(&sched, server.server.local_port())) == "read 1000000");
+}
+
+TEST_CASE("many large HTTP/2 responses can be read one at a time", "[http][http2][client][flow]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+
+    auto options       = prior_knowledge();
+    options.io_timeout = 5s;
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::vector<std::string>>
+    {
+        // 24 responses' heads, and as much of their bodies as their streams' windows allow (1.5 MiB in all); then each
+        // read to the end in turn.
+        constexpr int                      n = 24;
+        std::vector<http::client_response> responses;
+        for (int i = 0; i < n; ++i)
+        {
+            auto resp = co_await client->get(url);
+            REQUIRE(resp.has_value());
+            responses.push_back(std::move(*resp));
+        }
+
+        std::vector<std::string> out;
+        for (auto& resp : responses)
+        {
+            auto body = co_await net::io::read_all(*resp.body);
+            out.push_back(body.has_value() ? std::format("read {}", body->size()) : "error: " + body.error().message());
+        }
+        out.push_back(std::format("open {}", client->stats().open));
+        co_return out;
+    };
+
+    const auto results = sched.run_to_completion(test(&client, server.url("/huge")));
+    REQUIRE(results.size() == 25);
+    for (std::size_t i = 0; i < 24; ++i) CHECK(results[i] == "read 4000000");
+    CHECK(results.back() == "open 1");
 }
 
 TEST_CASE("at the server's stream limit, the client opens another connection, or waits",

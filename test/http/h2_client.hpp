@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <iterator>
@@ -52,6 +53,7 @@ struct h2_client final : http2::session_events
     bool                                 goaway   = false;
     bool                                 closed   = false;
     int                                  finished = 0;
+    int                                  pings    = 0; // acknowledged
 
     void
     on_headers(http2::stream_id id, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
@@ -89,7 +91,7 @@ struct h2_client final : http2::session_events
     {
         goaway = true;
     }
-    void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override {}
+    void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override { ++pings; }
 
     void done(response& r)
     {
@@ -171,6 +173,14 @@ struct h2_client final : http2::session_events
     net::coro::task<bool> wait_for(http2::stream_id id)
     {
         return pump([this, id] { return responses[id].done; });
+    }
+
+    // sync sends a PING, and pumps until it's acknowledged: by then, the server has received all that was sent before.
+    net::coro::task<bool> sync()
+    {
+        constexpr std::array<std::byte, 8> opaque{};
+        s.ping(opaque);
+        return pump([this, want = pings + 1] { return pings >= want; });
     }
 
     std::map<http2::stream_id, std::string> pending_body;

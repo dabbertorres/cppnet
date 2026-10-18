@@ -164,8 +164,10 @@ HTTP/2 is used over TLS with servers that agree on it with ALPN (unless `client_
 cleartext only when `client_options::http2_prior_knowledge` says the server speaks it. A response's `version` says
 which was used. An HTTP/2 connection is shared by the host's requests, each on a stream of its own, up to the
 server's limit on streams; then another connection is opened (within `max_connections_per_host`), or, with
-`strict_max_concurrent_streams`, requests wait for a stream. A response destroyed before its body's end resets just
-its stream. A request the server refused without processing it is sent again, once, if it has no body.
+`strict_max_concurrent_streams`, requests wait for a stream. Its responses' bodies may be read in any order, or not at
+all: each stream holds at most its window (64 KiB) of a body not yet read, and the connection's window has room for
+every stream's. A response destroyed before its body's end resets just its stream. A request the server refused
+without processing it is sent again, once, if it has no body.
 
 For `https://`, the server's certificate is verified against the system's trusted certificate authorities, or those
 in `client_options::tls` (e.g. `options.tls.trusted_ca_file = "ca.pem"`, for a private CA). A failed verification

@@ -1,15 +1,20 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <map>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_message.hpp>
@@ -27,6 +32,7 @@
 #include "http/router.hpp"
 #include "http/server.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
@@ -83,7 +89,11 @@ http::router make_router(net::io::scheduler* sched)
 struct test_server
 {
     explicit test_server(net::io::scheduler* sched, const http::server_config& cfg = {})
-        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), make_router(sched), cfg}
+        : test_server{sched, make_router(sched), cfg}
+    {}
+
+    test_server(net::io::scheduler* sched, http::router router, const http::server_config& cfg = {})
+        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), std::move(router), cfg}
     {
         REQUIRE(sched->spawn(server.serve()));
     }
@@ -95,16 +105,48 @@ struct test_server
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
-// with_client connects to port, and runs test with an h2_client over the connection.
+// with_client connects to port, and runs test with an h2_client over the connection (whose reads fail after
+// read_timeout without progress, if it's given: for a test whose server could stop sending).
 template<typename Test>
-task<> with_client(net::io::scheduler* sched, std::string port, Test test)
+task<> with_client(net::io::scheduler*                     sched,
+                   std::string                             port,
+                   Test                                    test,
+                   std::optional<net::io::clock::duration> read_timeout = std::nullopt)
 {
     auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
     REQUIRE(conn.has_value());
+    conn->set_read_timeout(read_timeout);
 
     h2_client client{&*conn, &*conn};
     co_await test(client);
 }
+
+// gate holds handlers until a test opens it: the n-th to pass waits for the n-th open() (or the scheduler to stop).
+struct gate
+{
+    explicit gate(net::io::scheduler* sched)
+        : sched{sched}
+    {}
+
+    task<> pass()
+    {
+        const auto n = arrived.fetch_add(1) + 1;
+        for (auto seen = opened.load(); seen < n; seen = opened.load())
+        {
+            if (co_await sched->wait_on(opened, seen) == std::errc::operation_canceled) co_return;
+        }
+    }
+
+    void open()
+    {
+        opened.fetch_add(1);
+        sched->notify_all(opened);
+    }
+
+    net::io::scheduler*        sched;
+    std::atomic<std::uint64_t> arrived{0};
+    std::atomic<std::uint64_t> opened{0};
+};
 
 }
 
@@ -304,4 +346,104 @@ TEST_CASE("without http2, a client's HTTP/2 preface isn't understood", "[http][h
                                             CHECK_FALSE(c.responses[id].done);
                                             CHECK(c.closed);
                                         }));
+}
+
+TEST_CASE("request bodies HTTP/2 handlers don't read give the connection's window back", "[http][http2][server][flow]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+    r.POST("/ignore",
+           [&g](const http::server_request&, http::response_writer& resp) -> task<void>
+           {
+               co_await g.pass();
+               co_await resp.send(http::status::OK, 0);
+           });
+
+    // with 10 streams, the connection's window is 1 MiB.
+    test_server server{&sched, std::move(r), {.http2_max_concurrent_streams = 10}};
+
+    sched.run_to_completion(with_client(
+        &sched,
+        server.port(),
+        [&g](h2_client& c) -> task<>
+        {
+            // 30 bodies of 60 KB (1.8 MB), each received whole before its handler returns without reading it.
+            const std::string body(60'000, 'x');
+            for (int i = 0; i < 30; ++i)
+            {
+                const auto id = c.request("POST", "/ignore", body);
+                REQUIRE(co_await c.sync());
+                g.open();
+                REQUIRE(co_await c.wait_for(id));
+                REQUIRE(c.responses[id].status == "200");
+            }
+
+            // then an upload, which needs the connection's window.
+            const std::string upload(300'000, 'u');
+            const auto        id = c.request("POST", "/echo", upload);
+            REQUIRE(co_await c.wait_for(id));
+            CAPTURE(c.responses[id].reset.message());
+            CHECK(c.responses[id].body == upload);
+        },
+        5s));
+}
+
+TEST_CASE("an HTTP/2 handler's reads give the window back at once, though it stops reading",
+          "[http][http2][server][flow]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    constexpr std::size_t first = 40'000;
+
+    auto r = make_router(&sched);
+    r.POST("/partial",
+           [&g](http::server_request& req, http::response_writer& resp) -> task<void>
+           {
+               // once the stream's window of the body has arrived, part of it is read (more than half the window, so
+               // the peer's owed a WINDOW_UPDATE), without the reads finding the buffer empty.
+               co_await g.pass();
+               std::vector<std::byte> buffer(4'096);
+               for (std::size_t read = 0; read < first;)
+               {
+                   const auto res =
+                       co_await req.body->read(std::span{buffer}.first(std::min(buffer.size(), first - read)));
+                   if (res.err) throw std::system_error{res.err};
+                   read += res.count;
+               }
+
+               // then nothing more, until the client has sent the rest (which needs that WINDOW_UPDATE).
+               co_await g.pass();
+               auto rest = co_await net::io::read_all(*req.body);
+               if (!rest.has_value()) throw std::system_error{rest.error()};
+
+               const auto size = std::to_string(first + rest->size());
+               auto*      body = co_await resp.send(http::status::OK, size.size());
+               co_await net::io::write_all(*body, size);
+           });
+
+    // NOTE: the connection's timer wakes the writer too (at the idle timeout it set before the request arrived, which
+    //       is header_read_timeout): not before the client's reads time out.
+    test_server server{&sched, std::move(r), {.header_read_timeout = 60s}};
+
+    sched.run_to_completion(with_client(
+        &sched,
+        server.port(),
+        [&g](h2_client& c) -> task<>
+        {
+            // a stream's window (65535) is sent at once; the rest fits in what the reads give back.
+            const std::string body(90'000, 'x');
+            const auto        id = c.request("POST", "/partial", body);
+            REQUIRE(co_await c.sync());
+            g.open();
+
+            REQUIRE(co_await c.pump([&] { return c.pending_body.empty(); }));
+            g.open();
+
+            REQUIRE(co_await c.wait_for(id));
+            CHECK(c.responses[id].body == "90000");
+        },
+        5s));
 }

@@ -156,7 +156,8 @@ net::coro::task<bool> starts_with_preface(net::io::buffered_reader& reader)
 }
 
 // http2_session_config is HTTP/2's settings for a server's config: its streams' limit, and its head's, as a header list
-// (whose fields count 32 more each, for at most as many fields as HTTP/1.1's).
+// (whose fields count 32 more each, for at most as many fields as HTTP/1.1's); and the connection's window, which holds
+// every stream's (at least 1 MiB), so bodies read one at a time don't wait for each other.
 net::http::http2::session_config http2_session_config(const net::http::server_config& cfg)
 {
     net::http::http2::session_config config;
@@ -164,6 +165,10 @@ net::http::http2::session_config http2_session_config(const net::http::server_co
     config.local.max_header_list_size =
         static_cast<std::uint32_t>(std::min<std::size_t>(cfg.max_header_bytes + (32 * net::http::http11::max_fields),
                                                          net::http::http2::unlimited - 1));
+
+    const auto streams       = std::uint64_t{config.local.max_concurrent_streams} * config.local.initial_window_size;
+    config.connection_window = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>(streams, std::uint64_t{1} << 20, net::http::http2::max_window));
     return config;
 }
 
