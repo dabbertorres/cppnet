@@ -235,7 +235,6 @@ using namespace std::string_view_literals;
 
 server::server(io::scheduler* scheduler, net::listener listener, request_handler handler, const server_config& cfg)
     : listener{std::move(listener)}
-    , is_serving{false}
     , handler{std::move(handler)}
     , logger{cfg.logger}
     , scheduler{scheduler}
@@ -275,7 +274,9 @@ server::~server()
 
 void server::close()
 {
-    if (!is_serving.exchange(false, std::memory_order::acq_rel)) return;
+    // NOTE: whether or not serve() has started: it may yet be, as a task the scheduler hasn't run, and then returns at
+    //       once.
+    if (closed.exchange(true, std::memory_order::acq_rel)) return;
 
     listener.shutdown();
 
@@ -290,18 +291,27 @@ void server::close()
 
 coro::task<> server::serve()
 {
-    // the server waits for this to finish before it's destroyed.
-    auto held = running.acquire();
+    // the server waits for the task to finish (or be destroyed) before it's destroyed: from now, rather than from when
+    // the task starts, which could be after the server was destroyed (its destructor finding nothing to wait for).
+    return accept_connections(running.acquire());
+}
+
+coro::task<> server::accept_connections(coro::async_scope::lease held)
+{
+    // the server's being destroyed: serve() was called too late.
     if (!held) co_return;
 
-    if (is_serving.exchange(true, std::memory_order::acq_rel))
+    // closed before it started.
+    if (closed.load(std::memory_order::acquire)) co_return;
+
+    if (serving.exchange(true, std::memory_order::acq_rel))
     {
         throw exception{"already serving"};
     }
 
     auto backoff = io::clock::duration::zero();
 
-    while (is_serving.load(std::memory_order::acquire))
+    while (!closed.load(std::memory_order::acquire))
     {
         if (!co_await room_for_connection()) co_return;
 
@@ -355,7 +365,7 @@ coro::task<> server::serve()
 
 coro::task<bool> server::room_for_connection()
 {
-    while (max_connections != 0 && is_serving.load(std::memory_order::acquire))
+    while (max_connections != 0 && !closed.load(std::memory_order::acquire))
     {
         const auto open = open_connections.load(std::memory_order::acquire);
         if (open < max_connections) co_return true;

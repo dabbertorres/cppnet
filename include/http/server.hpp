@@ -120,7 +120,9 @@ public:
     // close once their streams are done. Waiting for the connections is the destructor's, or the scheduler's.
     void close();
 
-    // serve accepts and serves connections, until the server is closed (or the scheduler stopped).
+    // serve accepts and serves connections, until the server is closed (or the scheduler stopped). The server waits
+    // for the task it returns from when it's called: until the task finishes, or is destroyed without running (e.g.
+    // by a scheduler that refused it). If the server's closed before the task starts, it returns at once.
     coro::task<> serve();
 
     // local_port is the port the server listens on: e.g. the one chosen for it, if it was configured with port "0".
@@ -129,6 +131,9 @@ public:
 private:
     // connection_state is what's kept for a connection from one request to the next (see server.cpp).
     struct connection_state;
+
+    // accept_connections is serve()'s task, holding a lease on running (so the server isn't destroyed meanwhile).
+    coro::task<> accept_connections(coro::async_scope::lease held);
 
     // room_for_connection waits until fewer than max_connections are open, returning false if the scheduler stops.
     coro::task<bool> room_for_connection();
@@ -173,7 +178,8 @@ private:
     coro::task<> respond_and_close(detail::connection& conn, connection_state& state, status code);
 
     net::listener                   listener;
-    std::atomic_bool                is_serving;
+    std::atomic_bool                serving{false}; // serve() has started
+    std::atomic_bool                closed{false};  // close() was called
     request_handler                 handler;
     std::shared_ptr<spdlog::logger> logger;
     io::scheduler*                  scheduler;

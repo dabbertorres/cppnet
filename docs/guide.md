@@ -76,8 +76,9 @@ The objects that coroutines use must outlive them too:
 - the scheduler outlives everything that uses it;
 - a socket outlives the reads and writes waiting on it;
 - a client outlives its requests (copies of a client share its connections, so a copy may be what a task keeps);
-- a server outlives `serve()`, and its destructor waits for its connections (so it can't be destroyed from one of
-  the scheduler's tasks).
+- a server's destructor waits for the task `serve()` returned (from when it's called: to finish, or to be destroyed
+  unrun, as by a scheduler that refuses it) and for its connections (so it can't be destroyed from one of the
+  scheduler's tasks).
 
 ## Errors
 
@@ -221,7 +222,8 @@ scheduler.spawn(server.serve());
 - **Stopping:** `server.close()` stops accepting and ends the connections gracefully: a connection waiting for a
   request (its first, or the next on a kept-alive one) closes at once, and one in the middle of a request finishes it
   (the handler reads the body and sends its response as usual, which says `Connection: close` if it wasn't sent yet),
-  then closes, without serving requests pipelined after it; HTTP/2 connections are below. `close()` cancels nothing:
+  then closes, without serving requests pipelined after it; HTTP/2 connections are below. A `serve()` task that
+  hasn't started yet returns at once when it does. `close()` cancels nothing:
   `scheduler.shutdown()` (or `request_stop()`) cancels what the connections are still waiting for, and destroying
   the server closes it, ends HTTP/1.1 requests still in progress (reading a body fails), and waits for its
   connections.

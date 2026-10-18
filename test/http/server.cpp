@@ -792,6 +792,57 @@ TEST_CASE("a server can be destroyed while the scheduler runs", "[http][server][
     CHECK(idle.read_to_end().empty());
 }
 
+TEST_CASE("a server can be destroyed before its serve() task starts", "[http][server][lifetime]")
+{
+    // one worker, kept busy for a moment: serve()'s task waits behind it.
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(1)};
+
+    const auto busy = [](std::chrono::milliseconds how_long) -> task<>
+    {
+        // NOTE: blocking the worker, deliberately.
+        std::this_thread::sleep_for(how_long);
+        co_return;
+    };
+
+    const auto router = []
+    {
+        http::router r;
+        r.GET("/:name", echo_name);
+        return r;
+    };
+
+    SECTION("destroyed")
+    {
+        auto server =
+            std::make_unique<http::server>(&sched, router(), http::server_config{.host = "127.0.0.1", .port = "0"});
+        REQUIRE(sched.spawn(busy(200ms)));
+        REQUIRE(sched.spawn(server->serve()));
+
+        // it waits for the task, which returns at once when it runs (rather than serving a destroyed server).
+        const auto start = std::chrono::steady_clock::now();
+        server.reset();
+        CHECK(std::chrono::steady_clock::now() - start < 2s);
+    }
+
+    SECTION("closed before it starts: it doesn't serve")
+    {
+        http::server server{
+            &sched,
+            router(),
+            {.host = "127.0.0.1", .port = "0"}
+        };
+        REQUIRE(sched.spawn(busy(100ms)));
+        REQUIRE(sched.spawn(server.serve()));
+        server.close();
+
+        // the connection's queued (the server listens from when it's constructed), but not served.
+        blocking_client conn{server.local_port()};
+        conn.set_receive_timeout(500ms);
+        conn.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+        CHECK(conn.read_some().empty());
+    }
+}
+
 TEST_CASE("the server closes connections that make no progress", "[http][server][timeout]")
 {
     running_scheduler running;
@@ -1008,10 +1059,12 @@ struct flag
     std::atomic<std::uint64_t> word = 0;
 };
 
-// serving serves with server until it's closed, then sets done.
-task<> serving(net::io::scheduler* sched, http::server* server, flag* done)
+// serving runs a server's serve() task until the server's closed, then sets done (which must outlive the scheduler,
+// as this may still be setting it after the server's destroyed). It takes the task, rather than calling serve() when
+// it starts: the server waits for the task from when serve() is called, and could otherwise be destroyed first.
+task<> serving(net::io::scheduler* sched, task<> serve, flag* done)
 {
-    co_await server->serve();
+    co_await std::move(serve);
     done->set(sched);
 }
 
@@ -1043,11 +1096,12 @@ task<void> read_body(http::server_request& req, http::response_writer& resp)
 TEST_CASE("closing the server lets the requests in progress finish, then closes their connections",
           "[http][server][close]")
 {
-    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
-
+    // NOTE: before the scheduler, which waits for the tasks that use them.
     flag started;
     flag release;
     flag serve_done;
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
     http::router router;
     router.GET("/:name", echo_name);
@@ -1084,7 +1138,7 @@ TEST_CASE("closing the server lets the requests in progress finish, then closes 
         std::move(router),
         {.host = "127.0.0.1", .port = "0"}
     };
-    REQUIRE(sched.spawn(serving(&sched, &server, &serve_done)));
+    REQUIRE(sched.spawn(serving(&sched, server.serve(), &serve_done)));
 
     struct outcome
     {
@@ -1188,6 +1242,9 @@ TEST_CASE("closing the server lets the requests in progress finish, then closes 
 
 TEST_CASE("closing the server closes idle connections at once", "[http][server][close]")
 {
+    // NOTE: before the scheduler, which waits for the task that sets it.
+    flag serve_done;
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
     http::router router;
@@ -1200,8 +1257,7 @@ TEST_CASE("closing the server closes idle connections at once", "[http][server][
         {.host = "127.0.0.1", .port = "0", .header_read_timeout = 30s}
     };
 
-    flag serve_done;
-    REQUIRE(sched.spawn(serving(&sched, &server, &serve_done)));
+    REQUIRE(sched.spawn(serving(&sched, server.serve(), &serve_done)));
 
     struct outcome
     {
