@@ -1,6 +1,6 @@
 # Plan: fixing what the TLS and HTTP/2 reviews found
 
-Status: planned (2026-10-18). Six groups, each its own branch and pull request, in order. Each fix comes with a test
+Status: planned (2026-10-18); groups 1 and 2 done. Six groups, each its own branch and pull request, in order. Each fix comes with a test
 that fails without it. Findings are labelled as the reviews' were: TLS (T), the HTTP/2 protocol (P), server (S),
 client (C), and the effects on what existed before (R).
 
@@ -156,7 +156,26 @@ the scheduler runs.
 - **Public headers include HTTP/2's internals (R10).** `session_config`, `settings` and `token_bucket` move to
   `http/http2_config.hpp`; `connection_pool.hpp` and `server.hpp` include that and forward-declare the connections.
 
-Tests: a cleartext connection that sends nothing closes at `header_read_timeout`; `max_header_bytes = SIZE_MAX`.
+- **A connection that ends with streams in flight isn't closed until their handlers return (found after group 2).**
+  After a connection error's GOAWAY (e.g. ENHANCE_YOUR_CALM at the handler limit), a protocol error, a failed write, or
+  the client closing, `http2_connection_base::run()` waits for the handlers before the connection is closed: RFC 9113
+  section 5.4.1 says the TCP connection MUST be closed, and a client waits for the streams GOAWAY says may have been
+  processed until it is (or for ever). `run()` shuts the connection down (`detail::shutdown()`: close_notify over TLS,
+  then FIN) once the writer has flushed what's left (after `workers.join()`), and only then awaits `finish_streams()`.
+  The fd, and the server's `max_connections` slot, are still held until the handlers return, deliberately: as handlers
+  can't be cancelled, that bounds those left running to `max_connections * max_concurrent_streams` (freeing the slot
+  would let a client reconnect and pile up more); HTTP/1.1 holds its slot the same way. The comments on `run()` and
+  `schedule()`, and `docs/plans/http2.md`, say so. Graceful `close()` is unchanged.
+- **The calm GOAWAY's last stream over-claims.** It's the highest stream whose handler was started, not
+  `last_peer_stream()` (which counts queued streams that never start, and the one that tripped the limit), so the
+  client may retry the rest.
+- **The stream that trips the handler limit stays in the stream maps.** It's removed (`remove_stream()`, which gives
+  back its unread data) when the connection is ended for it.
+
+Tests: a cleartext connection that sends nothing closes at `header_read_timeout`; `max_header_bytes = SIZE_MAX`; at
+the handler limit, the client sees the connection close while the handlers are still held, and (with
+`max_connections = 1`) a second client's request is answered only once they've finished; a client that closes its side
+with a handler held gets the server's FIN at once; the calm GOAWAY's last stream is the last started.
 
 ## 6. TLS
 
@@ -182,3 +201,11 @@ Tests: a response injected after a body (the review's reproduction), and close_n
 HTTP/1.1 over TLS (the client with `http2` off); a truncated body without Content-Length over https; an idle
 connection closed with close_notify, then the retry; a fatal alert mid-stream; the empty host guard; the mismatched
 key; an empty read; a slow peer while two tasks write.
+
+## Afterwards: cancelling handlers
+
+Handlers can't be cancelled: `server_request` has no stop token, so a handler that does no I/O (a sleep, a database
+call, a long computation) doesn't learn that its stream was reset or its connection ended, which is what makes a
+connection's `max_connections` slot (see group 5) held long. Once group 6 is done, plan a `std::stop_token` on
+`server_request` (stopped when the stream fails: a reset, a timeout, the connection ending; and for HTTP/1.1 when the
+connection ends), and how handlers and middleware would use it.
