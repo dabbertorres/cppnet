@@ -16,6 +16,7 @@
 
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 
 // HTTP/2's protocol, without I/O: a session is fed what's read from the connection (receive()), told what the
 // application sends (submit_headers(), submit_data(), ...), and gives what's to be written (take_output()). It's
@@ -75,53 +76,8 @@ public:
     virtual void on_ping_ack(std::span<const std::byte, 8> opaque) = 0;
 };
 
-// token_bucket allows a burst of events, then rate a second.
-struct token_bucket
-{
-    double                                burst  = 0;
-    double                                rate   = 0; // a second
-    double                                tokens = burst;
-    std::chrono::steady_clock::time_point last{};
-
-    // take takes a token, returning false if there are none.
-    bool take(std::chrono::steady_clock::time_point now) noexcept;
-};
-
-// session_config configures a session: what it advertises, and the limits that defend it.
-struct session_config
-{
-    // This side's settings, sent first. ENABLE_PUSH is always sent as 0 (this side never pushes, nor accepts pushes).
-    // initial_window_size must be at least its default (65535), as the peer may send that much before it has seen it.
-    settings local{
-        .max_concurrent_streams = 100,
-        .max_header_list_size   = hpack::default_max_list_size,
-    };
-
-    // The connection's receive window, raised from its initial 65535 with a WINDOW_UPDATE: how much the peer may send
-    // on all streams before this side consumes some. It's to hold every stream's window (local.initial_window_size
-    // times the streams that may be open), or streams read one at a time may wait for each other's data to be read:
-    // http::client's is 1 GiB, a server's its streams' (at least 1 MiB).
-    std::uint32_t connection_window = std::uint32_t{1} << 20;
-
-    // The most CONTINUATION frames a header block may have (nghttp2's default), or, if it's more, as many as a block
-    // of local.max_header_list_size takes in 16 KiB frames (the least MAX_FRAME_SIZE, which the peer may send whatever
-    // this side's). Its encoded size is limited by local.max_header_list_size. A block past either ends the connection
-    // (ENHANCE_YOUR_CALM), as it would have to be decoded anyway, to keep HPACK's table in step.
-    std::size_t max_continuations = 8;
-
-    // The most settings a SETTINGS frame may have (Go's limit).
-    std::size_t max_settings = 100;
-
-    // The most control frames this side may have to answer (SETTINGS and PING acknowledgements) before its output is
-    // taken: past it, the peer is flooding (nghttp2's default).
-    std::size_t max_pending_replies = 1'000;
-
-    // The most streams the peer may reset (Rapid Reset, CVE-2023-44487), and the most protocol errors and suspicious
-    // frames it may cause (MadeYouReset, empty frames, frames on closed streams), before it's sent GOAWAY
-    // (ENHANCE_YOUR_CALM): nghttp2's defaults.
-    token_bucket peer_resets{.burst = 1'000, .rate = 33};
-    token_bucket glitches{.burst = 10'000, .rate = 330};
-};
+// session_config's default max_header_list_size is HPACK's (see http2_config.hpp, which doesn't include hpack.hpp).
+static_assert(session_config{}.local.max_header_list_size == hpack::default_max_list_size);
 
 // session is one end of an HTTP/2 connection.
 class session

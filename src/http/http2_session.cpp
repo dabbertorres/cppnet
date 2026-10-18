@@ -19,6 +19,7 @@
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http::http2

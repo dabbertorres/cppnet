@@ -22,9 +22,8 @@
 #include <sys/socket.h>
 
 #include "coro/task.hpp"
-#include "http/http2.hpp"
 #include "http/http2_client.hpp"
-#include "http/http2_session.hpp"
+#include "http/http2_config.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
 #include "util/defer.hpp"

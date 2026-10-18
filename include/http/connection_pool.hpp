@@ -17,7 +17,7 @@
 
 #include "coro/task.hpp"
 #include "http/connection.hpp"
-#include "http/http2_client.hpp"
+#include "http/http2_config.hpp"
 #include "io/scheduler.hpp"
 
 #ifdef NET_HAS_TLS
@@ -90,6 +90,8 @@ struct connection_stats
 
 namespace detail
 {
+
+    class http2_client_connection;
 
     // connection_pool keeps connections open for reuse, keyed by scheme, host and port, within client_options' limits.
     //

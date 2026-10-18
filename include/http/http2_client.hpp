@@ -1,6 +1,5 @@
 #pragma once
 
-#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <functional>
@@ -19,8 +18,8 @@
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_connection.hpp"
-#include "http/http2_session.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
@@ -46,19 +45,6 @@ public:
     std::vector<hpack::field> fields;
     std::string               authority;
     std::string               path;
-};
-
-// http2_client_options are what a client's HTTP/2 connections are made with: client_options'.
-struct http2_client_options
-{
-    std::chrono::milliseconds response_header_timeout{}; // 0: no limit
-    std::chrono::milliseconds io_timeout{};              // 0: no limit
-
-    // How long the connection may be idle (no streams, nor any reserved) before it's closed; 0 closes it as soon as
-    // its last stream is done.
-    std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
-
-    http2::session_config session{};
 };
 
 // owned_connection holds what an http2_client_connection owns, before its base (which refers to the connection) is

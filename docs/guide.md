@@ -289,5 +289,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |
 
-The rest are what those are built from (e.g. `http/http11.hpp`, the HTTP/1.1 codec). `detail` namespaces, and what
-the headers' comments say is for the scheduler or I/O objects (e.g. `thread_pool::poller`), aren't for applications.
+The rest are what those are built from (e.g. `http/http11.hpp`, the HTTP/1.1 codec; and HTTP/2's, `http/hpack.hpp`
+and `http/http2*.hpp`, of which `http/server.hpp` and `http/client.hpp` include only `http/http2_config.hpp`, for their
+configurations). `detail` namespaces, and what the headers' comments say is for the scheduler or I/O objects (e.g.
+`thread_pool::poller`), aren't for applications.

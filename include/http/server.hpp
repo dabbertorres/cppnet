@@ -19,7 +19,7 @@
 #include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "http/connection.hpp"
-#include "http/http2_server.hpp"
+#include "http/http2_config.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "io/discard_writer.hpp"

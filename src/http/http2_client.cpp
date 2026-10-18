@@ -25,6 +25,7 @@
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/http2_connection.hpp"
+#include "http/http2_session.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/io.hpp"

@@ -410,6 +410,10 @@ RST_STREAM on an idle stream would be a connection error for the peer.
 - `client_options::http2` (on by default) offers `h2` over TLS; `http2_prior_knowledge` speaks it over cleartext.
   Response trailers end the body, but aren't passed on (as with requests' on the server).
 - `server_config::http2_max_concurrent_streams` (100, as nginx's) was added, for the client's stream-limit tests.
+- (After review:) the public headers don't include HTTP/2's internals: what the configurations hold (`settings`,
+  `token_bucket`, `session_config`, and the server's and client's options) is in `http/http2_config.hpp`, which
+  `http/server.hpp` and `http/connection_pool.hpp` (so `http/client.hpp`) include, forward-declaring the connections;
+  `http/http2.hpp` and `http/http2_session.hpp` include it too, so what used them from there still builds.
 - No public servers in the tests: the HTTPS test is against the loopback server, which agrees on `h2`.
 
 ## Stages

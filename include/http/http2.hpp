@@ -2,12 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <span>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <vector>
+
+#include "http/http2_config.hpp"
 
 // HTTP/2's framing (RFC 9113): what HTTP/2's session is built from, not for applications (see docs/plans/http2.md).
 namespace net::http::http2
@@ -105,25 +106,6 @@ enum class setting_id : std::uint16_t
     max_header_list_size    = 0x6,
     enable_connect_protocol = 0x8,
     no_rfc7540_priorities   = 0x9,
-};
-
-inline constexpr std::uint32_t unlimited = std::numeric_limits<std::uint32_t>::max();
-
-// min_max_frame_size and max_max_frame_size are MAX_FRAME_SIZE's bounds.
-inline constexpr std::uint32_t min_max_frame_size = 16'384;
-inline constexpr std::uint32_t max_max_frame_size = 16'777'215;
-
-// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2).
-struct settings
-{
-    std::uint32_t header_table_size      = 4'096;
-    bool          enable_push            = true;
-    std::uint32_t max_concurrent_streams = unlimited;
-    std::uint32_t initial_window_size    = 65'535;
-    std::uint32_t max_frame_size         = min_max_frame_size;
-    std::uint32_t max_header_list_size   = unlimited;
-
-    bool operator==(const settings&) const = default;
 };
 
 // Encoding frames: each appends a whole frame (header and payload) to out.

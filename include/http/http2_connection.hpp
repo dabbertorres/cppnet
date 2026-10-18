@@ -22,6 +22,7 @@
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
