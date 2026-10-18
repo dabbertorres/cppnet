@@ -251,7 +251,11 @@ streams in flight (that GOAWAY, any other connection error, a failed write, or t
 processed until it is. Its fd, and its `max_connections` slot, are still held until the handlers return, deliberately:
 as handlers can't be cancelled, that bounds those left running to `max_connections` times `max_concurrent_streams`
 (freeing the slot would let a client reconnect and pile up more), and HTTP/1.1 holds its slot the same way. Graceful
-`close()` is unchanged. A malformed PRIORITY (the wrong size, or a stream depending on itself) resets an open stream, as
+`close()` is unchanged. (Later:) however a connection ends (the client's side too), its reader then goes on reading, and
+dropping, what the peer still sends, until the peer closes its side too, for up to 2 s (or 256 KB), as HTTP/1.1 lingers
+after an error response: closing with input unread, or (on macOS) input arriving after the reading side was shut down
+(as `end()` did), resets the connection, which discards what's still on its way to the peer, e.g. the end of a response
+while the client sends WINDOW_UPDATEs for what it's read. A malformed PRIORITY (the wrong size, or a stream depending on itself) resets an open stream, as
 a stream error the application is told of; on a stream that isn't open, it only counts as a glitch, as RST_STREAM on an
 idle stream would be a connection error for the peer.
 

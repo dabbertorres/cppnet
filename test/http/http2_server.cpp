@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -27,6 +28,7 @@
 #include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -664,6 +666,73 @@ TEST_CASE("an HTTP/2 client that closes its side gets the server's FIN at once w
     };
 
     sched.run_to_completion(test(&sched, server.port()));
+}
+
+TEST_CASE("an HTTP/2 connection that ends reads what the client still sends, rather than cutting off the response",
+          "[http][http2][server]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // more than TCP's buffers hold while the client doesn't read.
+    constexpr std::size_t      size = std::size_t{8} << 20;
+    std::atomic<std::uint64_t> written{0};
+
+    auto r = make_router(&sched);
+    r.GET("/huge",
+          [&written, &sched](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              // at once (into the session: the windows don't hold it back), so the handler returns.
+              const std::string body(size, 'h');
+              auto*             out = co_await resp.send(http::status::OK, body.size());
+              co_await net::io::write_all(*out, body);
+
+              written.store(1);
+              sched.notify_all(written);
+          });
+
+    test_server server{&sched, std::move(r)};
+
+    const auto test = [](net::io::scheduler* sched, std::string port, std::atomic<std::uint64_t>* written) -> task<>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+        REQUIRE(conn.has_value());
+
+        // windows that don't hold the response back: only TCP's do.
+        http2::session_config config;
+        config.local.initial_window_size = 0x7fff'ffff;
+        config.connection_window         = 0x7fff'ffff;
+        h2_client c{&*conn, &*conn, &*conn, http2::role::client, config};
+
+        // the request, and GOAWAY: the server ends the connection once the handler's done.
+        const auto id = c.request("GET", "/huge");
+        c.s.goaway(0, http2::error_code::no_error);
+
+        std::vector<std::byte> output;
+        c.s.take_output(output);
+        const auto sent = co_await net::io::write_all(*conn, output);
+        REQUIRE_FALSE(sent.err);
+
+        // the handler's returned, with most of the response still to be sent, and (by now) the connection's ended.
+        for (auto seen = written->load(); seen == 0; seen = written->load())
+            (void)co_await sched->wait_on(*written, seen);
+        (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+
+        // the client sends something more (as it sends WINDOW_UPDATEs as it reads): the server mustn't reset the
+        // connection for it (e.g. for input after shutting down its reading side, on macOS; or closing with it unread),
+        // which would discard what it's still sending.
+        constexpr std::array<std::byte, 8> opaque{};
+        c.s.ping(opaque);
+
+        const bool done = co_await c.wait_for(id);
+        CHECK(done);
+
+        const auto& resp = c.responses[id];
+        CAPTURE(resp.reset.message());
+        CHECK(resp.status == "200");
+        CHECK(resp.body.size() == size);
+    };
+
+    sched.run_to_completion(test(&sched, server.port(), &written));
 }
 
 TEST_CASE("HTTP/2's header list limit doesn't wrap with max_header_bytes near SIZE_MAX",

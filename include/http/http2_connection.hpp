@@ -162,9 +162,14 @@ public:
 
 protected:
     // run runs the connection until it ends (when the peer closes it, or it fails, or end() is called): already_read
-    // is what was read of it before. Once the reader's done, it lets the writer write what's left, and waits for it and
-    // the timer; then shuts the connection down (shutdown(): close_notify over TLS, then FIN), so the peer sees it end
-    // at once, and only then awaits finish_streams() (e.g. the server's handlers, which may take a while).
+    // is what was read of it before. Once it's ending, the writer writes what's left and shuts the connection down
+    // (shutdown(): close_notify over TLS, then FIN), so the peer sees it end at once, while the reader goes on reading
+    // (and dropping) what the peer still sends, until it closes its side too, or for linger_time; then it waits for the
+    // writer and the timer, and only then awaits finish_streams() (e.g. the server's handlers, which may take a while).
+    //
+    // NOTE: the reader lingers as closing a socket with input unread (or, on macOS, input arriving after shutting down
+    //       its reading side) resets the connection, and a reset discards what's still on its way to the peer: e.g.
+    //       the end of a response, while the client sends WINDOW_UPDATEs for what it's read of it.
     coro::task<> run(std::span<const std::byte> already_read);
 
     // add_stream and remove_stream register a stream for the events and timeouts (holding the lock). remove_stream
@@ -184,7 +189,8 @@ protected:
     // maybe_end ends the connection if it's done (holding the lock): called after receiving.
     virtual void maybe_end() {}
 
-    // end ends the connection (holding the lock): its streams fail, the writer finishes, and the reader stops.
+    // end ends the connection (holding the lock): its streams fail, the writer finishes (shutting the connection down),
+    // and the reader stops receiving (lingering: see run()).
     void               end();
     [[nodiscard]] bool ending() const noexcept { return is_ending; }
 
@@ -211,7 +217,9 @@ private:
     std::optional<io::clock::time_point> check_streams(io::clock::time_point now);
 
     // Guarded by mu.
-    bool                                 is_ending = false;
+    bool                                 is_ending   = false;
+    bool                                 reader_done = false; // it's stopped lingering
+    io::clock::time_point                linger_until;        // when the timer stops the reader, once ending
     std::optional<io::clock::time_point> timer_target;
 
     coro::notifier             writer_wakeup; // output to write, or the connection's ending

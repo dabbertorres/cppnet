@@ -42,6 +42,11 @@ namespace
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
 
+    // How long, and how much, the reader goes on reading once the connection's ending, for the peer to close its side
+    // (see run()), as an HTTP/1.1 server lingers after an error response.
+    constexpr auto        linger_time      = std::chrono::seconds{2};
+    constexpr std::size_t max_linger_bytes = std::size_t{256} * 1'024;
+
     // connection_specific is whether a field is HTTP/1's connection management, which HTTP/2 mustn't send (RFC 9113,
     // section 8.2.2).
     bool connection_specific(std::string_view name) noexcept
@@ -250,7 +255,8 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
     std::vector<std::byte> pending(already_read.begin(), already_read.end());
     std::vector<std::byte> buffer(read_size);
 
-    auto& reader = as_reader(conn);
+    auto& reader   = as_reader(conn);
+    bool  read_end = false; // the peer's closed its side (or reading failed)
     while (receive(pending))
     {
         auto res = co_await reader.read(buffer);
@@ -259,27 +265,41 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
         {
             // what was read before the end is still received.
             if (!pending.empty()) (void)receive(pending);
+            read_end = true;
             break;
         }
     }
 
+    // the writer writes what's left (e.g. GOAWAY), then shuts the connection down, so the peer sees it end at once:
+    // before the streams are done (e.g. the server's handlers, which can't be cancelled, so may take a while), as after
+    // a connection error it MUST be closed (RFC 9113, section 5.4.1), and the peer would wait for the streams GOAWAY
+    // says may have been processed until it is.
     {
         std::scoped_lock lock{mu};
         end();
     }
 
-    // the writer writes what's left (e.g. GOAWAY), then finishes; and so does the timer.
-    writer_wakeup.close();
+    // what the peer sends meanwhile is read, and dropped, until it closes its side too: until then, closing would reset
+    // the connection, which may discard what the writer's still sending it (see run()'s declaration). The timer stops
+    // the reader at linger_until.
+    std::size_t lingered = 0;
+    while (!read_end && lingered < max_linger_bytes)
+    {
+        const auto res = co_await reader.read(buffer);
+        lingered += res.count;
+        read_end = static_cast<bool>(res.err);
+    }
+
+    {
+        std::scoped_lock lock{mu};
+        reader_done = true;
+    }
     wake_timer();
     co_await workers.join();
 
-    // the connection's shut down before the streams are done (e.g. the server's handlers, which can't be cancelled, so
-    // may take a while): after a connection error, it MUST be closed (RFC 9113, section 5.4.1), and the peer would wait
-    // for the streams GOAWAY says may have been processed until it is. Over TLS, after close_notify.
-    // NOTE: the connection itself (its fd, and a server's max_connections slot) is held until they're done,
+    // NOTE: the connection itself (its fd, and a server's max_connections slot) is held until the streams are done,
     //       deliberately: that bounds the handlers left running to max_connections * max_concurrent_streams, where
     //       freeing it would let a client reconnect, and pile up more. HTTP/1.1 holds its slot the same way.
-    (void)co_await shutdown(conn);
     co_await finish_streams();
 }
 
@@ -396,10 +416,12 @@ coro::task<> http2_connection_base::write_loop()
 
     while (true)
     {
-        const auto seen = writer_wakeup.value();
+        const auto seen   = writer_wakeup.value();
+        bool       ending = false;
         {
             std::scoped_lock lock{mu};
             session.take_output(out);
+            ending = is_ending;
         }
 
         if (!out.empty())
@@ -416,19 +438,17 @@ coro::task<> http2_connection_base::write_loop()
             continue;
         }
 
-        if (!co_await writer_wakeup.wait(seen))
-        {
-            // closed: what's left is written (e.g. GOAWAY), and then the writer's done.
-            {
-                std::scoped_lock lock{mu};
-                session.take_output(out);
-            }
-            if (!out.empty()) (void)co_await io::write_all(writer, out);
-            break;
-        }
+        // ending, and what was left is written (e.g. GOAWAY).
+        if (ending) break;
+
+        // NOTE: end() notifies it.
+        (void)co_await writer_wakeup.wait(seen);
     }
 
     drained.close();
+
+    // over TLS, after close_notify.
+    (void)co_await shutdown(conn);
 }
 
 coro::task<> http2_connection_base::timer_loop()
@@ -438,19 +458,36 @@ coro::task<> http2_connection_base::timer_loop()
     while (true)
     {
         std::optional<io::clock::time_point> next;
-        std::uint64_t                        seen = 0;
+        std::uint64_t                        seen         = 0;
+        bool                                 stop_reading = false;
         {
             std::scoped_lock lock{mu};
-            if (is_ending) break;
+            if (reader_done) break;
 
             seen           = timer_word.load(std::memory_order::acquire);
             const auto now = io::clock::now();
-            next           = check_streams(now);
-            const auto own = is_ending ? std::nullopt : check_connection(now);
-            if (own.has_value() && (!next.has_value() || *own < *next)) next = own;
+            if (!is_ending)
+            {
+                next           = check_streams(now);
+                const auto own = check_connection(now);
+                if (own.has_value() && (!next.has_value() || *own < *next)) next = own;
+            }
+
+            // (perhaps ended just now:) the reader lingers until linger_until (see run()).
+            if (is_ending)
+            {
+                stop_reading = linger_until <= now;
+                next         = linger_until;
+            }
 
             timer_target = next;
-            if (is_ending) break;
+        }
+
+        if (stop_reading)
+        {
+            // the peer hasn't closed its side: the reader finds the end of the stream.
+            socket_of(conn).shutdown_read();
+            break;
         }
 
         writer_wakeup.notify();
@@ -509,8 +546,11 @@ void http2_connection_base::end()
     }
     drained.notify();
 
-    // the reader stops (finding the end of the stream), the writer writes what's left, and the timer stops.
-    socket_of(conn).shutdown_read();
+    // the reader stops receiving, and lingers, as long as the timer lets it; the writer writes what's left, and
+    // finishes (see run()).
+    // NOTE: not shutting down the connection's reading side, which (on macOS) resets the connection if the peer then
+    //       sends anything, as it may well, reading what's still to be written.
+    linger_until = io::clock::now() + linger_time;
     writer_wakeup.notify();
     wake_timer();
 }

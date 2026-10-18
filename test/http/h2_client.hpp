@@ -49,7 +49,8 @@ struct h2_client final : http2::session_events
     // How long pump() waits by default, so a server that stops answering fails a test rather than hanging it.
     static constexpr std::chrono::seconds default_timeout{10};
 
-    // sock is the connection's socket, for pump()'s deadlines (none if it's null).
+    // sock is the connection's socket, for pump()'s deadlines, and to close its side once the server has (none if
+    // it's null).
     h2_client(net::io::reader*             in,
               net::io::writer*             out,
               net::socket*                 sock   = nullptr,
@@ -204,6 +205,9 @@ struct h2_client final : http2::session_events
             else if (res.err)
             {
                 closed = true;
+
+                // as a client would, it closes its side too, so the server needn't linger for it.
+                if (sock != nullptr) sock->shutdown_write();
             }
 
             const auto used = s.receive(pending, *this, std::chrono::steady_clock::now());
