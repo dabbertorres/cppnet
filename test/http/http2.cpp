@@ -866,3 +866,61 @@ TEST_CASE("a reset stream's late frames are ignored", "[http][http2][session]")
     CHECK_FALSE(c.server.failure);
     CHECK(c.client.events.take() == std::vector<std::string>{"reset 1 cancel"});
 }
+
+TEST_CASE("a malformed PRIORITY resets an open stream, and only counts against one that isn't",
+          "[http][http2][session][malformed]")
+{
+    struct test_case
+    {
+        std::string_view       what;
+        std::vector<std::byte> payload; // for stream 1 (other streams' have their ids instead)
+        http2::error_code      want;
+    };
+
+    const auto tc = GENERATE(
+        test_case{
+            .what    = "depending on itself",
+            .payload = {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}, std::byte{16}},
+            .want    = http2::error_code::protocol_error
+    },
+        test_case{.what    = "the wrong size",
+                  .payload = {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}},
+                  .want    = http2::error_code::frame_size_error});
+    CAPTURE(tc.what);
+
+    const auto for_stream = [&](http2::stream_id id)
+    {
+        auto payload = tc.payload;
+        if (payload.size() == 5) payload[3] = static_cast<std::byte>(id);
+        return payload;
+    };
+
+    endpoint server{http2::role::server};
+    raw      r;
+    r.client_start();
+    r.headers(1, request("POST"), http2::flags::end_headers);
+    r.frame(http2::frame_type::priority, 0, 1, for_stream(1));
+    r.frame(http2::frame_type::priority, 0, 3, for_stream(3)); // idle
+    server.deliver(r.bytes);
+
+    // the open stream is reset, and its reset reported.
+    CHECK_FALSE(server.failure);
+    CHECK(server.events.take()
+          == std::vector<std::string>{"settings",
+                                      "headers 1 head :method=POST :scheme=https :authority=example.com :path=/",
+                                      std::format("reset 1 {}", make_error_code(tc.want).message())});
+
+    // only it: RST_STREAM on an idle stream is a connection error for the client.
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+
+    std::vector<std::string> resets;
+    for (std::span<const std::byte> rest = out; rest.size() >= 9;)
+    {
+        const auto h = http2::decode_frame_header(rest.first<9>());
+        if (h.type == static_cast<std::uint8_t>(http2::frame_type::rst_stream))
+            resets.push_back(std::format("{} {}", h.stream, std::to_integer<int>(rest[12])));
+        rest = rest.subspan(9 + h.length);
+    }
+    CHECK(resets == std::vector<std::string>{std::format("1 {}", static_cast<int>(tc.want))});
+}

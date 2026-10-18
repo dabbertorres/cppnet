@@ -22,7 +22,9 @@ namespace net::coro
 // timeouts are for its owner to implement (by closing it, or changing the condition and notifying). Waiters are
 // resumed on the pool, never by notify()'s caller, which may be holding a lock they'd take.
 //
-// A coroutine mustn't be destroyed while it waits, nor the notifier while any do.
+// A coroutine mustn't be destroyed while it waits, nor the notifier while any do. The pool must be running whenever
+// waiters are woken: if it refuses them (it's shutting down), the program terminates, as resuming them on the
+// notifier's caller could deadlock.
 class notifier
 {
 public:

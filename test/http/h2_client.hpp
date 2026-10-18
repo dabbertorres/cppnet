@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <map>
 #include <span>
@@ -19,8 +21,10 @@
 #include "http/http2.hpp"
 #include "http/http2_session.hpp"
 #include "io/reader.hpp"
+#include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
+#include "socket.hpp"
 
 namespace test
 {
@@ -28,7 +32,8 @@ namespace test
 namespace http2 = net::http::http2;
 namespace hpack = net::http::hpack;
 
-// h2_client is a minimal HTTP/2 client for the tests: a session over a connection, with what it has received.
+// h2_client is a minimal HTTP/2 client for the tests: a session over a connection, with what it has received. With
+// role::server, it's a minimal server instead (for the client's tests), whose responses are the requests it receives.
 struct h2_client final : http2::session_events
 {
     struct response
@@ -41,19 +46,31 @@ struct h2_client final : http2::session_events
         int                                              order = 0; // when it was done
     };
 
-    h2_client(net::io::reader* in, net::io::writer* out)
-        : in{in}
+    // How long pump() waits by default, so a server that stops answering fails a test rather than hanging it.
+    static constexpr std::chrono::seconds default_timeout{10};
+
+    // sock is the connection's socket, for pump()'s deadlines (none if it's null).
+    h2_client(net::io::reader* in,
+              net::io::writer* out,
+              net::socket*     sock = nullptr,
+              http2::role      side = http2::role::client)
+        : s{side}
+        , in{in}
         , out{out}
+        , sock{sock}
     {}
 
-    http2::session                       s{http2::role::client};
+    http2::session                       s;
     net::io::reader*                     in;
     net::io::writer*                     out;
+    net::socket*                         sock;
     std::map<http2::stream_id, response> responses;
-    bool                                 goaway   = false;
-    bool                                 closed   = false;
-    int                                  finished = 0;
-    int                                  pings    = 0; // acknowledged
+    bool                                 goaway = false;
+    std::error_code                      goaway_error;
+    bool                                 closed    = false;
+    bool                                 timed_out = false; // the last pump() reached its deadline
+    int                                  finished  = 0;
+    int                                  pings     = 0; // acknowledged
 
     void
     on_headers(http2::stream_id id, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
@@ -87,9 +104,10 @@ struct h2_client final : http2::session_events
 
     void on_window_update(http2::stream_id /*stream*/) override {}
     void on_settings(const http2::settings& /*peer*/) override {}
-    void on_goaway(http2::stream_id /*last*/, std::error_code /*err*/, std::string_view /*debug*/) override
+    void on_goaway(http2::stream_id /*last*/, std::error_code err, std::string_view /*debug*/) override
     {
-        goaway = true;
+        goaway       = true;
+        goaway_error = err;
     }
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override { ++pings; }
 
@@ -135,13 +153,17 @@ struct h2_client final : http2::session_events
         }
     }
 
-    // pump writes what's to be written, and reads and receives, until done() says so (or the connection ends).
+    // pump writes what's to be written, and reads and receives, until done() says so, the connection ends, or (if
+    // the socket's known) timeout passes, returning done().
     template<typename Done>
-    net::coro::task<bool> pump(Done done)
+    net::coro::task<bool> pump(Done done, net::io::clock::duration timeout = default_timeout)
     {
         std::vector<std::byte> buffer(16'384);
         std::vector<std::byte> pending;
         std::vector<std::byte> output;
+
+        timed_out = false;
+        if (sock != nullptr) sock->set_read_deadline(net::io::clock::now() + timeout);
 
         while (true)
         {
@@ -158,7 +180,15 @@ struct h2_client final : http2::session_events
 
             auto res = co_await in->read(buffer);
             pending.insert(pending.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(res.count));
-            if (res.err) closed = true;
+            if (res.err == std::errc::timed_out)
+            {
+                // NOTE: what was read before is received, but nothing more is waited for.
+                timed_out = true;
+            }
+            else if (res.err)
+            {
+                closed = true;
+            }
 
             const auto used = s.receive(pending, *this, std::chrono::steady_clock::now());
             if (!used.has_value())
@@ -167,12 +197,21 @@ struct h2_client final : http2::session_events
                 co_return done();
             }
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(*used));
+            if (timed_out) co_return done();
         }
     }
 
-    net::coro::task<bool> wait_for(http2::stream_id id)
+    net::coro::task<bool> wait_for(http2::stream_id id, net::io::clock::duration timeout = default_timeout)
     {
-        return pump([this, id] { return responses[id].done; });
+        return pump([this, id] { return responses[id].done; }, timeout);
+    }
+
+    // window_update sends WINDOW_UPDATE (which a session sends only as it consumes data) at once.
+    net::coro::task<bool> window_update(http2::stream_id id, std::uint32_t increment) const
+    {
+        std::vector<std::byte> frame;
+        http2::encode_window_update(id, increment, frame);
+        co_return !(co_await net::io::write_all(*out, frame)).err;
     }
 
     // sync sends a PING, and pumps until it's acknowledged: by then, the server has received all that was sent before.
@@ -185,6 +224,33 @@ struct h2_client final : http2::session_events
 
     std::map<http2::stream_id, std::string> pending_body;
     std::map<http2::stream_id, bool>        pending_end;
+};
+
+// gate holds handlers until a test opens it: the n-th to pass waits for the n-th open() (or the scheduler to stop).
+struct gate
+{
+    explicit gate(net::io::scheduler* sched)
+        : sched{sched}
+    {}
+
+    net::coro::task<> pass()
+    {
+        const auto n = arrived.fetch_add(1) + 1;
+        for (auto seen = opened.load(); seen < n; seen = opened.load())
+        {
+            if (co_await sched->wait_on(opened, seen) == std::errc::operation_canceled) co_return;
+        }
+    }
+
+    void open()
+    {
+        opened.fetch_add(1);
+        sched->notify_all(opened);
+    }
+
+    net::io::scheduler*        sched;
+    std::atomic<std::uint64_t> arrived{0};
+    std::atomic<std::uint64_t> opened{0};
 };
 
 // header is a response's field's value, or "(none)".

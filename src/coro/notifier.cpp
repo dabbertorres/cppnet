@@ -2,8 +2,11 @@
 
 #include <atomic>
 #include <coroutine>
+#include <exception>
 #include <mutex>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 namespace net::coro
 {
@@ -60,9 +63,14 @@ void notifier::wake(std::vector<std::coroutine_handle<>>& woken) noexcept
 {
     if (woken.empty()) return;
 
-    // NOTE: if the pool is shutting down, it resumes nothing, so they're resumed here (as they'd otherwise never be).
-    if (pool != nullptr && pool->resume(woken) == woken.size()) return;
-    for (auto handle : woken) handle.resume();
+    if (pool->resume(woken) == woken.size()) return;
+
+    // NOTE: a pool refuses only once it's shutting down, which it doesn't while a scheduler holds it: the scheduler
+    //       waits for its tasks (which own the notifiers, e.g. HTTP/2's connections) before letting it go. So this is a
+    //       bug, e.g. a pool shut down under its scheduler. Resuming the waiters here instead could deadlock
+    //       (notify()'s caller may hold a lock they take), or leave them never resumed: either way, silently.
+    spdlog::critical("coro::notifier: the thread pool refused to resume {} waiters (it's shutting down)", woken.size());
+    std::terminate();
 }
 
 }

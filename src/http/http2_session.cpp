@@ -293,7 +293,7 @@ session::receive_frame(std::span<const std::byte> in, session_events& events, ti
     {
     case frame_type::data: err = on_data(h, payload, events, now); break;
     case frame_type::headers: err = on_headers(h, payload, events, now); break;
-    case frame_type::priority: err = on_priority(h, payload, now); break;
+    case frame_type::priority: err = on_priority(h, payload, events, now); break;
     case frame_type::rst_stream: err = on_rst_stream(h, payload, events, now); break;
     case frame_type::settings: err = on_settings(h, payload, events); break;
     case frame_type::ping: err = on_ping(h, payload, events); break;
@@ -567,15 +567,19 @@ std::optional<session::validated> session::validate(const stream_state& s, bool 
     return out;
 }
 
-std::error_code session::on_priority(const frame_header& h, std::span<const std::byte> payload, time_point now)
+std::error_code
+session::on_priority(const frame_header& h, std::span<const std::byte> payload, session_events& events, time_point now)
 {
     if (h.stream == 0) return connection_error(error_code::protocol_error);
-    if (payload.size() != 5) return stream_error(h.stream, error_code::frame_size_error, nullptr, now);
 
-    // ignored (RFC 9113 deprecated RFC 7540's priorities), but a stream can't depend on itself.
-    if ((read32(payload) & max_stream_id) == h.stream)
-        return stream_error(h.stream, error_code::protocol_error, nullptr, now);
-    return {};
+    // ignored (RFC 9113 deprecated RFC 7540's priorities), but it must be 5 bytes, and a stream can't depend on itself.
+    const bool wrong_size = payload.size() != 5;
+    if (!wrong_size && (read32(payload) & max_stream_id) != h.stream) return {};
+
+    // PRIORITY may come for a stream that isn't open (idle, or closed), which can't be reset (RST_STREAM on an idle
+    // stream is a connection error, RFC 9113 section 6.4): it's only counted.
+    if (!streams.contains(h.stream)) return glitch(now);
+    return stream_error(h.stream, wrong_size ? error_code::frame_size_error : error_code::protocol_error, &events, now);
 }
 
 std::error_code session::on_rst_stream(const frame_header&        h,

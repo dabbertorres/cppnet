@@ -231,8 +231,10 @@ private:
                                     std::span<const std::byte>            payload,
                                     session_events&                       events,
                                     std::chrono::steady_clock::time_point now);
-    std::error_code
-    on_priority(const frame_header& h, std::span<const std::byte> payload, std::chrono::steady_clock::time_point now);
+    std::error_code on_priority(const frame_header&                   h,
+                                std::span<const std::byte>            payload,
+                                session_events&                       events,
+                                std::chrono::steady_clock::time_point now);
     std::error_code on_rst_stream(const frame_header&                   h,
                                   std::span<const std::byte>            payload,
                                   session_events&                       events,

@@ -198,7 +198,12 @@ stream:
   for a body of unknown length (which HTTP/2 frames without anything special). Connection-specific fields a handler
   sets (Connection, Transfer-Encoding, ...) are dropped, and names lowercased, when encoding.
 - **What's left of a request body** when its handler returns isn't read: the stream is reset (RST_STREAM(NO_ERROR)),
-  or its remaining DATA ignored, with the connection's window still credited.
+  or its remaining DATA ignored, with the connection's window still credited. (After review:) a peer's
+  RST_STREAM(NO_ERROR) means the same, so if what the peer sent has ended (e.g. a client's response), it stands, and
+  only sending stops; otherwise the stream fails with `std::errc::connection_reset`, as a code of 0 can't say it
+  failed. A handler that throws once its final head is sent, or writes less than its Content-Length, has its stream
+  reset (INTERNAL_ERROR) rather than ended, so the client doesn't take what it got as complete; one that throws before
+  (even after a 1xx) gets a 500, without the headers it had set.
 - **`close()`** sends GOAWAY(2^31-1), then, after a PING round trip, GOAWAY with the last stream it accepted, lets
   those finish, and closes.
 
@@ -210,7 +215,11 @@ As Go's, nginx's and Envoy's (see Decided):
   be sent, including behind a window the peer doesn't open), each from the last progress. On expiry, the stream gets
   408 if nothing was sent yet, otherwise RST_STREAM; the connection goes on. The socket's own deadlines can't do this
   (they're per connection), so a timer task per connection sleeps until the earliest stream deadline and ends the
-  late streams.
+  late streams. (After review:) each stream has a read deadline (a client's covers its response's head, then its
+  body) and a write deadline, both checked by the timer. A wait sets its deadline only if there's none, and only
+  progress clears it (data or a head arriving, the stream's window growing, the stream sending some), so waking for
+  anything else (e.g. the connection's window growing) doesn't put it off. A write waiting for the connection's writer
+  (past 1 MiB queued) has its write deadline too.
 - **Per connection:** `header_read_timeout` bounds the preface and first SETTINGS, and each request's header block
   once it starts; an idle timeout (no open streams) ends the connection with GOAWAY(NO_ERROR); a SETTINGS that isn't
   acknowledged in time is SETTINGS_TIMEOUT; and if the socket itself can't be written for `write_timeout`, the
@@ -229,6 +238,13 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
 | Data dribble, empty frames, internal buffering | Empty frames budgeted (h2: 100); per-stream send buffers capped (h2: about 400 KB), and the whole connection's queue |
 | Slow peers | The timeouts above; the preface and first SETTINGS within `header_read_timeout` |
 | Concurrency | MAX_CONCURRENT_STREAMS 100 (nginx's default; Go's is 250), and `max_connections` as now |
+
+(After review:) handlers are bounded as Go's are (its fix for CVE-2023-44487): at MAX_CONCURRENT_STREAMS running, a
+new stream's handler waits for one to finish (and isn't started if its stream is reset meanwhile); past 4 times as
+many running and waiting, the connection ends with GOAWAY(ENHANCE_YOUR_CALM). It's closed once its handlers have
+finished, as any connection is. A malformed PRIORITY (the wrong size, or a stream depending on itself) resets an open
+stream, as a stream error the application is told of; on a stream that isn't open, it only counts as a glitch, as
+RST_STREAM on an idle stream would be a connection error for the peer.
 
 ### Client
 
@@ -315,7 +331,9 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
   about 3x faster with many coroutines on several workers.
 - The session's events run under the connection's lock, so nothing they do may take it again: handlers aren't
   started from them (the new streams are started once it's released, each hopping onto the pool, so the reader goes
-  on reading), and notifiers resume their waiters on the pool, never inline.
+  on reading), and notifiers resume their waiters on the pool, never inline. (After review:) a pool refusing them (as
+  it's shutting down) terminates the program, rather than resuming them inline: it can't happen while the scheduler
+  holds the pool, as it waits for its tasks (which own the notifiers) before letting it go.
 - `response_writer`'s back end is a `std::variant`; the HTTP/2 alternative holds the stream and a table of the
   server's functions (as the HTTP/1.1 one holds an encoder function), so that what uses `response.cpp` alone (e.g.
   `fuzz_http11`) doesn't need HTTP/2's server and the scheduler linked in.
@@ -348,7 +366,9 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
   HTTP/1.x connection or an HTTP/2 one, and a connection with a stream free (by the server's MAX_CONCURRENT_STREAMS,
   which `session::can_open_stream()` checks) is preferred to making another. With
   `client_options::strict_max_concurrent_streams`, a request waits for a stream instead; a stream being done (or the
-  connection closing) wakes the pool's waiters, as an HTTP/1.x connection being released does. The pool reserves the
+  connection closing) wakes the pool's waiters, as an HTTP/1.x connection being released does. (After review:) so
+  does the session being done with a stream (its response ended, or reset), though its response hasn't been read; and
+  a request that fails before its response's head (refused, reset, timed out) is done with its stream at once. The pool reserves the
   stream when it hands out the lease (`http2_client_connection::reserve()`, which `session::can_open_stream(reserved)`
   counts), as the stream is only opened later: without that, two requests could both take the last free stream, and
   one be refused by its own side.

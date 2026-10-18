@@ -91,12 +91,17 @@ public:
     http2_connection_base* conn;
     http2::stream_id       id;
 
-    std::vector<std::byte>               received; // DATA not read yet, from received_start (before it, what's read)
-    std::size_t                          received_start = 0;
-    bool                                 received_end   = false;
-    bool                                 ended          = false; // this side has sent END_STREAM
-    std::error_code                      failure;                // reset, timed out, or the connection ended
-    std::optional<io::clock::time_point> deadline;               // of the wait in progress, if any
+    std::vector<std::byte> received; // DATA not read yet, from received_start (before it, what's read)
+    std::size_t            received_start = 0;
+    bool                   received_end   = false;
+    bool                   ended          = false; // this side has sent END_STREAM
+    std::error_code        failure;                // reset, timed out, or the connection ended
+
+    // When the stream times out, if it makes no progress: receiving (a client's response's head, then the body), and
+    // sending. A wait sets its deadline if there's none, and only progress clears it (what's awaited arriving, or the
+    // window growing), so waking for anything else doesn't put the timeout off.
+    std::optional<io::clock::time_point> read_deadline;
+    std::optional<io::clock::time_point> write_deadline;
 
     // How long the reader's and writer's waits may go without progress (0: no limit).
     std::chrono::milliseconds read_timeout{};
@@ -143,8 +148,9 @@ public:
     // wake_writer tells the writer there's output, if there is: called without the lock.
     void wake_writer();
 
-    // set_deadline sets a stream's wait's deadline (holding the lock), telling the timer if it's sooner than it knew.
-    void set_deadline(http2_stream_base& s, std::chrono::milliseconds timeout);
+    // arm_deadline sets one of a stream's deadlines for a wait, timeout from now, unless it's set already (holding the
+    // lock): telling the timer, if it's sooner than it knew.
+    void arm_deadline(std::optional<io::clock::time_point>& deadline, std::chrono::milliseconds timeout);
 
     // output_drained is notified as the writer writes.
     coro::notifier& output_drained() noexcept { return drained; }

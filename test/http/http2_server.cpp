@@ -1,9 +1,7 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <compare>
 #include <cstddef>
-#include <cstdint>
 #include <expected>
 #include <format>
 #include <map>
@@ -45,6 +43,7 @@ namespace http2 = net::http::http2;
 using namespace std::chrono_literals;
 using namespace std::string_view_literals;
 using net::coro::task;
+using test::gate;
 using test::h2_client;
 using test::header;
 
@@ -83,6 +82,27 @@ http::router make_router(net::io::scheduler* sched)
           });
     r.GET("/throw",
           [](const http::server_request&, http::response_writer&) -> task<void> { throw std::runtime_error{"oops"}; });
+    r.GET("/throw-mid-body",
+          [](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK, 100);
+              co_await net::io::write_all(*body, "partial"sv);
+              throw std::runtime_error{"oops"};
+          });
+    r.GET("/throw-mid-stream",
+          [](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK);
+              co_await net::io::write_all(*body, "partial"sv);
+              throw std::runtime_error{"oops"};
+          });
+    r.GET("/throw-after-interim",
+          [](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              resp.headers().set("X-Meant-For-200", "yes");
+              co_await resp.send(http::status::PROCESSING);
+              throw std::runtime_error{"oops"};
+          });
     return r;
 }
 
@@ -117,36 +137,9 @@ task<> with_client(net::io::scheduler*                     sched,
     REQUIRE(conn.has_value());
     conn->set_read_timeout(read_timeout);
 
-    h2_client client{&*conn, &*conn};
+    h2_client client{&*conn, &*conn, &*conn};
     co_await test(client);
 }
-
-// gate holds handlers until a test opens it: the n-th to pass waits for the n-th open() (or the scheduler to stop).
-struct gate
-{
-    explicit gate(net::io::scheduler* sched)
-        : sched{sched}
-    {}
-
-    task<> pass()
-    {
-        const auto n = arrived.fetch_add(1) + 1;
-        for (auto seen = opened.load(); seen < n; seen = opened.load())
-        {
-            if (co_await sched->wait_on(opened, seen) == std::errc::operation_canceled) co_return;
-        }
-    }
-
-    void open()
-    {
-        opened.fetch_add(1);
-        sched->notify_all(opened);
-    }
-
-    net::io::scheduler*        sched;
-    std::atomic<std::uint64_t> arrived{0};
-    std::atomic<std::uint64_t> opened{0};
-};
 
 }
 
@@ -242,6 +235,7 @@ TEST_CASE("HTTP/2 handlers that throw, HEAD, and unknown methods", "[http][http2
                                             CHECK(header(c.responses[head], "content-length") == "17");
                                             CHECK(c.responses[head].body.empty());
                                             CHECK(c.responses[unknown].status == "501");
+                                            CHECK(header(c.responses[unknown], "date") != "(none)");
                                         }));
 }
 
@@ -446,4 +440,135 @@ TEST_CASE("an HTTP/2 handler's reads give the window back at once, though it sto
             CHECK(c.responses[id].body == "90000");
         },
         5s));
+}
+
+TEST_CASE("an HTTP/2 handler that throws mid-body has its stream reset, rather than its response ended",
+          "[http][http2][server]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            const auto with_length    = c.request("GET", "/throw-mid-body");
+                                            const auto without_length = c.request("GET", "/throw-mid-stream");
+                                            REQUIRE(co_await c.pump([&] { return c.finished == 2; }));
+
+                                            // the server's reset, not one for a Content-Length the client found short.
+                                            CHECK(c.responses[with_length].reset == http2::error_code::internal_error);
+                                            CHECK(c.responses[without_length].reset
+                                                  == http2::error_code::internal_error);
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 handler that throws after an interim response gets a 500, without its headers",
+          "[http][http2][server]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            const auto id = c.request("GET", "/throw-after-interim");
+                                            REQUIRE(co_await c.wait_for(id));
+
+                                            const auto& r = c.responses[id];
+                                            CAPTURE(r.reset.message());
+                                            CHECK(r.status == "500");
+                                            CHECK(header(r, "x-meant-for-200") == "(none)");
+                                            CHECK(header(r, "date") != "(none)");
+                                        }));
+}
+
+TEST_CASE("WINDOW_UPDATEs on the connection don't put off an HTTP/2 stream's body_read_timeout",
+          "[http][http2][server][timeouts]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, {.body_read_timeout = 1s}};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            // a request whose body never comes, while the connection's window grows
+                                            // every 0.3 s (which wakes the stream's reader).
+                                            const auto stalled = c.request("POST", "/echo", "", false);
+                                            const auto start   = std::chrono::steady_clock::now();
+                                            while (!c.responses[stalled].done && !c.closed
+                                                   && std::chrono::steady_clock::now() - start < 4s)
+                                            {
+                                                (void)co_await c.wait_for(stalled, 300ms);
+                                                REQUIRE(co_await c.window_update(0, 1));
+                                            }
+
+                                            CHECK(c.responses[stalled].reset == http2::error_code::cancel);
+                                            CHECK(std::chrono::steady_clock::now() - start < 3s);
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 client resetting its streams can't run more handlers than it may open streams",
+          "[http][http2][server][limits]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+    r.GET("/hold",
+          [&g](const http::server_request&, http::response_writer& resp) -> task<void>
+          {
+              co_await g.pass();
+              co_await resp.send(http::status::OK, 0);
+          });
+
+    test_server server{&sched, std::move(r), {.http2_max_concurrent_streams = 2}};
+
+    SECTION("past the limit, a stream's handler waits for another to finish")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&g](h2_client& c) -> task<>
+                                            {
+                                                // two handlers held; one's stream reset (which frees the stream, but
+                                                // not the handler); then another.
+                                                const auto first  = c.request("GET", "/hold");
+                                                const auto second = c.request("GET", "/hold");
+                                                c.s.reset(first, http2::error_code::cancel);
+                                                const auto third = c.request("GET", "/");
+
+                                                // it waits, though it's quick, until a held one finishes.
+                                                CHECK_FALSE(co_await c.wait_for(third, 300ms));
+
+                                                g.open();
+                                                REQUIRE(co_await c.wait_for(third));
+                                                CHECK(c.responses[third].body == "hello over HTTP/2");
+
+                                                g.open();
+                                                REQUIRE(co_await c.wait_for(second));
+                                                CHECK(c.responses[second].status == "200");
+                                            }));
+    }
+
+    SECTION("too many waiting, the connection's ended")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [](h2_client& c) -> task<>
+                                            {
+                                                // streams opened and reset at once, whose handlers never finish.
+                                                for (int i = 0; i < 20; ++i)
+                                                {
+                                                    const auto id = c.request("GET", "/hold");
+                                                    c.s.reset(id, http2::error_code::cancel);
+                                                }
+
+                                                // NOTE: the connection's closed once its handlers have finished,
+                                                //       which these never do.
+                                                REQUIRE(co_await c.pump([&] { return c.goaway; }, 3s));
+                                                CHECK(c.goaway_error == http2::error_code::enhance_your_calm);
+                                            }));
+    }
 }

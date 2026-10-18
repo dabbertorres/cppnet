@@ -1,8 +1,11 @@
 #include "http/http2_server.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <compare>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <expected>
 #include <memory>
@@ -20,7 +23,9 @@
 #include <spdlog/logger.h>
 
 #include "coro/async_scope.hpp"
+#include "coro/notifier.hpp"
 #include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
 #include "http/connection.hpp"
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
@@ -34,6 +39,7 @@
 #include "http/router.hpp"
 #include "io/discard_writer.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
 
@@ -136,7 +142,19 @@ namespace
         // refuse answers a request with just a status, ending the stream.
         void refuse(http2::stream_id id, status code, bool request_ended);
 
+        // schedule starts a stream's handler, or queues it if max_concurrent_streams handlers are running (holding
+        // the lock); promote starts queued handlers as running ones finish (skipping streams reset meanwhile).
+        void schedule(http2_stream& stream);
+        void promote();
+
+        // start_handlers spawns the handlers that schedule() and promote() started (without the lock).
+        void start_handlers();
+
         coro::task<> run_stream(http2_stream* stream);
+
+        // respond_after sends what's left of a response once its handler has returned (or thrown, with failure),
+        // returning whether the response is complete; if it's not, the stream's to be reset rather than finished.
+        coro::task<bool> respond_after(http2_stream& stream, response_writer& rw, const std::exception_ptr& failure);
 
         // begin_drain starts a graceful shutdown: GOAWAY, then once the client has seen it (a PING), the final
         // GOAWAY.
@@ -149,6 +167,8 @@ namespace
         // Guarded by mu.
         std::unordered_map<http2::stream_id, std::unique_ptr<http2_stream>> streams;
         std::vector<http2_stream*>                                          started; // to start once unlocked
+        std::deque<http2_stream*>                                           queued;  // to start once others finish
+        std::size_t                                                         running     = 0; // handlers started
         bool                                                                draining    = false;
         bool                                                                final_sent  = false; // the final GOAWAY
         bool                                                                peer_goaway = false;
@@ -229,7 +249,9 @@ namespace
         co_await run(already_read);
     }
 
-    void http2_server_connection::after_receive()
+    void http2_server_connection::after_receive() { start_handlers(); }
+
+    void http2_server_connection::start_handlers()
     {
         std::vector<http2_stream*> to_start;
         {
@@ -237,19 +259,75 @@ namespace
             to_start.swap(started);
         }
 
+        bool refused = false;
         for (auto* s : to_start)
         {
-            if (!handlers.spawn(run_stream(s)))
+            if (handlers.spawn(run_stream(s))) continue;
+
+            std::scoped_lock lock{mu};
+            session.reset(s->id, http2::error_code::refused_stream);
+            remove_stream(s->id);
+            streams.erase(s->id);
+            --running;
+            refused = true;
+        }
+
+        // the refusals' RST_STREAMs go now, rather than with whatever's sent next.
+        if (refused) wake_writer();
+    }
+
+    void http2_server_connection::schedule(http2_stream& stream)
+    {
+        // As Go's (its fix for CVE-2023-44487): a client resetting streams can open new ones while the handlers of
+        // those it reset go on running, so handlers are limited as streams are; past the limit, they wait for others
+        // to finish; and a client that keeps opening streams regardless is told to calm down.
+        const auto limit = std::max<std::size_t>(options.session.local.max_concurrent_streams, 1);
+        if (running + queued.size() >= 4 * limit)
+        {
+            logger.debug("HTTP/2 client opened too many streams while their handlers ran");
+            session.goaway(session.last_peer_stream(), http2::error_code::enhance_your_calm, "too many handlers");
+            end();
+            return;
+        }
+
+        queued.push_back(&stream);
+        promote();
+    }
+
+    void http2_server_connection::promote()
+    {
+        const auto limit = std::max<std::size_t>(options.session.local.max_concurrent_streams, 1);
+        while (running < limit && !queued.empty() && !ending())
+        {
+            auto* s = queued.front();
+            queued.pop_front();
+
+            // a stream reset while it waited isn't started.
+            if (s->failure)
             {
-                std::scoped_lock lock{mu};
-                session.reset(s->id, http2::error_code::refused_stream);
                 remove_stream(s->id);
                 streams.erase(s->id);
+                continue;
             }
+
+            ++running;
+            started.push_back(s);
         }
     }
 
-    coro::task<> http2_server_connection::finish_streams() { co_await handlers.join(); }
+    coro::task<> http2_server_connection::finish_streams()
+    {
+        co_await handlers.join();
+
+        // the connection's ending: handlers that hadn't started won't be.
+        std::scoped_lock lock{mu};
+        for (const auto* s : queued)
+        {
+            remove_stream(s->id);
+            streams.erase(s->id);
+        }
+        queued.clear();
+    }
 
     void http2_server_connection::on_headers(http2::stream_id              id,
                                              http2::block_kind             kind,
@@ -262,18 +340,21 @@ namespace
             if (const auto it = streams.find(id); it != streams.end() && end_stream)
             {
                 it->second->received_end = true;
+                it->second->read_deadline.reset();
                 it->second->changed.notify();
             }
             return;
         }
 
+        if (ending()) return;
+
         auto stream = start_stream(id, fields, end_stream);
         if (stream == nullptr) return;
 
         idle_since.reset();
-        started.push_back(stream.get());
         add_stream(*stream);
-        streams.emplace(id, std::move(stream));
+        auto& s = *streams.emplace(id, std::move(stream)).first->second;
+        schedule(s);
     }
 
     std::unique_ptr<http2_stream>
@@ -358,8 +439,9 @@ namespace
     void http2_server_connection::refuse(http2::stream_id id, status code, bool request_ended)
     {
         const auto                        text = std::to_string(static_cast<int>(code));
-        const std::array<hpack::field, 1> head{
-            hpack::field{.name = ":status", .value = text}
+        const std::array<hpack::field, 2> head{
+            hpack::field{.name = ":status",           .value = text},
+            hpack::field{   .name = "date", .value = current_date()},
         };
 
         if (auto err = session.submit_headers(id, head, true))
@@ -389,19 +471,49 @@ namespace
         // NOTE: onto the pool, so the reader (which started it) goes on reading.
         co_await pool->schedule();
 
-        auto&           req = stream->req;
         response_writer rw{stream, &http2_ops, &stream->resp};
 
         std::exception_ptr failure;
         try
         {
-            co_await handler(req, rw);
+            co_await handler(stream->req, rw);
         }
         catch (...)
         {
             failure = std::current_exception();
         }
 
+        // a response cut short isn't finished (which would end it as if it were complete), but reset.
+        const bool complete = co_await respond_after(*stream, rw, failure);
+
+        {
+            std::scoped_lock lock{mu};
+
+            // reset (so the client doesn't take it as complete) if it's not ended; and the client needn't send what
+            // the handler didn't read of the request.
+            if (!stream->failure && (!complete || !stream->ended))
+                session.reset(stream->id, http2::error_code::internal_error);
+            else if (!stream->failure && !stream->received_end) session.reset(stream->id, http2::error_code::no_error);
+
+            remove_stream(stream->id);
+            streams.erase(stream->id);
+            if (streams.empty()) idle_since = io::clock::now();
+
+            // another handler may start in its place.
+            --running;
+            promote();
+            maybe_end();
+        }
+
+        start_handlers();
+        wake_writer();
+        wake_timer();
+    }
+
+    coro::task<bool>
+    http2_server_connection::respond_after(http2_stream& stream, response_writer& rw, const std::exception_ptr& failure)
+    {
+        const auto& req = stream.req;
         try
         {
             if (failure)
@@ -419,12 +531,21 @@ namespace
                     logger.error("handler for {} {} threw", method_string(req.method), req.target.path);
                 }
 
-                if (rw.status_code() == status::NONE) co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
+                // a response under way can't be finished: the client mustn't take what it has as all of it.
+                if (rw.sent()) co_return false;
+
+                // a 500 rather than the response the handler meant (perhaps after a 1xx), without its headers.
+                rw.headers().clear();
+                rw.headers().set("Date"sv, current_date());
+                co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
             }
             else if (!rw.sent())
             {
                 co_await rw.send(status::OK, 0);
             }
+
+            // less than its Content-Length (a response to HEAD has none, whatever its head says).
+            if (!stream.head_request && rw.body_remaining() > 0) co_return false;
 
             (void)co_await rw.finish();
         }
@@ -436,24 +557,7 @@ namespace
                          ex.what());
         }
 
-        {
-            std::scoped_lock lock{mu};
-
-            // a response cut short (the handler threw, or wrote less than its Content-Length) is reset, so the client
-            // doesn't take it as complete; and the client needn't send what the handler didn't read of the request.
-            const bool short_body = !stream->head_request && rw.body_remaining() > 0;
-            if (!stream->failure && (failure || short_body || !stream->ended))
-                session.reset(stream->id, http2::error_code::internal_error);
-            else if (!stream->failure && !stream->received_end) session.reset(stream->id, http2::error_code::no_error);
-
-            remove_stream(stream->id);
-            streams.erase(stream->id);
-            if (streams.empty()) idle_since = io::clock::now();
-            maybe_end();
-        }
-
-        wake_writer();
-        wake_timer();
+        co_return true;
     }
 
     std::optional<io::clock::time_point> http2_server_connection::check_connection(io::clock::time_point now)

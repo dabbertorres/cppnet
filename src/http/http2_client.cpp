@@ -30,6 +30,7 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "url.hpp"
+#include "util/defer.hpp"
 
 namespace net::http::detail
 {
@@ -125,6 +126,17 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     }
     wake_writer();
 
+    // the stream is done with unless the response's body takes it: whether the request fails (refused, reset, timed
+    // out), or this coroutine is destroyed while it waits.
+    const auto id    = stream->id;
+    bool       taken = false;
+    // NOTE: done() checks on.freed before calling it, and only throws if it can't allocate, when terminating is fine.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
+    util::defer release{[this, id, &taken] noexcept
+                        {
+                            if (!taken) done(id);
+                        }};
+
     // a server may answer before it's read all of the body (e.g. 413 Content Too Large), and reset the stream, failing
     // the rest: the response is still worth having.
     std::optional<std::error_code> body_error;
@@ -133,7 +145,9 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
         if (auto err = co_await send_body(request, *stream)) body_error = err;
     }
 
-    co_return co_await wait_for_head(std::move(stream), body_error);
+    auto resp = co_await wait_for_head(std::move(stream), body_error);
+    taken     = resp.has_value();
+    co_return resp;
 }
 
 std::expected<std::shared_ptr<http2_client_stream>, std::error_code>
@@ -173,6 +187,9 @@ http2_client_connection::open(const client_request& request)
     streams.emplace(*id, stream);
     add_stream(*stream);
     idle_since.reset();
+
+    // NOTE: counted rather than looked up, so a stream a receive frees meanwhile is still noticed (see after_receive).
+    ++open_seen;
     return stream;
 }
 
@@ -227,8 +244,6 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
 
             if (s.head_received)
             {
-                s.deadline.reset();
-
                 client_response resp;
                 resp.version     = {.major = 2, .minor = 0};
                 resp.status_code = s.status_code;
@@ -249,7 +264,7 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
             }
 
             seen = s.changed.value();
-            set_deadline(s, options.response_header_timeout);
+            arm_deadline(s.read_deadline, options.response_header_timeout);
         }
 
         (void)co_await stream->changed.wait(seen);
@@ -270,6 +285,7 @@ void http2_client_connection::done(http2::stream_id id)
             remove_stream(id);
             streams.erase(it);
             if (streams.empty()) idle_since = io::clock::now();
+            open_seen = session.open_streams();
             maybe_end();
         }
     }
@@ -312,10 +328,15 @@ void http2_client_connection::on_headers(http2::stream_id              id,
             else if (!f.name.starts_with(':')) s.headers.add(f.name, f.value);
         }
         s.head_received = true;
+        s.read_deadline.reset();
     }
 
     // trailers end the body (and aren't passed on).
-    if (end_stream) s.received_end = true;
+    if (end_stream)
+    {
+        s.received_end = true;
+        s.read_deadline.reset();
+    }
     s.changed.notify();
 }
 
@@ -327,6 +348,21 @@ void http2_client_connection::on_goaway(http2::stream_id /*last*/, std::error_co
 }
 
 void http2_client_connection::on_ping_ack(std::span<const std::byte, 8> /*opaque*/) {}
+
+void http2_client_connection::after_receive()
+{
+    // a stream the session's done with (its response ended, or it was reset) is free for another request, though its
+    // response may not have been read yet: a request waiting for one (strict_max_concurrent_streams) is told now.
+    bool freed = false;
+    {
+        std::scoped_lock lock{mu};
+        const auto       open_now = session.open_streams();
+        freed                     = open_now < open_seen;
+        open_seen                 = open_now;
+    }
+
+    if (freed && on.freed) on.freed();
+}
 
 std::optional<io::clock::time_point> http2_client_connection::check_connection(io::clock::time_point now)
 {

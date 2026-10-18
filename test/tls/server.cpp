@@ -337,7 +337,7 @@ TEST_CASE("an HTTPS server serves HTTP/2 to clients that agree on h2", "[tls][ht
         REQUIRE(s.has_value());
         if (s->alpn() != "h2") co_return std::pair{"ALPN: " + std::string{s->alpn()}, std::string{}};
 
-        test::h2_client client{&*s, &*s};
+        test::h2_client client{&*s, &*s, &s->socket()};
         const auto      id = client.request("GET", "/");
         REQUIRE(co_await client.wait_for(id));
 

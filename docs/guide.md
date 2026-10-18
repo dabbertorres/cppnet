@@ -210,9 +210,11 @@ scheduler.spawn(server.serve());
 - **HTTP/2** is served too (unless `server_config::http2` is off), with the same handlers: over TLS to clients that
   agree on `h2` with ALPN (browsers do), and over cleartext to clients that start with HTTP/2's preface (prior
   knowledge, e.g. `curl --http2-prior-knowledge`, or a proxy in front). A request's `version` says which (2.0). Its
-  streams are served at once, each handler in a task of its own; the timeouts apply to each stream (one that times
-  out is reset, and the connection's others go on), and `close()` ends HTTP/2 connections gracefully (GOAWAY, then
-  once their streams are done).
+  streams are served at once, each handler in a task of its own, up to `http2_max_concurrent_streams` at a time
+  (more wait for others to finish); the timeouts apply to each stream (one that times out is reset, and the
+  connection's others go on), and `close()` ends HTTP/2 connections gracefully (GOAWAY, then once their streams are
+  done). A handler that throws once its response is under way has its stream reset, so the client doesn't take what
+  it got as the whole response.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

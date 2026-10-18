@@ -103,7 +103,8 @@ public:
     // close ends the connection (GOAWAY), failing the streams still open.
     void close();
 
-    // done is a response's body being done with its stream.
+    // done is a request being done with its stream: its response's body, or send() if the request failed (resetting
+    // it if it's not finished, and telling the pool it's free).
     void done(http2::stream_id id);
 
 protected:
@@ -115,6 +116,7 @@ protected:
     void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
     void on_ping_ack(std::span<const std::byte, 8> opaque) override;
 
+    void                                 after_receive() override;
     std::optional<io::clock::time_point> check_connection(io::clock::time_point now) override;
     void                                 maybe_end() override;
 
@@ -139,6 +141,7 @@ private:
     std::size_t                                                                reserved    = 0;
     bool                                                                       peer_goaway = false;
     std::optional<io::clock::time_point>                                       idle_since  = io::clock::now();
+    std::size_t open_seen = 0; // the session's open streams, when last looked at: fewer now means one's been freed
 };
 
 }

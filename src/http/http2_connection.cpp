@@ -122,7 +122,6 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 
                 // the peer may send as much more.
                 c.session.consume(s.id, n);
-                s.deadline.reset();
                 output = c.session.has_output();
             }
             else
@@ -131,7 +130,7 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
                 if (s.failure) co_return io::result{.err = s.failure};
 
                 seen = s.changed.value();
-                c.set_deadline(s, s.read_timeout);
+                c.arm_deadline(s.read_deadline, s.read_timeout);
             }
         }
 
@@ -167,9 +166,11 @@ coro::task<io::result> stream_writer::write(std::span<const std::byte> data)
 
             if (c.session.output_size() > max_output)
             {
-                // the writer's behind (the peer reads slowly): wait for it, rather than queueing more.
+                // the writer's behind (the peer reads slowly): wait for it, rather than queueing more; for as long as
+                // the stream may go without progress.
                 wait_for_writer = true;
                 seen            = c.output_drained().value();
+                c.arm_deadline(s.write_deadline, s.write_timeout);
             }
             else
             {
@@ -181,15 +182,13 @@ coro::task<io::result> stream_writer::write(std::span<const std::byte> data)
                 }
 
                 written += *sent;
-                if (written == data.size())
-                {
-                    s.deadline.reset();
-                }
-                else
+                if (*sent > 0) s.write_deadline.reset();
+
+                if (written < data.size())
                 {
                     // no window: wait for the peer to give some back.
                     seen = s.changed.value();
-                    c.set_deadline(s, s.write_timeout);
+                    c.arm_deadline(s.write_deadline, s.write_timeout);
                 }
             }
         }
@@ -228,10 +227,13 @@ void http2_connection_base::wake_writer()
     if (output) writer_wakeup.notify();
 }
 
-void http2_connection_base::set_deadline(http2_stream_base& s, std::chrono::milliseconds timeout)
+void http2_connection_base::arm_deadline(std::optional<io::clock::time_point>& deadline,
+                                         std::chrono::milliseconds             timeout)
 {
-    s.deadline = after(timeout);
-    if (s.deadline.has_value() && (!timer_target.has_value() || *s.deadline < *timer_target)) wake_timer();
+    if (deadline.has_value()) return;
+
+    deadline = after(timeout);
+    if (deadline.has_value() && (!timer_target.has_value() || *deadline < *timer_target)) wake_timer();
 }
 
 coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
@@ -326,6 +328,7 @@ void http2_connection_base::on_data(http2::stream_id id, std::span<const std::by
     auto& s = *it->second;
     s.received.insert(s.received.end(), data.begin(), data.end());
     if (end_stream) s.received_end = true;
+    s.read_deadline.reset();
     s.changed.notify();
 }
 
@@ -334,19 +337,35 @@ void http2_connection_base::on_stream_reset(http2::stream_id id, std::error_code
     const auto it = active.find(id);
     if (it == active.end()) return;
 
-    if (!it->second->failure) it->second->failure = err;
-    it->second->changed.notify();
+    // NO_ERROR asks for nothing more to be sent (RFC 9113, section 8.1). If what the peer sent has ended, it stands
+    // (the reader reads to its end before finding the failure); if not, it's cut short, which a code of 0 (no error)
+    // can't say.
+    if (err == http2::error_code::no_error) err = std::make_error_code(std::errc::connection_reset);
+
+    auto& s = *it->second;
+    if (!s.failure) s.failure = err;
+    s.changed.notify();
+
+    // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
+    drained.notify();
 }
 
 void http2_connection_base::on_window_update(http2::stream_id id)
 {
+    // a stream that may send again has made progress, as far as its write deadline's concerned.
+    const auto grew = [this](http2_stream_base& s)
+    {
+        if (session.send_window(s.id) > 0) s.write_deadline.reset();
+        s.changed.notify();
+    };
+
     if (id != 0)
     {
-        if (const auto it = active.find(id); it != active.end()) it->second->changed.notify();
+        if (const auto it = active.find(id); it != active.end()) grew(*it->second);
         return;
     }
 
-    for (auto& [_, s] : active) s->changed.notify();
+    for (auto& [_, s] : active) grew(*s);
 }
 
 void http2_connection_base::on_settings(const http2::settings& /*peer*/)
@@ -433,22 +452,35 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
 {
     // a stream waiting too long for what it's to receive, or to send, is reset alone.
     std::optional<io::clock::time_point> next;
+    bool                                 timed_out = false;
     for (auto& [id, s] : active)
     {
-        if (!s->deadline.has_value()) continue;
-        if (*s->deadline > now)
+        const auto expired = [&](const std::optional<io::clock::time_point>& deadline)
         {
-            if (!next.has_value() || *s->deadline < *next) next = s->deadline;
-            continue;
-        }
+            if (!deadline.has_value()) return false;
+            if (*deadline <= now) return true;
+            if (!next.has_value() || *deadline < *next) next = deadline;
+            return false;
+        };
+
+        // NOTE: both checked, so the one that hasn't expired still counts for when to check next.
+        const bool read_expired  = expired(s->read_deadline);
+        const bool write_expired = expired(s->write_deadline);
+        if (!read_expired && !write_expired) continue;
+
+        s->read_deadline.reset();
+        s->write_deadline.reset();
+        if (s->failure) continue; // e.g. reset by the peer, which its waits haven't seen yet
 
         logger.debug("HTTP/2 stream {} timed out", id);
-        s->deadline.reset();
         s->failure = std::make_error_code(std::errc::timed_out);
         session.reset(id, http2::error_code::cancel);
         s->changed.notify();
+        timed_out = true;
     }
 
+    // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
+    if (timed_out) drained.notify();
     return next;
 }
 
@@ -462,6 +494,7 @@ void http2_connection_base::end()
         if (!s->failure) s->failure = std::make_error_code(std::errc::connection_aborted);
         s->changed.notify();
     }
+    drained.notify();
 
     // the reader stops (finding the end of the stream), the writer writes what's left, and the timer stops.
     socket_of(conn).shutdown_read();
