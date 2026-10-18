@@ -1,11 +1,13 @@
 // bench_request measures what the server does for each request: decoding it (HTTP/1.1), routing it to a handler, the
 // handler's response, and encoding that, with TechEmpower's plaintext requests. It counts heap allocations per request
-// too. Three ways:
+// too. Four ways:
 // - pipelined: 16 requests read together (as a client pipelining them sends them), from memory rather than a socket.
 // - one per read: the same, but each read hands over just one request, and has to wait for it (a coroutine, as a
 //   socket's read that has to wait is): as for a client that waits for each response, apart from the socket.
 // - over a socket: the server itself, and a client on another thread sending a request at a time (as TechEmpower's
 //   JSON test does), so with the socket, scheduler and kernel's round trip too.
+// - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
+//   allocations are counted with the server's (as they share the process): for what a stream costs.
 #include "http/request.hpp"
 
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <memory>
 #include <new>
 #include <print>
@@ -27,6 +30,7 @@
 #include <vector>
 
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -36,6 +40,8 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "http/client.hpp"
+#include "http/connection_pool.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/response.hpp"
@@ -96,6 +102,7 @@ constexpr int         repeats         = 7;
 constexpr std::size_t date_bytes      = 29; // e.g. "Sun, 06 Nov 1994 08:49:37 GMT"
 constexpr std::size_t buffer_size     = std::size_t{16} * 1'024;
 constexpr int         socket_requests = 50'000;
+constexpr int         http2_requests  = 20'000;
 
 task<void> plaintext(const http::server_request& /*req*/, http::response_writer& resp)
 {
@@ -259,6 +266,12 @@ public:
         addr.sin_port        = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
+        if (fd < 0)
+        {
+            std::println(stderr, "failed to make a socket");
+            return;
+        }
+
         // NOTE: the server listens from when it's constructed.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
         if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
@@ -345,6 +358,88 @@ void measure_socket(const Router& router)
     runner.join();
 }
 
+// http2_outcome is what measure_http2's client measured.
+struct http2_outcome
+{
+    std::size_t              allocations = 0;
+    std::chrono::nanoseconds took{};
+    int                      failed = -1; // the request that failed, if one did
+};
+
+// get_all GETs url, and reads its response's body to the end, returning whether it got all of it.
+task<bool> get_all(http::client& client, std::string_view url)
+{
+    auto resp = co_await client.get(url);
+    if (!resp.has_value()) co_return false;
+
+    std::array<std::byte, 64> scratch{};
+    while (true)
+    {
+        auto res = co_await resp->body->read(scratch);
+        if (res.err) co_return res.err == net::io::errc::end_of_stream;
+    }
+}
+
+// send_http2_requests sends requests to url one at a time, after warming up, counting the allocations meanwhile.
+task<http2_outcome> send_http2_requests(http::client* client, std::string url)
+{
+    // warms up: e.g. the connection, and the session's buffers.
+    for (int i = 0; i < 1'000; ++i)
+    {
+        if (!co_await get_all(*client, url)) co_return http2_outcome{.failed = i};
+    }
+
+    http2_outcome out;
+    const auto    at    = allocations.load();
+    const auto    start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < http2_requests; ++i)
+    {
+        if (!co_await get_all(*client, url))
+        {
+            out.failed = i;
+            break;
+        }
+    }
+
+    out.took        = std::chrono::steady_clock::now() - start;
+    out.allocations = allocations.load() - at;
+    co_return out;
+}
+
+// measure_http2 serves requests over cleartext HTTP/2, a stream at a time from cppnet's client, and prints the time and
+// allocations per request (the client's and the server's together).
+template<typename Router>
+void measure_http2(const Router& router)
+{
+    auto               workers = std::make_shared<net::coro::thread_pool>(2);
+    net::io::scheduler scheduler{workers};
+
+    http::server server{
+        &scheduler,
+        router,
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    scheduler.spawn(server.serve());
+
+    http::client_options options;
+    options.http2_prior_knowledge = true;
+    http::client client{&scheduler, options};
+
+    const auto url = std::format("http://127.0.0.1:{}/plaintext", server.local_port());
+    const auto out = scheduler.run_to_completion(send_http2_requests(&client, url));
+    if (out.failed >= 0) std::println(stderr, "HTTP/2 request {} failed", out.failed);
+
+    std::println("over HTTP/2 (a stream at a time, {} workers; the client's allocations too):", workers->concurrency());
+    std::println("{:>10.1f} us per request",
+                 std::chrono::duration<double, std::micro>(out.took).count() / http2_requests);
+    std::println("{:>10.1f} allocations per request",
+                 static_cast<double>(out.allocations) / static_cast<double>(http2_requests));
+
+    server.close();
+    scheduler.shutdown();
+}
+
 }
 
 int main()
@@ -356,4 +451,5 @@ int main()
     measure("pipelined", router, [](std::string_view input) { return net::io::string_reader{input}; });
     measure("one per read", router, [](std::string_view input) { return one_request_per_read{input}; });
     measure_socket(router);
+    measure_http2(router);
 }
