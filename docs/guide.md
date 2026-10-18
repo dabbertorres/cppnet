@@ -49,14 +49,17 @@ To stop:
   destructor terminates).
 
 A server's `close()` stops it accepting and ends its connections gracefully (those waiting for a request at once, the
-others once their requests are done), so a server is stopped first: `server.close()`, then `scheduler.shutdown()`
-(which cancels what requests still in progress are waiting for).
+others once their requests are done), so a server is stopped first: `server.close()`, then `co_await server.join()`
+for the requests in progress to finish (for a while: then `server.abort()` stops them), then `scheduler.shutdown()`.
+`request_stop()` aborts the servers using the scheduler too, as well as canceling what their requests are waiting for
+(see HTTP server).
 
 One wait can be canceled alone, with a `std::stop_token`: the scheduler's waits take one as a last argument
 (`sleep_until(deadline, stop)`, `wait_on(word, expected, deadline, stop)`, `wait(fd, op, stop)`, ...), and end with
 `std::errc::operation_canceled` when stop is requested (at once, if it already was), unless they've ended already.
 Sockets take one with `set_stop_token()` (see TCP). A token that can't be stopped (e.g. a default-constructed one) is
-as none. The callback that cancels a wait takes the scheduler's lock for it, and runs on whoever requests stop.
+as none. The callback that cancels a wait takes the scheduler's lock for it, and runs on whoever requests stop. An
+HTTP server's handler gets one with its request (`req.stop`), stopped once the request is no longer wanted.
 
 ```cpp
 // sleeps for a minute, unless stop is requested first.
@@ -93,7 +96,7 @@ The objects that coroutines use must outlive them too:
 - a client outlives its requests (copies of a client share its connections, so a copy may be what a task keeps);
 - a server's destructor waits for the task `serve()` returned (from when it's called: to finish, or to be destroyed
   unrun, as by a scheduler that refuses it) and for its connections (so it can't be destroyed from one of the
-  scheduler's tasks).
+  scheduler's tasks); `join()`, which waits for them in a task, must start while the server exists.
 
 ## Errors
 
@@ -234,9 +237,27 @@ scheduler.spawn(server.serve());
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).
+- **Canceling:** `req.stop`, a `std::stop_token`, is stopped once the request is no longer wanted: over HTTP/2, when
+  the client resets its stream, the stream times out, or its connection ends; over HTTP/1.1, when its connection
+  ends; and when the server is aborted (below). Canceling is cooperative: a handler checks `req.stop.stop_requested()`
+  between steps, registers a `std::stop_callback` (quick, and not blocking: it runs on whichever thread stopped the
+  token), or passes the token on to the waits that take one, which then fail with `std::errc::operation_canceled`:
+
+  ```cpp
+  if (auto err = co_await scheduler->sleep_until(net::io::clock::now() + 1s, req.stop)) co_return;   // canceled
+  ```
+
+  The server doesn't answer for a handler that's stopped without answering (nor send a 500 if it throws): the
+  connection's closed, or the stream reset. A handler stopped by the server's `abort()` may still answer (e.g. a 503).
+  A copy of the token stays valid after the handler returns. The server sets `req.stop` before calling the handler, so
+  middleware can swap in a token of its own (e.g. stopped by a deadline, or by the server's through a
+  `std::stop_callback`) for the handler it wraps. `req.aborted` is stopped once the server is aborted: not a reason,
+  only whether the server's own stop came, for telling it from the client's side.
 - **Middleware** wraps a handler: e.g. `instrument::http_metrics{std::move(router)}` (`instrument/middleware.hpp`)
-  measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Middleware passes values to
-  handlers in `req.extensions`.
+  measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Both record a request
+  canceled before its response was sent as 499 Client Closed Request (not an error) if the client's side stopped it,
+  or as 503 Service Unavailable (an error, as any 5xx) if the server was aborted. Middleware passes values to handlers
+  in `req.extensions`.
 - **`server_config`** sets the host and port, and limits: header and body read timeouts, the write timeout, the size
   of a request's head, and how many connections are served at once. To handle a failure to listen, give the server a
   listener from `listener::make()` instead of a host and port.
@@ -244,20 +265,28 @@ scheduler.spawn(server.serve());
   request (its first, or the next on a kept-alive one) closes at once, and one in the middle of a request finishes it
   (the handler reads the body and sends its response as usual, which says `Connection: close` if it wasn't sent yet),
   then closes, without serving requests pipelined after it; HTTP/2 connections are below. A `serve()` task that
-  hasn't started yet returns at once when it does. `close()` cancels nothing:
-  `scheduler.shutdown()` (or `request_stop()`) cancels what the connections are still waiting for, and destroying
-  the server closes it, ends HTTP/1.1 requests still in progress (reading a body fails), and waits for its
-  connections.
+  hasn't started yet returns at once when it does. `close()` cancels nothing. `co_await server.join()` waits for
+  `serve()` and the connections to finish; `server.abort()` does what `close()` does and stops every handler's
+  `req.stop` too, and ends HTTP/1.1 requests in progress (reading a body fails), for a program that gives the
+  requests a while and then gives up (as Go's `Shutdown` then `Close`). Destroying the server aborts it, and waits for
+  its connections; so does the scheduler's `request_stop()` (or `shutdown()`), which also cancels what the
+  connections are waiting for. `example/http-server` drains for up to 10 seconds:
+
+  ```cpp
+  server.close();
+  scheduler.run_to_completion(drain(&scheduler, &server, std::chrono::seconds{10}));   // join(), or abort() after 10 s
+  ```
 - **HTTP/2** is served too (unless `server_config::http2` is off), with the same handlers: over TLS to clients that
   agree on `h2` with ALPN (browsers do), and over cleartext to clients that start with HTTP/2's preface (prior
   knowledge, e.g. `curl --http2-prior-knowledge`, or a proxy in front). A request's `version` says which (2.0). Its
   streams are served at once, each handler in a task of its own, up to `http2_max_concurrent_streams` at a time
   (more wait for others to finish); the timeouts apply to each stream (one that times out is reset, and the
   connection's others go on), and `close()` ends HTTP/2 connections gracefully (GOAWAY, then once their streams are
-  done). A connection that ends otherwise (the client closing it, or an error) is closed at once, while its handlers
-  (which can't be cancelled) still run, and hold its place among `max_connections` until they return. A handler that
-  throws once its response is under way has its stream reset, so the client doesn't take what it got as the whole
-  response.
+  done; the client's GOAWAY doesn't stop the streams it has open either). A connection that ends otherwise (the
+  client closing it, or an error) is closed at once, and its handlers' tokens stopped; the handlers still hold its
+  place among `max_connections` until they return. A handler that throws once its response is under way has its
+  stream reset, so the client doesn't take what it got as the whole response; one the server's `abort()` stopped, with
+  its response incomplete, has it reset with CANCEL.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

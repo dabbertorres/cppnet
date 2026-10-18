@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -40,6 +41,7 @@
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "listen.hpp"
+#include "socket.hpp"
 #include "tcp.hpp"
 
 namespace http  = net::http;
@@ -781,4 +783,364 @@ TEST_CASE("an HTTP/2 response's field with a line break throws, as over HTTP/1.1
                                             CHECK(r.body == "threw");
                                             CHECK(header(r, "x-bad") == "(none)");
                                         }));
+}
+
+namespace
+{
+
+// stop_probe records how handlers' waits on their requests' tokens end.
+struct stop_probe
+{
+    std::atomic<std::uint64_t> started{0};
+    std::atomic<std::uint64_t> woke{0};
+    std::atomic<std::uint64_t> canceled{0}; // of those that woke, how many were stopped
+
+    // wait waits for a minute, or until stop is requested, returning whether it was.
+    task<bool> wait(net::io::scheduler* sched, std::stop_token stop)
+    {
+        bump(sched, started);
+        const auto err     = co_await sched->sleep_until(net::io::clock::now() + 60s, std::move(stop));
+        const bool stopped = err == std::errc::operation_canceled;
+        if (stopped) canceled.fetch_add(1);
+        bump(sched, woke);
+        co_return stopped;
+    }
+
+    // reach waits (up to 5 seconds) for word to reach n, returning whether it did.
+    static task<bool> reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t n)
+    {
+        const auto deadline = net::io::clock::now() + 5s;
+        for (auto seen = word.load(); seen < n; seen = word.load())
+        {
+            if (co_await sched->wait_on(word, seen, deadline)) co_return word.load() >= n;
+        }
+        co_return true;
+    }
+
+    static void bump(net::io::scheduler* sched, std::atomic<std::uint64_t>& word)
+    {
+        word.fetch_add(1);
+        sched->notify_all(word);
+    }
+};
+
+// probe_router is make_router's, with handlers that wait on their request's token:
+// - /wait waits, then answers 200 "waited" if it wasn't stopped, or 503 "aborted" if the server was aborted, or
+//   "stopped" if it was stopped otherwise;
+// - /wait-silent waits, then returns without answering;
+// - /partial sends a head (with a Content-Length of 100) and some of its body, then waits;
+// - /nap waits a little (or until stopped), then answers "rested" or "stopped".
+http::router probe_router(net::io::scheduler* sched, stop_probe* probe)
+{
+    auto r = make_router(sched);
+    r.GET("/wait",
+          [sched, probe](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const bool stopped = co_await probe->wait(sched, req.stop);
+              auto       msg     = "waited"sv;
+              if (stopped) msg = req.aborted.stop_requested() ? "aborted"sv : "stopped"sv;
+              auto* body =
+                  co_await resp.send(stopped ? http::status::SERVICE_UNAVAILABLE : http::status::OK, msg.size());
+              co_await net::io::write_all(*body, msg);
+          });
+    r.GET("/wait-silent",
+          [sched, probe](const http::server_request& req, http::response_writer&) -> task<void>
+          { (void)co_await probe->wait(sched, req.stop); });
+    r.GET("/partial",
+          [sched, probe](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK, 100);
+              co_await net::io::write_all(*body, "partial"sv);
+              (void)co_await probe->wait(sched, req.stop);
+          });
+    r.GET("/nap",
+          [sched, probe](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              stop_probe::bump(sched, probe->started);
+              const auto err = co_await sched->sleep_until(net::io::clock::now() + 300ms, req.stop);
+              const auto msg = err ? "stopped"sv : "rested"sv;
+              stop_probe::bump(sched, probe->woke);
+
+              auto* body = co_await resp.send(http::status::OK, msg.size());
+              co_await net::io::write_all(*body, msg);
+          });
+    return r;
+}
+
+}
+
+TEST_CASE("an HTTP/2 handler's token is stopped when the client resets its stream, and only its",
+          "[http][http2][server][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use it.
+    stop_probe probe;
+
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, probe_router(&sched, &probe)};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&](h2_client& c) -> task<>
+                                        {
+                                            const auto reset = c.request("GET", "/wait");
+                                            const auto other = c.request("GET", "/slow");
+                                            REQUIRE(co_await c.sync());
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.started, 1));
+
+                                            const auto start = std::chrono::steady_clock::now();
+                                            c.s.reset(reset, http2::error_code::cancel);
+
+                                            // the other stream goes on.
+                                            REQUIRE(co_await c.wait_for(other));
+                                            CHECK(c.responses[other].body == "slow");
+
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.woke, 1));
+                                            CHECK(probe.canceled.load() == 1);
+                                            CHECK(std::chrono::steady_clock::now() - start < 5s);
+
+                                            // and the connection.
+                                            const auto next = c.request("GET", "/");
+                                            REQUIRE(co_await c.wait_for(next));
+                                            CHECK(c.responses[next].status == "200");
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 handler's token is stopped when its stream times out", "[http][http2][server][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use them.
+    stop_probe                 probe;
+    std::atomic<std::uint64_t> read_done{0};
+
+    net::io::scheduler sched{make_pool()};
+
+    // reads its body in a task of its own (which times out, as the body never comes), while it waits on its token.
+    auto r = probe_router(&sched, &probe);
+    r.POST("/read-aside",
+           [&](http::server_request& req, http::response_writer&) -> task<void>
+           {
+               REQUIRE(sched.spawn(
+                   [](net::io::scheduler* sched, net::io::reader* body, std::atomic<std::uint64_t>* done) -> task<>
+                   {
+                       (void)co_await net::io::read_all(*body);
+                       stop_probe::bump(sched, *done);
+                   }(&sched, req.body.get(), &read_done)));
+
+               (void)co_await probe.wait(&sched, req.stop);
+
+               // the body's reader is the stream's, which goes once the handler returns.
+               (void)co_await stop_probe::reach(&sched, read_done, 1);
+           });
+
+    test_server server{&sched, std::move(r), {.body_read_timeout = 1s}};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&](h2_client& c) -> task<>
+                                        {
+                                            const auto stalled = c.request("POST", "/read-aside", "", false);
+                                            REQUIRE(co_await c.wait_for(stalled));
+                                            CHECK(c.responses[stalled].reset == http2::error_code::cancel);
+
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.woke, 1));
+                                            CHECK(probe.canceled.load() == 1);
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 handler's token is stopped when its connection ends", "[http][http2][server][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use it.
+    stop_probe probe;
+
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, probe_router(&sched, &probe)};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&](h2_client& c) -> task<>
+                                        {
+                                            (void)c.request("GET", "/wait");
+                                            (void)c.request("GET", "/wait");
+                                            REQUIRE(co_await c.sync());
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.started, 2));
+
+                                            // the client closes its side.
+                                            c.sock->shutdown_write();
+
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.woke, 2));
+                                            CHECK(probe.canceled.load() == 2);
+                                        }));
+}
+
+TEST_CASE("HTTP/2 handlers that heed their tokens free their connection's slot once it's ended",
+          "[http][http2][server][limits][cancel]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+    r.GET("/hold",
+          [&g](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              if (co_await g.pass(req.stop)) co_return;
+              co_await resp.send(http::status::OK, 0);
+          });
+
+    // NOTE: one connection at a time, so a second client waits for the first's slot.
+    test_server server{
+        &sched,
+        std::move(r),
+        {.max_connections = 1, .http2_max_concurrent_streams = 2}
+    };
+
+    const auto port = server.port();
+    sched.run_to_completion(with_client(&sched,
+                                        port,
+                                        [&sched, port](h2_client& c) -> task<>
+                                        {
+                                            // as the group-5 test: streams opened and reset at once, until the
+                                            // connection's ended with ENHANCE_YOUR_CALM.
+                                            for (int i = 0; i < 20; ++i)
+                                            {
+                                                const auto id = c.request("GET", "/hold");
+                                                c.s.reset(id, http2::error_code::cancel);
+                                            }
+
+                                            const bool closed = co_await c.pump([&] { return c.closed; }, 3s);
+                                            REQUIRE(closed);
+                                            CHECK(c.goaway_error == http2::error_code::enhance_your_calm);
+
+                                            // the handlers return (their tokens stopped), so the next client's
+                                            // served without the gate opening.
+                                            co_await with_client(
+                                                &sched,
+                                                port,
+                                                [](h2_client& next) -> task<>
+                                                {
+                                                    const auto id       = next.request("GET", "/");
+                                                    const bool answered = co_await next.wait_for(id, 3s);
+                                                    REQUIRE(answered);
+                                                    CHECK(next.responses[id].body == "hello over HTTP/2");
+                                                });
+                                        }));
+}
+
+TEST_CASE("the client's GOAWAY doesn't stop the HTTP/2 handlers running", "[http][http2][server][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use it.
+    stop_probe probe;
+
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, probe_router(&sched, &probe)};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&](h2_client& c) -> task<>
+                                        {
+                                            const auto id = c.request("GET", "/nap");
+                                            REQUIRE(co_await c.sync());
+                                            REQUIRE(co_await stop_probe::reach(&sched, probe.started, 1));
+
+                                            c.s.goaway(0, http2::error_code::no_error);
+                                            REQUIRE(co_await c.wait_for(id));
+                                            CHECK(c.responses[id].body == "rested");
+                                        }));
+}
+
+TEST_CASE("closing the server doesn't stop HTTP/2 handlers' tokens; aborting it does", "[http][http2][server][cancel]")
+{
+    // NOTE: before the scheduler, as the handlers use it.
+    stop_probe probe;
+
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, probe_router(&sched, &probe)};
+
+    // starts a request for path, and waits for its handler to start.
+    const auto start = [&](h2_client& c, std::string_view path) -> task<http2::stream_id>
+    {
+        const auto id = c.request("GET", path);
+        REQUIRE(co_await c.sync());
+        REQUIRE(co_await stop_probe::reach(&sched, probe.started, 1));
+        co_return id;
+    };
+
+    SECTION("closed: the handler finishes")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id = co_await start(c, "/nap");
+                                                server.server.close();
+
+                                                REQUIRE(co_await c.wait_for(id));
+                                                CHECK(c.responses[id].body == "rested");
+                                            }));
+    }
+
+    SECTION("aborted: a handler may still answer")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id = co_await start(c, "/wait");
+                                                server.server.abort();
+
+                                                REQUIRE(co_await c.wait_for(id));
+                                                CHECK(c.responses[id].status == "503");
+                                                CHECK(c.responses[id].body == "aborted");
+                                                CHECK(probe.canceled.load() == 1);
+                                            }));
+    }
+
+    SECTION("aborted: an incomplete response is reset with CANCEL")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id = co_await start(c, "/partial");
+                                                server.server.abort();
+
+                                                REQUIRE(co_await c.wait_for(id));
+                                                CHECK(c.responses[id].status == "200");
+                                                CHECK(c.responses[id].body == "partial");
+                                                CHECK(c.responses[id].reset == http2::error_code::cancel);
+                                            }));
+    }
+
+    SECTION("aborted: a handler that doesn't answer gets no answer from the server")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id = co_await start(c, "/wait-silent");
+                                                server.server.abort();
+
+                                                REQUIRE(co_await c.wait_for(id));
+                                                CHECK(c.responses[id].status.empty());
+                                                CHECK(c.responses[id].reset == http2::error_code::cancel);
+                                            }));
+    }
+
+    SECTION("aborted: a stream started after is stopped from the start")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto first = co_await start(c, "/nap");
+                                                server.server.abort();
+
+                                                // (the drain's first GOAWAY still lets the client open streams.)
+                                                const auto later = c.request("GET", "/wait");
+                                                REQUIRE(co_await c.wait_for(later));
+                                                CHECK(c.responses[later].status == "503");
+                                                CHECK(c.responses[later].body == "aborted");
+
+                                                REQUIRE(co_await c.wait_for(first));
+                                                CHECK(c.responses[first].body == "stopped");
+                                            }));
+    }
 }

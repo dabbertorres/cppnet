@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -263,6 +265,17 @@ struct gate
         {
             if (co_await sched->wait_on(opened, seen) == std::errc::operation_canceled) co_return;
         }
+    }
+
+    // pass(stop) passes as pass() does, or once stop is requested, returning whether it was.
+    net::coro::task<bool> pass(std::stop_token stop)
+    {
+        const auto n = arrived.fetch_add(1) + 1;
+        for (auto seen = opened.load(); seen < n; seen = opened.load())
+        {
+            if (co_await sched->wait_on(opened, seen, std::nullopt, stop)) co_return stop.stop_requested();
+        }
+        co_return false;
     }
 
     void open()

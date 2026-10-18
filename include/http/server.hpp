@@ -80,7 +80,9 @@ public:
     // listen as an error, where these constructors throw std::system_error).
     //
     // handler is called for each request. If it returns without sending a response, an empty 200 OK is sent. If it
-    // throws, a 500 Internal Server Error is sent (if nothing was yet), and the connection is closed.
+    // throws, a 500 Internal Server Error is sent (if nothing was yet), and the connection is closed. Neither is sent
+    // for a request whose token (server_request::stop) was stopped: the connection's closed (an HTTP/2 stream reset)
+    // instead.
     server(io::scheduler* scheduler, net::listener listener, request_handler handler, const server_config& cfg = {});
 
     server(io::scheduler* scheduler, net::listener listener, router&& handler, const server_config& cfg = {})
@@ -105,20 +107,33 @@ public:
     server(server&&)            = delete;
     server& operator=(server&&) = delete;
 
-    // Closes the server, ends its HTTP/1.x connections' requests in progress (reads of a request's body fail, with
-    // std::errc::connection_aborted), and blocks until serve() and the connections have finished: so it must not be
-    // destroyed from one of the scheduler's tasks, which might be one of them (or one a worker it needs is running).
-    // HTTP/2 connections end gracefully, as close() ends them. A handler that doesn't finish (e.g. waiting for
-    // something other than its connection) holds it up: the scheduler's request_stop() (or shutdown()) cancels what
-    // the handlers are waiting for.
+    // Aborts the server (see abort()), and blocks until serve() and the connections have finished: so it must not be
+    // destroyed from one of the scheduler's tasks, which might be one of them (or one a worker it needs is running). A
+    // handler that doesn't heed its request's stop token (and isn't waiting on its connection) holds it up: the
+    // scheduler's request_stop() (or shutdown()) cancels what the handlers are waiting for.
     ~server();
 
     // close stops accepting connections, and ends the open ones gracefully. An HTTP/1.x connection waiting for a
     // request (its first, or the next) is closed at once (as is a TLS handshake in progress); one in the middle of a
     // request finishes it (the handler reads the body and sends its response as usual, which says Connection: close
     // if it wasn't sent yet), then closes, without serving any pipelined after it. HTTP/2 connections send GOAWAY, and
-    // close once their streams are done. Waiting for the connections is the destructor's, or the scheduler's.
+    // close once their streams are done. It doesn't stop the handlers' tokens (server_request::stop): abort() does.
+    // join() waits for the connections, as the destructor does.
     void close();
+
+    // abort does what close() does, and stops every handler's token (server_request::stop; those of requests that
+    // start later too): for a program that has let the requests in progress finish for a while (see join()), and
+    // gives up on the rest, as Go's Shutdown then Close. HTTP/1.x connections' requests in progress end too (reads of
+    // a request's body fail, with std::errc::connection_aborted), and an HTTP/2 response a handler leaves incomplete
+    // is reset with CANCEL. A handler may still respond (e.g. 503); one that doesn't (or throws) gets no response from
+    // the server (its connection's closed, or its stream reset). The destructor aborts, and so does the scheduler's
+    // request_stop() (through scheduler::stop_token()).
+    void abort();
+
+    // join waits until serve()'s task and the connections have finished (at once, if there are none: e.g. serve()
+    // wasn't called): after close(), perhaps racing a deadline, after which abort() stops what's left. The server must
+    // exist when the task starts; the task may finish on the thread that ends the last connection.
+    [[nodiscard]] coro::task<> join();
 
     // serve accepts and serves connections, until the server is closed (or the scheduler stopped). The server waits
     // for the task it returns from when it's called: until the task finishes, or is destroyed without running (e.g.
@@ -167,6 +182,11 @@ private:
     // if it's to a HEAD request.
     static void start_response(connection_state& state, io::discard_writer& no_body);
 
+    // default_response sends the empty 200 OK a handler that sent no response gets, returning whether the connection
+    // may go on: not if the handler was stopped (by abort()), which gets none, as the server closes the connection
+    // rather than claim the request succeeded.
+    coro::task<bool> default_response(connection_state& state, response_writer& rw) const;
+
     // The ways a connection ends other than the client closing it, which close it.
     coro::task<> end_after_decode_error(detail::connection& conn, connection_state& state, std::error_code err);
     coro::task<> end_after_handler_failure(detail::connection& conn,
@@ -204,11 +224,25 @@ private:
     // closing is requested by close(), to end the connections (and TLS handshakes) being served, gracefully.
     std::stop_source closing;
 
-    // aborting is requested by the destructor, to end HTTP/1.x connections' requests in progress too.
+    // aborting is requested by abort(), to stop the handlers' tokens, and end HTTP/1.x connections' requests in
+    // progress too.
     std::stop_source aborting;
 
-    // running counts serve() and the connections (which are the scheduler's tasks), for the destructor to wait for.
+    // running counts serve() and the connections (which are the scheduler's tasks), for join() and the destructor to
+    // wait for.
     coro::async_scope running;
+
+    // abort_on_stop aborts the server once the scheduler's stopped.
+    struct abort_on_stop
+    {
+        server* self;
+
+        void operator()() const noexcept { self->abort(); }
+    };
+
+    // NOTE: last, as it may run as soon as it's registered (if the scheduler's stopped already), and the destructor
+    //       unregisters it first (waiting for a call in progress).
+    std::optional<std::stop_callback<abort_on_stop>> on_scheduler_stop;
 };
 
 }

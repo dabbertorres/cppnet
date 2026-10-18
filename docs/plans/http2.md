@@ -251,7 +251,8 @@ streams in flight (that GOAWAY, any other connection error, a failed write, or t
 (close_notify over TLS, then FIN) once the writer has flushed what's left, before its handlers finish: RFC 9113 (section
 5.4.1) says it MUST be closed after a connection error, and a client waits for the streams GOAWAY says may have been
 processed until it is. Its fd, and its `max_connections` slot, are still held until the handlers return, deliberately:
-as handlers can't be cancelled, that bounds those left running to `max_connections` times `max_concurrent_streams`
+as handlers needn't heed their tokens (`server_request::stop`, which the connection's end stops: see
+`handler-cancellation.md`), that bounds those left running to `max_connections` times `max_concurrent_streams`
 (freeing the slot would let a client reconnect and pile up more), and HTTP/1.1 holds its slot the same way. Graceful
 `close()` is unchanged. (Later:) however a connection ends (the client's side too), its reader then goes on reading, and
 dropping, what the peer still sends, until the peer closes its side too, for up to 2 s (or 256 KB), as HTTP/1.1 lingers

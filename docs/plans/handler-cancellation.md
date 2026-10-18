@@ -1,8 +1,9 @@
 # Plan: canceling HTTP server handlers
 
-Status: stage 1 (waits that take a token) done (2026-10-18); stages 2 to 5 planned. Where things stand describes what
-was there before (HTTP/1.1's graceful `close()`, and the `aborting` source the destructor stops), and stage 1's
-section, what it added. The questions below (under Decided questions) were decided as recommended.
+Status: stage 1 (waits that take a token) done (2026-10-18); stage 2 (the server's token), with stage 5's 499/503, done
+(2026-10-18); stages 3 and 4 planned. Where things stand describes what was there before (HTTP/1.1's graceful
+`close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they added. The
+questions below (under Decided questions) were decided as recommended.
 
 ## Goal
 
@@ -173,6 +174,49 @@ HTTP/1.1 connections register on it (to shut their reading side). Which calls st
   already cancels every wait; this reaches handlers between waits (computing, or waiting on something that isn't the
   scheduler's). `example/http-server`'s `close()` then `shutdown()` gets the hard stop without a change.
 
+Done as above (stage 2), with these details settled in the code:
+
+- **Who stops what, and where.** HTTP/2's streams keep their source in `http2_stream_base::stop` (no source for the
+  client's streams, rather than a virtual `stop_source_of()`: the stage 3 client may not need one), made in
+  `start_stream` once the request's accepted. `http2_connection_base::fail_stream()` is the one place a stream fails
+  (the reset, the timeout, `end()`, a failed submit): under `mu`, it sets the failure and queues a copy of the source
+  on `to_stop`, unless the stream had failed already. `stop_pending()` swaps the queue out under `mu` and stops it
+  after; the reader and the timer swap it out in the critical sections they already have (so no extra locking per
+  receive), and the writer and `run()` after `end()`, `run_stream()` after a handler (whose `maybe_end()` may end the
+  connection) and a stream's own failed write call `stop_pending()`. The queue isn't reserved: it's empty unless
+  streams fail, and swapping it out hands its buffer to the caller. The connection's `mu` is a `connection_mutex`, a
+  `std::mutex` that in debug builds records its owner, so `stop_all()` asserts it's never called holding it.
+- **The hard stop.** `abort()` is `close()` then `aborting.request_stop()`; `~server` unregisters its callback on
+  `scheduler::stop_token()` (waiting for a call in progress) and aborts; the callback, registered at the end of the
+  constructor, aborts. HTTP/1.1 registers its abort callback (shutting the reading side, and stopping the connection's
+  source) once it knows the connection isn't HTTP/2, rather than at once: `close()`, which `abort()` runs first, ends
+  a connection waiting for the preface anyway. HTTP/2 connections register `stop_handlers()`, which collects every
+  stream's source under `mu` (queued streams too: their handlers then start stopped) and stops them after, and sets
+  `aborted`, so the sources of streams started later (the drain's first GOAWAY still admits them) are queued at once.
+- **A handler that returns after a stop gets no response it didn't send.** Rather than an empty 200, or a 500 for a
+  handler that threw (logged at debug): HTTP/1.1 closes the connection, and HTTP/2 resets the stream with CANCEL (or
+  leaves it, if it failed). This goes past the plan's "no 500 to a client that's gone" for the hard stop too: a
+  default 200 would claim a request succeeded that its handler may have abandoned. A handler that answers (e.g. 503)
+  is sent as usual; an HTTP/2 response it leaves incomplete after a hard stop is reset with CANCEL, not
+  INTERNAL_ERROR.
+- **`join()`** is `co_await running.join()`: it resumes on the thread that ends the last connection, and touches
+  nothing of the server after, as the server may be destroyed as soon as the scope's empty; the server must exist when
+  it starts. `example/http-server` closes, then `run_to_completion()`s a drain: `join()`, with a task sleeping 10 s on
+  a token the drain stops once joined, which aborts the server if it wakes.
+- **499 and 503 (Decided questions (7)), in this stage rather than stage 5:** `http_metrics` and `http_tracing` record
+  a request whose token was stopped before its final response was sent, whatever the handler did, as 499 if the
+  client's side stopped it (the span not an error, even if the handler threw), or 503 if the server was aborted (the
+  span an error, as for any 5xx). Middleware tells them apart by `server_request::aborted`, a copy of the server's
+  `aborting` token, which the server sets once per HTTP/1.1 connection (its requests reuse the request) and per HTTP/2
+  stream (in `start_stream`, so queued streams have it too): nothing's allocated, and HTTP/1.1's per-request cost is
+  unchanged. It says only whether the server aborted (by the time the middleware looks: a request the client's side
+  stopped just before an abort is recorded as 503), not why the token was stopped, so Decided questions (4) stands.
+- **Measured** (`bench_request`, Release, 2 workers): HTTP/1.1 over a socket, 3.0 allocations per request before and
+  after, and the same time (27 us, within noise); the in-memory tests are unchanged. HTTP/2, a stream at a time from
+  the client with prior knowledge (both sides' allocations, as they share the process; added to `bench_request` for
+  this): 50.7 allocations per request before, 51.8 after (the stream's source), at the same time (78 us). Accepted,
+  as Decided questions (9) recommends.
+
 ### Waits that take a token (`io/scheduler.hpp`, sockets)
 
 What makes the token useful in a handler: a `co_await scheduler.sleep_until(deadline, req.stop)` that ends when the
@@ -263,10 +307,11 @@ questions (3); the recommended design:
 ### Middleware and routers
 
 The routers and `http_metrics`/`http_tracing` pass the request through, so the token reaches the handler without them
-doing anything. What they record for a canceled request is Decided questions (7): the recommendation is 499 (nginx's
-Client Closed Request, `status::CLIENT_CLOSED_REQUEST`) when the token was stopped by the client's side (not the
-server's hard stop) before a final response was sent, in the metrics' `code` and the span's
-`http.response.status_code`, the span not marked an error (it's the client's doing, as a 4xx is). Middleware that
+doing anything. What they record for a canceled request is Decided questions (7): 499 (nginx's Client Closed Request,
+`status::CLIENT_CLOSED_REQUEST`) when the token was stopped by the client's side before a final response was sent, in
+the metrics' `code` and the span's `http.response.status_code`, the span not marked an error (it's the client's doing,
+as a 4xx is); and 503 when it was the server's hard stop (`server_request::aborted` tells them apart), an error as any
+5xx. Middleware that
 wants its own deadline (a timeout handler, as Go's `TimeoutHandler`) makes a source of its own, linked to `req.stop`
 by a `std::stop_callback`, swaps it into `req.stop` for the handler it wraps, and puts the original back: the field
 being assignable is what allows it. A timeout middleware itself is later (it needs a timer task per request).
@@ -312,7 +357,8 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
 - **Client** (`test/http/client.cpp`, `http2_client.cpp`): canceled waiting for a connection, while connecting, while
   waiting for the head and while reading the body; over HTTP/1.1 the connection isn't reused, over HTTP/2 the stream's
   reset (the server's handler sees its token stopped) and the connection is.
-- **Middleware** (`test/instrument/middleware.cpp`): a canceled request is recorded as 499.
+- **Middleware** (`test/instrument/middleware.cpp`): a request the client's side canceled is recorded as 499 (the span
+  not an error), one the server's abort did as 503 (an error).
 - `bench_request`'s numbers (time and allocations per request) before and after each stage, in the pull requests.
 
 ## Stages
@@ -329,8 +375,8 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
 4. **HTTP/1.1 noticing the client leave**: the watcher, `flush_before_read`'s hold, deadlines that apply to a read
    already waiting. Measured with `bench_request` before it's merged; if the hand-over costs too much, it's opt-in
    (a `server_config` setting) or dropped.
-5. **Middleware**: 499 in `http_metrics` and `http_tracing`. Later: a timeout middleware, and a helper for linking
-   sources.
+5. **Middleware**: 499 (and 503 for the server's abort) in `http_metrics` and `http_tracing` (done with stage 2). Later: a timeout middleware, and a
+   helper for linking sources.
 
 ## Decided questions
 
@@ -370,8 +416,10 @@ Each was decided as recommended (2026-10-18); the options are kept for the reaso
    `io::writer` interfaces stay as they are. (b) A token parameter on `read`/`write`: every reader and writer changes.
    **Recommended: (a).**
 7. **How middleware records a canceled request.** (a) 499 when the client's side stopped it before a final response
-   (metrics and spans; the span not an error). (b) As now (the handler's status, or 200 or 500). (c) A separate label
-   or attribute (e.g. `error.type`). **Recommended: (a)**, as nginx's logs do.
+   (metrics and spans; the span not an error), and 503 when the server's hard stop did (an error, as any 5xx; told
+   apart by `server_request::aborted`, whether the server aborted, which isn't a reason: (4) stands). (b) As now (the
+   handler's status, or 200 or 500). (c) A separate label or attribute (e.g. `error.type`). **Recommended: (a)**, as
+   nginx's logs do.
 8. **Implicit propagation**, as `std::execution::task`'s environment: `co_await scheduler.sleep_until(t)` inside a
    handler would be canceled without passing the token. It costs every `co_await` a copy and every promise a pointer,
    and spawned tasks would need a rule. **Recommended: not now**; explicit tokens can coexist with it later.

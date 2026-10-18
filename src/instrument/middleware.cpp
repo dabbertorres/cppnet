@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -37,10 +38,21 @@ using namespace std::string_view_literals;
 namespace http          = net::http;
 namespace opentelemetry = net::instrument::opentelemetry;
 
-// responded_status is the status the server sends: what the handler sent, if it did, otherwise 500 Internal Server
-// Error if it threw, or 200 OK if it didn't.
-http::status responded_status(const http::response_writer& resp, bool threw) noexcept
+// canceled_status is the status recorded for a request that was stopped (see http::server_request::stop) before its
+// final response was sent (when the server sends none the handler didn't, nor a 500 for one that threw): 503 Service
+// Unavailable if the server was aborted (server_request::aborted), or else 499 Client Closed Request (as nginx logs
+// it), the client's side having stopped it. NONE if it wasn't canceled.
+http::status canceled_status(const http::server_request& req, const http::response_writer& resp) noexcept
 {
+    if (resp.sent() || !req.stop.stop_requested()) return http::status::NONE;
+    return req.aborted.stop_requested() ? http::status::SERVICE_UNAVAILABLE : http::status::CLIENT_CLOSED_REQUEST;
+}
+
+// responded_status is the status the server sends: what the handler sent, if it did, otherwise 500 Internal Server
+// Error if it threw, or 200 OK if it didn't; or, if it was canceled, its canceled_status.
+http::status responded_status(http::status canceled, const http::response_writer& resp, bool threw) noexcept
+{
+    if (canceled != http::status::NONE) return canceled;
     if (auto sent = resp.status_code(); sent != http::status::NONE) return sent;
     return threw ? http::status::INTERNAL_SERVER_ERROR : http::status::OK;
 }
@@ -145,7 +157,8 @@ struct http_metrics::state
 
         const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
         self->active.decrement();
-        self->duration(req.method, responded_status(resp, failure != nullptr), req.route).observe(elapsed.count());
+        const auto code = responded_status(canceled_status(req, resp), resp, failure != nullptr);
+        self->duration(req.method, code, req.route).observe(elapsed.count());
 
         if (failure != nullptr) std::rethrow_exception(failure);
     }
@@ -225,8 +238,12 @@ struct http_tracing::state
 
         span.end_time = std::chrono::system_clock::now();
 
-        const auto method = method_name(req.method);
-        const auto code   = responded_status(resp, failure != nullptr);
+        const auto method   = method_name(req.method);
+        const auto canceled = canceled_status(req, resp);
+        const auto code     = responded_status(canceled, resp, failure != nullptr);
+
+        // the client's side stopped it.
+        const bool client_closed = canceled == http::status::CLIENT_CLOSED_REQUEST;
 
         span.name = std::string{method};
         if (!req.route.empty()) span.name.append(1, ' ').append(req.route);
@@ -243,8 +260,9 @@ struct http_tracing::state
         span.attributes.push_back(
             attribute("http.response.status_code", static_cast<std::int64_t>(std::to_underlying(code))));
 
-        // for a server, only a 5xx is an error: a 4xx is the client's.
-        if (failure != nullptr)
+        // for a server, only a 5xx is an error: a 4xx is the client's, as is a request its side canceled, whatever the
+        // handler threw for it (one the server's abort canceled is a 503, an error as any).
+        if (failure != nullptr && !client_closed)
         {
             span.status = {.message = exception_message(failure), .code = opentelemetry::status_code::error};
         }

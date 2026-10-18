@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -179,8 +181,9 @@ coro::task<io::result> stream_writer::write(std::span<const std::byte> data)
 
     while (true)
     {
-        bool          wait_for_writer = false;
-        std::uint64_t seen            = 0;
+        bool            wait_for_writer = false;
+        std::uint64_t   seen            = 0;
+        std::error_code failed; // submitting failed
         {
             std::scoped_lock lock{c.mu};
             auto&            s = *stream;
@@ -200,20 +203,29 @@ coro::task<io::result> stream_writer::write(std::span<const std::byte> data)
                 const auto sent = c.session.submit_data(s.id, data.subspan(written), false);
                 if (!sent.has_value())
                 {
-                    s.failure = sent.error();
-                    co_return io::result{.count = written, .err = s.failure};
+                    c.fail_stream(s, sent.error());
+                    failed = sent.error();
                 }
-
-                written += *sent;
-                if (*sent > 0) s.write_deadline.reset();
-
-                if (written < data.size())
+                else
                 {
-                    // no window: wait for the peer to give some back.
-                    seen = s.changed.value();
-                    c.arm_deadline(s.write_deadline, s.write_timeout);
+                    written += *sent;
+                    if (*sent > 0) s.write_deadline.reset();
+
+                    if (written < data.size())
+                    {
+                        // no window: wait for the peer to give some back.
+                        seen = s.changed.value();
+                        c.arm_deadline(s.write_deadline, s.write_timeout);
+                    }
                 }
             }
+        }
+
+        if (failed)
+        {
+            // the handler's token, which its own callbacks may be registered on, so it's after unlocking.
+            c.stop_pending();
+            co_return io::result{.count = written, .err = failed};
         }
 
         c.wake_writer();
@@ -259,6 +271,38 @@ void http2_connection_base::arm_deadline(std::optional<io::clock::time_point>& d
     if (deadline.has_value() && (!timer_target.has_value() || *deadline < *timer_target)) wake_timer();
 }
 
+void http2_connection_base::fail_stream(http2_stream_base& s, std::error_code err)
+{
+    if (s.failure) return;
+    s.failure = err;
+
+    // NOTE: a copy (sharing its state, so not allocating), as the stream may be gone once it's stopped.
+    if (s.stop.stop_possible() && !s.stop.stop_requested()) to_stop.push_back(s.stop);
+}
+
+void http2_connection_base::stop_pending()
+{
+    std::vector<std::stop_source> sources;
+    {
+        std::scoped_lock lock{mu};
+        sources.swap(to_stop);
+    }
+
+    stop_all(sources);
+}
+
+void http2_connection_base::stop_all(std::vector<std::stop_source>& sources) const
+{
+    // the callbacks run here, and are anyone's: e.g. a scheduler wait's, which takes the scheduler's locks, or a
+    // handler's, which may take this connection's (e.g. by writing).
+    // NOLINTNEXTLINE(cert-dcl03-c,misc-static-assert): not constant: in debug builds, held() reads the lock's owner.
+    assert(!mu.held() && "a stream's stop source is stopped holding its connection's lock");
+
+    // NOLINTNEXTLINE(misc-const-correctness): request_stop() isn't const in libc++ (nor in the standard).
+    for (auto& source : sources) source.request_stop();
+    sources.clear();
+}
+
 coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
 {
     (void)workers.spawn(write_loop());
@@ -283,13 +327,14 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
     }
 
     // the writer writes what's left (e.g. GOAWAY), then shuts the connection down, so the peer sees it end at once:
-    // before the streams are done (e.g. the server's handlers, which can't be cancelled, so may take a while), as after
-    // a connection error it MUST be closed (RFC 9113, section 5.4.1), and the peer would wait for the streams GOAWAY
-    // says may have been processed until it is.
+    // before the streams are done (e.g. the server's handlers, which may take a while to heed their tokens, or not at
+    // all), as after a connection error it MUST be closed (RFC 9113, section 5.4.1), and the peer would wait for the
+    // streams GOAWAY says may have been processed until it is.
     {
         std::scoped_lock lock{mu};
         end();
     }
+    stop_pending();
 
     // what the peer sends meanwhile is read, and dropped, until it closes its side too: until then, closing would reset
     // the connection, which may discard what the writer's still sending it (see run()'s declaration). The timer stops
@@ -309,15 +354,20 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
     wake_timer();
     co_await workers.join();
 
+    // what the timer failed as it stopped, if anything.
+    stop_pending();
+
     // NOTE: the connection itself (its fd, and a server's max_connections slot) is held until the streams are done,
     //       deliberately: that bounds the handlers left running to max_connections * max_concurrent_streams, where
-    //       freeing it would let a client reconnect, and pile up more. HTTP/1.1 holds its slot the same way.
+    //       freeing it would let a client reconnect, and pile up more. HTTP/1.1 holds its slot the same way. Their
+    //       tokens are stopped (end() failed every stream), so handlers that heed them return soon.
     co_await finish_streams();
 }
 
 bool http2_connection_base::receive(std::vector<std::byte>& pending)
 {
-    bool go_on = true;
+    bool                          go_on = true;
+    std::vector<std::stop_source> stopping; // the streams it failed
     {
         std::scoped_lock lock{mu};
         if (is_ending) return false;
@@ -336,9 +386,13 @@ bool http2_connection_base::receive(std::vector<std::byte>& pending)
 
         maybe_end();
         go_on = go_on && !is_ending;
+
+        // NOTE: taken here, rather than with stop_pending() (which would lock again), as it's usually empty.
+        stopping.swap(to_stop);
     }
 
     writer_wakeup.notify();
+    stop_all(stopping);
     after_receive();
     return go_on;
 }
@@ -388,7 +442,7 @@ void http2_connection_base::on_stream_reset(http2::stream_id id, std::error_code
     if (err == http2::error_code::no_error) err = std::make_error_code(std::errc::connection_reset);
 
     auto& s = *it->second;
-    if (!s.failure) s.failure = err;
+    fail_stream(s, err);
     s.changed.notify();
 
     // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
@@ -443,8 +497,11 @@ coro::task<> http2_connection_base::write_loop()
             if (res.err)
             {
                 logger.debug("HTTP/2 connection's write failed: {}", res.err.message());
-                std::scoped_lock lock{mu};
-                end();
+                {
+                    std::scoped_lock lock{mu};
+                    end();
+                }
+                stop_pending();
                 break;
             }
             continue;
@@ -472,6 +529,7 @@ coro::task<> http2_connection_base::timer_loop()
         std::optional<io::clock::time_point> next;
         std::uint64_t                        seen         = 0;
         bool                                 stop_reading = false;
+        std::vector<std::stop_source>        stopping; // the streams it failed
         {
             std::scoped_lock lock{mu};
             if (reader_done) break;
@@ -493,7 +551,10 @@ coro::task<> http2_connection_base::timer_loop()
             }
 
             timer_target = next;
+            stopping.swap(to_stop);
         }
+
+        stop_all(stopping);
 
         if (stop_reading)
         {
@@ -535,7 +596,7 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
         if (s->failure) continue; // e.g. reset by the peer, which its waits haven't seen yet
 
         logger.debug("HTTP/2 stream {} timed out", id);
-        s->failure = std::make_error_code(std::errc::timed_out);
+        fail_stream(*s, std::make_error_code(std::errc::timed_out));
         session.reset(id, http2::error_code::cancel);
         s->changed.notify();
         timed_out = true;
@@ -553,7 +614,7 @@ void http2_connection_base::end()
 
     for (auto& [_, s] : active)
     {
-        if (!s->failure) s->failure = std::make_error_code(std::errc::connection_aborted);
+        fail_stream(*s, std::make_error_code(std::errc::connection_aborted));
         s->changed.notify();
     }
     drained.notify();

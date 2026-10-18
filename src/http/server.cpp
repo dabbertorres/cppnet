@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/common.h>
+
 #include "coro/task.hpp"
 #include "exception.hpp"
 #include "http/connection.hpp"
@@ -43,6 +45,7 @@
 #include "io/writer.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+#include "util/defer.hpp"
 
 #ifdef NET_HAS_TLS
 #    include "tls/tls.hpp"
@@ -216,6 +219,13 @@ net::http::protocol_version response_version(net::http::protocol_version version
     return {.major = 1, .minor = version.major == 1 && version.minor == 0 ? 0U : 1U};
 }
 
+// sent_after is true once sending (which needed a coroutine) has sent a response.
+net::coro::task<bool> sent_after(net::coro::task<net::io::writer*> sending)
+{
+    (void)co_await std::move(sending);
+    co_return true;
+}
+
 // decode_error_status is the response to a request that couldn't be decoded.
 net::http::status decode_error_status(std::error_code err) noexcept
 {
@@ -258,14 +268,19 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
     // NOTE: listening from now, rather than from when serve() starts (on a worker), so connections made in between are
     //       queued (up to max_pending_connections) rather than refused.
     if (!this->listener.listening()) this->listener.listen(max_pending_connections);
+
+    // NOTE: once the rest is ready, as it aborts the server at once if the scheduler's stopped already.
+    on_scheduler_stop.emplace(scheduler->stop_token(), abort_on_stop{this});
 }
 
 server::~server()
 {
-    close();
+    // NOTE: first, waiting for a call in progress, so the scheduler stopping doesn't abort the server as it's
+    //       destroyed.
+    on_scheduler_stop.reset();
 
-    // and the HTTP/1.x requests close() let finish (see serve_requests()).
-    aborting.request_stop();
+    // nothing will read what the handlers would answer, and they must finish before the server's gone.
+    abort();
 
     // serve() and the connections use the server until they finish.
     running.close();
@@ -287,6 +302,22 @@ void server::close()
     // serve() may be waiting for a connection to close (see max_connections).
     scheduler->notify_all(open_connections);
     logger->flush();
+}
+
+void server::abort()
+{
+    close();
+
+    // the handlers' tokens, and HTTP/1.x requests in progress, which close() lets finish (see serve_requests()).
+    // NOTE: holding no lock: the callbacks run here, and handlers' are anyone's.
+    aborting.request_stop();
+}
+
+coro::task<> server::join()
+{
+    // NOTE: nothing of the server is touched once it's resumed, as the server may be destroyed as soon as the scope's
+    //       empty.
+    co_await running.join();
 }
 
 coro::task<> server::serve()
@@ -382,14 +413,13 @@ coro::task<bool> server::room_for_connection()
 // that their memory (e.g. for header values) is.
 struct server::connection_state
 {
-    connection_state(detail::connection* conn, std::stop_token closing, const std::stop_token& aborting)
+    connection_state(detail::connection* conn, std::stop_token closing)
         : writer{&detail::as_writer(*conn), buffer_size}
         , input{&detail::as_reader(*conn), &writer}
         , reader{&input, buffer_size}
         , conn{conn}
         , closing{std::move(closing)}
         , on_close{std::in_place, this->closing, close_now{this}}
-        , on_abort{std::in_place, aborting, abort_now{conn}}
     {}
 
     // phase is where a connection is between requests, for close(): whose stop callback (close_now) and the connection
@@ -414,13 +444,28 @@ struct server::connection_state
         }
     };
 
-    // abort_now is the destructor's callback: it shuts the connection's reading side, whatever it's doing.
+    // abort_now is abort()'s callback: it shuts the connection's reading side, whatever it's doing, and stops its
+    // handlers' token.
     struct abort_now
     {
-        detail::connection* conn;
+        connection_state* state;
 
-        void operator()() const noexcept { detail::socket_of(*conn).shutdown_read(); }
+        void operator()() const noexcept
+        {
+            detail::socket_of(*state->conn).shutdown_read();
+            state->stop.request_stop();
+        }
     };
+
+    // serve_http1 readies the connection to serve HTTP/1.x requests (once it isn't HTTP/2): its handlers' stop source,
+    // which abort() stops (as does the connection ending), and abort()'s callback.
+    // NOTE: not before, as close() (which abort() calls first) ends a connection waiting for HTTP/2's preface anyway,
+    //       and an HTTP/2 connection needs no source of its own.
+    void serve_http1(const std::stop_token& aborting)
+    {
+        stop = std::stop_source{};
+        on_abort.emplace(aborting, abort_now{this});
+    }
 
     // start_request is whether to serve the request whose head (or HTTP/2's preface) was just read: not if close()
     // ended the connection as it waited for it (e.g. having read it from what was buffered, or before the reading side
@@ -443,14 +488,13 @@ struct server::connection_state
     }
 
     // hand_over is whether to serve the connection as HTTP/2, once its preface was read: unless close() came first. Its
-    // callbacks are unregistered (waiting for a call in progress), as HTTP/2 registers its own on closing, which ends
-    // it gracefully.
+    // callback is unregistered (waiting for a call in progress), as HTTP/2 registers its own on closing, which ends it
+    // gracefully.
     bool hand_over() noexcept
     {
         if (!start_request()) return false;
 
         on_close.reset();
-        on_abort.reset();
         return true;
     }
 
@@ -463,6 +507,10 @@ struct server::connection_state
     // the server's close(), which responses check, to say the connection closes after them.
     std::stop_token    closing;
     std::atomic<phase> current = phase::idle;
+
+    // the source of the handlers' tokens (server_request::stop): one for the connection's requests, as a request can
+    // only be canceled by the connection ending. None until serve_http1().
+    std::stop_source stop{std::nostopstate};
 
     // NOTE: after what they use, as they may run straight away (if the server's closing already), and are unregistered
     //       (waiting for a call in progress) before it's destroyed.
@@ -557,12 +605,15 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
 coro::task<> server::serve_requests(detail::connection& conn)
 {
     // close() ends the connection gracefully: at once if it's waiting for a request, or after the request it's serving
-    // (see connection_state::phase). The destructor ends it either way.
-    connection_state state{&conn, closing.get_token(), aborting.get_token()};
+    // (see connection_state::phase). abort() (and the destructor) ends it either way.
+    connection_state state{&conn, closing.get_token()};
     auto&            req  = state.req;
     auto&            resp = state.resp;
 
     req.tls = detail::is_tls(conn);
+
+    // the server's, for the connection's requests (which reuse req).
+    req.aborted = aborting.get_token();
 
     // the first request's head has header_read_timeout from now, whether or not it's looked at first for HTTP/2's
     // preface (once, rather than again after it); the next requests' from when they're waited for.
@@ -578,6 +629,11 @@ coro::task<> server::serve_requests(detail::connection& conn)
             co_return;
         }
     }
+
+    // abort() (or the destructor) ends the connection whatever it's doing, and stops its handlers' token, as does its
+    // end, for a token a handler kept (e.g. in a task it spawned).
+    state.serve_http1(aborting.get_token());
+    const util::defer stop_at_end{[&state] noexcept { state.stop.request_stop(); }};
 
     // NOTE: each request is served here, rather than by a coroutine of its own, which would allocate its frame for
     //       each request (as one this large isn't elided). Only the rare ways a connection ends have their own.
@@ -623,6 +679,9 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
         response_writer rw{&state.writer, &resp, http11::response_encode, &state.closing};
 
+        // NOTE: set for each request, as middleware may have replaced it for the handler it wrapped.
+        req.stop = state.stop.get_token();
+
         // NOTE: a co_await can't be in a catch block, so a failure is responded to after it.
         std::exception_ptr failure;
         try
@@ -640,7 +699,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
             break;
         }
 
-        if (!rw.sent()) co_await rw.send(status::OK, 0);
+        if (!co_await default_response(state, rw)) break;
 
         // ends a body sent without a Content-Length, chunked.
         if (auto finished = co_await rw.finish(); finished.err)
@@ -691,7 +750,14 @@ coro::task<> server::serve_http2(detail::connection& conn, std::span<const std::
     sock.set_read_timeout(std::nullopt);
     sock.set_read_deadline(std::nullopt);
 
-    co_await detail::serve_http2(scheduler, conn, already_read, http2_config, handler, *logger, closing.get_token());
+    co_await detail::serve_http2(scheduler,
+                                 conn,
+                                 already_read,
+                                 http2_config,
+                                 handler,
+                                 *logger,
+                                 closing.get_token(),
+                                 aborting.get_token());
 }
 
 std::optional<io::clock::time_point> server::head_deadline() const
@@ -718,6 +784,26 @@ void server::start_response(connection_state& state, io::discard_writer& no_body
     if (has_close(req.headers) || (http10 && !req.headers.has_token("Connection"sv, "keep-alive"sv)))
         resp.headers.set("Connection"sv, "close"sv);
     else if (http10) resp.headers.set("Connection"sv, "keep-alive"sv);
+}
+
+coro::task<bool> server::default_response(connection_state& state, response_writer& rw) const
+{
+    if (rw.sent()) return coro::ready_task<bool>(true);
+
+    if (state.stop.stop_requested())
+    {
+        logger->debug("closing connection: the handler for {} {} was stopped without responding",
+                      method_string(state.req.method),
+                      state.req.target.path);
+        return coro::ready_task<bool>(false);
+    }
+
+    // usually, the head fits in the connection's buffer, so there's no need for a coroutine (see coro::ready_task).
+    auto sending = rw.send(status::OK, 0);
+    if (!sending.finished_without_coroutine()) return sent_after(std::move(sending));
+
+    (void)std::move(sending).result();
+    return coro::ready_task<bool>(true);
 }
 
 coro::task<> server::end_after_decode_error(detail::connection& conn, connection_state& state, std::error_code err)
@@ -747,21 +833,26 @@ coro::task<> server::end_after_handler_failure(detail::connection& conn,
 {
     const auto& req = state.req;
 
+    // a handler that throws once it's been stopped (e.g. a database driver's own "canceled") isn't an error of the
+    // server's, and gets no 500, as no one wants its answer.
+    const bool stopped = state.stop.stop_requested();
+    const auto level   = stopped ? spdlog::level::debug : spdlog::level::err;
+
     try
     {
         std::rethrow_exception(failure);
     }
     catch (const std::exception& ex)
     {
-        logger->error("handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
+        logger->log(level, "handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
     }
     catch (...)
     {
-        logger->error("handler for {} {} threw", method_string(req.method), req.target.path);
+        logger->log(level, "handler for {} {} threw", method_string(req.method), req.target.path);
     }
 
     // whatever the handler sent of the response can't be finished, so the connection is closed.
-    if (rw.status_code() == status::NONE)
+    if (rw.status_code() == status::NONE && !stopped)
     {
         co_await respond_and_close(conn, state, status::INTERNAL_SERVER_ERROR);
         co_return;

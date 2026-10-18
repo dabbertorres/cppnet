@@ -18,8 +18,13 @@
 //   http::server server{&scheduler, instrument::http_metrics{std::move(router)}};
 //
 // The response status they see is the one the server sends: 200 OK if the handler didn't send a response, or 500
-// Internal Server Error if it threw before it did. The route is the pattern of the route that matched (see
-// http::server_request::route): wrapping a router, rather than being wrapped by one, means it's been set.
+// Internal Server Error if it threw before it did. A request canceled before its final response was sent (its
+// http::server_request::stop stopped), whatever the handler did (the server sends no response it didn't send, nor a
+// 500), is recorded as 499 Client Closed Request (as nginx logs it) if the client's side stopped it (e.g. it reset its
+// HTTP/2 stream, or the connection ended), or 503 Service Unavailable if the server was aborted
+// (http::server_request::aborted: abort(), its destructor, or the scheduler's request_stop()). The route is the pattern
+// of the route that matched (see http::server_request::route): wrapping a router, rather than being wrapped by one,
+// means it's been set.
 namespace net::instrument
 {
 
@@ -103,7 +108,8 @@ private:
 // Each span is named "{method} {route}" (or "{method}", if no route matched), and has OpenTelemetry's HTTP server
 // attributes: http.request.method, http.route, url.path, url.scheme, network.protocol.version and
 // http.response.status_code. Its status is an error if the response is a 5xx, or if the handler threw (with the
-// exception's message).
+// exception's message), unless the client's side canceled the request (a 499, which is the client's doing, as a 4xx
+// is); one the server's abort canceled is a 503, an error.
 //
 // The handler can get the trace from the request's extensions (see trace): e.g. to propagate it to the requests it
 // makes.

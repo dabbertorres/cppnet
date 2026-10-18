@@ -8,6 +8,7 @@
 #include <exception> // IWYU pragma: keep
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -63,9 +64,14 @@ http::router test_router()
     return router;
 }
 
-// call calls handler with a GET of path, with headers, returning whether it threw.
+// call calls handler with a GET of path, with headers (and stop and aborted, the request's tokens), returning whether
+// it threw.
 template<typename Handler>
-bool call(const Handler& handler, std::string path, const http::headers& headers = {})
+bool call(const Handler&       handler,
+          std::string          path,
+          const http::headers& headers = {},
+          std::stop_token      stop    = {},
+          std::stop_token      aborted = {})
 {
     http::server_request req{
         .method  = http::request_method::GET,
@@ -73,6 +79,8 @@ bool call(const Handler& handler, std::string path, const http::headers& headers
     };
     req.target.path = std::move(path);
     req.headers     = headers;
+    req.stop        = std::move(stop);
+    req.aborted     = std::move(aborted);
 
     net::io::string_writer<char> out;
     http::server_response        base{
@@ -90,6 +98,14 @@ bool call(const Handler& handler, std::string path, const http::headers& headers
     {
         return true;
     }
+}
+
+// stopped is a token that's been stopped, as a canceled request's is (and an aborted server's).
+std::stop_token stopped()
+{
+    std::stop_source source;
+    source.request_stop();
+    return source.get_token();
 }
 
 std::string record()
@@ -124,6 +140,14 @@ TEST_CASE("http_metrics measures requests, by method, route and status", "[instr
     CHECK_FALSE(call(handler, "/silent"));
     CHECK(call(handler, "/throws"));
 
+    // canceled before a response was sent (by the client's side, or the server's abort): whatever the handler did (it
+    // sent none, or threw), and whatever it would have sent; but not once a response was sent.
+    CHECK_FALSE(call(handler, "/silent", {}, stopped()));
+    CHECK(call(handler, "/throws", {}, stopped()));
+    CHECK_FALSE(call(handler, "/fails", {}, stopped()));
+    CHECK_FALSE(call(handler, "/silent", {}, stopped(), stopped()));
+    CHECK(call(handler, "/throws", {}, stopped(), stopped()));
+
     auto text = record();
     INFO(text);
 
@@ -140,6 +164,19 @@ TEST_CASE("http_metrics measures requests, by method, route and status", "[instr
         text.contains("http_server_request_duration_seconds_count{code=\"200\",method=\"GET\",route=\"/silent\"} 1\n"));
     CHECK(
         text.contains("http_server_request_duration_seconds_count{code=\"500\",method=\"GET\",route=\"/throws\"} 1\n"));
+
+    // 499 Client Closed Request, for those the client's side canceled before a response was sent; 503 Service
+    // Unavailable for those the server's abort did.
+    CHECK(
+        text.contains("http_server_request_duration_seconds_count{code=\"499\",method=\"GET\",route=\"/silent\"} 1\n"));
+    CHECK(
+        text.contains("http_server_request_duration_seconds_count{code=\"499\",method=\"GET\",route=\"/throws\"} 1\n"));
+    CHECK(
+        text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/fails\"} 1\n"));
+    CHECK(
+        text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/silent\"} 1\n"));
+    CHECK(
+        text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/throws\"} 1\n"));
 }
 
 TEST_CASE("http_tracing makes a server span for each request", "[instrument][middleware][tracing]")
@@ -205,6 +242,26 @@ TEST_CASE("http_tracing makes a server span for each request", "[instrument][mid
         REQUIRE(spans.size() == 1);
         CHECK(spans[0].status.code == opentelemetry::status_code::error);
         CHECK(attribute(spans[0], "http.response.status_code") == "503");
+    }
+
+    SECTION("a request the client's side canceled is a 499, and not an error, though its handler threw")
+    {
+        CHECK(call(handler, "/throws", {}, stopped()));
+        REQUIRE(spans.size() == 1);
+        CHECK(spans[0].status.code == opentelemetry::status_code::unset);
+        CHECK(attribute(spans[0], "http.response.status_code") == "499");
+    }
+
+    SECTION("a request the server's abort canceled is a 503, an error")
+    {
+        CHECK_FALSE(call(handler, "/silent", {}, stopped(), stopped()));
+        CHECK(call(handler, "/throws", {}, stopped(), stopped()));
+        REQUIRE(spans.size() == 2);
+        CHECK(spans[0].status.code == opentelemetry::status_code::error);
+        CHECK(attribute(spans[0], "http.response.status_code") == "503");
+        CHECK(spans[1].status.code == opentelemetry::status_code::error);
+        CHECK(spans[1].status.message == "oops");
+        CHECK(attribute(spans[1], "http.response.status_code") == "503");
     }
 
     SECTION("a handler that throws is an error, with its message, and the exception is rethrown")

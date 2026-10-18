@@ -5,11 +5,11 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -113,6 +113,27 @@ struct server_request
     // Whether the request came over TLS (HTTPS): e.g. for building absolute URLs, or Secure cookies.
     bool tls = false;
 
+    // stop is stopped once the request is no longer wanted: over HTTP/2, when the client resets its stream, the stream
+    // times out, or its connection ends; over HTTP/1.1, when its connection ends; and for either, when the server is
+    // aborted (abort(), its destructor, or the scheduler's request_stop(); not close(), which lets requests finish).
+    // Canceling is cooperative: nothing is ended for the handler, which learns of it by checking
+    // stop.stop_requested() (e.g. between the steps of a long computation), by registering a std::stop_callback (which
+    // must be quick, and not block: it runs on whichever thread stopped it, e.g. the connection's reader), or by
+    // passing it to the waits that take one (e.g. scheduler::sleep_until(deadline, stop), socket::set_stop_token()),
+    // which then fail with std::errc::operation_canceled. A handler stopped by the server's abort may still respond
+    // (e.g. 503); otherwise its client is gone. A copy stays valid after the handler returns.
+    //
+    // The server sets it before calling the handler, so middleware may replace it for the handler it wraps (e.g. with
+    // a token of its own, stopped by a deadline, or by this one through a std::stop_callback), putting it back after.
+    std::stop_token stop{};
+
+    // aborted is stopped once the server is aborted (abort(), its destructor, or the scheduler's request_stop()): so
+    // middleware that finds stop stopped can tell the server's doing from the client's (e.g. http_metrics records 503
+    // rather than 499). It isn't a reason: only whether the server aborted, which it may have done after the client's
+    // side stopped the request. The server sets it for the connection (HTTP/1.1) or stream (HTTP/2): a copy of the
+    // server's token, so nothing's allocated for it.
+    std::stop_token aborted{};
+
     // The pattern of the route that matched the request (e.g. "/users/:id"), which the router sets; empty if none did.
     // It views the router's copy, so is only valid while the router is (as it is while the router handles it).
     std::string_view route{};
@@ -146,7 +167,8 @@ struct server_request
     void add_path_value(std::string_view name, std::string_view encoded);
 
     // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces), and
-    // tls, as the next request comes over the same connection.
+    // tls, stop and aborted, as the next request comes over the same connection (whose server sets stop for each
+    // request).
     void clear() noexcept
     {
         method  = request_method::NONE;

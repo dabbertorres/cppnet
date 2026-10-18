@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/common.h>
 #include <spdlog/logger.h>
 
 #include "coro/async_scope.hpp"
@@ -117,7 +118,7 @@ namespace
             , handler{handler}
         {}
 
-        coro::task<> serve(std::span<const std::byte> already_read, std::stop_token stop);
+        coro::task<> serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort);
 
     protected:
         // the session's events, and the base's hooks: protected, as they're declared.
@@ -144,7 +145,8 @@ namespace
 
         // schedule starts a stream's handler, or queues it if max_concurrent_streams handlers are running (holding
         // the lock), or ends the connection if too many are queued (removing the stream); promote starts queued
-        // handlers as running ones finish (skipping streams reset meanwhile).
+        // handlers as running ones finish (skipping streams reset meanwhile). A queued stream's handler gets its token
+        // when it starts: one stopped meanwhile (e.g. by abort) is stopped from the start.
         void schedule(http2_stream& stream);
         void promote();
 
@@ -152,6 +154,9 @@ namespace
         void start_handlers();
 
         coro::task<> run_stream(http2_stream* stream);
+
+        // stop_handlers is abort's callback: it stops every stream's token (and those of streams started after).
+        void stop_handlers();
 
         // respond_after sends what's left of a response once its handler has returned (or thrown, with failure),
         // returning whether the response is complete; if it's not, the stream's to be reset rather than finished.
@@ -164,6 +169,7 @@ namespace
 
         const http2_options&   options;
         const request_handler& handler;
+        std::stop_token        abort_token; // the server's abort(), for each request (set by serve(), before streams)
 
         // Guarded by mu.
         std::unordered_map<http2::stream_id, std::unique_ptr<http2_stream>> streams;
@@ -174,6 +180,7 @@ namespace
         bool                                                                draining     = false;
         bool                                                                final_sent   = false; // the final GOAWAY
         bool                                                                peer_goaway  = false;
+        bool                                                                aborted      = false; // stop_handlers()
         std::optional<io::clock::time_point>                                drain_deadline;
         std::optional<io::clock::time_point>                                idle_since;
         io::clock::time_point                                               started_at = io::clock::now();
@@ -236,7 +243,8 @@ const http2_stream_ops http2_ops{.send_head = http2_send_head, .finish = http2_f
 namespace
 {
 
-    coro::task<> http2_server_connection::serve(std::span<const std::byte> already_read, std::stop_token stop)
+    coro::task<>
+    http2_server_connection::serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort)
     {
         // close() (stop) ends the connection gracefully.
         std::stop_callback on_stop{stop,
@@ -249,7 +257,29 @@ namespace
                                        wake_writer();
                                    }};
 
+        // abort() stops the handlers' tokens too (and runs close()'s callback first).
+        abort_token = abort;
+        std::stop_callback on_abort{abort, [this] noexcept { stop_handlers(); }};
+
         co_await run(already_read);
+    }
+
+    void http2_server_connection::stop_handlers()
+    {
+        std::vector<std::stop_source> sources;
+        {
+            std::scoped_lock lock{mu};
+            aborted = true;
+
+            // NOTE: those queued too, whose handlers then start stopped.
+            for (const auto& [_, s] : streams)
+            {
+                if (!s->stop.stop_requested()) sources.push_back(s->stop);
+            }
+        }
+
+        // NOTE: without the lock (see fail_stream()).
+        stop_all(sources);
     }
 
     void http2_server_connection::after_receive() { start_handlers(); }
@@ -434,6 +464,13 @@ namespace
         req.tls     = is_tls(conn);
         req.body    = std::make_unique<stream_reader>(stream.get());
 
+        // its handler's token: stopped when the stream fails (see fail_stream()), or by abort (at once, after
+        // receiving, if it came first); and the server's abort token, for middleware to tell the two apart.
+        stream->stop = std::stop_source{};
+        req.stop     = stream->stop.get_token();
+        req.aborted  = abort_token;
+        if (aborted) to_stop.push_back(stream->stop);
+
         stream->head_request  = req.method == request_method::HEAD;
         stream->received_end  = end_stream;
         stream->read_timeout  = options.body_read_timeout;
@@ -501,11 +538,19 @@ namespace
         {
             std::scoped_lock lock{mu};
 
-            // reset (so the client doesn't take it as complete) if it's not ended; and the client needn't send what
-            // the handler didn't read of the request.
+            // reset (so the client doesn't take it as complete) if it's not ended: with CANCEL if the handler was
+            // stopped by abort (as a failed stream's is stopped only once it has failed, a stopped one that hasn't
+            // was); and the client needn't send what the handler didn't read of the request.
             if (!stream->failure && (!complete || !stream->ended))
-                session.reset(stream->id, http2::error_code::internal_error);
-            else if (!stream->failure && !stream->received_end) session.reset(stream->id, http2::error_code::no_error);
+            {
+                const bool aborted_handler = stream->stop.stop_requested();
+                session.reset(stream->id,
+                              aborted_handler ? http2::error_code::cancel : http2::error_code::internal_error);
+            }
+            else if (!stream->failure && !stream->received_end)
+            {
+                session.reset(stream->id, http2::error_code::no_error);
+            }
 
             remove_stream(stream->id);
             streams.erase(stream->id);
@@ -518,6 +563,7 @@ namespace
         }
 
         start_handlers();
+        stop_pending(); // maybe_end() may have ended the connection
         wake_writer();
         wake_timer();
     }
@@ -526,25 +572,35 @@ namespace
     http2_server_connection::respond_after(http2_stream& stream, response_writer& rw, const std::exception_ptr& failure)
     {
         const auto& req = stream.req;
+
+        // the handler was stopped: its stream failed (reset, timed out, or its connection ended), or abort. Either way,
+        // no one wants an answer the handler didn't give (nor a 500 for one that threw, e.g. a database driver's own
+        // "canceled", which isn't an error of the server's): the stream's reset, unless it failed already.
+        const bool stopped = stream.stop.stop_requested();
         try
         {
             if (failure)
             {
+                const auto level = stopped ? spdlog::level::debug : spdlog::level::err;
                 try
                 {
                     std::rethrow_exception(failure);
                 }
                 catch (const std::exception& ex)
                 {
-                    logger.error("handler for {} {} threw: {}", method_string(req.method), req.target.path, ex.what());
+                    logger.log(level,
+                               "handler for {} {} threw: {}",
+                               method_string(req.method),
+                               req.target.path,
+                               ex.what());
                 }
                 catch (...)
                 {
-                    logger.error("handler for {} {} threw", method_string(req.method), req.target.path);
+                    logger.log(level, "handler for {} {} threw", method_string(req.method), req.target.path);
                 }
 
                 // a response under way can't be finished: the client mustn't take what it has as all of it.
-                if (rw.sent()) co_return false;
+                if (rw.sent() || stopped) co_return false;
 
                 // a 500 rather than the response the handler meant (perhaps after a 1xx), without its headers.
                 rw.headers().clear();
@@ -553,6 +609,7 @@ namespace
             }
             else if (!rw.sent())
             {
+                if (stopped) co_return false;
                 co_await rw.send(status::OK, 0);
             }
 
@@ -641,10 +698,11 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
                          const http2_options&       options,
                          const request_handler&     handler,
                          spdlog::logger&            logger,
-                         std::stop_token            stop)
+                         std::stop_token            stop,
+                         std::stop_token            abort)
 {
     http2_server_connection c{scheduler, conn, options, handler, logger};
-    co_await c.serve(already_read, std::move(stop));
+    co_await c.serve(already_read, std::move(stop), std::move(abort));
 }
 
 }

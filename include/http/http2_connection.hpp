@@ -7,9 +7,11 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread> // IWYU pragma: keep (std::this_thread::get_id, in debug builds)
 #include <unordered_map>
 #include <vector>
 
@@ -36,6 +38,54 @@ namespace net::http::detail
 
 class http2_connection_base;
 class http2_stream_base;
+
+// connection_mutex is a connection's lock: a std::mutex that, in debug builds, knows whether the calling thread holds
+// it, so that stop sources are checked to be stopped without it (see http2_connection_base::stop_pending()).
+class connection_mutex
+{
+public:
+    void lock()
+    {
+        mu.lock();
+#ifndef NDEBUG
+        owner.store(std::this_thread::get_id(), std::memory_order::relaxed);
+#endif
+    }
+
+    bool try_lock()
+    {
+        const bool locked = mu.try_lock();
+#ifndef NDEBUG
+        if (locked) owner.store(std::this_thread::get_id(), std::memory_order::relaxed);
+#endif
+        return locked;
+    }
+
+    void unlock()
+    {
+#ifndef NDEBUG
+        owner.store(std::thread::id{}, std::memory_order::relaxed);
+#endif
+        mu.unlock();
+    }
+
+    // held is whether the calling thread holds the lock (in debug builds; always false otherwise).
+    // NOTE: relaxed is enough: only this thread stores its own id, and it clears it before unlocking.
+    [[nodiscard]] bool held() const noexcept
+    {
+#ifndef NDEBUG
+        return owner.load(std::memory_order::relaxed) == std::this_thread::get_id();
+#else
+        return false;
+#endif
+    }
+
+private:
+    std::mutex mu;
+#ifndef NDEBUG
+    std::atomic<std::thread::id> owner{};
+#endif
+};
 
 // stream_reader reads what a stream receives (a request's body, or a response's), as its DATA arrives, giving the
 // peer back its windows as it goes.
@@ -97,7 +147,11 @@ public:
     std::size_t            received_start = 0;
     bool                   received_end   = false;
     bool                   ended          = false; // this side has sent END_STREAM
-    std::error_code        failure;                // reset, timed out, or the connection ended
+    std::error_code        failure;                // reset, timed out, or the connection ended (see fail_stream())
+
+    // The stop source of the stream's handler's token (server_request::stop): the server's streams have one, the
+    // client's none. It's stopped when the stream fails, once the lock's released (see fail_stream()).
+    std::stop_source stop{std::nostopstate};
 
     // When the stream times out, if it makes no progress: receiving (a client's response's head, then the body), and
     // sending. A wait sets its deadline if there's none, and only progress clears it (what's awaited arriving, or the
@@ -150,8 +204,8 @@ public:
     ~http2_connection_base() override                              = default;
 
     // Used by the streams, holding the lock.
-    std::mutex     mu;
-    http2::session session;
+    connection_mutex mu;
+    http2::session   session;
 
     // wake_writer tells the writer there's output, if there is: called without the lock.
     void wake_writer();
@@ -162,6 +216,19 @@ public:
 
     // output_drained is notified as the writer writes.
     coro::notifier& output_drained() noexcept { return drained; }
+
+    // fail_stream fails s with err, unless it has failed already (holding the lock), queuing its stop source (if it
+    // has one) for stop_pending() to stop. Waking its waits is the caller's.
+    //
+    // Stop sources are never stopped holding the lock: std::stop_source::request_stop() runs the callbacks registered
+    // on it inline, and they're anyone's (the handler's, a scheduler wait's, ...), taking locks of their own. So each
+    // place that may fail a stream calls stop_pending() once it's released the lock: the reader after receiving, the
+    // timer after its checks, the writer and run() after end(), and a stream's own failed write. A copy of the source
+    // is queued, rather than the stream, as the stream may be gone by then.
+    void fail_stream(http2_stream_base& s, std::error_code err);
+
+    // stop_pending stops the sources fail_stream() queued (without the lock).
+    void stop_pending();
 
     [[nodiscard]] io::handle native_handle() const noexcept { return detail::native_handle(conn); }
 
@@ -207,6 +274,9 @@ protected:
     void on_window_update(http2::stream_id id) override;
     void on_settings(const http2::settings& peer) override;
 
+    // stop_all stops sources (without the lock: it checks, in debug builds).
+    void stop_all(std::vector<std::stop_source>& sources) const;
+
     io::scheduler*     scheduler;
     coro::thread_pool* pool;
     connection&        conn;
@@ -214,6 +284,7 @@ protected:
 
     // Guarded by mu.
     std::unordered_map<http2::stream_id, http2_stream_base*> active;
+    std::vector<std::stop_source>                            to_stop; // for stop_pending()
 
 private:
     bool                                 receive(std::vector<std::byte>& pending);

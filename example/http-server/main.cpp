@@ -1,7 +1,9 @@
-// http-server serves "hello world" on port 8080, and "hello, <name>" at /hello/<name>, until SIGINT or SIGTERM.
+// http-server serves "hello world" on port 8080, and "hello, <name>" at /hello/<name>, until SIGINT or SIGTERM. Then it
+// lets the requests in progress finish, for up to 10 seconds, before it stops them.
 //
 // With --cert <chain.pem> --key <key.pem> (if built with TLS), it serves HTTPS, with that certificate chain and key.
 
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <expected>
@@ -9,6 +11,7 @@
 #include <format>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -38,6 +41,33 @@
 namespace http = net::http;
 
 using net::coro::task;
+
+namespace
+{
+
+// abort_after aborts server after grace, unless stop is requested first.
+task<>
+abort_after(net::io::scheduler* scheduler, http::server* server, std::chrono::seconds grace, std::stop_token stop)
+{
+    // canceled (once the server's drained, or the scheduler's stopping).
+    if (co_await scheduler->sleep_until(net::io::clock::now() + grace, std::move(stop))) co_return;
+
+    spdlog::warn("requests still in progress after {}s: stopping them", grace.count());
+    server->abort();
+}
+
+// drain waits for server's connections to finish, once it's closed: for up to grace, after which it aborts it (stopping
+// its handlers' tokens), and waits for the handlers to return.
+task<> drain(net::io::scheduler* scheduler, http::server* server, std::chrono::seconds grace)
+{
+    std::stop_source drained;
+    scheduler->spawn(abort_after(scheduler, server, grace, drained.get_token()));
+
+    co_await server->join();
+    drained.request_stop();
+}
+
+}
 
 int main(int argc, char** argv)
 {
@@ -130,9 +160,9 @@ int main(int argc, char** argv)
 
     spdlog::info("exiting...");
 
-    // stop accepting connections, end the ones still open, and wait for them to finish.
+    // stop accepting connections, and end the ones still open: gracefully, then (after a while) not.
     server.close();
-    scheduler.shutdown();
+    scheduler.run_to_completion(drain(&scheduler, &server, std::chrono::seconds{10}));
 
     return 0;
 }
