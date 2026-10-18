@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -138,6 +137,10 @@ public:
     // open_stream opens a client's stream, failing with refused_stream if the server's MAX_CONCURRENT_STREAMS are
     // open, or it has sent GOAWAY, or stream ids have run out.
     std::expected<stream_id, std::error_code> open_stream();
+
+    // can_open_stream is whether open_stream() would succeed now, with reserved more streams to be opened first (e.g.
+    // by requests that have been promised them).
+    [[nodiscard]] bool can_open_stream(std::size_t reserved = 0) const noexcept;
 
     // submit_headers sends a header block on a stream: a request's (on a stream from open_stream()), a response's
     // (informational, or final), or trailers (with end_stream). It fails if the stream isn't open for sending.

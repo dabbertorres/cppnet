@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,7 @@
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
 #include "http/h2_client.hpp"
+#include "http/http.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -183,17 +185,49 @@ TEST_CASE("an HTTPS server serves requests over TLS", "[tls][http][server]")
     http::client      client{&sched, trusting_options()};
     const std::string url = (use_tls ? "https://localhost:" : "http://localhost:") + server.port() + "/";
 
-    const auto test = [](http::client* client, std::string url) -> task<std::pair<std::string, std::string>>
-    { co_return std::pair{co_await fetch(client, url), co_await fetch(client, url)}; };
+    struct outcome
+    {
+        std::string            first;
+        std::string            second;
+        http::connection_stats stats;
+    };
 
-    auto [first, second] = sched.run_to_completion(test(&client, url));
+    // NOTE: the stats while the scheduler runs: stopping it ends an HTTP/2 connection (which TLS agrees on).
+    const auto test = [](http::client* client, std::string url) -> task<outcome>
+    {
+        auto first  = co_await fetch(client, url);
+        auto second = co_await fetch(client, url);
+        co_return outcome{.first = first, .second = second, .stats = client->stats()};
+    };
+
+    const auto out = sched.run_to_completion(test(&client, url));
 
     const std::string_view expected = use_tls ? "hello over TLS" : "hello over TCP";
-    CHECK(first == expected);
-    CHECK(second == expected);
+    CHECK(out.first == expected);
+    CHECK(out.second == expected);
 
     // the connection was kept for the second request.
-    CHECK(client.stats() == http::connection_stats{.open = 1, .idle = 1});
+    CHECK(out.stats == http::connection_stats{.open = 1, .idle = 1});
+}
+
+TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][http][client][http2]")
+{
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+    http::client       client{&sched, trusting_options()};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::string>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        co_return std::format("HTTP/{} {}", resp->version.major, *body);
+    };
+
+    CHECK(sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"))
+          == "HTTP/2 hello over TLS");
 }
 
 TEST_CASE("an HTTPS server closes connections that don't speak TLS", "[tls][http][server]")

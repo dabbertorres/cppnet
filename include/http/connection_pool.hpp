@@ -16,6 +16,7 @@
 
 #include "coro/task.hpp"
 #include "http/connection.hpp"
+#include "http/http2_client.hpp"
 #include "io/scheduler.hpp"
 
 #ifdef NET_HAS_TLS
@@ -51,9 +52,21 @@ struct client_options
     // connection may wait this long for it. Slow but steady transfers aren't limited. 0 is no limit.
     std::chrono::milliseconds io_timeout = std::chrono::seconds{30};
 
+    // Whether to speak HTTP/2 (each request a stream of a connection that others share) to servers that do: over TLS,
+    // it's offered with ALPN, and used if the server agrees.
+    bool http2 = true;
+
+    // Whether to speak HTTP/2 to http:// URLs, without asking first ("prior knowledge"): only for servers known to.
+    bool http2_prior_knowledge = false;
+
+    // Whether a request waits for an HTTP/2 connection's stream to be free when the server's MAX_CONCURRENT_STREAMS
+    // are open (as Chromium, hyper and gRPC do), rather than opening another connection (as Go, curl and OkHttp do,
+    // within max_connections_per_host).
+    bool strict_max_concurrent_streams = false;
+
 #ifdef NET_HAS_TLS
     // For https:// URLs: which certificate authorities to trust (the system's, by default), or not to verify servers'
-    // certificates, for testing. Its ALPN protocols are ignored: the client offers HTTP/1.1.
+    // certificates, for testing. Its ALPN protocols are ignored: the client offers h2 (if http2 is on) and http/1.1.
     tls::client_options tls{};
 
     // How long a TLS handshake may take, once connected (separately from connect_timeout, so an error says which
@@ -81,11 +94,14 @@ namespace detail
     class connection_pool : public std::enable_shared_from_this<connection_pool>
     {
     public:
+        // lease is an HTTP/1.x connection for one request (conn), or an HTTP/2 connection the request is to take a
+        // stream of (http2).
         struct lease
         {
-            std::unique_ptr<connection> conn;
-            std::string                 key;
-            bool                        reused = false; // it was idle in the pool, rather than newly connected
+            std::unique_ptr<connection>              conn;
+            std::shared_ptr<http2_client_connection> http2;
+            std::string                              key;
+            bool reused = false; // it was idle in the pool, rather than newly connected
         };
 
         connection_pool(io::scheduler* scheduler, client_options options);
@@ -129,8 +145,9 @@ namespace detail
 
         struct host_connections
         {
-            std::size_t                 open = 0;
-            std::deque<idle_connection> idle; // oldest first
+            std::size_t                                           open = 0;
+            std::deque<idle_connection>                           idle; // oldest first
+            std::vector<std::shared_ptr<http2_client_connection>> http2;
         };
 
         static std::string make_key(const std::string& scheme, const std::string& host, const std::string& port);
@@ -139,20 +156,45 @@ namespace detail
         coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
         connect(bool tls, std::string host, std::string port, io::clock::time_point deadline);
 
+        // wants_http2 is whether a new connection is to speak HTTP/2: it agreed on h2 (or it's cleartext, with prior
+        // knowledge).
+        [[nodiscard]] bool wants_http2(const connection& conn) const noexcept;
+
+        // start_http2 makes a connection an HTTP/2 connection the host's requests share, returning nullptr if the
+        // scheduler's stopping.
+        std::shared_ptr<http2_client_connection> start_http2(const std::string& key, std::unique_ptr<connection> conn);
+
+        // available_http2 is one of the host's HTTP/2 connections with a stream free, which it reserves for the
+        // request, if there is one (holding mu).
+        std::shared_ptr<http2_client_connection> available_http2(const std::string& key);
+
+        // idle_count is how many of a host's connections are idle (holding mu).
+        static std::size_t idle_count(const host_connections& conns);
+
         // reap closes idle connections as they expire, until there are none.
         static coro::task<> reap(std::weak_ptr<connection_pool> weak, io::scheduler* scheduler);
 
+        // claim is what try_claim found for a request: a connection to use, or room to connect one, or neither (so it
+        // waits).
+        struct claim
+        {
+            std::optional<lease> leased{};
+            bool                 connect = false;
+        };
+
         // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
-        bool has_room(const host_connections& host) const noexcept;
-        bool evict_idle(const std::string& except_key, connections& closing);
-        void forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
+        claim try_claim(const std::string& key, bool allow_idle, connections& closing);
+        bool  has_room(const host_connections& host) const noexcept;
+        bool  evict_idle(const std::string& except_key, connections& closing);
+        void  forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
         std::optional<io::clock::time_point> close_expired(connections& closing);
 
         // freed tells waiters that a connection may be free.
         void freed() noexcept;
 
-        io::scheduler* scheduler;
-        client_options config;
+        io::scheduler*       scheduler;
+        client_options       config;
+        http2_client_options http2_config;
 
         mutable std::mutex                                mu;
         std::unordered_map<std::string, host_connections> hosts;

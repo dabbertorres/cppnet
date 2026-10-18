@@ -18,6 +18,8 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/http2.hpp"
+#include "http/http2_client.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
@@ -166,6 +168,89 @@ std::optional<std::size_t> known_length(const net::http::client_response& resp, 
     return resp.headers.get_content_length();
 }
 
+// sent is what sending a request once made of it: its response (or why there's none), and whether to send it again.
+struct sent
+{
+    std::expected<net::http::client_response, std::error_code> response;
+    bool                                                       retry = false;
+};
+
+// send_http2 sends a request on a stream of an HTTP/2 connection. One the server didn't process (it was refused, or
+// after a GOAWAY's last stream) may be sent again, whatever its method, unless its body's been read.
+net::coro::task<sent>
+send_http2(net::http::detail::connection_pool::lease leased, net::http::client_request& request, bool first)
+{
+    auto       resp  = co_await leased.http2->send(request);
+    const bool retry = !resp.has_value() && first && request.body == nullptr
+                    && resp.error() == net::http::http2::error_code::refused_stream;
+    co_return sent{.response = std::move(resp), .retry = retry};
+}
+
+// send_http11 sends a request on an HTTP/1.x connection, which the response's body gives back to the pool once it's
+// been read. A request that's safe to repeat may be sent again if a reused connection turns out to have been closed.
+net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_pool> pool,
+                                  net::http::detail::connection_pool::lease           leased,
+                                  net::http::client_request&                          request,
+                                  bool                                                first,
+                                  bool                                                reusable_request)
+{
+    namespace io     = net::io;
+    namespace http11 = net::http::http11;
+    namespace detail = net::http::detail;
+
+    const bool reused = leased.reused;
+    auto       body   = std::make_unique<pooled_body>(pool, std::move(leased));
+    auto*      conn   = body->connection();
+
+    // NOTE: set every time, as a reused connection has whatever its last request left.
+    const auto& options = pool->options();
+    auto&       sock    = detail::socket_of(*conn);
+    sock.set_deadline(std::nullopt);
+    sock.set_timeout(limit(options.io_timeout));
+
+    // NOTE: not with a body, which has been read.
+    const auto retry = [&](std::error_code err)
+    { return reused && first && request.body == nullptr && is_idempotent(request.method) && closed_early(err); };
+
+    // the head in one write, rather than one per field.
+    io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
+
+    auto res = co_await http11::request_encode(&out, request);
+    if (res.has_value())
+    {
+        if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);
+    }
+
+    // a server may respond before reading all of the body (e.g. 413 Content Too Large), and then close the
+    // connection, failing the rest of the write. The response is still worth reading, if it's there.
+    const bool write_failed = !res.has_value();
+    if (write_failed)
+    {
+        if (retry(res.error())) co_return sent{.response = std::unexpected(res.error()), .retry = true};
+        if (request.body == nullptr || !closed_early(res.error()))
+            co_return sent{.response = std::unexpected(res.error())};
+    }
+
+    if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
+
+    auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
+
+    // the body's reads are only limited by io_timeout.
+    sock.set_read_deadline(std::nullopt);
+    if (!resp.has_value())
+    {
+        if (write_failed) co_return sent{.response = std::unexpected(res.error())};
+        co_return sent{.response = std::unexpected(resp.error()), .retry = retry(resp.error())};
+    }
+
+    // the server didn't get all of the request, so the connection is no use for another.
+    const bool reuse = !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
+    body->attach(std::move(resp->body), reuse, known_length(*resp, request.method));
+    resp->body = std::move(body);
+
+    co_return sent{.response = std::move(*resp)};
+}
+
 }
 
 namespace net::http
@@ -177,7 +262,7 @@ client::client(io::scheduler* scheduler, const client_options& options)
 
 coro::task<std::expected<client_response, std::error_code>> client::send(client_request request)
 {
-    // Only HTTP/1.x is implemented: the http2 encoders are stubs.
+    // a request's version is the HTTP/1.x it's sent as: HTTP/2 is used when a connection agrees on it.
     if (request.version.major > 1) co_return std::unexpected(std::make_error_code(std::errc::not_supported));
 
     auto target = endpoint(request.uri);
@@ -196,60 +281,12 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
         auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0);
         if (!leased.has_value()) co_return std::unexpected(leased.error());
 
-        const bool reused = leased->reused;
-        auto       body   = std::make_unique<pooled_body>(pool, std::move(*leased));
-        auto*      conn   = body->connection();
-
-        // NOTE: set every time, as a reused connection has whatever its last request left.
-        const auto& options = pool->options();
-        auto&       sock    = detail::socket_of(*conn);
-        sock.set_deadline(std::nullopt);
-        sock.set_timeout(limit(options.io_timeout));
-
-        // NOTE: not with a body, which has been read.
-        const auto retry = [&](std::error_code err)
-        {
-            return reused && attempt == 0 && request.body == nullptr && is_idempotent(request.method)
-                && closed_early(err);
-        };
-
-        // the head in one write, rather than one per field.
-        io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
-
-        auto res = co_await http11::request_encode(&out, request);
-        if (res.has_value())
-        {
-            if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);
-        }
-
-        // a server may respond before reading all of the body (e.g. 413 Content Too Large), and then close the
-        // connection, failing the rest of the write. The response is still worth reading, if it's there.
-        const bool write_failed = !res.has_value();
-        if (write_failed)
-        {
-            if (retry(res.error())) continue;
-            if (request.body == nullptr || !closed_early(res.error())) co_return std::unexpected(res.error());
-        }
-
-        if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
-
-        auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
-
-        // the body's reads are only limited by io_timeout.
-        sock.set_read_deadline(std::nullopt);
-        if (!resp.has_value())
-        {
-            if (write_failed) co_return std::unexpected(res.error());
-            if (retry(resp.error())) continue;
-            co_return std::unexpected(resp.error());
-        }
-
-        // the server didn't get all of the request, so the connection is no use for another.
-        const bool reuse = !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
-        body->attach(std::move(resp->body), reuse, known_length(*resp, request.method));
-        resp->body = std::move(body);
-
-        co_return std::move(*resp);
+        // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the response's
+        // body is read.
+        auto result = leased->http2 != nullptr
+                        ? co_await send_http2(std::move(*leased), request, attempt == 0)
+                        : co_await send_http11(pool, std::move(*leased), request, attempt == 0, reusable_request);
+        if (!result.retry) co_return std::move(result.response);
     }
 }
 

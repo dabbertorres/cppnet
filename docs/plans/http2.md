@@ -1,9 +1,10 @@
 # Plan: HTTP/2
 
-Status: stages 1 to 3 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with its tests and `fuzz_hpack`); the frames
-and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`); and the
-server (`coro/notifier.hpp` and `bench_notifier`, `http/http2_server.hpp`, `test/http/http2_server.cpp`). The client
-(stage 4) is next.
+Status: stages 1 to 4 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with its tests and `fuzz_hpack`); the frames
+and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`); the
+server (`coro/notifier.hpp` and `bench_notifier`, `http/http2_server.hpp`, `test/http/http2_server.cpp`); and the
+client (`http/http2_connection.hpp`, the machinery both sides share, `http/http2_client.hpp`, the pool's HTTP/2
+connections, `test/http/http2_client.cpp`). What's left is stage 5's.
 
 ## Goal
 
@@ -329,6 +330,33 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
   options say.
 - Request trailers end the body, but aren't passed on (there's no API for them yet).
 - h2spec and h2load weren't run (they aren't installed here); curl (built with nghttp2) was, over cleartext and TLS.
+
+## Learned in stage 4
+
+- Both sides' connections share a base, `http2_connection_base` (`http/http2_connection.hpp`): the reader that feeds
+  the session, the writer that drains it, the timer task for per-stream timeouts, the registry of streams, and the
+  streams' body reader and writer (`stream_reader`, `stream_writer`). Each side adds its events (a server starts
+  handlers; a client wakes the request waiting for its response's head) and its connection-level checks (the server's
+  preface and idle timeouts, and graceful close; the client's idle timeout).
+- A client's HTTP/2 connection is owned by its own task (holding a `shared_ptr`), and by the pool's list for its host;
+  responses' bodies hold it too, so it lives until the last is destroyed. The pool hands out a lease that's either an
+  HTTP/1.x connection or an HTTP/2 one, and a connection with a stream free (by the server's MAX_CONCURRENT_STREAMS,
+  which `session::can_open_stream()` checks) is preferred to making another. With
+  `client_options::strict_max_concurrent_streams`, a request waits for a stream instead; a stream being done (or the
+  connection closing) wakes the pool's waiters, as an HTTP/1.x connection being released does. The pool reserves the
+  stream when it hands out the lease (`http2_client_connection::reserve()`, which `session::can_open_stream(reserved)`
+  counts), as the stream is only opened later: without that, two requests could both take the last free stream, and
+  one be refused by its own side.
+- No PING check before reusing an HTTP/2 connection, after all: its reader is always reading, so a connection the
+  server closed is noticed (and dropped from the pool) as it happens, unlike an idle HTTP/1.1 connection, which
+  nothing reads.
+- A request that's refused (REFUSED_STREAM, or after the server's GOAWAY) is sent again once, on another connection,
+  if it has no body (whose reader can't be rewound), whatever its method. One the server sent headers for was
+  processed, so its refusal is reported as CANCEL, which isn't retried.
+- `client_options::http2` (on by default) offers `h2` over TLS; `http2_prior_knowledge` speaks it over cleartext.
+  Response trailers end the body, but aren't passed on (as with requests' on the server).
+- `server_config::http2_max_concurrent_streams` (100, as nginx's) was added, for the client's stream-limit tests.
+- No public servers in the tests: the HTTPS test is against the loopback server, which agrees on `h2`.
 
 ## Stages
 

@@ -762,12 +762,16 @@ std::error_code session::on_window_update(const frame_header&        h,
     return {};
 }
 
-std::expected<stream_id, std::error_code> session::open_stream()
+bool session::can_open_stream(std::size_t reserved) const noexcept
 {
     const auto limit = settings_received ? peer.max_concurrent_streams : assumed_max_concurrent_streams;
-    if (side != role::client || connection_failed || peer_goaway.has_value() || local_goaway.has_value()
-        || open_local_streams >= limit || next_local_stream > max_stream_id)
-        return std::unexpected(make_error_code(error_code::refused_stream));
+    return side == role::client && !connection_failed && !peer_goaway.has_value() && !local_goaway.has_value()
+        && open_local_streams + reserved < limit && next_local_stream + (2 * reserved) <= max_stream_id;
+}
+
+std::expected<stream_id, std::error_code> session::open_stream()
+{
+    if (!can_open_stream()) return std::unexpected(make_error_code(error_code::refused_stream));
 
     const auto id = next_local_stream;
     next_local_stream += 2;

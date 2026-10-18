@@ -351,6 +351,33 @@ TEST_CASE("a client and server exchange prefaces and settings", "[http][http2][s
     CHECK_FALSE(server.failure);
 }
 
+TEST_CASE("a client opens streams up to the server's MAX_CONCURRENT_STREAMS, counting those reserved",
+          "[http][http2][session][limits]")
+{
+    http2::session_config server_config;
+    server_config.local.max_concurrent_streams = 2;
+
+    endpoint client{http2::role::client};
+    endpoint server{http2::role::server, server_config};
+    pump(client, server);
+    REQUIRE(client.s.peer_settings().max_concurrent_streams == 2);
+
+    CHECK(client.s.can_open_stream());
+    CHECK(client.s.can_open_stream(1));
+    CHECK_FALSE(client.s.can_open_stream(2));
+
+    REQUIRE(client.s.open_stream().has_value());
+    CHECK(client.s.can_open_stream());
+    CHECK_FALSE(client.s.can_open_stream(1));
+
+    REQUIRE(client.s.open_stream().has_value());
+    CHECK_FALSE(client.s.can_open_stream());
+    CHECK(client.s.open_stream().error() == http2::error_code::refused_stream);
+
+    // a server never opens streams.
+    CHECK_FALSE(server.s.can_open_stream());
+}
+
 TEST_CASE("a request and its response", "[http][http2][session]")
 {
     connected c;

@@ -56,7 +56,11 @@ struct server_config
     // client starts with HTTP/2's preface (prior knowledge). Its streams are limited by the timeouts above, as
     // requests are (a stream that times out is reset, rather than the connection closed), and a connection without
     // streams is closed after header_read_timeout.
-    bool                            http2  = true;
+    bool http2 = true;
+
+    // The most streams (requests) an HTTP/2 client may have open on a connection at once (nginx's default).
+    std::uint32_t http2_max_concurrent_streams = 100;
+
     std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 
 #ifdef NET_HAS_TLS

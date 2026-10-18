@@ -1,7 +1,7 @@
 # net for C++
 
-A C++23 networking library, built on its own coroutine runtime: TCP sockets, DNS lookups, URLs, an HTTP/1.1 client,
-an HTTP/1.1 and HTTP/2 server (with a router, and middleware for Prometheus metrics and OpenTelemetry tracing), and
+A C++23 networking library, built on its own coroutine runtime: TCP sockets, DNS lookups, URLs, an HTTP/1.1 and HTTP/2
+client, an HTTP/1.1 and HTTP/2 server (with a router, and middleware for Prometheus metrics and OpenTelemetry tracing), and
 TLS (with Botan), for HTTPS in both.
 
 ```cpp
