@@ -1,8 +1,9 @@
 # Each target is a libFuzzer executable. Run one for longer with a corpus directory (which it adds
 # to as it goes), e.g.:
 #
-# mkdir -p fuzz-corpus/url && ./build/fuzz/Debug/fuzz_url -max_total_time=300 -max_len=256
-# fuzz-corpus/url
+# cmake-format: off
+#   mkdir -p fuzz-corpus/url && ./build/fuzz/Debug/fuzz_url -max_total_time=300 -max_len=256 fuzz-corpus/url
+# cmake-format: on
 #
 # Each is also a 10 second ctest run, labelled "fuzz" (exclude them with `ctest -LE fuzz`).
 #

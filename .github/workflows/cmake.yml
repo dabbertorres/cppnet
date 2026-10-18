@@ -135,25 +135,36 @@ jobs:
     - name: Test
       run: ctest --test-dir build --output-on-failure
 
-    # clang-tidy, with warnings as errors, on the C++ files the change touches (of those in the compile database): a
-    # pull request's against its base, a push's against what it replaced. Once, with Clang on Linux, after the build
-    # (which made the compile database), even if the tests failed.
+    # clang-tidy, with warnings as errors, on the C++ files the change touches: a pull request's against its base, a
+    # push's against what it replaced (or, for a new branch, or a force push whose old commit isn't in the clone, its
+    # parent). The sources in the compile database, and the headers of the project's own directories, whose commands
+    # clang-tidy infers from it (a nearby source's, as a header). Once, with Clang on Linux, after the build (which made
+    # the compile database), even if the tests failed.
     - name: Lint the changed files
       if: always() && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang'
+      env:
+        EVENT: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        BEFORE: ${{ github.event.before }}
       run: |
         git config --global --add safe.directory '*'
-        if [ "${{ github.event_name }}" = pull_request ]; then
-          base="origin/${{ github.base_ref }}"
+        if [ "$EVENT" = pull_request ]; then
+          base="origin/$BASE_REF"
+        elif [ -n "$BEFORE" ] && [ -n "${BEFORE//0/}" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          base="$BEFORE"
         else
-          base="${{ github.event.before }}"
+          base="HEAD^"
         fi
+        echo "Changes since: $base"
 
-        git diff --name-only --diff-filter=d "$base"...HEAD -- '*.cpp' > changed.txt
+        git diff --name-only --diff-filter=d "$base"...HEAD -- '*.cpp' '*.hpp' '*.h' > changed.txt
         python3 - <<'PY' > lint.txt
         import json, os
         compiled = {os.path.relpath(e["file"]) for e in json.load(open("build/compile_commands.json"))}
+        own = ("include/", "src/", "test/", "bench/", "example/", "fuzz/")
         for line in open("changed.txt"):
-            if line.strip() in compiled: print(line.strip())
+            path = line.strip()
+            if path in compiled or (path.endswith((".hpp", ".h")) and path.startswith(own)): print(path)
         PY
 
         echo "Linting:"; cat lint.txt
@@ -161,29 +172,32 @@ jobs:
           xargs -P "$(nproc)" -n 1 clang-tidy -p build --quiet --warnings-as-errors='*' < lint.txt
         fi
 
-  # Formatting: every C++ file with clang-format (the latest, as the Linux jobs' compilers are), and every CMake file
-  # with cmake-format, as they're configured.
+  # Formatting: every C++ file with clang-format, and every CMake file (but the overlay ports', which are vcpkg's) with
+  # cmake-format, as they're configured. clang-format is PyPI's, pinned to a major version, so a new one (which formats
+  # differently) is taken deliberately, with a commit that reformats.
   format:
     runs-on: ubuntu-26.04
     container: archlinux:base-devel
 
     steps:
     - name: Install tools
-      run: pacman -Syu --noconfirm --needed git clang python
+      run: pacman -Syu --noconfirm --needed git python
 
     - uses: actions/checkout@v7
+
+    - name: Install the formatters
+      run: |
+        python -m venv .venv
+        .venv/bin/pip install --quiet 'clang-format==23.*' cmakelang==0.6.13 pyyaml
 
     - name: Check C++ formatting
       run: |
         git config --global --add safe.directory '*'
-        clang-format --version
-        git ls-files '*.cpp' '*.hpp' '*.h' | xargs clang-format --dry-run --Werror
+        .venv/bin/clang-format --version
+        git ls-files '*.cpp' '*.hpp' '*.h' | xargs .venv/bin/clang-format --dry-run --Werror
 
     - name: Check CMake formatting
-      run: |
-        python -m venv .venv
-        .venv/bin/pip install --quiet cmakelang==0.6.13 pyyaml
-        git ls-files 'CMakeLists.txt' '*/CMakeLists.txt' '*.cmake' | xargs .venv/bin/cmake-format --check
+      run: git ls-files 'CMakeLists.txt' '*/CMakeLists.txt' '*.cmake' ':!ports/' | xargs .venv/bin/cmake-format --check
 
   # The check master's branch protection requires, which passes only if every job of the matrix, and the formatting
   # check, did: so they can change without changing the protection.
