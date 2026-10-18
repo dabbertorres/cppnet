@@ -162,6 +162,11 @@ HTTP/1.1 connections register on it (to shut their reading side). Which calls st
   and drains HTTP/2 (GOAWAY), but doesn't stop handlers' tokens.
 - `abort()` (new) does what `close()` does, and stops every handler's token: for a program that drains for a while
   and then gives up, as Go's `Shutdown` then `Close`.
+- `join()` (new, a task) waits until `serve()` and every connection have finished (the `running` scope's `join()`), so
+  a program can `close()`, `co_await server.join()` (perhaps racing a deadline, then `abort()`), and only then shut the
+  scheduler down. Today it can only give the drain time before `scheduler.shutdown()`, which cancels at once; the
+  destructor waits the same way, but blocking, and must not run on one of the scheduler's tasks. (Decided 2026-10-18,
+  after HTTP/1.1's `close()` became graceful.) `example/http-server` uses it, with a bound on how long it drains.
 - `~server` aborts (it must wait for the handlers anyway, and nothing will read their answers).
 - `scheduler::request_stop()` aborts, through a token the scheduler gets (`scheduler::stop_token()`, a
   `std::stop_source` it stops in `request_stop()`), which the server's constructor registers a callback on. It
@@ -297,7 +302,7 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
    `set_stop_token` (and `tls::stream`'s, and `connect`'s option), `run_blocking(func, stop)`, and
    `scheduler::stop_token()`. Tests. Useful without HTTP, and what the next stages build on.
 2. **The server's token**: `server_request::stop`; HTTP/2's per-stream sources, stopped outside the lock; HTTP/1.1's
-   per-connection source; `abort()`, the destructor and the scheduler's stop; handlers returning after a stop (resets,
+   per-connection source; `abort()`, `join()`, the destructor and the scheduler's stop; handlers returning after a stop (resets,
    logging). The HTTP/2 allocation count. `docs/guide.md` (the server section's "which can't be cancelled", and the
    runtime's waits), CLAUDE.md, and the comments on `run()`/`schedule()` and in `http2.md` that say handlers can't be
    canceled.
