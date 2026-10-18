@@ -9,6 +9,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 #include "coro/task.hpp"
 #include "http/chunked_writer.hpp"
@@ -16,6 +17,7 @@
 #include "http/http.hpp"
 #include "http/request.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/io.hpp"
 #include "io/limit_writer.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
@@ -249,11 +251,34 @@ using response_decoder = coro::task<response_decoder_result> (*)(std::unique_ptr
                                                                  request_method,
                                                                  std::size_t) noexcept;
 
+namespace detail
+{
+    // http2_stream is an HTTP/2 stream the server serves (see http/http2_server.hpp).
+    class http2_stream;
+
+    // http2_stream_ops are what a response_writer does with an HTTP/2 stream, which its server provides: so that
+    // response_writer doesn't depend on HTTP/2's server (as it doesn't on HTTP/1.1's encoder).
+    struct http2_stream_ops
+    {
+        // send_head sends a response's head (ending the stream, if end_stream), returning the writer for its body.
+        coro::task<response_encoder_result> (*send_head)(http2_stream&          stream,
+                                                         const server_response& resp,
+                                                         bool                   end_stream);
+
+        // finish ends the stream's response, if it hasn't been.
+        coro::task<io::result> (*finish)(http2_stream& stream);
+    };
+}
+
 // response_writer presents an interface for building a server_response to request handlers.
 struct response_writer
 {
 public:
+    // An HTTP/1.x response, whose head encoder writes to writer.
     response_writer(io::writer* writer, server_response* base, response_encoder encoder);
+
+    // An HTTP/2 response, on stream.
+    response_writer(detail::http2_stream* stream, const detail::http2_stream_ops* ops, server_response* base) noexcept;
 
     net::http::headers& headers() noexcept;
 
@@ -271,11 +296,12 @@ public:
     // send sends the response's status and headers without a Content-Length, for a body whose length isn't known
     // beforehand, and returns the writer for it: the body is as long as what's written to it. It's sent chunked to an
     // HTTP/1.1 client, and finish() (which the server calls once the handler returns) ends it; to an HTTP/1.0 client,
-    // closing the connection ends it. Otherwise, as send(status_code, content_length).
+    // closing the connection ends it; and HTTP/2 frames it as it goes, ended by finish(). Otherwise, as
+    // send(status_code, content_length).
     coro::task<io::writer*> send(status status_code);
 
-    // finish ends the body of a response sent without a Content-Length, if it's chunked (see send(status)). It does
-    // nothing otherwise, or if the body was ended already.
+    // finish ends the body of a response sent without a Content-Length, if it's chunked (see send(status)), or an
+    // HTTP/2 response's stream. It does nothing otherwise, or if the body was ended already.
     coro::task<io::result> finish();
 
     // body_remaining is how much of the body the handler has yet to write.
@@ -306,13 +332,27 @@ private:
     // take_encoding takes the encoder's result, returning the body's writer, or throwing if it failed.
     io::writer* take_encoding(const response_encoder_result& res, framing how, std::size_t body_length);
 
-    io::writer*            writer;
-    server_response*       resp;
-    response_encoder       encode;
-    io::limit_writer       body;
-    http11::chunked_writer chunked{nullptr};
-    bool                   chunked_open = false;
-    bool                   final_sent   = false;
+    // http11_backend frames the response for HTTP/1.x: its head through encode, and its body by its length, chunks,
+    // or closing the connection.
+    struct http11_backend
+    {
+        io::writer*            writer;
+        response_encoder       encode;
+        http11::chunked_writer chunked{nullptr};
+        bool                   chunked_open = false;
+    };
+
+    // http2_backend sends the response on an HTTP/2 stream, which frames its body itself.
+    struct http2_backend
+    {
+        detail::http2_stream*           stream;
+        const detail::http2_stream_ops* ops;
+    };
+
+    server_response*                            resp;
+    std::variant<http11_backend, http2_backend> backend;
+    io::limit_writer                            body;
+    bool                                        final_sent = false;
 };
 
 }

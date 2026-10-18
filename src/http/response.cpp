@@ -10,6 +10,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 
 #include "coro/task.hpp"
 #include "http/chunked_writer.hpp"
@@ -41,9 +42,19 @@ status parse_status(std::string_view str) noexcept
 }
 
 response_writer::response_writer(io::writer* writer, server_response* base, response_encoder encode)
-    : writer(writer)
-    , resp(base)
-    , encode(encode)
+    : resp{
+          base
+}
+    , backend{http11_backend{.writer = writer, .encode = encode}}
+{}
+
+response_writer::response_writer(detail::http2_stream*           stream,
+                                 const detail::http2_stream_ops* ops,
+                                 server_response*                base) noexcept
+    : resp{
+          base
+}
+    , backend{http2_backend{.stream = stream, .ops = ops}}
 {}
 
 headers& response_writer::headers() noexcept { return resp->headers; }
@@ -79,6 +90,21 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
     resp->status_code = status_code;
     resp->headers.remove("Content-Length"sv);
     resp->headers.remove("Transfer-Encoding"sv);
+
+    if (const auto* h2 = std::get_if<http2_backend>(&backend))
+    {
+        // HTTP/2 frames the body itself: with its length, if it's known; ended by finish() otherwise, or with the head
+        // if there's none.
+        if (how == framing::length && has_content) resp->headers.set_content_length(body_length);
+        const bool end = how == framing::length && body_length == 0 && !status_is_information(status_code);
+
+        auto sending = h2->ops->send_head(*h2->stream, *resp, end);
+        if (sending.finished_without_coroutine())
+            return coro::ready_task<io::writer*>(take_encoding(std::move(sending).result(), how, body_length));
+        return finish_send(std::move(sending), how, body_length);
+    }
+
+    const auto& h1 = std::get<http11_backend>(backend);
     switch (how)
     {
     case framing::length:
@@ -89,7 +115,7 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
     }
 
     // usually, the head fits in the connection's buffer: then there's no need for a coroutine (see coro::ready_task).
-    auto encoding = encode(writer, *resp);
+    auto encoding = h1.encode(h1.writer, *resp);
     if (encoding.finished_without_coroutine())
         return coro::ready_task<io::writer*>(take_encoding(std::move(encoding).result(), how, body_length));
 
@@ -113,14 +139,23 @@ io::writer* response_writer::take_encoding(const response_encoder_result& res, f
 
     if (!status_is_information(resp->status_code)) final_sent = true;
 
+    // HTTP/2's stream gives the body's writer, which frames it; its length is still limited to what was sent.
+    if (std::holds_alternative<http2_backend>(backend))
+    {
+        if (how != framing::length) return *res;
+        body = io::limit_writer{*res, body_length};
+        return &body;
+    }
+
+    auto& h1 = std::get<http11_backend>(backend);
     switch (how)
     {
     case framing::length: body = io::limit_writer{resp->body, body_length}; return &body;
 
     case framing::chunked:
-        chunked      = http11::chunked_writer{resp->body};
-        chunked_open = true;
-        return &chunked;
+        h1.chunked      = http11::chunked_writer{resp->body};
+        h1.chunked_open = true;
+        return &h1.chunked;
 
     case framing::close: return resp->body;
     }
@@ -130,9 +165,12 @@ io::writer* response_writer::take_encoding(const response_encoder_result& res, f
 
 coro::task<io::result> response_writer::finish()
 {
-    if (!chunked_open) return coro::ready_task<io::result>();
+    if (const auto* h2 = std::get_if<http2_backend>(&backend)) return h2->ops->finish(*h2->stream);
 
-    chunked_open = false;
-    return chunked.finish();
+    auto& h1 = std::get<http11_backend>(backend);
+    if (!h1.chunked_open) return coro::ready_task<io::result>();
+
+    h1.chunked_open = false;
+    return h1.chunked.finish();
 }
 }

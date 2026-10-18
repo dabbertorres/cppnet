@@ -7,6 +7,7 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <system_error>
@@ -18,6 +19,7 @@
 #include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "http/connection.hpp"
+#include "http/http2_server.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "io/discard_writer.hpp"
@@ -47,14 +49,20 @@ struct server_config
     std::chrono::seconds write_timeout     = std::chrono::seconds{60};
     // The most connections served at once: once that many are open, the server waits for one to close before
     // accepting another. 0 doesn't limit them. (512 is nginx's worker_connections default.)
-    std::size_t                     max_connections         = 512;
-    std::uint16_t                   max_pending_connections = 512;
-    std::shared_ptr<spdlog::logger> logger                  = spdlog::default_logger();
+    std::size_t   max_connections         = 512;
+    std::uint16_t max_pending_connections = 512;
+
+    // Serve HTTP/2 as well as HTTP/1.1: over TLS when the client agrees on h2 with ALPN, and over cleartext when a
+    // client starts with HTTP/2's preface (prior knowledge). Its streams are limited by the timeouts above, as
+    // requests are (a stream that times out is reset, rather than the connection closed), and a connection without
+    // streams is closed after header_read_timeout.
+    bool                            http2  = true;
+    std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 
 #ifdef NET_HAS_TLS
     // Serve HTTPS: each connection starts with a TLS handshake, with this context's certificate and key (see
-    // tls::server_context::make()), which has header_read_timeout to finish. Only HTTP/1.1 is served: a client that
-    // agrees on another protocol with ALPN (e.g. h2, if the context offers it) is disconnected.
+    // tls::server_context::make()), which has header_read_timeout to finish. The server offers h2 (if http2 is on) and
+    // http/1.1 with ALPN, whatever the context's options say.
     std::optional<tls::server_context> tls{};
 #endif
 };
@@ -124,8 +132,12 @@ private:
     coro::task<std::optional<detail::connection>> accept_tls(tcp_socket conn, tls::server_context ctx);
 #endif
 
-    // serve_requests reads and responds to conn's requests, until it closes (or should be).
+    // serve_requests reads and responds to conn's HTTP/1.x requests, until it closes (or should be); or if it starts
+    // with HTTP/2's preface (and http2 is on), serves it as HTTP/2.
     coro::task<> serve_requests(detail::connection& conn);
+
+    // serve_http2 serves conn as HTTP/2, already_read being what was read of it to tell.
+    coro::task<> serve_http2(detail::connection& conn, std::span<const std::byte> already_read);
 
     // head_deadline is how long a connection may take to send the next request's head, or finish its TLS handshake
     // (see header_read_timeout).
@@ -157,6 +169,9 @@ private:
     std::chrono::seconds write_timeout;
     std::size_t          max_connections;
     std::uint16_t        max_pending_connections;
+
+    bool                  http2_enabled;
+    detail::http2_options http2_config;
 
     // open_connections counts the connections being served, for max_connections (waited on, with the scheduler).
     std::atomic<std::uint64_t> open_connections = 0;

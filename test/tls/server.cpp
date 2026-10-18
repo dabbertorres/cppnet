@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -30,6 +31,7 @@
 #include "coro/thread_pool.hpp"
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
+#include "http/h2_client.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -284,38 +286,61 @@ TEST_CASE("closing an HTTPS server ends handshakes in progress", "[tls][http][se
     CHECK(std::chrono::steady_clock::now() - start < 4s);
 }
 
-TEST_CASE("an HTTPS server closes connections that agree on a protocol besides HTTP/1.1", "[tls][http][server]")
+TEST_CASE("an HTTPS server serves HTTP/2 to clients that agree on h2", "[tls][http][server][http2]")
+{
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+
+    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::pair<std::string, std::string>>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+        REQUIRE(conn.has_value());
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"h2", "http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        REQUIRE(s.has_value());
+        if (s->alpn() != "h2") co_return std::pair{"ALPN: " + std::string{s->alpn()}, std::string{}};
+
+        test::h2_client client{&*s, &*s};
+        const auto      id = client.request("GET", "/");
+        REQUIRE(co_await client.wait_for(id));
+
+        co_await s->close();
+        co_return std::pair{client.responses[id].status, client.responses[id].body};
+    };
+
+    auto [status, body] = sched.run_to_completion(test(&sched, server.port()));
+    CHECK(status == "200");
+    CHECK(body == "hello over TLS");
+}
+
+TEST_CASE("without http2, an HTTPS server doesn't agree on h2", "[tls][http][server][http2]")
 {
     net::io::scheduler sched{make_pool()};
 
-    auto ctx = tls::server_context::make({
-        .certificate_chain = pki().localhost_chain,
-        .private_key       = pki().localhost_key,
-        .alpn              = {"h2", "http/1.1"},
-    });
-    REQUIRE(ctx.has_value());
+    auto cfg  = tls_config();
+    cfg.http2 = false;
+    https_server server{&sched, cfg};
 
-    https_server server{&sched, {.tls = std::move(*ctx)}};
-
-    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::pair<std::string, std::error_code>>
+    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::string>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-        if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
+        REQUIRE(conn.has_value());
 
         auto s = co_await tls::stream::connect(std::move(*conn),
                                                trusting_client({"h2"}),
                                                "localhost",
                                                net::io::clock::now() + 5s);
-        if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
-        if (s->alpn() != "h2") co_return std::pair{"ALPN: " + std::string{s->alpn()}, std::error_code{}};
+        REQUIRE(s.has_value());
 
-        co_return co_await read_to_end(*s);
+        const std::string alpn{s->alpn()};
+        co_await s->close();
+        co_return alpn;
     };
 
-    auto [received, err] = sched.run_to_completion(test(&sched, server.port()));
-    CAPTURE(err.message());
-    CHECK(received.empty());
-    CHECK(err == net::io::errc::end_of_stream);
+    CHECK(sched.run_to_completion(test(&sched, server.port())).empty());
 }
 
 TEST_CASE("an HTTPS server's error responses end with close_notify", "[tls][http][server]")

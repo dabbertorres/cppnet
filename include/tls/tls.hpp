@@ -121,9 +121,13 @@ public:
                                                                       io::clock::time_point deadline,
                                                                       std::stop_token       stop = {});
 
-    // accept runs a server's handshake over conn, until deadline, or stop is requested (as connect).
-    static coro::task<std::expected<stream, std::error_code>>
-    accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, std::stop_token stop = {});
+    // accept runs a server's handshake over conn, until deadline, or stop is requested (as connect). alpn, if it's
+    // given, is the ALPN protocols to offer instead of ctx's (e.g. a server's, which decides what it speaks).
+    static coro::task<std::expected<stream, std::error_code>> accept(tcp_socket                              conn,
+                                                                     server_context                          ctx,
+                                                                     io::clock::time_point                   deadline,
+                                                                     std::stop_token                         stop = {},
+                                                                     std::optional<std::vector<std::string>> alpn = {});
 
     stream(const stream&)            = delete;
     stream& operator=(const stream&) = delete;

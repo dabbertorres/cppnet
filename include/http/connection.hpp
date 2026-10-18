@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string_view>
 #include <system_error>
 
 #include "coro/task.hpp"
@@ -66,6 +67,15 @@ inline io::handle native_handle(const connection& conn) noexcept
 #else
     return conn.native_handle();
 #endif
+}
+
+// alpn is the protocol a TLS connection agreed on with ALPN (empty if none, or it's not TLS).
+inline std::string_view alpn([[maybe_unused]] const connection& conn) noexcept
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->alpn();
+#endif
+    return {};
 }
 
 // is_tls is whether it's a TLS connection.

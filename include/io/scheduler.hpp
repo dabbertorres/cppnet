@@ -270,6 +270,9 @@ public:
     void register_handle(handle fd);
     void deregister_handle(handle fd) noexcept;
 
+    // pool is the thread pool the scheduler runs tasks on.
+    [[nodiscard]] coro::thread_pool* pool() const noexcept { return workers.get(); }
+
     // spawn starts task on the thread pool. If the scheduler is stopping, the task is destroyed without being run, and
     // false is returned.
     //

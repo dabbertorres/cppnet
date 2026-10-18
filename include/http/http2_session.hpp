@@ -164,7 +164,11 @@ public:
 
     // take_output swaps what's to be written with out (which it clears first), so a writer can reuse its buffer.
     void               take_output(std::vector<std::byte>& out);
-    [[nodiscard]] bool has_output() const noexcept { return !output.empty(); }
+    [[nodiscard]] bool        has_output() const noexcept { return !output.empty(); }
+    [[nodiscard]] std::size_t output_size() const noexcept { return output.size(); }
+
+    // has_peer_settings is whether the peer's first SETTINGS have arrived.
+    [[nodiscard]] bool has_peer_settings() const noexcept { return settings_received; }
 
     // send_window is how much may be sent on the stream now: the smaller of its window and the connection's (0 if it
     // can't send).

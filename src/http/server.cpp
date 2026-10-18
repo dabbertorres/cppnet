@@ -17,6 +17,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "exception.hpp"
@@ -24,6 +25,8 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/http2.hpp"
+#include "http/http2_session.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
@@ -136,6 +139,33 @@ net::coro::task<> linger_before_close(net::http::detail::connection& conn) noexc
     }
 }
 
+// starts_with_preface reads (into reader's buffer, without consuming it) until it can tell whether the connection
+// starts with HTTP/2's preface.
+net::coro::task<bool> starts_with_preface(net::io::buffered_reader& reader)
+{
+    const auto preface = std::as_bytes(std::span{net::http::http2::preface});
+    while (true)
+    {
+        const auto buffered = reader.buffered();
+        const auto n        = std::min(buffered.size(), preface.size());
+        if (!std::ranges::equal(buffered.first(n), preface.first(n))) co_return false;
+        if (n == preface.size()) co_return true;
+
+        if (co_await reader.fill()) co_return false;
+    }
+}
+
+// http2_session_config is HTTP/2's settings for a server's config: its head's limit, as a header list (whose fields
+// count 32 more each, for at most as many fields as HTTP/1.1's).
+net::http::http2::session_config http2_session_config(const net::http::server_config& cfg)
+{
+    net::http::http2::session_config config;
+    config.local.max_header_list_size =
+        static_cast<std::uint32_t>(std::min<std::size_t>(cfg.max_header_bytes + (32 * net::http::http11::max_fields),
+                                                         net::http::http2::unlimited - 1));
+    return config;
+}
+
 // has_close is whether fields say the connection closes after this message.
 bool has_close(const net::http::headers& fields) { return fields.has_token("Connection"sv, "close"sv); }
 
@@ -175,6 +205,13 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
     , write_timeout{cfg.write_timeout}
     , max_connections{cfg.max_connections}
     , max_pending_connections{cfg.max_pending_connections}
+    , http2_enabled{cfg.http2}
+    , http2_config{
+          .header_read_timeout = cfg.header_read_timeout,
+          .body_read_timeout   = cfg.body_read_timeout,
+          .write_timeout       = cfg.write_timeout,
+          .session             = http2_session_config(cfg),
+      }
 #ifdef NET_HAS_TLS
     , tls_ctx{cfg.tls}
 #endif
@@ -322,12 +359,9 @@ coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease 
         opened = co_await open_connection(std::move(conn));
         if (opened)
         {
-            // close() ends the connection: reads (e.g. waiting for the next request) find the end of the stream.
-            // NOTE: unregistered (waiting for a call in progress) before the connection closes.
-            std::stop_callback on_close{closing.get_token(),
-                                        [&open = *opened] noexcept { detail::socket_of(open).shutdown_read(); }};
-
-            co_await serve_requests(*opened);
+            // TLS chooses HTTP/2 with ALPN; over cleartext, serve_requests() looks for its preface.
+            if (http2_enabled && detail::alpn(*opened) == "h2"sv) co_await serve_http2(*opened, {});
+            else co_await serve_requests(*opened);
         }
     }
     catch (const std::exception& ex)
@@ -360,15 +394,24 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
     // NOTE: the handshake needs a deadline: without header_read_timeout, only close() ends one that doesn't finish.
     const auto deadline = head_deadline().value_or(io::clock::now() + std::chrono::hours{24} * 365);
 
-    auto stream = co_await tls::stream::accept(std::move(conn), std::move(ctx), deadline, closing.get_token());
+    // the server decides what it speaks, whatever the context's options say.
+    std::vector<std::string> protocols{"http/1.1"};
+    if (http2_enabled) protocols.insert(protocols.begin(), "h2");
+
+    auto stream = co_await tls::stream::accept(std::move(conn),
+                                               std::move(ctx),
+                                               deadline,
+                                               closing.get_token(),
+                                               std::move(protocols));
     if (!stream.has_value())
     {
         logger->debug("TLS handshake failed: {}", stream.error().message());
         co_return std::nullopt;
     }
 
-    // only HTTP/1.1 is served: a client that agreed on another protocol (e.g. h2) would speak it.
-    if (const auto protocol = stream->alpn(); !protocol.empty() && protocol != "http/1.1"sv)
+    // (a client that agreed on a protocol the server didn't offer would speak it.)
+    if (const auto protocol = stream->alpn();
+        !protocol.empty() && protocol != "http/1.1"sv && !(http2_enabled && protocol == "h2"sv))
     {
         logger->debug("closing connection that agreed on {} with ALPN", protocol);
         co_await stream->close();
@@ -387,6 +430,23 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
     req.tls = detail::is_tls(conn);
 
+    // close() ends the connection: reads (e.g. waiting for the next request) find the end of the stream.
+    // NOTE: unregistered (waiting for a call in progress) before the connection closes, or is served as HTTP/2.
+    const auto shut_down = [&conn] noexcept { detail::socket_of(conn).shutdown_read(); };
+    std::optional<std::stop_callback<decltype(shut_down)>> on_close{std::in_place, closing.get_token(), shut_down};
+
+    // a cleartext client may start with HTTP/2's preface, knowing the server speaks it (RFC 9113, section 3.3).
+    if (http2_enabled && !req.tls)
+    {
+        detail::socket_of(conn).set_read_deadline(head_deadline());
+        if (co_await starts_with_preface(state.reader))
+        {
+            on_close.reset();
+            co_await serve_http2(conn, state.reader.buffered());
+            co_return;
+        }
+    }
+
     // NOTE: each request is served here, rather than by a coroutine of its own, which would allocate its frame for
     //       each request (as one this large isn't elided). Only the rare ways a connection ends have their own.
     // NOTE: not conn.valid(), a syscall per request: a socket's pending error fails the next read or write anyway.
@@ -395,8 +455,6 @@ coro::task<> server::serve_requests(detail::connection& conn)
         // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
         detail::socket_of(conn).set_read_deadline(head_deadline());
 
-        // NOTE: HTTP/2 (parked) would be told apart here by its connection preface ("PRI * HTTP/2.0"), which
-        // HTTP/1.1 decoding rejects as not_supported, so it gets a 501 Not Implemented.
         auto err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
 
         detail::socket_of(conn).set_read_deadline(std::nullopt);
@@ -477,6 +535,17 @@ coro::task<> server::serve_requests(detail::connection& conn)
     }
 
     co_await state.writer.flush();
+}
+
+coro::task<> server::serve_http2(detail::connection& conn, std::span<const std::byte> already_read)
+{
+    // HTTP/2's reader waits for as long as the connection's open: its streams, and the connection, have timeouts of
+    // their own.
+    auto& sock = detail::socket_of(conn);
+    sock.set_read_timeout(std::nullopt);
+    sock.set_read_deadline(std::nullopt);
+
+    co_await detail::serve_http2(scheduler, conn, already_read, http2_config, handler, *logger, closing.get_token());
 }
 
 std::optional<io::clock::time_point> server::head_deadline() const

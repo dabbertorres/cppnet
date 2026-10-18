@@ -198,6 +198,12 @@ scheduler.spawn(server.serve());
   listener from `listener::make()` instead of a host and port.
 - **Stopping:** `server.close()` stops accepting and ends the connections, then `scheduler.shutdown()` waits for
   them.
+- **HTTP/2** is served too (unless `server_config::http2` is off), with the same handlers: over TLS to clients that
+  agree on `h2` with ALPN (browsers do), and over cleartext to clients that start with HTTP/2's preface (prior
+  knowledge, e.g. `curl --http2-prior-knowledge`, or a proxy in front). A request's `version` says which (2.0). Its
+  streams are served at once, each handler in a task of its own; the timeouts apply to each stream (one that times
+  out is reset, and the connection's others go on), and `close()` ends HTTP/2 connections gracefully (GOAWAY, then
+  once their streams are done).
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

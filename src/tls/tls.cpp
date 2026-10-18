@@ -696,13 +696,18 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
 }
 
 coro::task<std::expected<stream, std::error_code>>
-stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, std::stop_token stop)
+stream::accept(tcp_socket                              conn,
+               server_context                          ctx,
+               io::clock::time_point                   deadline,
+               std::stop_token                         stop,
+               std::optional<std::vector<std::string>> alpn)
 {
     auto c = std::make_unique<detail::connection>(std::move(conn));
 
     try
     {
-        c->cb = std::make_shared<detail::callbacks>(c.get(), false, ctx.state->alpn);
+        auto protocols = alpn.has_value() ? std::move(*alpn) : ctx.state->alpn;
+        c->cb          = std::make_shared<detail::callbacks>(c.get(), false, std::move(protocols));
 
         std::scoped_lock lock{c->mu};
         c->channel = std::make_unique<Botan::TLS::Server>(c->cb,

@@ -1,8 +1,9 @@
 # Plan: HTTP/2
 
-Status: stages 1 and 2 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with its tests and `fuzz_hpack`), and the
-frames and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`).
-The server (stage 3) and client (stage 4) are next.
+Status: stages 1 to 3 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with its tests and `fuzz_hpack`); the frames
+and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`); and the
+server (`coro/notifier.hpp` and `bench_notifier`, `http/http2_server.hpp`, `test/http/http2_server.cpp`). The client
+(stage 4) is next.
 
 ## Goal
 
@@ -298,6 +299,37 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
   INITIAL_WINDOW_SIZE is at least 65535, as the peer may send that much before it has seen this side's SETTINGS.
 - `util/packed.hpp` went with the stub: nothing else packed structs.
 
+## Learned in stage 3
+
+- No queue for the writer, after all: handlers submit their heads and data to the session directly, under the
+  connection's lock (the session keeps its output in the order it was submitted, so HPACK's encoding stays in step),
+  and the one writer per connection drains the session's output to the socket. Only one primitive was needed:
+  `coro::notifier`, which body writes wait on for windows (and for the writer, if more than 1 MiB is waiting), and
+  the writer for output. `bench_notifier` compares it with `wait_on()`: about the same with one worker, and up to
+  about 3x faster with many coroutines on several workers.
+- The session's events run under the connection's lock, so nothing they do may take it again: handlers aren't
+  started from them (the new streams are started once it's released, each hopping onto the pool, so the reader goes
+  on reading), and notifiers resume their waiters on the pool, never inline.
+- `response_writer`'s back end is a `std::variant`; the HTTP/2 alternative holds the stream and a table of the
+  server's functions (as the HTTP/1.1 one holds an encoder function), so that what uses `response.cpp` alone (e.g.
+  `fuzz_http11`) doesn't need HTTP/2's server and the scheduler linked in.
+- Per-stream timeouts are a timer task per connection (the one place that waits with the scheduler's `wait_on()`, as
+  it needs a deadline), which resets a stream whose body read or write has made no progress for its timeout
+  (RST_STREAM(CANCEL)), rather than sending 408 (nginx, too, ends such a stream without a response). The connection's
+  own timeouts reuse `header_read_timeout`: for the preface, and for a connection with no streams (as HTTP/1.1's wait
+  for a kept-alive connection's next request does). The socket's read timeout is cleared for HTTP/2: its reader waits
+  as long as the connection's open.
+- The server's MAX_HEADER_LIST_SIZE is `max_header_bytes` plus 32 bytes for each of up to 100 fields (HTTP/1.1's
+  limit on fields), as HPACK counts 32 more per field than the text.
+- `close()` is graceful: GOAWAY with the highest stream id and a PING, then the final GOAWAY once the PING's
+  acknowledged (or after a second), and the connection ends once its streams are done.
+- Over cleartext, `serve_requests` peeks for the preface before reading a request; HTTP/1.1's `close()` callback
+  (which ends reads) is removed before handing the connection to HTTP/2, which registers its own (graceful) one. Over
+  TLS, `tls::stream::accept()` now takes the server's ALPN protocols, so the server offers `h2` whatever its context's
+  options say.
+- Request trailers end the body, but aren't passed on (there's no API for them yet).
+- h2spec and h2load weren't run (they aren't installed here); curl (built with nghttp2) was, over cleartext and TLS.
+
 ## Stages
 
 1. **HPACK.** The static table, Huffman coding (the nibble decoder generated at compile time), integers and strings,
@@ -305,8 +337,8 @@ or (for floods) the connection with GOAWAY(ENHANCE_YOUR_CALM):
    target.
 2. **Frames and the connection's state machine**, without I/O: the codec, settings, streams' states, flow control,
    errors, GOAWAY. Tests on bytes, and a fuzz target. The stub (and `util/packed.hpp`) is removed.
-3. **The server.** The new primitives in `coro/`, with their tests and the benchmark against `wait_on` (see Decided),
-   first; then `response_writer`'s back ends; the connection coroutine, its writer and the
+3. **The server.** The new primitive in `coro/` (`coro::notifier`), with its tests and the benchmark against `wait_on`
+   (see Decided and Learned in stage 3), first; then `response_writer`'s back ends; the connection coroutine, its writer and the
    handlers' tasks; ALPN and prior knowledge; per-stream timeouts; the limits; graceful `close()`. Loopback tests
    (with a minimal test client), h2spec, curl, h2load.
 4. **The client.** The pool's shared connections, ALPN, stream limits (and the second connection), retries, PING
