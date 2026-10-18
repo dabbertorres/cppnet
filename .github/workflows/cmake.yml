@@ -110,6 +110,7 @@ jobs:
         -DBUILD_EXAMPLE=ON
 
     - name: Build
+      id: build
       run: cmake --build build --parallel
 
     # NOTE: saved even if a later step fails (e.g. a test), as what was built is still good.
@@ -134,12 +135,64 @@ jobs:
     - name: Test
       run: ctest --test-dir build --output-on-failure
 
-  # The check master's branch protection requires, which passes only if every job of the matrix did, so the matrix can
-  # change without changing the protection.
+    # clang-tidy, with warnings as errors, on the C++ files the change touches (of those in the compile database): a
+    # pull request's against its base, a push's against what it replaced. Once, with Clang on Linux, after the build
+    # (which made the compile database), even if the tests failed.
+    - name: Lint the changed files
+      if: always() && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang'
+      run: |
+        git config --global --add safe.directory '*'
+        if [ "${{ github.event_name }}" = pull_request ]; then
+          base="origin/${{ github.base_ref }}"
+        else
+          base="${{ github.event.before }}"
+        fi
+
+        git diff --name-only --diff-filter=d "$base"...HEAD -- '*.cpp' > changed.txt
+        python3 - <<'PY' > lint.txt
+        import json, os
+        compiled = {os.path.relpath(e["file"]) for e in json.load(open("build/compile_commands.json"))}
+        for line in open("changed.txt"):
+            if line.strip() in compiled: print(line.strip())
+        PY
+
+        echo "Linting:"; cat lint.txt
+        if [ -s lint.txt ]; then
+          xargs -P "$(nproc)" -n 1 clang-tidy -p build --quiet --warnings-as-errors='*' < lint.txt
+        fi
+
+  # Formatting: every C++ file with clang-format (the latest, as the Linux jobs' compilers are), and every CMake file
+  # with cmake-format, as they're configured.
+  format:
+    runs-on: ubuntu-26.04
+    container: archlinux:base-devel
+
+    steps:
+    - name: Install tools
+      run: pacman -Syu --noconfirm --needed git clang python
+
+    - uses: actions/checkout@v7
+
+    - name: Check C++ formatting
+      run: |
+        git config --global --add safe.directory '*'
+        clang-format --version
+        git ls-files '*.cpp' '*.hpp' '*.h' | xargs clang-format --dry-run --Werror
+
+    - name: Check CMake formatting
+      run: |
+        python -m venv .venv
+        .venv/bin/pip install --quiet cmakelang==0.6.13 pyyaml
+        git ls-files 'CMakeLists.txt' '*/CMakeLists.txt' '*.cmake' | xargs .venv/bin/cmake-format --check
+
+  # The check master's branch protection requires, which passes only if every job of the matrix, and the formatting
+  # check, did: so they can change without changing the protection.
   build:
-    needs: test
+    needs: [test, format]
     if: always()
     runs-on: ubuntu-26.04
     steps:
-    - name: Check the matrix's results
-      run: test "${{ needs.test.result }}" = success
+    - name: Check the results
+      run: |
+        test "${{ needs.test.result }}" = success
+        test "${{ needs.format.result }}" = success
