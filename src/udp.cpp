@@ -1,71 +1,99 @@
 #include "udp.hpp"
 
-#include <string>
-#include <string_view>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <span>
+#include <system_error>
 
-#include <netdb.h>
 #include <sys/socket.h>
 
-#include "exception.hpp"
+#include "coro/task.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
+#include "sockaddr.hpp"
 #include "socket.hpp"
+
+namespace
+{
+
+std::error_code last_error() noexcept { return {errno, std::system_category()}; }
+
+// open makes a socket of family's, owned (and registered with the scheduler) from the start.
+std::expected<net::udp_socket, std::error_code> open(net::io::scheduler* scheduler, int family) noexcept
+{
+    const net::io::handle fd = ::socket(family, SOCK_DGRAM, 0);
+    if (fd == -1) return std::unexpected(last_error());
+
+    try
+    {
+        // NOTE: closes fd if it throws.
+        return net::udp_socket{scheduler, fd};
+    }
+    catch (const std::system_error& ex)
+    {
+        return std::unexpected(ex.code());
+    }
+}
+
+}
 
 namespace net
 {
 
-udp_socket::udp_socket(io::scheduler* scheduler, io::handle fd) noexcept
+udp_socket::udp_socket(io::scheduler* scheduler, io::handle fd)
     : socket{scheduler, fd}
 {}
 
-udp_socket::udp_socket(io::scheduler* scheduler, std::string_view port, protocol proto)
-    : udp_socket{scheduler, "", port, proto}
-{}
-
-udp_socket::udp_socket(io::scheduler* scheduler, std::string_view host, std::string_view port, protocol proto)
-    : socket{scheduler, open(host, port, proto)}
-{}
-
-io::handle udp_socket::open(std::string_view host, std::string_view port, protocol proto)
+std::expected<udp_socket, std::error_code>
+udp_socket::connect(io::scheduler* scheduler, const ip_addr& addr, std::uint16_t port) noexcept
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wmissing-field-initializers"
-    ::addrinfo hints = {.ai_flags = 0};
-#pragma clang diagnostic pop
+    const auto to = detail::to_sockaddr(addr, port);
 
-    if (host.empty()) hints.ai_flags = AI_PASSIVE;
+    auto sock = open(scheduler, to.family());
+    if (!sock.has_value()) return sock;
 
-    switch (proto)
-    {
-    case protocol::not_care: hints.ai_family = AF_UNSPEC; break;
-    case protocol::ipv4: hints.ai_family = AF_INET; break;
-    case protocol::ipv6: hints.ai_family = AF_INET6; break;
-    }
+    // NOTE: a datagram socket connects at once: nothing is sent.
+    if (::connect(sock->native_handle(), to.get(), to.size) != 0) return std::unexpected(last_error());
+    return sock;
+}
 
-    hints.ai_socktype = SOCK_DGRAM;
+std::expected<udp_socket, std::error_code>
+udp_socket::bind(io::scheduler* scheduler, const ip_addr& addr, std::uint16_t port) noexcept
+{
+    const auto at = detail::to_sockaddr(addr, port);
 
-    // NOTE: copies, as getaddrinfo needs them null-terminated.
-    const std::string host_str{host};
-    const std::string port_str{port};
+    auto sock = open(scheduler, at.family());
+    if (!sock.has_value()) return sock;
 
-    addrinfo* servinfo = nullptr;
-    int       sts      = ::getaddrinfo(host.empty() ? nullptr : host_str.c_str(), port_str.c_str(), &hints, &servinfo);
-    if (sts != 0) throw std::system_error{make_gai_error_code(sts), "getaddrinfo"};
+    // NOTE: no SO_REUSEADDR (unlike a TCP listener's): for UDP, it would let another socket bind the same port, and
+    //       take its datagrams.
+    if (::bind(sock->native_handle(), at.get(), at.size) != 0) return std::unexpected(last_error());
+    return sock;
+}
 
-    // find first valid addr, and use it!
-    io::handle fd = -1;
+coro::task<std::expected<udp_socket::datagram, std::error_code>> udp_socket::receive_from(std::span<std::byte> data)
+{
+    detail::socket_address from;
 
-    for (const ::addrinfo* info = servinfo; info != nullptr; info = info->ai_next)
-    {
-        fd = ::socket(info->ai_family, info->ai_socktype, info->ai_protocol);
-        if (fd > -1) break;
-    }
+    auto res = co_await read_from(data, from);
+    if (res.err) co_return std::unexpected(res.err);
 
-    freeaddrinfo(servinfo);
+    auto sender = detail::from_sockaddr(from);
+    if (!sender.has_value()) co_return std::unexpected(sender.error());
 
-    if (fd == -1) throw exception{"failed to bind"};
+    co_return datagram{.size = res.count, .addr = sender->addr, .port = sender->port};
+}
 
-    return fd;
+coro::task<std::expected<std::size_t, std::error_code>>
+udp_socket::send_to(std::span<const std::byte> data, ip_addr addr, std::uint16_t port)
+{
+    const auto to = detail::to_sockaddr(addr, port);
+
+    auto res = co_await write_to(data, to);
+    if (res.err) co_return std::unexpected(res.err);
+    co_return res.count;
 }
 
 }

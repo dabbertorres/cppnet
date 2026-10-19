@@ -77,8 +77,8 @@ Tools: the [QUIC interop runner](https://github.com/quic-interop/quic-interop-ru
 - **QUIC libraries** that fit a coroutine runtime are those without I/O of their own: ngtcp2 with nghttp3 (C, MIT,
   very active, in vcpkg; crypto through OpenSSL 3.5+, wolfSSL, GnuTLS, BoringSSL or picotls, so a second TLS library
   besides Botan), and quiche (needs Rust). msquic owns its sockets and threads, and lsquic needs BoringSSL.
-- **UDP** in cppnet is minimal: `udp_socket` reads and writes with `recv`/`send`, never binds or connects, and has no
-  `recvfrom`/`sendto`, `recvmsg`/`sendmsg`, batching, ECN or packet info.
+- **UDP** in cppnet is minimal: `udp_socket` connects or binds, and has `receive_from`/`send_to` (`recvfrom`/`sendto`,
+  since the DNS resolver plan's stage 1), but no `recvmsg`/`sendmsg`, batching, ECN or packet info.
 - **Discovery**: browsers don't use HTTP/3 with prior knowledge. They learn of it from an `Alt-Svc: h3=":443"` header
   (so from a later connection), or HTTPS DNS records (Safari more than Chrome). So an HTTP/3 server also serves
   HTTP/1.1 and HTTP/2 over TCP, and advertises.

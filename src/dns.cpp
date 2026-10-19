@@ -10,13 +10,9 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-
 #include "exception.hpp"
 #include "ip_addr.hpp"
-#include "ipv4_addr.hpp"
-#include "ipv6_addr.hpp"
+#include "sockaddr.hpp"
 #include "util/defer.hpp"
 
 namespace net
@@ -43,17 +39,10 @@ std::expected<std::vector<ip_addr>, std::error_code> dns_lookup(std::string_view
 
     for (const auto* next = servinfo; next != nullptr; next = next->ai_next)
     {
-        ip_addr addr;
+        auto found = detail::from_sockaddr(next->ai_addr, next->ai_addrlen);
+        if (!found.has_value()) continue;
 
-        switch (next->ai_family)
-        {
-        case AF_INET:
-            addr = ipv4_addr(ntohl(reinterpret_cast<const sockaddr_in*>(next->ai_addr)->sin_addr.s_addr));
-            break;
-        case AF_INET6: addr = ipv6_addr(reinterpret_cast<const sockaddr_in6*>(next->ai_addr)->sin6_addr.s6_addr); break;
-        default: continue;
-        }
-
+        const auto addr = found->addr;
         if (addr == prev) continue;
         prev = addr;
         addrs.push_back(addr);

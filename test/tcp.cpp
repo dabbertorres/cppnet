@@ -1,16 +1,22 @@
 #include "tcp.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <compare>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <sys/socket.h>
 
@@ -24,6 +30,9 @@
 #include "coro/thread_pool.hpp"
 #include "exception.hpp"
 #include "io/scheduler.hpp"
+#include "ip_addr.hpp"
+#include "ipv4_addr.hpp"
+#include "ipv6_addr.hpp"
 #include "listen.hpp"
 #include "socket.hpp"
 
@@ -193,4 +202,238 @@ TEST_CASE("requesting stop ends connecting", "[tcp][connect][stop]")
     CHECK(err);
     CHECK(elapsed < 5s);
     if (err == std::errc::operation_canceled) CHECK(elapsed >= 100ms);
+}
+
+namespace
+{
+
+// connect_addresses_error connects to addresses, and returns why it failed (or nothing, if it didn't).
+net::coro::task<std::error_code> connect_addresses_error(net::io::scheduler*              sched,
+                                                         std::vector<net::ip_addr>        addresses,
+                                                         std::uint16_t                    port,
+                                                         net::tcp_socket::connect_options options)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, addresses, port, options);
+    co_return conn.has_value() ? std::error_code{} : conn.error();
+}
+
+// non-routable addresses: depending on the network, connecting to one either hangs, or fails straight away.
+const net::ip_addr non_routable_1{
+    net::ipv4_addr{10, 255, 255, 1}
+};
+const net::ip_addr non_routable_2{
+    net::ipv4_addr{10, 255, 255, 2}
+};
+const net::ip_addr non_routable_3{
+    net::ipv4_addr{10, 255, 255, 3}
+};
+
+// block holds one of the scheduler's blocking threads until release is set, counting it in blocked once it has.
+net::coro::task<void> block(net::io::scheduler* sched, std::atomic<bool>* release, std::atomic<int>* blocked)
+{
+    co_await sched->run_blocking(
+        [=]
+        {
+            blocked->fetch_add(1);
+            blocked->notify_all();
+            release->wait(false);
+        });
+}
+
+}
+
+TEST_CASE("each attempt to connect gets a share of the time left", "[tcp][connect][timeout]")
+{
+    struct test_case
+    {
+        std::chrono::milliseconds left      = {};
+        std::size_t               remaining = 0;
+        std::chrono::milliseconds expected  = {};
+    };
+
+    auto tc = GENERATE(test_case{.left = 10s, .remaining = 1, .expected = 10s},
+                       test_case{.left = 10s, .remaining = 2, .expected = 5s},
+                       // a share under 2 seconds is raised to 2...
+                       test_case{.left = 10s, .remaining = 10, .expected = 2s},
+                       test_case{.left = 3s, .remaining = 2, .expected = 2s},
+                       // ... but never past the end.
+                       test_case{.left = 1s, .remaining = 3, .expected = 1s},
+                       test_case{.left = 2s, .remaining = 2, .expected = 2s});
+
+    CAPTURE(tc.left.count(), tc.remaining);
+
+    const auto now = net::io::clock::now();
+    CHECK(net::detail::attempt_deadline(now, now + tc.left, tc.remaining) - now == tc.expected);
+}
+
+TEST_CASE("connecting to addresses tries the next after a refusal", "[tcp][connect]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    // nothing listens on ::1 (and it may not even be available): the attempt fails, and the next one is made.
+    const std::vector<net::ip_addr> addresses{net::ipv6_addr::loopback(), net::ipv4_addr::loopback()};
+
+    auto err = sched.run_to_completion(connect_addresses_error(&sched, addresses, listener->local_port(), {}));
+    CAPTURE(err.message());
+    CHECK_FALSE(err);
+}
+
+TEST_CASE("connecting to addresses leaves time for the next if one doesn't answer", "[tcp][connect][timeout]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    // the first attempt gets 2 of the 4 seconds, rather than all of them, as it would if they weren't shared.
+    const std::vector<net::ip_addr> addresses{non_routable_1, net::ipv4_addr::loopback()};
+
+    auto start = net::io::clock::now();
+    auto err =
+        sched.run_to_completion(connect_addresses_error(&sched, addresses, listener->local_port(), {.timeout = 4s}));
+    auto elapsed = net::io::clock::now() - start;
+
+    CAPTURE(err.message());
+    CHECK_FALSE(err);
+    CHECK(elapsed < 4s);
+}
+
+TEST_CASE("connecting to addresses gives up at its timeout", "[tcp][connect][timeout]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const std::vector<net::ip_addr> addresses{non_routable_1, non_routable_2};
+
+    auto start   = net::io::clock::now();
+    auto err     = sched.run_to_completion(connect_addresses_error(&sched, addresses, 81, {.timeout = 200ms}));
+    auto elapsed = net::io::clock::now() - start;
+
+    CAPTURE(err.message());
+    CHECK(err);
+    CHECK(elapsed < 2s);
+    if (err == std::errc::timed_out) CHECK(elapsed >= 200ms);
+}
+
+TEST_CASE("requesting stop ends connecting to addresses", "[tcp][connect][stop]")
+{
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+
+    const std::vector<net::ip_addr> addresses{non_routable_1, non_routable_2, non_routable_3};
+
+    std::jthread stopper{[&]
+                         {
+                             std::this_thread::sleep_for(100ms);
+                             source.request_stop();
+                         }};
+
+    // each attempt's share is over 3 seconds: stopping ends the first, and the rest aren't tried.
+    auto start = net::io::clock::now();
+    auto err   = sched.run_to_completion(
+        connect_addresses_error(&sched, addresses, 81, {.timeout = 10s, .stop = source.get_token()}));
+    auto elapsed = net::io::clock::now() - start;
+
+    CAPTURE(err.message());
+    CHECK(err);
+    CHECK(elapsed < 3s);
+    if (err == std::errc::operation_canceled) CHECK(elapsed >= 100ms);
+}
+
+TEST_CASE("connecting to addresses with a stopped token fails without connecting", "[tcp][connect][stop]")
+{
+    std::stop_source source;
+    source.request_stop();
+
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const std::vector<net::ip_addr> addresses{net::ipv4_addr::loopback()};
+
+    auto err = sched.run_to_completion(
+        connect_addresses_error(&sched, addresses, listener->local_port(), {.stop = source.get_token()}));
+    CHECK(err == std::errc::operation_canceled);
+}
+
+TEST_CASE("connecting to addresses only tries those of the protocol asked for", "[tcp][connect]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    SECTION("none of its family")
+    {
+        const std::vector<net::ip_addr> addresses{net::ipv4_addr::loopback()};
+
+        auto err =
+            sched.run_to_completion(connect_addresses_error(&sched, addresses, 81, {.proto = net::protocol::ipv6}));
+        CHECK(err == std::errc::address_family_not_supported);
+    }
+
+    SECTION("none at all")
+    {
+        auto err = sched.run_to_completion(connect_addresses_error(&sched, {}, 81, {}));
+        CHECK(err == std::errc::invalid_argument);
+    }
+
+    SECTION("an IP address as the host")
+    {
+        const auto connect = [](net::io::scheduler* sched) -> net::coro::task<std::error_code>
+        {
+            auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", "81", {.proto = net::protocol::ipv6});
+            co_return conn.has_value() ? std::error_code{} : conn.error();
+        };
+
+        CHECK(sched.run_to_completion(connect(&sched)) == std::errc::address_family_not_supported);
+    }
+}
+
+TEST_CASE("connecting to an IP address doesn't use a blocking thread", "[tcp][connect]")
+{
+    std::atomic<bool> release{false};
+    std::atomic<int>  blocked{0};
+
+    net::io::scheduler sched{make_pool()};
+
+    // releases the blocking threads, after the test or 10 seconds, whichever is first, so a connect that waits for one
+    // fails the test rather than hanging it. (Destroyed before the scheduler, which waits for the tasks they block.)
+    std::jthread releaser{[&](const std::stop_token& stop)
+                          {
+                              std::mutex                  mu;
+                              std::condition_variable_any cv;
+                              std::unique_lock            lock{mu};
+                              cv.wait_for(lock, stop, 10s, [] { return false; });
+
+                              release.store(true);
+                              release.notify_all();
+                          }};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+    const auto port = std::to_string(listener->local_port());
+
+    // the scheduler sets aside 4 threads for blocking calls: hold all of them.
+    constexpr int blocking_threads = 4;
+    for (int i = 0; i < blocking_threads; ++i) sched.spawn(block(&sched, &release, &blocked));
+    for (int seen = blocked.load(); seen < blocking_threads; seen = blocked.load()) blocked.wait(seen);
+
+    // connects, then releases the blocking threads (which run_to_completion() waits for), saying whether they already
+    // were: if connecting waited for one, they were, by the releaser.
+    const auto connect = [](net::io::scheduler* sched,
+                            std::string         port,
+                            std::atomic<bool>*  release) -> net::coro::task<std::pair<std::error_code, bool>>
+    {
+        auto err      = co_await connect_error(sched, "127.0.0.1", std::move(port), 5s);
+        auto released = release->exchange(true);
+        release->notify_all();
+        co_return std::pair{err, released};
+    };
+
+    auto [err, released_first] = sched.run_to_completion(connect(&sched, port, &release));
+
+    CAPTURE(err.message());
+    CHECK_FALSE(err);
+    CHECK_FALSE(released_first);
 }

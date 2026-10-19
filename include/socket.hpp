@@ -3,6 +3,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -18,6 +19,11 @@
 
 namespace net
 {
+
+namespace detail
+{
+    struct socket_address;
+}
 
 class socket
     : public io::reader
@@ -39,6 +45,10 @@ public:
     [[nodiscard]] bool        valid() const noexcept;
     [[nodiscard]] std::string local_addr() const;
     [[nodiscard]] std::string remote_addr() const;
+
+    // local_port is the port the socket is bound to (e.g. the one the OS chose, for one bound to port 0, or connected
+    // without binding). It throws std::system_error if the OS can't say, or the socket isn't IPv4 or IPv6.
+    [[nodiscard]] std::uint16_t local_port() const;
 
     // Deadlines limit how long reads and writes wait for the socket to be ready: once one has passed, they fail with
     // std::errc::timed_out (until the deadline is changed). std::nullopt removes it.
@@ -93,6 +103,14 @@ public:
 protected:
     static constexpr io::handle invalid_fd = -1;
 
+    // read_from is read() for a datagram socket, which also gives the datagram's sender in from: as one datagram is
+    // read at a time, an empty one is read as such, rather than as the end of the stream. from must outlive the read.
+    coro::task<io::result> read_from(std::span<std::byte> data, detail::socket_address& from) noexcept;
+
+    // write_to is write() for a datagram socket, sending data as one datagram to to (rather than to the socket's peer),
+    // even if it's empty. to must outlive the write.
+    coro::task<io::result> write_to(std::span<const std::byte> data, const detail::socket_address& to) noexcept;
+
     template<typename T>
     static bool set_option(io::handle fd, int flag, T* value) noexcept
     {
@@ -114,8 +132,9 @@ private:
             : sock{sock}
         {}
 
-        // claim readies it to read into into, returning false if it's already in use.
-        [[nodiscard]] bool claim(std::span<std::byte> into) noexcept;
+        // claim readies it to read into into (and, if from isn't null, the sender's address into from: see
+        // read_from()), returning false if it's already in use.
+        [[nodiscard]] bool claim(std::span<std::byte> into, detail::socket_address* from = nullptr) noexcept;
 
         // set_read_deadline is the socket's: the operation's waits are limited by it (see limit_deadline()).
         void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
@@ -131,6 +150,7 @@ private:
     private:
         socket*                              sock;
         std::span<std::byte>                 data;
+        detail::socket_address*              from = nullptr;
         std::optional<io::clock::time_point> deadline;
         io::result                           res;
     };
@@ -144,9 +164,11 @@ private:
             : sock{sock}
         {}
 
-        // claim readies it to write the rest of from, after the already written, returning false if it's already in
-        // use.
-        [[nodiscard]] bool claim(std::span<const std::byte> from, std::size_t already) noexcept;
+        // claim readies it to write the rest of from, after the already written (or, if to isn't null, all of from as
+        // one datagram to to: see write_to()), returning false if it's already in use.
+        [[nodiscard]] bool claim(std::span<const std::byte>    from,
+                                 std::size_t                   already,
+                                 const detail::socket_address* to = nullptr) noexcept;
 
         bool       start(std::coroutine_handle<> awaiting) noexcept override;
         io::result result() noexcept override;
@@ -156,19 +178,23 @@ private:
     private:
         socket*                              sock;
         std::span<const std::byte>           data;
+        const detail::socket_address*        to      = nullptr;
         std::size_t                          written = 0;
         std::optional<io::clock::time_point> deadline;
         std::optional<io::clock::duration>   timeout;
         io::result                           res;
     };
 
-    // try_read reads, unless it would have to wait (then returning nothing).
-    [[nodiscard]] std::optional<io::result> try_read(std::span<std::byte> data) const noexcept;
+    // try_read reads, unless it would have to wait (then returning nothing). If from isn't null, it reads a datagram,
+    // and its sender's address into from.
+    [[nodiscard]] std::optional<io::result> try_read(std::span<std::byte>    data,
+                                                     detail::socket_address* from = nullptr) const noexcept;
 
     // try_write writes from data[written], counting what it writes in written, unless it would have to wait for the
-    // rest (then returning nothing).
-    [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte> data,
-                                                      std::size_t&               written) const noexcept;
+    // rest (then returning nothing). If to isn't null, it sends data as one datagram to to (written being 0).
+    [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte>    data,
+                                                      std::size_t&                  written,
+                                                      const detail::socket_address* to = nullptr) const noexcept;
 
     // NOTE: the read deadline is the read operation's (see read_operation::set_read_deadline()).
     io::scheduler*                       scheduler;

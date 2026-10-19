@@ -64,6 +64,7 @@ public:
     friend constexpr std::partial_ordering operator<=>(const ipv6_addr& lhs, const ip_addr& rhs) noexcept;
     friend constexpr std::partial_ordering operator<=>(const ipv4_addr& lhs, const ip_addr& rhs) noexcept;
 
+    // NOLINTNEXTLINE(bugprone-exception-escape): the variant can't be valueless.
     friend constexpr bool operator==(const ip_addr& lhs, const ip_addr& rhs) noexcept = default;
 
 private:

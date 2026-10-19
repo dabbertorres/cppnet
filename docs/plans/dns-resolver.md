@@ -2,8 +2,8 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. Nothing below is implemented yet. The questions at the end (Decided questions) were decided as
-recommended (2026-10-19).
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stage 1 is done
+(2026-10-19); "Where things stand" describes the code before it.
 
 ## Goal
 
@@ -291,6 +291,14 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
 1. **Connecting to addresses.** `ip_addr` to and from `sockaddr` (internal), the address-list `connect` overload with
    Go's per-address share of the timeout, `connect(host, ...)` taking literals without a thread, and `udp_socket`'s
    `connect`, `bind`, `receive_from` and `send_to` (Decided question 9). Useful alone; stages 2 and 5 build on it.
+   **Done** as above: `detail::to_sockaddr()`/`from_sockaddr()` (`sockaddr.hpp`), `connect(scheduler, addresses,
+   port, options)` (a plain function, copying the addresses before it returns; addresses not of `options.proto`'s
+   family are skipped), `detail::attempt_deadline()` for the share (a timed-out attempt moves on to the next), and
+   `udp_socket::connect`/`bind` (synchronous, returning `std::expected`) with `receive_from()`/`send_to()` (coroutines,
+   through the socket's own read and write operations, so its deadlines, timeouts and token apply). A literal takes
+   the fast path only in its usual form (an IPv4 one as `to_string()` writes it, as `getaddrinfo()` reads e.g.
+   `010.0.0.1` as octal) with a numeric port; the rest (service names as ports, IPv6 zones) still goes to
+   `getaddrinfo()` until stage 2, whose addresses keep their zones.
 2. **`dns::resolver` over `getaddrinfo()`.** The API, `default_resolver()`, the errors and conditions, the lookup's
    shared state and task with callers waiting on `wait_on` (deadline and stop), `connect_options::resolver` and
    `client_options::resolver`, `connect`'s timeout covering resolving (Decided question 2). `dns_lookup()` and `dns.hpp`

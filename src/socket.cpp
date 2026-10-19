@@ -6,6 +6,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
+#include <expected>
 #include <iterator>
 #include <optional>
 #include <span>
@@ -16,6 +17,7 @@
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -27,6 +29,7 @@
 #include "io/io.hpp"
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
+#include "sockaddr.hpp"
 
 namespace
 {
@@ -169,6 +172,19 @@ std::string socket::remote_addr() const
     return addr_name(&addr);
 }
 
+std::uint16_t socket::local_port() const
+{
+    detail::socket_address addr;
+    addr.size = sizeof(addr.storage);
+
+    if (::getsockname(fd, addr.get(), &addr.size) != 0)
+        throw system_error_from_errno(errno, "failed to get local address");
+
+    auto local = detail::from_sockaddr(addr);
+    if (!local.has_value()) throw std::system_error{local.error(), "failed to get local port"};
+    return local->port;
+}
+
 void socket::set_deadline(std::optional<io::clock::time_point> deadline) noexcept
 {
     set_read_deadline(deadline);
@@ -213,6 +229,37 @@ coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
     return coro::operation_task(reading);
 }
 
+coro::task<io::result> socket::read_from(std::span<std::byte> data, detail::socket_address& from) noexcept
+{
+    if (fd == invalid_fd || scheduler == nullptr)
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)});
+
+    if (auto res = try_read(data, &from); res.has_value()) return coro::ready_task<io::result>(*res);
+
+    if (!reading.claim(data, &from))
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+
+    return coro::operation_task(reading);
+}
+
+coro::task<io::result> socket::write_to(std::span<const std::byte> data, const detail::socket_address& to) noexcept
+{
+    if (fd == invalid_fd || scheduler == nullptr)
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)});
+
+    std::size_t written = 0;
+    if (auto res = try_write(data, written, &to); res.has_value()) return coro::ready_task<io::result>(*res);
+
+    if (!writing.claim(data, written, &to))
+        return coro::ready_task<io::result>(
+            io::result{.count = written, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+
+    return coro::operation_task(writing);
+}
+
 coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 {
     if (fd == invalid_fd || scheduler == nullptr)
@@ -230,9 +277,11 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
     return coro::operation_task(writing);
 }
 
-bool socket::read_operation::claim(std::span<std::byte> into) noexcept
+bool socket::read_operation::claim(std::span<std::byte> into, detail::socket_address* from) noexcept
 {
     if (!try_claim()) return false;
+
+    this->from = from;
 
     // NOTE: the timeout's deadline: the socket's read deadline is the operation's limit, which the scheduler applies
     //       (see set_read_deadline()).
@@ -258,7 +307,7 @@ bool socket::read_operation::start(std::coroutine_handle<> awaiting) noexcept
 
 bool socket::read_operation::perform() noexcept
 {
-    auto read = sock->try_read(data);
+    auto read = sock->try_read(data, from);
     if (!read.has_value()) return false;
 
     res = *read;
@@ -279,10 +328,13 @@ void socket::read_operation::cancel() noexcept
     release();
 }
 
-bool socket::write_operation::claim(std::span<const std::byte> from, std::size_t already) noexcept
+bool socket::write_operation::claim(std::span<const std::byte>    from,
+                                    std::size_t                   already,
+                                    const detail::socket_address* to) noexcept
 {
     if (!try_claim()) return false;
 
+    this->to = to;
     data     = from;
     written  = already;
     timeout  = sock->write_timeout;
@@ -300,7 +352,7 @@ bool socket::write_operation::perform() noexcept
 {
     const auto before = written;
 
-    auto wrote = sock->try_write(data, written);
+    auto wrote = sock->try_write(data, written, to);
     if (wrote.has_value())
     {
         res = *wrote;
@@ -331,16 +383,30 @@ void socket::write_operation::cancel() noexcept
     release();
 }
 
-std::optional<io::result> socket::try_read(std::span<std::byte> data) const noexcept
+std::optional<io::result> socket::try_read(std::span<std::byte> data, detail::socket_address* from) const noexcept
 {
     while (true)
     {
-        const auto num = ::recv(fd, data.data(), data.size(), 0);
+        ssize_t num = 0;
+        if (from != nullptr)
+        {
+            // NOTE: a datagram longer than data is cut short, the rest of it dropped.
+            from->size = sizeof(from->storage);
+            num        = ::recvfrom(fd, data.data(), data.size(), 0, from->get(), &from->size);
+        }
+        else
+        {
+            num = ::recv(fd, data.data(), data.size(), 0);
+        }
 
         if (num > 0) return io::result{.count = static_cast<std::size_t>(num)};
 
-        // the other end closed the connection
-        if (num == 0) return io::result{.count = 0, .err = make_error_code(io::errc::end_of_stream)};
+        // the other end closed the connection (or, reading datagrams, sent an empty one).
+        if (num == 0)
+        {
+            if (from != nullptr) return io::result{.count = 0};
+            return io::result{.count = 0, .err = make_error_code(io::errc::end_of_stream)};
+        }
 
         auto err = errno;
         if (err == EINTR) continue;
@@ -352,13 +418,38 @@ std::optional<io::result> socket::try_read(std::span<std::byte> data) const noex
     }
 }
 
-std::optional<io::result> socket::try_write(std::span<const std::byte> data, std::size_t& written) const noexcept
+std::optional<io::result> socket::try_write(std::span<const std::byte>    data,
+                                            std::size_t&                  written,
+                                            const detail::socket_address* to) const noexcept
 {
 #ifdef MSG_NOSIGNAL
     constexpr int flags = MSG_NOSIGNAL; // don't raise SIGPIPE when writing to a closed socket.
 #else
     constexpr int flags = 0;
 #endif
+
+    // a datagram is sent whole (or not at all: e.g. std::errc::message_size, if it's too long), even if it's empty.
+    if (to != nullptr)
+    {
+        while (true)
+        {
+            const auto num = ::sendto(fd, data.data(), data.size(), flags, to->get(), to->size);
+
+            if (num >= 0)
+            {
+                written = static_cast<std::size_t>(num);
+                return io::result{.count = written};
+            }
+
+            auto err = errno;
+            if (err == EINTR) continue;
+            if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
+            return io::result{
+                .count = 0,
+                .err   = {err, std::system_category()}
+            };
+        }
+    }
 
     while (written < data.size())
     {

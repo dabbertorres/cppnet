@@ -164,7 +164,19 @@ auto conn = co_await listener->accept();          // std::expected<tcp_socket, s
 // a client's side: resolves the host, and connects, within connect_options' timeout (10s), until its stop token (if
 // any) is stopped.
 auto sock = co_await net::tcp_socket::connect(&scheduler, "example.com", "80");
+
+// or connects to addresses, in order, without resolving anything.
+const std::array<net::ip_addr, 2> addresses{net::ipv6_addr::loopback(), net::ipv4_addr::loopback()};
+auto local = co_await net::tcp_socket::connect(&scheduler, addresses, 7777);
 ```
+
+`connect` tries a host's addresses in order, until one accepts. Each attempt gets a share of the timeout, as Go's
+dialer gives it: what's left over the addresses left, but at least 2 seconds (never past the end), so an address that
+doesn't answer leaves time for the rest. Resolving a name blocks (`getaddrinfo()`, on one of the scheduler's threads for
+blocking calls), and the timeout doesn't cover it; an IP address (e.g. `"127.0.0.1"` or `"::1"`) with a numeric port
+isn't resolved, so it's connected to without that thread. `connect_options::proto` limits it to IPv4's or IPv6's
+addresses. It fails with the last address's error (e.g. `std::errc::connection_refused`), `timed_out`, or
+`operation_canceled`.
 
 A socket's reads and writes can be limited by a **deadline** (a time by which they must finish:
 `set_read_deadline()`, `set_write_deadline()`, `set_deadline()`) or a **timeout** (how long each may go without
@@ -174,6 +186,26 @@ have to wait for the socket are affected. A read canceled while it waits has rea
 again; a canceled write's result counts what it wrote. `shutdown_write()` ends the outgoing side (the peer reads the
 end of the stream). `dns_lookup(host)` (`dns.hpp`) resolves a name's addresses, and blocks: call it with
 `run_blocking` from a task.
+
+## UDP
+
+```cpp
+// a server's side: bound to an address and port (0 lets the OS choose: server->local_port()).
+auto server = net::udp_socket::bind(&scheduler, net::ipv4_addr::loopback(), 5353);
+
+std::array<std::byte, 1232> buf{};
+auto got = co_await server->receive_from(buf);   // std::expected<udp_socket::datagram, std::error_code>
+if (got) co_await server->send_to(std::span{buf}.first(got->size), got->addr, got->port);
+
+// a client's side: connected to one peer (nothing is sent, so it doesn't wait), with read() and write().
+auto client = net::udp_socket::connect(&scheduler, net::ipv4_addr::loopback(), 5353);
+```
+
+A read or `receive_from()` is one datagram (cut short if it's longer than the buffer), and a write or `send_to()` sends
+one. A connected socket only reads its peer's datagrams, and an ICMP refusal of one it sent fails its next read with
+`std::errc::connection_refused`. An empty datagram is one of size 0 to `receive_from()`, but reads as
+`io::errc::end_of_stream` with `read()`, which ends nothing here. Deadlines, timeouts and stop tokens apply as they do to
+TCP's sockets.
 
 ## HTTP client
 
@@ -497,6 +529,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `io/reader.hpp`, `io/writer.hpp`, `io/util.hpp` | reading and writing (`write_all`, `read_all`, `readline`) |
 | `io/io.hpp`                            | `io::result`, `io::errc`, `io::status_condition`          |
 | `listen.hpp`, `tcp.hpp`                | TCP sockets                                                 |
+| `udp.hpp`                              | UDP sockets                                               |
 | `dns.hpp`, `ip_addr.hpp`, `url.hpp`    | names, addresses and URLs                                 |
 | `http/client.hpp`                      | the HTTP client                                           |
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
