@@ -203,11 +203,14 @@ A `dns::resolver` (`dns/resolver.hpp`) looks names up with the system's resolver
 threads for blocking calls; `dns::default_resolver()` is the one `connect` and the HTTP client use unless given
 another. `resolve_options::proto` limits it to IPv4's or IPv6's addresses. An IP address is returned as it is, without
 a thread or a lookup, and a name that isn't valid (labels of letters, digits, `-` and `_`) fails with
-`std::errc::invalid_argument` without one. A caller gives up at its deadline (`timed_out`) or when stop is requested
-(`operation_canceled`, as when the scheduler is stopped), at once: `getaddrinfo()` can't be interrupted, so it goes on
-holding its thread until it returns, and its result is dropped (a lookup whose caller gave up before it got a thread
-isn't started), and the scheduler's `shutdown()` waits for it. Errors are `getaddrinfo()`'s (in `gai_category()`):
-compare them with `dns::condition`.
+`std::errc::invalid_argument` without one. Concurrent calls for the same name (ignoring case) and families, on the same
+scheduler, share one lookup (as Go's `singleflight` merges them), so a burst of connections to a host resolves it once;
+nothing is cached, so a call after it has finished looks the name up again. A caller gives up at its deadline
+(`timed_out`) or when stop is requested (`operation_canceled`, as when the scheduler is stopped), at once, and the
+callers sharing its lookup go on waiting. Once they've all given up, the lookup is stopped, and a later call starts
+another rather than share it: `getaddrinfo()` can't be interrupted, so it goes on holding its thread until it returns,
+and its result is dropped (a lookup whose callers gave up before it got a thread isn't started), and the scheduler's
+`shutdown()` waits for it. Errors are `getaddrinfo()`'s (in `gai_category()`): compare them with `dns::condition`.
 
 ## UDP
 

@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 and 2 are
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 3 are
 done (2026-10-19); "Where things stand" describes the code before them.
 
 ## Goal
@@ -313,6 +313,15 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
    `getaddrinfo(AI_NUMERICHOST)`, keeping the zone. `temporary_failure` matches `EAI_FAIL` too; `refused` and
    `bad_response` match neither condition. `io::scheduler::options::blocking_threads` (4) sizes `run_blocking`'s pool.
 3. **Merging lookups in flight**, Go's `singleflight` with `ForgetUnshared`.
+   **Done** as above: `resolver_state` holds the table (`in_flight`, an `unordered_map` behind its own `std::mutex`,
+   keyed by views of the lookup's own scheduler, name and family, so a lookup alone adds only the map's node). The
+   back end isn't in the key yet, as it's the resolver's, whose table it is: stage 6 adds it if `automatic` chooses
+   per name. The name is lower-cased in place and looked up so (one string, which the key views). Callers join and
+   leave under the lock (`waiters` is no longer atomic); the last to leave forgets the lookup in the same step, then
+   stops it outside the lock, so no one can join a lookup that's being stopped (and fail with `operation_canceled` for
+   others' reasons); a lookup that finishes is forgotten before its result is published. A lookup whose task the
+   scheduler refuses (it's stopping) finishes at once with `operation_canceled`, so callers that joined it meanwhile
+   don't wait.
 4. **The message codec.** `dns/message.hpp` rewritten: a header encoded field by field (no bit-field layout), queries
    (with the OPT record), and responses decoded defensively (bounds; compression pointers only backwards, at most a
    fixed number per name, so loops can't hang it); only A, AAAA and CNAME data decoded, other records skipped by

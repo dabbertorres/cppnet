@@ -3,9 +3,13 @@
 #include <atomic>
 #include <chrono>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <exception> // IWYU pragma: keep
 #include <expected>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <system_error>
@@ -40,13 +44,73 @@ using resolve_result = std::expected<std::vector<net::ip_addr>, std::error_code>
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(2); }
 
-// wait_started waits (in a task) until lookup has started n lookups, or the scheduler's stopped, returning whether it
-// has.
+// wait_started waits (in a task) until lookup has started n lookups, returning whether it has: not if the scheduler's
+// stopped, or they haven't within 10 seconds.
 task<bool> wait_started(net::io::scheduler* sched, const test::blocking_lookup* lookup, int n)
 {
+    const auto until = net::io::clock::now() + 10s;
     while (lookup->started.load() < n)
     {
+        if (net::io::clock::now() >= until) co_return false;
         if (auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms); err) co_return false;
+    }
+    co_return true;
+}
+
+// one_worker is a pool of one thread, which runs one task at a time: a caller joins (or starts) a lookup without
+// suspending, so a task that runs after a caller has called resolve() (e.g. one that saw caller_counts::called count
+// it) runs after it has joined.
+std::shared_ptr<net::coro::thread_pool> one_worker() { return std::make_shared<net::coro::thread_pool>(1); }
+
+// caller is one of a test's concurrent resolve() calls: what it asks for, and what it got.
+struct caller
+{
+    std::string                               host{};
+    net::protocol                             proto = net::protocol::not_care;
+    std::optional<net::io::clock::time_point> deadline{};
+    std::stop_token                           stop{};
+    resolve_result                            result{std::unexpected(std::error_code{})};
+};
+
+// caller_counts counts a test's callers: those that have called resolve(), and those that it has returned to.
+struct caller_counts
+{
+    std::atomic<std::uint64_t> called{0};
+    std::atomic<std::uint64_t> returned{0};
+};
+
+// call makes c's resolve() call, counting it in counts.
+task<> call(net::io::scheduler* sched, const net::dns::resolver* resolver, caller* c, caller_counts* counts)
+{
+    counts->called.fetch_add(1);
+    sched->notify_all(counts->called);
+
+    c->result =
+        co_await resolver->resolve(sched, c->host, {.proto = c->proto, .deadline = c->deadline, .stop = c->stop});
+
+    counts->returned.fetch_add(1);
+    sched->notify_all(counts->returned);
+}
+
+// start spawns callers' calls, returning whether the scheduler took them all.
+[[nodiscard]] bool
+start(net::io::scheduler* sched, const net::dns::resolver* resolver, std::span<caller> callers, caller_counts* counts)
+{
+    for (auto& c : callers)
+    {
+        if (!sched->spawn(call(sched, resolver, &c, counts))) return false;
+    }
+    return true;
+}
+
+// wait_count waits (in a task) until count reaches n, returning whether it has: not if the scheduler's stopped, or it
+// hasn't within 10 seconds.
+task<bool> wait_count(net::io::scheduler* sched, const std::atomic<std::uint64_t>* count, std::uint64_t n)
+{
+    const auto until = net::io::clock::now() + 10s;
+    for (auto seen = count->load(); seen < n; seen = count->load())
+    {
+        if (auto err = co_await sched->wait_on(*count, seen, until); err) co_return false;
     }
     co_return true;
 }
@@ -458,6 +522,252 @@ TEST_CASE("shutting the scheduler down waits for a lookup in flight", "[dns][res
 
     sched.shutdown();
     CHECK(lookup.finished.load() == 1);
+}
+
+TEST_CASE("concurrent lookups of one name share one", "[dns][resolver][merge]")
+{
+    struct test_case
+    {
+        resolve_result answer{std::unexpected(std::error_code{})};
+    };
+
+    // an error is shared as addresses are.
+    auto tc = GENERATE(
+        test_case{
+            .answer = std::vector<net::ip_addr>{net::ipv6_addr::loopback(), net::ipv4_addr::loopback()}
+    },
+        test_case{.answer = std::unexpected(net::make_gai_error_code(EAI_NONAME))});
+
+    test::blocking_lookup lookup;
+    lookup.answer = tc.answer;
+
+    // the same name, spelled two ways.
+    std::vector<caller> callers(8);
+    for (std::size_t i = 0; i < callers.size(); ++i) callers[i].host = i % 2 == 0 ? "shared.test" : "Shared.TEST";
+    caller_counts counts;
+
+    net::io::scheduler sched{one_worker()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      callers,
+                         caller_counts*         counts) -> task<>
+    {
+        REQUIRE(start(sched, &lookup->resolver, callers, counts));
+
+        const auto called = co_await wait_count(sched, &counts->called, callers.size());
+        REQUIRE(called);
+        const auto started = co_await wait_started(sched, lookup, 1);
+        REQUIRE(started);
+
+        lookup->release();
+        const auto returned = co_await wait_count(sched, &counts->returned, callers.size());
+        REQUIRE(returned);
+    };
+
+    sched.run_to_completion(test(&sched, &lookup, callers, &counts));
+
+    CHECK(lookup.started.load() == 1);
+    for (const auto& c : callers)
+    {
+        CAPTURE(c.host);
+        CHECK(c.result == tc.answer);
+    }
+
+    if (!tc.answer.has_value())
+    {
+        for (const auto& c : callers)
+        {
+            REQUIRE_FALSE(c.result.has_value());
+            CHECK(c.result.error() == net::dns::condition::not_found);
+        }
+    }
+}
+
+TEST_CASE("lookups of different names or families don't share", "[dns][resolver][merge]")
+{
+    test::blocking_lookup lookup;
+
+    // four lookups (the last caller shares the first's), as many as the threads for blocking calls.
+    std::vector<caller> callers{
+        caller{.host = "a.test"},
+        caller{.host = "a.test", .proto = net::protocol::ipv4},
+        caller{.host = "a.test", .proto = net::protocol::ipv6},
+        caller{.host = "b.test"},
+        caller{.host = "A.test"},
+    };
+    caller_counts counts;
+
+    net::io::scheduler sched{one_worker(), {.blocking_threads = 4}};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      callers,
+                         caller_counts*         counts) -> task<>
+    {
+        REQUIRE(start(sched, &lookup->resolver, callers, counts));
+
+        const auto called = co_await wait_count(sched, &counts->called, callers.size());
+        REQUIRE(called);
+        const auto started = co_await wait_started(sched, lookup, 4);
+        REQUIRE(started);
+
+        lookup->release();
+        const auto returned = co_await wait_count(sched, &counts->returned, callers.size());
+        REQUIRE(returned);
+    };
+
+    sched.run_to_completion(test(&sched, &lookup, callers, &counts));
+
+    CHECK(lookup.started.load() == 4);
+    for (const auto& c : callers)
+    {
+        CAPTURE(c.host, c.proto);
+        CHECK(c.result == lookup.answer);
+    }
+}
+
+TEST_CASE("a caller that leaves a shared lookup leaves the others waiting", "[dns][resolver][merge]")
+{
+    test::blocking_lookup lookup;
+
+    std::stop_source    stop;
+    std::vector<caller> callers{
+        caller{.host = "shared.test"},
+        caller{.host = "shared.test", .deadline = net::io::clock::now() + 100ms},
+        caller{.host = "shared.test", .stop = stop.get_token()},
+        caller{.host = "shared.test"},
+    };
+    caller_counts counts;
+
+    net::io::scheduler sched{one_worker()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      callers,
+                         caller_counts*         counts,
+                         std::stop_source*      stop) -> task<int>
+    {
+        REQUIRE(start(sched, &lookup->resolver, callers, counts));
+
+        const auto called = co_await wait_count(sched, &counts->called, callers.size());
+        REQUIRE(called);
+        const auto started = co_await wait_started(sched, lookup, 1);
+        REQUIRE(started);
+
+        // one leaves at its deadline, and one when it's stopped: the others still wait.
+        stop->request_stop();
+        const auto left = co_await wait_count(sched, &counts->returned, 2);
+        REQUIRE(left);
+
+        const auto finished_then = lookup->finished.load();
+        lookup->release();
+        const auto returned = co_await wait_count(sched, &counts->returned, callers.size());
+        REQUIRE(returned);
+        co_return finished_then;
+    };
+
+    const auto finished_then = sched.run_to_completion(test(&sched, &lookup, callers, &counts, &stop));
+    CHECK(finished_then == 0);
+    CHECK(lookup.started.load() == 1);
+
+    REQUIRE_FALSE(callers[1].result.has_value());
+    CHECK(callers[1].result.error() == std::errc::timed_out);
+    REQUIRE_FALSE(callers[2].result.has_value());
+    CHECK(callers[2].result.error() == std::errc::operation_canceled);
+
+    CHECK(callers[0].result == lookup.answer);
+    CHECK(callers[3].result == lookup.answer);
+}
+
+TEST_CASE("a shared lookup whose callers have all left is stopped, and not shared", "[dns][resolver][merge]")
+{
+    test::blocking_lookup lookup;
+
+    // the first holds the only thread for blocking calls, so the lookup the next three share waits for it. (The one
+    // that starts it stays until it's stopped, so the others share it, whenever their deadlines pass.)
+    std::stop_source    stop;
+    std::vector<caller> callers{
+        caller{.host = "held.test"},
+        caller{.host = "queued.test", .stop = stop.get_token()},
+        caller{.host = "queued.test", .deadline = net::io::clock::now() + 50ms},
+        caller{.host = "queued.test", .deadline = net::io::clock::now() + 100ms},
+    };
+    // then one for the same name, once they've left.
+    caller        later{.host = "queued.test"};
+    caller_counts counts;
+
+    net::io::scheduler sched{one_worker(), {.blocking_threads = 1}};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      callers,
+                         caller*                later,
+                         caller_counts*         counts,
+                         std::stop_source*      stop) -> task<>
+    {
+        REQUIRE(start(sched, &lookup->resolver, callers, counts));
+
+        const auto called = co_await wait_count(sched, &counts->called, callers.size());
+        REQUIRE(called);
+        const auto started = co_await wait_started(sched, lookup, 1);
+        REQUIRE(started);
+
+        stop->request_stop();
+        const auto left = co_await wait_count(sched, &counts->returned, 3);
+        REQUIRE(left);
+
+        // a lookup of its own, rather than the one they left, which was stopped (and would fail with
+        // operation_canceled for their reasons).
+        REQUIRE(start(sched, &lookup->resolver, {later, 1}, counts));
+        const auto later_called = co_await wait_count(sched, &counts->called, callers.size() + 1);
+        REQUIRE(later_called);
+
+        lookup->release();
+        const auto returned = co_await wait_count(sched, &counts->returned, callers.size() + 1);
+        REQUIRE(returned);
+    };
+
+    sched.run_to_completion(test(&sched, &lookup, callers, &later, &counts, &stop));
+
+    // run_to_completion() waited for every lookup: the one they left never started.
+    CHECK(lookup.started.load() == 2);
+    CHECK(lookup.finished.load() == 2);
+
+    CHECK(callers[0].result == lookup.answer);
+    for (std::size_t i = 1; i < callers.size(); ++i)
+    {
+        CAPTURE(i);
+        CHECK_FALSE(callers[i].result.has_value());
+    }
+    CHECK(later.result == lookup.answer);
+}
+
+TEST_CASE("a lookup that has finished isn't shared", "[dns][resolver][merge]")
+{
+    test::blocking_lookup lookup;
+    lookup.release(); // answers at once
+
+    net::io::scheduler sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, test::blocking_lookup* lookup) -> task<int>
+    {
+        auto first = co_await lookup->resolver.resolve(sched, "again.test");
+        REQUIRE(first.has_value());
+        const auto started_then = lookup->started.load();
+
+        auto second = co_await lookup->resolver.resolve(sched, "again.test");
+        REQUIRE(second.has_value());
+        co_return started_then;
+    };
+
+    const auto started_then = sched.run_to_completion(test(&sched, &lookup));
+    CHECK(started_then == 1);
+    CHECK(lookup.started.load() == 2);
 }
 
 TEST_CASE("the system's resolver finds localhost", "[dns][resolver]")

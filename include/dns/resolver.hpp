@@ -80,10 +80,15 @@ namespace detail
 // resolver looks up host names' addresses, with a back end: for now, the system's resolver (getaddrinfo()), on the
 // scheduler's threads for blocking calls (see io::scheduler::run_blocking()).
 //
+// Concurrent calls for the same name (ignoring case) and families, on the same scheduler, share one lookup (as Go's
+// singleflight merges them), each caller with its own deadline and stop. Nothing is cached: a call after a lookup has
+// finished starts another.
+//
 // A caller gives up at its deadline or when stop is requested (or the scheduler is stopped), at once, whatever the back
-// end is doing: as getaddrinfo() can't be interrupted, it goes on, holding its thread until it returns, and its result
-// is dropped. (A lookup whose callers have all given up before it got a thread doesn't start.) The scheduler's
-// shutdown() waits for it, as for any task.
+// end is doing, and the others sharing its lookup go on waiting. Once they all have, the lookup is stopped, and a later
+// call starts another rather than join it: as getaddrinfo() can't be interrupted, it goes on, holding its thread until
+// it returns, and its result is dropped. (A lookup whose callers have all given up before it got a thread doesn't
+// start.) The scheduler's shutdown() waits for it, as for any task.
 //
 // Copies share their state, and lookups keep it, so a resolver may go before the lookups it started.
 class resolver
@@ -126,7 +131,7 @@ public:
     resolve(io::scheduler* scheduler, std::string host, resolve_options options = {}) const;
 
 private:
-    std::shared_ptr<const detail::resolver_state> state;
+    std::shared_ptr<detail::resolver_state> state;
 };
 
 // default_resolver is the process's resolver (as Go's net.DefaultResolver): what tcp_socket::connect() and the HTTP
