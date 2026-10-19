@@ -2,7 +2,7 @@
 
 Status: done (2026-10-18): stage 1 (waits that take a token), stage 2 (the server's token, with stage 5's 499/503),
 stage 3 (the client) and stage 4 (HTTP/1.1 noticing the client leave, watching only handlers that wait); stage 5's
-timeout middleware and source-linking helper are later. Where things stand describes what was there before (HTTP/1.1's
+timeout middleware and source-linking helper moved to `middleware.md`. Where things stand describes what was there before (HTTP/1.1's
 graceful `close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they
 added. The questions below (under Decided questions) were decided as recommended.
 
@@ -459,8 +459,9 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
 4. **HTTP/1.1 noticing the client leave**: the watcher, `flush_before_read`'s hold, deadlines that apply to a read
    already waiting. Measured with `bench_request` before it's merged; if the hand-over costs too much, it's opt-in
    (a `server_config` setting) or dropped.
-5. **Middleware**: 499 (and 503 for the server's abort) in `http_metrics` and `http_tracing` (done with stage 2). Later: a timeout middleware, and a
-   helper for linking sources.
+5. **Middleware**: 499 (and 503 for the server's abort) in `http_metrics` and `http_tracing` (done with stage 2). The
+   timeout middleware, and a helper for linking sources, moved to `middleware.md` (its stage 4), built on the
+   middleware shape that plan settles.
 
 ## Decided questions
 
