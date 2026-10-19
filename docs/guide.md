@@ -68,6 +68,24 @@ auto err = co_await scheduler->sleep_until(net::io::clock::now() + std::chrono::
 if (err == std::errc::operation_canceled) { /* stopped */ }
 ```
 
+A token of your own that the request's (or any other) also stops is a `util::linked_stop_source{parent}`
+(`util/linked_stop_source.hpp`): a `std::stop_source` with a `std::stop_callback` on `parent`, so it's stopped when
+`parent` is, or by its own `request_stop()` (which doesn't stop `parent`). It can't be moved, as the callback refers to
+it. As with any stop callback, its own callbacks then run on whichever thread stopped `parent`.
+
+`scheduler.call_at(deadline, func)` calls a `noexcept` function at a deadline, rather than resuming a task: e.g. to
+request stop on a source, with no task waiting to do it. It returns the call, which is the caller's (nothing is
+allocated) and can't be moved: `cancel()` (or destroying it) cancels it, waiting for `func` to return if it's being
+called on another thread, so what `func` refers to may go once it has. `func` runs on the thread polling for the
+scheduler (a worker), holding none of the scheduler's locks, so it may request stop on a source whose tokens waits
+were given; it must be quick, and not block. A call isn't made once the scheduler is stopped.
+
+```cpp
+net::util::linked_stop_source source{req.stop};
+auto deadline = scheduler->call_at(net::io::clock::now() + 5s, [&source] noexcept { source.request_stop(); });
+co_await work(source.get_token());   // stopped after 5 seconds, or with the request
+```
+
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that, and returns a task of its
 result. `run_blocking(func, stop)` doesn't run `func` if stop was requested before it starts (its result, a
@@ -268,8 +286,8 @@ scheduler.spawn(server.serve());
   The server doesn't answer for a handler that's stopped without answering (nor send a 500 if it throws): the
   connection's closed, or the stream reset. A handler stopped by the server's `abort()` may still answer (e.g. a 503).
   A copy of the token stays valid after the handler returns. The server sets `req.stop` before calling the handler, so
-  middleware can swap in a token of its own (e.g. stopped by a deadline, or by the server's through a
-  `std::stop_callback`) for the handler it wraps. `req.aborted` is stopped once the server is aborted: not a reason,
+  middleware can swap in a token of its own (e.g. a `util::linked_stop_source`'s, stopped by a deadline as well as by
+  the request's, as `http::timeout` does: below) for the handler it wraps. `req.aborted` is stopped once the server is aborted: not a reason,
   only whether the server's own stop came, for telling it from the client's side.
 
   An HTTP/1.1 server reads the connection while a handler waits (once it has suspended, and has read the request's
@@ -352,6 +370,25 @@ scheduler.spawn(server.serve());
   `instrument::http_tracing{on_end}` traces them. Both record a request canceled before its response was sent as 499
   Client Closed Request (not an error) if the client's side stopped it, or as 503 Service Unavailable (an error, as
   any 5xx) if the server was aborted.
+
+  `http::timeout{&scheduler, duration}` (`http/timeout.hpp`) gives the rest of its chain a deadline, as Go's
+  `TimeoutHandler` does: it swaps `req.stop` for a `util::linked_stop_source`'s token (so the request's own stops
+  still reach the handler), stopped at the deadline by the scheduler's `call_at()`, and puts the request's back after
+  (also if the handler throws). Canceling stays cooperative: at the deadline the handler is only asked to stop (its
+  waits given `req.stop` end), and once it returns, if the deadline passed and it sent no response (and the request
+  wasn't stopped otherwise), the timeout answers 503 Service Unavailable with an empty body. A response the handler
+  sent stands. Unlike Go's, it doesn't buffer the handler's output, so it never writes while the handler might, and a
+  handler that ignores its token delays the 503 until it returns (holding its connection, or its HTTP/2 stream's
+  place, meanwhile). It's also what ends an HTTP/2 handler that waits with its stream open, sending nothing, which no
+  stream timeout does. Put the instrumentation outside it, so it records the 503 sent rather than the timeout's token
+  stopped (a 499):
+
+  ```cpp
+  net::http::chain(net::instrument::http_metrics{}, net::http::timeout{&scheduler, 5s}, std::move(router))
+  ```
+
+  It costs a request an allocation (the linked source's state) and a timer (a node in the scheduler's timers, reused,
+  added and removed under a lock).
 - **`server_config`** sets the host and port, and limits: header and body read timeouts, the write timeout, the size
   of a request's head, and how many connections are served at once. To handle a failure to listen, give the server a
   listener from `listener::make()` instead of a host and port.
@@ -452,7 +489,8 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `listen.hpp`, `tcp.hpp`                | TCP sockets                                                 |
 | `dns.hpp`, `ip_addr.hpp`, `url.hpp`    | names, addresses and URLs                                 |
 | `http/client.hpp`                      | the HTTP client                                           |
-| `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp` | the HTTP server |
+| `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
+| `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
 | `tls/tls.hpp`                          | TLS                                                       |
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |

@@ -3,7 +3,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <concepts>
+#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -83,21 +85,24 @@ class scheduler : private coro::thread_pool::poller
 {
 public:
     class handle_operation;
+    class call_base;
 
 private:
     struct waiter;
 
-    using timer_list   = std::multimap<clock::time_point, waiter*>;
     using watched_list = std::multimap<const std::atomic<std::uint64_t>*, waiter*>;
 
-    // timer_queue holds waiters' deadlines in order. It keeps the nodes of (a few of) the timers removed, for the next
-    // ones added, so adding one doesn't allocate each time: e.g. for each read with a deadline.
+    // timer_queue holds deadlines in order, each with what's waiting for it (T: a waiter, or a call_base). It keeps the
+    // nodes of (a few of) the timers removed, for the next ones added, so adding one doesn't allocate each time: e.g.
+    // for each read with a deadline.
+    template<class T>
     class timer_queue
     {
     public:
-        using iterator = timer_list::iterator;
+        using timer_list = std::multimap<clock::time_point, T*>;
+        using iterator   = timer_list::iterator;
 
-        iterator add(clock::time_point deadline, waiter* state)
+        iterator add(clock::time_point deadline, T* state)
         {
             if (spares.empty())
             {
@@ -128,9 +133,12 @@ private:
     private:
         static constexpr std::size_t max_spares = 16;
 
-        timer_list                         timers;
-        std::vector<timer_list::node_type> spares;
+        timer_list                                  timers;
+        std::vector<typename timer_list::node_type> spares;
     };
+
+    using waiter_timers = timer_queue<waiter>;
+    using call_timers   = timer_queue<call_base>;
 
     // waiter is a pending wait, owned by the suspended coroutine's wait_operation. It's one of:
     // - a wait for a handle (op is read or write).
@@ -145,13 +153,13 @@ private:
         // Guarded by its shard's lock (for a handle's), or timers_mu.
         bool canceled = false;
 
-        std::optional<clock::time_point>      deadline;
-        std::coroutine_handle<>               awaiting{nullptr};
-        std::error_code                       result{};
-        std::optional<timer_list::iterator>   timer{}; // guarded by its shard's lock, or (if not a handle's) timers_mu
-        const std::atomic<std::uint64_t>*     word     = nullptr;
-        std::uint64_t                         expected = 0;
-        std::optional<watched_list::iterator> watch{};
+        std::optional<clock::time_point>       deadline;
+        std::coroutine_handle<>                awaiting{nullptr};
+        std::error_code                        result{};
+        std::optional<waiter_timers::iterator> timer{}; // guarded by its shard's lock, or (if not a handle's) timers_mu
+        const std::atomic<std::uint64_t>*      word     = nullptr;
+        std::uint64_t                          expected = 0;
+        std::optional<watched_list::iterator>  watch{};
 
         // operation, for a wait for a handle, is what to perform once the handle's ready (see handle_operation).
         handle_operation* operation = nullptr;
@@ -177,7 +185,7 @@ private:
     {
         std::mutex                               mu;
         std::unordered_map<handle, registration> registrations;
-        timer_queue                              timers;
+        waiter_timers                            timers;
 
         // earliest is the earliest of the timers' deadlines (as clock::rep), for run() to read without the lock.
         std::atomic<clock::rep> earliest = std::numeric_limits<clock::rep>::max();
@@ -387,6 +395,84 @@ public:
         std::optional<stop_registration> on_stop;
     };
 
+    // call_base is a callback the scheduler calls at a deadline, rather than a coroutine it resumes: call_at()'s call,
+    // without the callback's type. It's its caller's (nothing is allocated for it), so it can't be moved, and mustn't
+    // outlive the scheduler.
+    class call_base
+    {
+    public:
+        call_base(const call_base&)            = delete;
+        call_base& operator=(const call_base&) = delete;
+
+        call_base(call_base&&)            = delete;
+        call_base& operator=(call_base&&) = delete;
+
+        // cancel cancels the call, returning whether it was still to be made (and now won't be). If it's being made on
+        // another thread, cancel() waits for the callback to return: so once cancel() has returned, the callback isn't
+        // running, and what it refers to may go. (Unless it's called by the callback itself, which it doesn't wait
+        // for.) It takes the scheduler's lock for its timers, so it mustn't be called holding one of the scheduler's
+        // locks.
+        bool cancel() noexcept;
+
+    protected:
+        call_base(scheduler* sched, void (*invoke)(call_base&) noexcept) noexcept
+            : sched{sched}
+            , invoke{invoke}
+        {}
+
+        ~call_base() = default;
+
+        // schedule schedules the call for deadline: once, by the derived class's constructor, once it's ready to be
+        // called (as it may be at once, on another thread).
+        void schedule(clock::time_point deadline) noexcept { sched->schedule_call(*this, deadline); }
+
+    private:
+        friend class scheduler;
+
+        // stage is where the call is: not scheduled (the scheduler was stopping), or canceled; scheduled; being made;
+        // or made.
+        enum class stage : std::uint8_t
+        {
+            idle,
+            pending,
+            calling,
+            called,
+        };
+
+        scheduler* sched;
+        void (*invoke)(call_base&) noexcept;
+
+        // guarded by the scheduler's timers_mu.
+        std::optional<call_timers::iterator> timer{};
+        stage                                status = stage::idle;
+    };
+
+    // call is call_at()'s call of func: destroying it cancels it (see call_base::cancel()).
+    template<class F>
+    class call final : public call_base
+    {
+    public:
+        call(scheduler* sched, clock::time_point deadline, F func) noexcept(std::is_nothrow_move_constructible_v<F>)
+            : call_base{sched, &call::invoke_func}
+            , func{std::move(func)}
+        {
+            schedule(deadline);
+        }
+
+        call(const call&)            = delete;
+        call& operator=(const call&) = delete;
+
+        call(call&&)            = delete;
+        call& operator=(call&&) = delete;
+
+        ~call() { cancel(); }
+
+    private:
+        static void invoke_func(call_base& base) noexcept { std::invoke(static_cast<call&>(base).func); }
+
+        F func;
+    };
+
     // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
     explicit scheduler(std::shared_ptr<coro::thread_pool>     workers,
                        const std::shared_ptr<spdlog::logger>& logger = std::make_shared<spdlog::logger>(
@@ -480,6 +566,23 @@ public:
     stoppable_wait_operation sleep_until(clock::time_point deadline, std::stop_token stop) noexcept
     {
         return {this, nullptr, 0, deadline, std::move(stop)};
+    }
+
+    // call_at calls func at deadline (or as soon as it can, if that's passed), unless the call it returns is canceled
+    // or destroyed first: a timer that runs a callback rather than resuming a coroutine, for what needs no task of its
+    // own (e.g. http::timeout's, which only requests stop). Nothing is allocated for it (the call holds func, and the
+    // scheduler's timers keep the nodes of a few removed, for the next ones), and it's canceled by a lock and a
+    // removal.
+    //
+    // func is called on whichever thread polls for the scheduler (one of its pool's workers, or the thread calling
+    // run(): see run()), holding none of the scheduler's locks: so it may request stop on a source whose tokens the
+    // scheduler's waits were given. It must be quick, and not block, as it holds up the thread's polling; and it
+    // mustn't destroy its own call. If the scheduler is stopped first (or was already), func isn't called.
+    template<class F>
+        requires std::is_nothrow_invocable_v<std::decay_t<F>&>
+    [[nodiscard]] call<std::decay_t<F>> call_at(clock::time_point deadline, F&& func)
+    {
+        return {this, deadline, std::forward<F>(func)};
     }
 
     // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo()), so it doesn't hold up the
@@ -664,9 +767,17 @@ private:
     // holding timers_mu.
     [[nodiscard]] std::coroutine_handle<> complete_other(waiter* state, std::error_code result) noexcept;
 
+    // schedule_call adds call to the calls, for deadline, unless the scheduler is stopping.
+    void schedule_call(call_base& call, clock::time_point deadline) noexcept;
+
+    // make_calls makes the calls whose deadlines have passed.
+    void make_calls() noexcept;
+
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
     void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;
-    void expire_timers(completions& done) noexcept;
+    // expire_timers completes the waits whose deadlines have passed, returning whether a call's has too (see
+    // make_calls()).
+    bool expire_timers(completions& done) noexcept;
 
     // next_deadline is the earliest deadline of any wait (as clock::rep): the most run() may wait for.
     [[nodiscard]] clock::rep next_deadline() const noexcept;
@@ -690,11 +801,16 @@ private:
     // Lock order: a shard's mu, then timers_mu.
     std::array<shard, shard_count> shards;
 
-    // timers_mu guards the timers of waits that aren't for handles (sleeps, and waits for notifications), and the
-    // waits for notifications (watched).
+    // timers_mu guards the timers of waits that aren't for handles (sleeps, and waits for notifications), the waits for
+    // notifications (watched), and the calls (see call_at()).
     mutable std::mutex timers_mu;
-    timer_queue        timers;
+    waiter_timers      timers;
     watched_list       watched;
+
+    // calls are the calls pending (see call_at()), and calls_done is notified (holding timers_mu) when one has been
+    // made, for call_base::cancel() to wait for one being made. Guarded by timers_mu.
+    call_timers             calls;
+    std::condition_variable calls_done;
 
     // sleeping_until is the deadline run() is waiting for (as clock::rep), so that a wait with an earlier one
     // interrupts it (see run()).

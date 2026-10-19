@@ -6,12 +6,14 @@
 #include <compare>
 #include <cstdint>
 #include <exception> // IWYU pragma: keep
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -21,6 +23,7 @@
 
 #include "coro/sync_wait.hpp"
 #include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
@@ -29,10 +32,12 @@
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "http/timeout.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
 #include "instrument/opentelemetry/tracecontext.hpp"
 #include "instrument/prometheus/registry.hpp"
 #include "io/io.hpp"
+#include "io/scheduler.hpp"
 #include "io/string_writer.hpp"
 #include "util/type_map.hpp"
 
@@ -42,6 +47,7 @@ namespace opentelemetry = net::instrument::opentelemetry;
 namespace
 {
 
+using namespace std::chrono_literals;
 using namespace std::string_view_literals;
 
 using net::coro::task;
@@ -132,7 +138,25 @@ std::optional<std::string> attribute(const opentelemetry::span& span, std::strin
 // NOTE: one test, as the registry is global: nothing else registers these metrics.
 TEST_CASE("http_metrics measures requests, by method, route and status", "[instrument][middleware][metrics]")
 {
-    const auto handler = http::chain(net::instrument::http_metrics{}, test_router());
+    // NOTE: before the chains, whose timeout uses it.
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    const net::instrument::http_metrics metrics;
+    const auto                          handler = http::chain(metrics, test_router());
+
+    // outside a timeout, it sees the 503 the timeout sends, rather than the timeout's token stopped (a 499).
+    http::router slow;
+    slow.GET("/slow",
+             [](const http::server_request& req, http::response_writer&) -> task<void>
+             {
+                 // NOTE: without suspending (call() runs the chain on this thread), until the timeout stops its token.
+                 const auto give_up = std::chrono::steady_clock::now() + 10s;
+                 while (!req.stop.stop_requested() && std::chrono::steady_clock::now() < give_up)
+                     std::this_thread::sleep_for(1ms);
+                 co_return;
+             });
+    const auto timed = http::chain(metrics, http::timeout{&sched, 1ms}, std::move(slow));
+    CHECK_FALSE(call(timed, "/slow"));
 
     CHECK_FALSE(call(handler, "/users/1"));
     CHECK_FALSE(call(handler, "/users/2"));
@@ -178,6 +202,9 @@ TEST_CASE("http_metrics measures requests, by method, route and status", "[instr
         text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/silent\"} 1\n"));
     CHECK(
         text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/throws\"} 1\n"));
+
+    // the timeout's 503.
+    CHECK(text.contains("http_server_request_duration_seconds_count{code=\"503\",method=\"GET\",route=\"/slow\"} 1\n"));
 }
 
 TEST_CASE("http_tracing makes a server span for each request", "[instrument][middleware][tracing]")

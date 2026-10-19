@@ -1240,3 +1240,159 @@ TEST_CASE("the scheduler's stop token is stopped by request_stop", "[io][schedul
     CHECK(token.stop_requested());
     CHECK(called.load());
 }
+
+TEST_CASE("call_at calls a function at its deadline, on a worker", "[io][scheduler][call_at]")
+{
+    // NOTE: before the scheduler, and the call, which use them.
+    std::atomic<bool>                       called = false;
+    std::atomic<std::thread::id>            caller{};
+    std::atomic<net::io::clock::time_point> called_at{};
+
+    scheduler sched{make_pool()};
+
+    const auto start = net::io::clock::now();
+    auto       call  = sched.call_at(start + 50ms,
+                                     [&] noexcept
+                                     {
+                                  called_at.store(net::io::clock::now());
+                                  caller.store(std::this_thread::get_id());
+                                  called.store(true);
+                                     });
+
+    REQUIRE(eventually([&] { return called.load(); }));
+    CHECK(called_at.load() - start >= 50ms);
+    CHECK(caller.load() != std::this_thread::get_id());
+
+    // it's been made, so there's nothing to cancel.
+    CHECK_FALSE(call.cancel());
+}
+
+TEST_CASE("call_at calls a function whose deadline has passed at once", "[io][scheduler][call_at]")
+{
+    std::atomic<bool> called = false;
+
+    scheduler sched{make_pool()};
+
+    auto call = sched.call_at(net::io::clock::now() - 1s, [&] noexcept { called.store(true); });
+    CHECK(eventually([&] { return called.load(); }));
+}
+
+TEST_CASE("a call canceled before its deadline isn't made", "[io][scheduler][call_at]")
+{
+    std::atomic<int> calls = 0;
+
+    scheduler sched{make_pool()};
+
+    SECTION("by cancel()")
+    {
+        auto call = sched.call_at(net::io::clock::now() + 50ms, [&] noexcept { calls.fetch_add(1); });
+        CHECK(call.cancel());
+        CHECK_FALSE(call.cancel()); // once
+    }
+
+    SECTION("by destroying it")
+    {
+        auto call = sched.call_at(net::io::clock::now() + 50ms, [&] noexcept { calls.fetch_add(1); });
+    }
+
+    // a call after it is made, so its deadline has passed when this looks.
+    std::atomic<bool> later = false;
+    auto              call  = sched.call_at(net::io::clock::now() + 100ms, [&] noexcept { later.store(true); });
+    REQUIRE(eventually([&] { return later.load(); }));
+    CHECK(calls.load() == 0);
+}
+
+TEST_CASE("canceling a call being made waits for it to return", "[io][scheduler][call_at]")
+{
+    std::atomic<bool> started  = false;
+    std::atomic<bool> finished = false;
+
+    scheduler sched{make_pool()};
+
+    auto call = sched.call_at(net::io::clock::now(),
+                              [&] noexcept
+                              {
+                                  started.store(true);
+                                  std::this_thread::sleep_for(100ms); // NOTE: a call mustn't block: only to test it.
+                                  finished.store(true);
+                              });
+
+    REQUIRE(eventually([&] { return started.load(); }));
+    CHECK_FALSE(call.cancel());
+    CHECK(finished.load());
+}
+
+TEST_CASE("a call may cancel itself", "[io][scheduler][call_at]")
+{
+    // NOTE: before the scheduler, and the call, which use them.
+    std::atomic<scheduler::call_base*> self = nullptr;
+    std::atomic<int>                   canceled{-1};
+
+    scheduler sched{make_pool()};
+
+    auto call =
+        sched.call_at(net::io::clock::now() + 20ms, [&] noexcept { canceled.store(self.load()->cancel() ? 1 : 0); });
+    self.store(&call);
+
+    // it doesn't wait for itself, and wasn't pending, as it's being made.
+    REQUIRE(eventually([&] { return canceled.load() != -1; }));
+    CHECK(canceled.load() == 0);
+}
+
+TEST_CASE("a call isn't made once the scheduler is stopped", "[io][scheduler][call_at]")
+{
+    std::atomic<int> calls = 0;
+
+    scheduler sched{make_pool()};
+
+    auto before = sched.call_at(net::io::clock::now() + 20ms, [&] noexcept { calls.fetch_add(1); });
+    sched.request_stop();
+    auto after = sched.call_at(net::io::clock::now(), [&] noexcept { calls.fetch_add(1); });
+
+    std::this_thread::sleep_for(100ms);
+    CHECK(calls.load() == 0);
+    CHECK_FALSE(before.cancel());
+    CHECK_FALSE(after.cancel());
+}
+
+TEST_CASE("a call may request stop, ending the waits given the source's token", "[io][scheduler][call_at][stop]")
+{
+    // NOTE: before the scheduler, whose task uses it.
+    std::stop_source source;
+
+    scheduler sched{make_pool()};
+
+    const auto sleep = [](scheduler* sched, std::stop_source* source) -> task<std::error_code>
+    {
+        auto call = sched->call_at(net::io::clock::now() + 20ms, [source] noexcept { source->request_stop(); });
+        co_return co_await sched->sleep_until(net::io::clock::now() + 1h, source->get_token());
+    };
+
+    const auto start = net::io::clock::now();
+    const auto err   = sched.run_to_completion(sleep(&sched, &source));
+    CHECK(err == std::errc::operation_canceled);
+    CHECK(net::io::clock::now() - start < 10s);
+}
+
+TEST_CASE("a scheduler whose workers poll for another scheduler makes its calls in run()", "[io][scheduler][call_at]")
+{
+    auto      pool = make_pool();
+    scheduler first{pool};
+    scheduler second{pool};
+
+    const auto wait_for_call = [](scheduler* sched) -> task<bool>
+    {
+        std::atomic<std::uint64_t> word{0};
+
+        auto call = sched->call_at(net::io::clock::now() + 10ms,
+                                   [sched, &word] noexcept
+                                   {
+                                       word.store(1);
+                                       sched->notify_all(word);
+                                   });
+
+        co_return !co_await sched->wait_on(word, 0, net::io::clock::now() + test_timeout);
+    };
+
+    CHECK(second.run_to_completion(wait_for_call(&second)));
+}

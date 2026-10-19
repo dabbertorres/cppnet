@@ -12,7 +12,8 @@
 //   allocations are counted with the server's (as they share the process): for what a stream costs.
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
 // costs (see docs/plans/middleware.md), with the metrics' own work; and with the metrics on the route instead (use()),
-// with each router: for what middleware on routes costs.
+// with each router: for what middleware on routes costs. And through http::timeout on the route, pipelined and over a
+// socket, with a deadline that never comes: for what its timer costs.
 #include "http/request.hpp"
 
 #include <algorithm>
@@ -54,6 +55,7 @@
 #include "http/router.hpp"
 #include "http/server.hpp"
 #include "http/static_router.hpp"
+#include "http/timeout.hpp"
 #include "instrument/middleware.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
@@ -92,6 +94,7 @@ namespace http = net::http;
 
 using http::literals::operator""_route;
 using namespace std::string_view_literals;
+using namespace std::chrono_literals;
 using net::coro::task;
 
 // as bench/web/cppnet's, and wrk sends it, with TechEmpower's headers.
@@ -338,15 +341,15 @@ private:
 
 // measure_socket serves requests (each request) over a socket, a request at a time, and prints the time and allocations
 // per request.
-template<typename Router>
-void measure_socket(std::string_view name, const Router& router, std::string_view request)
+template<typename MakeRouter>
+void measure_socket(std::string_view name, MakeRouter make_router, std::string_view request)
 {
     auto               workers = std::make_shared<net::coro::thread_pool>(2);
     net::io::scheduler scheduler{workers};
 
     http::server server{
         &scheduler,
-        router,
+        make_router(&scheduler),
         {.host = "127.0.0.1", .port = "0"}
     };
 
@@ -484,8 +487,14 @@ int main()
 
     measure("pipelined", router, [](std::string_view input) { return net::io::string_reader{input}; });
     measure("one per read", router, [](std::string_view input) { return one_request_per_read{input}; });
-    measure_socket("over a socket, a request at a time", router, request);
-    measure_socket("over a socket, to a handler that waits once", waiting, waiting_request);
+    measure_socket(
+        "over a socket, a request at a time",
+        [&](net::io::scheduler* /*sched*/) { return router; },
+        request);
+    measure_socket(
+        "over a socket, to a handler that waits once",
+        [&](net::io::scheduler* /*sched*/) { return waiting; },
+        waiting_request);
     measure_http2(router);
     measure("pipelined, through http_metrics",
             http::chain(net::instrument::http_metrics{}, router),
@@ -510,4 +519,20 @@ int main()
     measure("pipelined, the runtime router, http_metrics on the route",
             runtime,
             [](std::string_view input) { return net::io::string_reader{input}; });
+
+    // NOTE: a deadline that never comes, for what the timer costs (on the route, so the layer's frame is elided):
+    //       against "pipelined" and "over a socket, a request at a time", which have the same handler.
+    net::io::scheduler timers{std::make_shared<net::coro::thread_pool>(2)};
+
+    const auto timed = [](net::io::scheduler* sched)
+    {
+        return http::make_static_router(http::use(http::timeout{sched, 60s}),
+                                        http::GET("/plaintext"_route,
+                                                  [](const http::server_request& req, http::response_writer& resp)
+                                                  { return plaintext(req, resp); }));
+    };
+    measure("pipelined, http::timeout on the route",
+            timed(&timers),
+            [](std::string_view input) { return net::io::string_reader{input}; });
+    measure_socket("over a socket, http::timeout on the route", timed, request);
 }

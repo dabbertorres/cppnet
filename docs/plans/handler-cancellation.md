@@ -1,10 +1,11 @@
 # Plan: canceling HTTP server handlers
 
-Status: done (2026-10-18): stage 1 (waits that take a token), stage 2 (the server's token, with stage 5's 499/503),
-stage 3 (the client) and stage 4 (HTTP/1.1 noticing the client leave, watching only handlers that wait); stage 5's
-timeout middleware and source-linking helper moved to `middleware.md`. Where things stand describes what was there before (HTTP/1.1's
-graceful `close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they
-added. The questions below (under Decided questions) were decided as recommended.
+Status: done (2026-10-18): every stage. Stage 1 (waits that take a token), stage 2 (the server's token, with stage 5's
+499/503), stage 3 (the client), stage 4 (HTTP/1.1 noticing the client leave, watching only handlers that wait) and
+stage 5 (middleware: the timeout middleware and the source-linking helper were built as `middleware.md`'s stage 4).
+Where things stand describes what was there before (HTTP/1.1's graceful `close()`, and the `aborting` source the
+destructor stops), and the stages' "Done as above" notes, what they added. The questions below (under Decided
+questions) were decided as recommended.
 
 ## Goal
 
@@ -398,7 +399,8 @@ as a 4xx is); and 503 when it was the server's hard stop (`server_request::abort
 5xx. Middleware that
 wants its own deadline (a timeout handler, as Go's `TimeoutHandler`) makes a source of its own, linked to `req.stop`
 by a `std::stop_callback`, swaps it into `req.stop` for the handler it wraps, and puts the original back: the field
-being assignable is what allows it. A timeout middleware itself is later (it needs a timer task per request).
+being assignable is what allows it. That's `http::timeout` (`middleware.md`'s stage 4), with `util::linked_stop_source`
+as the link, and the scheduler's `call_at()` as its timer (no task per request).
 
 ## Costs
 
@@ -461,7 +463,8 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
    (a `server_config` setting) or dropped.
 5. **Middleware**: 499 (and 503 for the server's abort) in `http_metrics` and `http_tracing` (done with stage 2). The
    timeout middleware, and a helper for linking sources, moved to `middleware.md` (its stage 4), built on the
-   middleware shape that plan settles.
+   middleware shape that plan settles. Done there: `http::timeout` and `util::linked_stop_source`, with the scheduler's
+   `call_at()` as the timer (measured against a task per request: see that stage).
 
 ## Decided questions
 
@@ -519,5 +522,6 @@ Each was decided as recommended (2026-10-18); the options are kept for the reaso
 - Interrupting `run_blocking`'s function, or `getaddrinfo()`.
 - Freeing a connection's `max_connections` slot before its handlers return (group 5's bound stays).
 - Per-request deadlines for handlers that don't wait on their stream (HTTP/2's stream timeouts only run while the
-  handler reads or writes it), and a timeout middleware: later, built on this.
+  handler reads or writes it), and a timeout middleware: later, built on this (since done: `middleware.md`'s stage 4,
+  `http::timeout`, which also covers HTTP/2 handlers that sit idle with their streams open).
 - Tokens on `coro::notifier`, `async_scope::join` and `thread_pool::schedule`.

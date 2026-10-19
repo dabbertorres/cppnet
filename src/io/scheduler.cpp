@@ -35,6 +35,10 @@ net::coro::task<> start_on(net::coro::thread_pool* workers, net::coro::task<> ta
     co_await task;
 }
 
+// making is the call this thread is making, if any: so that a call that cancels itself doesn't wait for itself.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): a thread's own.
+thread_local const net::io::scheduler::call_base* making = nullptr;
+
 }
 
 namespace net::io
@@ -325,7 +329,9 @@ void scheduler::poll(bool block, completions& done) noexcept
     if (block) sleeping_until.store(std::numeric_limits<clock::rep>::max());
 
     dispatch(std::span{events}.first(num_ready), done);
-    expire_timers(done);
+    // NOTE: calls are made once expire_timers() has released the locks, as they may request stop (whose callbacks
+    //       take them).
+    if (expire_timers(done)) make_calls();
 }
 
 void scheduler::wake() noexcept { loop.interrupt(); }
@@ -487,7 +493,7 @@ void scheduler::stop_wait(waiter& state) noexcept
     if (awaiting) resume(awaiting);
 }
 
-void scheduler::expire_timers(completions& done) noexcept
+bool scheduler::expire_timers(completions& done) noexcept
 {
     const auto now       = clock::now();
     const auto timed_out = std::make_error_code(std::errc::timed_out);
@@ -523,6 +529,8 @@ void scheduler::expire_timers(completions& done) noexcept
         // a sleep that's over isn't an error.
         done.push_back(complete_other(state, state->word == nullptr ? std::error_code{} : timed_out));
     }
+
+    return !calls.empty() && calls.earliest() <= now;
 }
 
 clock::rep scheduler::next_deadline() const noexcept
@@ -532,7 +540,79 @@ clock::rep scheduler::next_deadline() const noexcept
 
     std::scoped_lock lock{timers_mu};
     if (!timers.empty()) next = std::min(next, timers.earliest().time_since_epoch().count());
+    if (!calls.empty()) next = std::min(next, calls.earliest().time_since_epoch().count());
     return next;
+}
+
+void scheduler::schedule_call(call_base& call, clock::time_point deadline) noexcept
+{
+    {
+        std::scoped_lock lock{timers_mu};
+
+        // NOTE: read under timers_mu: request_stop() sets it before dropping the calls under it, so either this sees
+        // it,
+        //       or request_stop() sees this call.
+        if (stopping.load(std::memory_order::acquire)) return;
+
+        call.timer  = calls.add(deadline, &call);
+        call.status = call_base::stage::pending;
+    }
+
+    // run() may be waiting for a later deadline (or none at all).
+    note_deadline(deadline);
+}
+
+void scheduler::make_calls() noexcept
+{
+    const auto now = clock::now();
+
+    while (true)
+    {
+        call_base* due = nullptr;
+
+        {
+            std::scoped_lock lock{timers_mu};
+            if (calls.empty() || calls.earliest() > now) return;
+
+            due = calls.begin()->second;
+            calls.remove(calls.begin());
+            due->timer.reset();
+            due->status = call_base::stage::calling;
+        }
+
+        making = due;
+        due->invoke(*due);
+        making = nullptr;
+
+        {
+            std::scoped_lock lock{timers_mu};
+            due->status = call_base::stage::called;
+
+            // NOTE: under the lock, so that a cancel() waiting for it can't return (and the call go) before this is
+            // done
+            //       with it.
+            calls_done.notify_all();
+        }
+    }
+}
+
+bool scheduler::call_base::cancel() noexcept
+{
+    std::unique_lock lock{sched->timers_mu};
+
+    if (status == stage::pending && timer)
+    {
+        sched->calls.remove(*timer);
+        timer.reset();
+        status = stage::idle;
+        return true;
+    }
+
+    // being made on another thread: so that what it refers to may go once this returns.
+    if (status == stage::calling && making != this)
+        sched->calls_done.wait(lock, [this] { return status != stage::calling; });
+
+    return false;
 }
 
 void scheduler::note_deadline(clock::time_point deadline) noexcept
@@ -565,6 +645,15 @@ void scheduler::request_stop() noexcept
         // then waits for notifications, and (all that's left with a timer) sleeps.
         while (!watched.empty()) done.push_back(complete_other(watched.begin()->second, canceled));
         while (!timers.empty()) done.push_back(complete_other(timers.begin()->second, canceled));
+
+        // and calls, which aren't made.
+        while (!calls.empty())
+        {
+            auto* call = calls.begin()->second;
+            calls.remove(calls.begin());
+            call->timer.reset();
+            call->status = call_base::stage::idle;
+        }
     }
 
     scope.close();

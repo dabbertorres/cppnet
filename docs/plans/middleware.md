@@ -1,8 +1,8 @@
 # Plan: a standard shape for HTTP server middleware
 
-Status: planned (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
+Status: done (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
 questions at the end were decided. Stage 1 (measuring) is done: B kept, with the costs corrected (Costs). Stage 2 (the
-shape) and stage 3 (some routes only) are done.
+shape), stage 3 (some routes only) and stage 4 (the timeout middleware, with its timer measured) are done.
 
 ## Goal
 
@@ -111,7 +111,7 @@ the router (through `chain`) runs for every request, including 404s and 405s.
 
 ### The timeout middleware (from `handler-cancellation.md`, stage 5)
 
-`http::timeout{duration}`: makes a `std::stop_source` linked to `req.stop` (a `std::stop_callback` that stops it; the
+`http::timeout{&scheduler, duration}` (stage 4 has what was built): makes a `std::stop_source` linked to `req.stop` (a `std::stop_callback` that stops it; the
 "helper for linking sources" of that plan, `util` or `coro`), stopped at the deadline, swaps it into `req.stop` for the
 handler, and puts the original back. What stops it at the deadline is the cost: a timer per request. Options for the
 stage itself: a scheduler `sleep_until(deadline, stop)` task per request (an allocation, and a wait registered), or
@@ -155,7 +155,10 @@ throwaway layers that do nothing but `co_await next`; the prototype is not in th
 - Groups: `static_router` middleware runs only for its group's routes (not 404s, other groups, or the root), in order
   with nested groups', with `params` reaching the handler; the runtime router's the same, through subrouters.
 - The timeout: a handler waiting past it is stopped (its token, and a wait it gave the token), the original token is
-  restored, a client's stop still reaches the handler through the linked source.
+  restored (also when the handler throws), a client's stop (and the server's abort) still reaches the handler through
+  the linked source, a response the handler sent stands, a handler finishing first is unaffected (no stray stop
+  later), over HTTP/1.1 and HTTP/2, and `http_metrics` outside it records the 503. The scheduler's `call_at` and the
+  linking helper have their own tests.
 
 ## Stages
 
@@ -190,7 +193,45 @@ throwaway layers that do nothing but `co_await next`; the prototype is not in th
    built per request, but each layer is called indirectly: one frame each. `bench_request`, pipelined: the runtime
    router alone is 2.4 allocations per request (its own frame and the handler's), 3.4 with `http_metrics` on its route.
 4. **The timeout middleware**, with the source-linking helper (measuring its timer first): `handler-cancellation.md`'s
-   stage 5 points here.
+   stage 5 points here. Done as above: `util::linked_stop_source` (`util/linked_stop_source.hpp`: a `std::stop_source`
+   and a `std::stop_callback` on the parent, not movable), and `http::timeout{&scheduler, duration}`
+   (`http/timeout.hpp`), whose timer is the scheduler's new `call_at(deadline, func)` (option (b) below). The scheduler
+   is an option, as neither the request nor the `response_writer` reaches it. The 503: once the rest of the chain
+   returns, if the deadline passed, no final response was sent, and the request's own token wasn't stopped (then the
+   client's gone, or the server aborted, and the server sends nothing), as Go's `TimeoutHandler` answers; also when the
+   rest threw (the deadline being the likelier cause), before rethrowing. It never writes while the handler might, so a
+   handler ignoring its token delays the 503. The instrumentation goes outside it, so it records the 503 (inside, it
+   would see the timeout's token stopped and record 499): tested with `http_metrics`.
+
+   The timer, measured (2026-10-18; `bench_request` in Release, 2 workers, 7 rounds alternating the configurations;
+   each pipelined run is the best of its 7 repeats; a 60 s deadline that never fires; the middleware on the route, with
+   a lambda handler, so its frame is elided and the numbers are the timer's and the linked source's):
+
+   | Configuration | Pipelined, min / median | Socket, min / median | Allocations per request (pipelined / socket) |
+   |---|---|---|---|
+   | No timeout | 1116 / 1146 ns | 27.2 / 29.4 us | 1.4 / 3.0 |
+   | (b) `call_at`: a callback timer in the scheduler | 1332 / 1338 ns | 29.3 / 30.0 us | 2.4 / 4.0 |
+   | (a) a `sleep_until(deadline, stop)` task per request | 7068 / 7272 ns | 33.2 / 34.4 us | 6.4 / 8.0 |
+
+   (a) costs four allocations more than (b): the task's frame, `spawn()`'s two (its `start_on` and the scope's
+   detached frame), and a second `std::stop_source` to cancel the sleep with when the handler finishes first (stopping
+   the linked one would stop a token the handler may have kept); and a hand-over to the pool and back for every
+   request. (b)'s one allocation is the linked source's state, which both need. So (b), by the rule set for it (an
+   allocation fewer, or more than 5%). `call_at` returns the call, the caller's (in the middleware's frame), so
+   nothing's allocated for it; the scheduler keeps calls in a queue of their own under `timers_mu` (the timer queue is
+   a template now, reusing its spare nodes for either), and makes the due ones after `expire_timers()` has released
+   its locks, on the polling thread (stop must never be requested holding the scheduler's locks). `cancel()` waits for
+   a call being made on another thread (on a condition variable under `timers_mu`), so the middleware's linked source
+   may go once it returns. What's left of (b)'s ~220 ns in memory is its parts: the source's allocation, the
+   callback's registration on the parent, `clock::now()`, and the queue's insertion and removal under the lock (about
+   20% of a pipelined request that does nothing else); on a socket, 0.6 to 2 us (2% by the median, 8% by the minimum,
+   where single runs vary by about 10%), and (a) 5 us. All requests' timers share `timers_mu`, as sleeps do: not measured under
+   contention.
+
+   Where it reaches the handler: a wait given the request's token (`sleep_until(..., req.stop)`) ends with
+   `operation_canceled` at the deadline (tested, as are the rest of the plan's Testing items, over HTTP/1.1 and
+   HTTP/2 through a server: there, a handler sitting idle with its stream open, which no stream timeout ends, is
+   answered 503).
 
 ## Decided questions
 
