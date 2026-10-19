@@ -16,12 +16,10 @@
 #include <utility>
 #include <vector>
 
-#include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
-#include "http/router.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
 #include "instrument/opentelemetry/tracecontext.hpp"
 #include "instrument/prometheus/gauge.hpp"
@@ -95,17 +93,15 @@ struct http_metrics::state
     // the series of the duration histogram: method, status, route.
     using series = std::tuple<http::request_method, http::status, std::string>;
 
-    http::request_handler next;
-    std::vector<double>   buckets;
-    prometheus::gauge&    active;
+    std::vector<double> buckets;
+    prometheus::gauge&  active;
 
     // NOTE: a cache of the histogram's series, so that most requests don't need the registry's (exclusive) lock.
     std::shared_mutex                                     mutex;
     std::map<series, prometheus::histogram*, std::less<>> durations;
 
-    state(http::request_handler&& next, std::vector<double>&& buckets)
-        : next{std::move(next)}
-        , buckets{std::move(buckets)}
+    explicit state(std::vector<double>&& buckets)
+        : buckets{std::move(buckets)}
         , active{
               prometheus::registry::register_metric(
                   prometheus::gauge{"http_server_active_requests", "Number of HTTP requests being handled."}),
@@ -138,43 +134,27 @@ struct http_metrics::state
         durations.emplace(series{method, code, std::string{route}}, &h);
         return h;
     }
-
-    static coro::task<void> handle(std::shared_ptr<state> self, http::server_request& req, http::response_writer& resp)
-    {
-        self->active.increment();
-        const auto start = std::chrono::steady_clock::now();
-
-        // NOTE: a co_await can't be in a catch block, so a failure is rethrown after it.
-        std::exception_ptr failure;
-        try
-        {
-            co_await self->next(req, resp);
-        }
-        catch (...)
-        {
-            failure = std::current_exception();
-        }
-
-        const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
-        self->active.decrement();
-        const auto code = responded_status(canceled_status(req, resp), resp, failure != nullptr);
-        self->duration(req.method, code, req.route).observe(elapsed.count());
-
-        if (failure != nullptr) std::rethrow_exception(failure);
-    }
 };
 
-http_metrics::http_metrics(http::request_handler next, http_metrics_options options)
-    : shared{std::make_shared<state>(std::move(next), std::move(options.buckets))}
+http_metrics::http_metrics(http_metrics_options options)
+    : shared{std::make_shared<state>(std::move(options.buckets))}
 {}
 
-http_metrics::http_metrics(http::router&& next, http_metrics_options options)
-    : http_metrics{http::make_handler(std::move(next)), std::move(options)}
-{}
-
-coro::task<void> http_metrics::operator()(http::server_request& req, http::response_writer& resp) const
+std::chrono::steady_clock::time_point http_metrics::begin() const
 {
-    return state::handle(shared, req, resp);
+    shared->active.increment();
+    return std::chrono::steady_clock::now();
+}
+
+void http_metrics::end(std::chrono::steady_clock::time_point start,
+                       const http::server_request&           req,
+                       const http::response_writer&          resp,
+                       bool                                  threw) const
+{
+    const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+    shared->active.decrement();
+    const auto code = responded_status(canceled_status(req, resp), resp, threw);
+    shared->duration(req.method, code, req.route).observe(elapsed.count());
 }
 
 opentelemetry::span trace::start_child(std::string name, opentelemetry::span_kind kind) const
@@ -197,97 +177,73 @@ void trace::end(opentelemetry::span&& child) const
     (*on_end)(std::move(child));
 }
 
-struct http_tracing::state
-{
-    http::request_handler next;
-    span_handler          on_end;
+http_tracing::http_tracing(span_handler on_end)
+    : on_end{std::make_shared<const span_handler>(std::move(on_end))}
+{}
 
-    static coro::task<void>
-    handle(std::shared_ptr<const state> self, http::server_request& req, http::response_writer& resp)
+void http_tracing::begin(http::server_request& req, opentelemetry::span& span) const
+{
+    auto parsed = opentelemetry::tracecontext::parse(req.headers);
+    if (parsed.has_value())
     {
-        auto parsed = opentelemetry::tracecontext::parse(req.headers);
-
-        opentelemetry::span span;
-        if (parsed.has_value())
-        {
-            span = std::move(*parsed);
-        }
-        else
-        {
-            span.trace_id = opentelemetry::tracecontext::new_trace_id();
-            span.span_id  = opentelemetry::tracecontext::new_span_id();
-            span.flags    = opentelemetry::span_flags::sampled | opentelemetry::span_flags::random;
-        }
-
-        span.kind       = opentelemetry::span_kind::server;
-        span.start_time = std::chrono::system_clock::now();
-
-        req.extensions.emplace<trace>(&span, &self->on_end);
-
-        std::exception_ptr failure;
-        try
-        {
-            co_await self->next(req, resp);
-        }
-        catch (...)
-        {
-            failure = std::current_exception();
-        }
-
-        req.extensions.erase<trace>();
-
-        span.end_time = std::chrono::system_clock::now();
-
-        const auto method   = method_name(req.method);
-        const auto canceled = canceled_status(req, resp);
-        const auto code     = responded_status(canceled, resp, failure != nullptr);
-
-        // the client's side stopped it.
-        const bool client_closed = canceled == http::status::CLIENT_CLOSED_REQUEST;
-
-        span.name = std::string{method};
-        if (!req.route.empty()) span.name.append(1, ' ').append(req.route);
-
-        // version 2 and later have no minor version.
-        auto version = std::to_string(req.version.major);
-        if (req.version.major < 2) version += '.' + std::to_string(req.version.minor);
-
-        span.attributes.push_back(attribute("http.request.method", std::string{method}));
-        if (!req.route.empty()) span.attributes.push_back(attribute("http.route", std::string{req.route}));
-        span.attributes.push_back(attribute("url.path", req.target.path));
-        span.attributes.push_back(attribute("url.scheme", std::string{"http"}));
-        span.attributes.push_back(attribute("network.protocol.version", std::move(version)));
-        span.attributes.push_back(
-            attribute("http.response.status_code", static_cast<std::int64_t>(std::to_underlying(code))));
-
-        // for a server, only a 5xx is an error: a 4xx is the client's, as is a request its side canceled, whatever the
-        // handler threw for it (one the server's abort canceled is a 503, an error as any).
-        if (failure != nullptr && !client_closed)
-        {
-            span.status = {.message = exception_message(failure), .code = opentelemetry::status_code::error};
-        }
-        else if (http::status_is_server_error(code))
-        {
-            span.status = {.message = "", .code = opentelemetry::status_code::error};
-        }
-
-        self->on_end(std::move(span));
-
-        if (failure != nullptr) std::rethrow_exception(failure);
+        span = std::move(*parsed);
     }
-};
+    else
+    {
+        span.trace_id = opentelemetry::tracecontext::new_trace_id();
+        span.span_id  = opentelemetry::tracecontext::new_span_id();
+        span.flags    = opentelemetry::span_flags::sampled | opentelemetry::span_flags::random;
+    }
 
-http_tracing::http_tracing(http::request_handler next, span_handler on_end)
-    : shared{std::make_shared<const state>(state{.next = std::move(next), .on_end = std::move(on_end)})}
-{}
+    span.kind       = opentelemetry::span_kind::server;
+    span.start_time = std::chrono::system_clock::now();
 
-http_tracing::http_tracing(http::router&& next, span_handler on_end)
-    : http_tracing{http::make_handler(std::move(next)), std::move(on_end)}
-{}
+    req.extensions.emplace<trace>(&span, on_end.get());
+}
 
-coro::task<void> http_tracing::operator()(http::server_request& req, http::response_writer& resp) const
+void http_tracing::end(http::server_request&        req,
+                       const http::response_writer& resp,
+                       opentelemetry::span&&        span,
+                       const std::exception_ptr&    failure) const
 {
-    return state::handle(shared, req, resp);
+    req.extensions.erase<trace>();
+
+    span.end_time = std::chrono::system_clock::now();
+
+    const auto method   = method_name(req.method);
+    const auto canceled = canceled_status(req, resp);
+    const auto code     = responded_status(canceled, resp, failure != nullptr);
+
+    // the client's side stopped it.
+    const bool client_closed = canceled == http::status::CLIENT_CLOSED_REQUEST;
+
+    span.name = std::string{method};
+    if (!req.route.empty()) span.name.append(1, ' ').append(req.route);
+
+    // version 2 and later have no minor version.
+    auto version = std::to_string(req.version.major);
+    if (req.version.major < 2) version += '.' + std::to_string(req.version.minor);
+
+    span.attributes.push_back(attribute("http.request.method", std::string{method}));
+    if (!req.route.empty()) span.attributes.push_back(attribute("http.route", std::string{req.route}));
+    span.attributes.push_back(attribute("url.path", req.target.path));
+    span.attributes.push_back(attribute("url.scheme", std::string{"http"}));
+    span.attributes.push_back(attribute("network.protocol.version", std::move(version)));
+    span.attributes.push_back(
+        attribute("http.response.status_code", static_cast<std::int64_t>(std::to_underlying(code))));
+
+    // for a server, only a 5xx is an error: a 4xx is the client's, as is a request its side canceled, whatever the
+    // handler threw for it (one the server's abort canceled is a 503, an error as any).
+    if (failure != nullptr && !client_closed)
+    {
+        span.status = {.message = exception_message(failure), .code = opentelemetry::status_code::error};
+    }
+    else if (http::status_is_server_error(code))
+    {
+        span.status = {.message = "", .code = opentelemetry::status_code::error};
+    }
+
+    (*on_end)(std::move(span));
 }
 
 }

@@ -10,6 +10,8 @@
 //   client leaving.
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
 //   allocations are counted with the server's (as they share the process): for what a stream costs.
+// And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
+// costs (see docs/plans/middleware.md), with the metrics' own work.
 #include "http/request.hpp"
 
 #include <algorithm>
@@ -46,9 +48,11 @@
 #include "http/connection_pool.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/middleware.hpp"
 #include "http/response.hpp"
 #include "http/server.hpp"
 #include "http/static_router.hpp"
+#include "instrument/middleware.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/discard_writer.hpp"
@@ -481,4 +485,7 @@ int main()
     measure_socket("over a socket, a request at a time", router, request);
     measure_socket("over a socket, to a handler that waits once", waiting, waiting_request);
     measure_http2(router);
+    measure("pipelined, through http_metrics",
+            http::chain(net::instrument::http_metrics{}, router),
+            [](std::string_view input) { return net::io::string_reader{input}; });
 }

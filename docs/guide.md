@@ -278,11 +278,51 @@ scheduler.spawn(server.serve());
   so a response still goes out; over TLS 1.2 it's answered at once (as RFC 5246 requires), after which a handler
   stopped that way can't respond. A request that arrives meanwhile isn't a leaving, and is served next. A handler that
   runs straight through, never suspending, isn't watched: it's done before a watch would help.
-- **Middleware** wraps a handler: e.g. `instrument::http_metrics{std::move(router)}` (`instrument/middleware.hpp`)
-  measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Both record a request
-  canceled before its response was sent as 499 Client Closed Request (not an error) if the client's side stopped it,
-  or as 503 Service Unavailable (an error, as any 5xx) if the server was aborted. Middleware passes values to handlers
-  in `req.extensions`.
+- **Middleware** runs around a handler. `http::chain(middleware..., handler)` (`http/middleware.hpp`) composes them
+  at compile time into one handler, which the server takes (moved in, if it can't be copied, as a router can't); the
+  first middleware runs outermost:
+
+  ```cpp
+  net::http::server server{&scheduler, std::move(*listener),
+                           net::http::chain(net::instrument::http_metrics{}, require_key{"secret"}, std::move(router))};
+  ```
+
+  A middleware is a value (its options, and any state its copies share) with a `const` `operator()` that takes the
+  request, the response and `next`, the rest of the chain, which `next(req, resp)` runs:
+
+  ```cpp
+  struct require_key
+  {
+      std::string key;
+
+      template<class Next>
+      net::coro::task<void>
+      operator()(net::http::server_request& req, net::http::response_writer& resp, Next& next) const
+      {
+          if (req.headers.get("X-Key") != key)
+          {
+              co_await resp.send(net::http::status::UNAUTHORIZED, 0);
+              co_return;
+          }
+
+          co_await next(req, resp);
+      }
+  };
+  ```
+
+  It may answer without calling `next` (as above), or `return next(req, resp);` without being a coroutine itself, if
+  its work is all before (e.g. putting a value in `req.extensions`, which is how middleware passes values to
+  handlers). It calls `next` at most once, and may swap `req.stop` for the rest of the chain (putting it back after).
+  `Next` is the chain's own object, called directly, so Clang puts the inner layers' coroutine frames in the outermost
+  one's (and a handler's, though not a router's handlers'). A middleware whose body belongs in a `.cpp` takes an
+  `http::next_handler` instead, in an `operator()` that isn't a template: a reference to the rest of the chain, called
+  indirectly (so the rest's frame is allocated, as a `std::function`'s would be). Or it keeps a few lines of template
+  in its header, calling functions in the `.cpp` before and after `next`, as the instrumentation does.
+
+  `instrument::http_metrics` (`instrument/middleware.hpp`) measures requests with Prometheus metrics, and
+  `instrument::http_tracing{on_end}` traces them. Both record a request canceled before its response was sent as 499
+  Client Closed Request (not an error) if the client's side stopped it, or as 503 Service Unavailable (an error, as
+  any 5xx) if the server was aborted.
 - **`server_config`** sets the host and port, and limits: header and body read timeouts, the write timeout, the size
   of a request's head, and how many connections are served at once. To handle a failure to listen, give the server a
   listener from `listener::make()` instead of a host and port.
@@ -383,7 +423,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `listen.hpp`, `tcp.hpp`                | TCP sockets                                                 |
 | `dns.hpp`, `ip_addr.hpp`, `url.hpp`    | names, addresses and URLs                                 |
 | `http/client.hpp`                      | the HTTP client                                           |
-| `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp` | the HTTP server                   |
+| `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp` | the HTTP server |
 | `tls/tls.hpp`                          | TLS                                                       |
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |

@@ -24,6 +24,7 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/middleware.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
@@ -131,7 +132,7 @@ std::optional<std::string> attribute(const opentelemetry::span& span, std::strin
 // NOTE: one test, as the registry is global: nothing else registers these metrics.
 TEST_CASE("http_metrics measures requests, by method, route and status", "[instrument][middleware][metrics]")
 {
-    const net::instrument::http_metrics handler{test_router()};
+    const auto handler = http::chain(net::instrument::http_metrics{}, test_router());
 
     CHECK_FALSE(call(handler, "/users/1"));
     CHECK_FALSE(call(handler, "/users/2"));
@@ -183,8 +184,9 @@ TEST_CASE("http_tracing makes a server span for each request", "[instrument][mid
 {
     std::vector<opentelemetry::span> spans;
 
-    const net::instrument::http_tracing handler{test_router(),
-                                                [&](opentelemetry::span&& s) { spans.push_back(std::move(s)); }};
+    const auto handler =
+        http::chain(net::instrument::http_tracing{[&](opentelemetry::span&& s) { spans.push_back(std::move(s)); }},
+                    test_router());
 
     SECTION("continuing the request's trace")
     {
@@ -306,8 +308,9 @@ TEST_CASE("handlers can continue the request's trace", "[instrument][middleware]
 
     SECTION("with http_tracing")
     {
-        const net::instrument::http_tracing handler{std::move(router),
-                                                    [&](opentelemetry::span&& s) { spans.push_back(std::move(s)); }};
+        const auto handler =
+            http::chain(net::instrument::http_tracing{[&](opentelemetry::span&& s) { spans.push_back(std::move(s)); }},
+                        std::move(router));
 
         http::headers incoming;
         incoming.set("traceparent"sv, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"sv);
@@ -341,7 +344,7 @@ TEST_CASE("handlers can continue the request's trace", "[instrument][middleware]
 
 TEST_CASE("the trace is removed from the request once it's handled", "[instrument][middleware][tracing]")
 {
-    const net::instrument::http_tracing handler{test_router(), [](const opentelemetry::span&) {}};
+    const auto handler = http::chain(net::instrument::http_tracing{[](const opentelemetry::span&) {}}, test_router());
 
     http::server_request req{
         .method  = http::request_method::GET,

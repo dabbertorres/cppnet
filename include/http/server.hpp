@@ -83,10 +83,15 @@ public:
     // throws, a 500 Internal Server Error is sent (if nothing was yet), and the connection is closed. Neither is sent
     // for a request whose token (server_request::stop) was stopped: the connection's closed (an HTTP/2 stream reset)
     // instead.
+    //
+    // handler is a request_handler, or something that becomes one: e.g. a router (see http/router.hpp), or a chain of
+    // middleware and a handler (see http/middleware.hpp). One that isn't copyable (e.g. a router, or a chain with one)
+    // is moved in, and shared by make_handler().
     server(io::scheduler* scheduler, net::listener listener, request_handler handler, const server_config& cfg = {});
 
-    server(io::scheduler* scheduler, net::listener listener, router&& handler, const server_config& cfg = {})
-        : server{scheduler, std::move(listener), make_handler(std::move(handler)), cfg}
+    template<move_only_handler H>
+    server(io::scheduler* scheduler, net::listener listener, H&& handler, const server_config& cfg = {})
+        : server{scheduler, std::move(listener), make_handler(std::forward<H>(handler)), cfg}
     {}
 
     server(io::scheduler*       scheduler,
@@ -97,8 +102,9 @@ public:
         : server{scheduler, net::listener{scheduler, cfg.host, cfg.port, network::tcp}, std::move(handler), cfg}
     {}
 
-    server(io::scheduler* scheduler, router&& handler, const server_config& cfg = server_config{})
-        : server{scheduler, make_handler(std::move(handler)), cfg}
+    template<move_only_handler H>
+    server(io::scheduler* scheduler, H&& handler, const server_config& cfg = server_config{})
+        : server{scheduler, make_handler(std::forward<H>(handler)), cfg}
     {}
 
     server(const server&)            = delete;

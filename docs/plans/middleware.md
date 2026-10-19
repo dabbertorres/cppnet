@@ -1,7 +1,8 @@
 # Plan: a standard shape for HTTP server middleware
 
 Status: planned (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
-questions at the end were decided. Stage 1 (measuring) is done: B kept, with the costs corrected (Costs).
+questions at the end were decided. Stage 1 (measuring) is done: B kept, with the costs corrected (Costs). Stage 2 (the
+shape) is done.
 
 ## Goal
 
@@ -68,7 +69,7 @@ calls directly is elided too, but a router never is (below), so a chain around a
 request more than the router alone, however many layers it has.
 
 The server's constructor already takes a `request_handler`; a chain converts to one (`make_handler` if it isn't
-copyable). No change to the server.
+copyable: the server's constructors that took a `router&&` take any handler that can be moved but not copied).
 
 ### Middleware whose work belongs in a `.cpp`
 
@@ -161,7 +162,15 @@ throwaway layers that do nothing but `co_await next`; the prototype is not in th
 1. **Measure:** the benchmark above, with throwaway middleware of both shapes. Report before going on. Done as above
    (Costs): B kept, on the user's decision, with the claims corrected (a router isn't elided).
 2. **The shape:** the concept, `chain`, `next_handler`, the tests; the instrumentation rewritten (hooks), the example,
-   the guide.
+   the guide. Done as above (`http/middleware.hpp`; no example used the instrumentation): `chain()` makes an
+   `http::chained_handler<Items...>`, checked with the `middleware` concept and a `handler` one (what a chain ends
+   with); the server's `router&&` constructors became templates on `move_only_handler` (in `http/router.hpp`), wrapped
+   by `make_handler`, so a chain around a router is moved in. The remarks (Clang 23, `-O3`) match stage 1's with the
+   real chain: three layers and a handler are one frame; `http_tracing` is elided into `http_metrics`, and a handler
+   into `http_tracing`; a layer returning `next`'s task has no frame; a router isn't elided into `http_metrics`; a
+   `next_handler` middleware is elided into the layer that calls it, but what it calls isn't. `bench_request` measures
+   `chain(http_metrics{}, router)`, pipelined: 2.4 allocations per request (the router alone's 1.4, plus the metrics'
+   frame).
 3. **Some routes only:** `static_router`'s `use()` in groups, the runtime router's `use()` on subrouters.
 4. **The timeout middleware**, with the source-linking helper (measuring its timer first): `handler-cancellation.md`'s
    stage 5 points here.

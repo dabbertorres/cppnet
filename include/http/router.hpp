@@ -18,9 +18,9 @@
 namespace net::http
 {
 
-// request_handler is what a server calls for each request: e.g. a router, or middleware wrapping one (see
-// instrument/middleware.hpp), or a route's handler. It may take the request as const (most handlers only read it), or
-// not (e.g. middleware that adds to its extensions).
+// request_handler is what a server calls for each request: e.g. a router, or a chain of middleware around one (see
+// http/middleware.hpp), or a route's handler. It may take the request as const (most handlers only read it), or not
+// (e.g. one that adds to its extensions).
 using request_handler = std::function<coro::task<void>(server_request&, response_writer&)>;
 
 // handler_func is a route's handler (see router): a request_handler.
@@ -35,6 +35,13 @@ request_handler make_handler(H&& h)
     auto shared = std::make_shared<std::decay_t<H>>(std::forward<H>(h));
     return [shared](server_request& req, response_writer& resp) { return std::invoke(*shared, req, resp); };
 }
+
+// move_only_handler is a handler that can be moved but not copied (e.g. a router, or a chain holding one: see
+// http/middleware.hpp), as an rvalue: it can't be a request_handler itself (a std::function, which copies what it
+// holds), but make_handler can make one of it, as the server's constructors do.
+template<typename H>
+concept move_only_handler = !std::is_reference_v<H> && std::move_constructible<H> && !std::copy_constructible<H>
+                         && std::is_invocable_r_v<coro::task<void>, H&, server_request&, response_writer&>;
 
 // router routes requests to handlers by method and path.
 //

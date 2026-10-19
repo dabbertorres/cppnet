@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -8,23 +10,25 @@
 #include "coro/task.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
-#include "http/router.hpp"
 #include "instrument/opentelemetry/protocol.hpp"
 #include "instrument/prometheus/buckets.hpp"
 
-// HTTP server middleware: request handlers that wrap another (e.g. a router) to measure or trace the requests it
-// handles. They're opt-in: e.g.
+// HTTP server middleware (see http/middleware.hpp) to measure or trace the requests that the rest of the chain (e.g. a
+// router) handles. They're opt-in: e.g.
 //
-//   http::server server{&scheduler, instrument::http_metrics{std::move(router)}};
+//   http::server server{&scheduler, http::chain(instrument::http_metrics{}, std::move(router))};
 //
-// The response status they see is the one the server sends: 200 OK if the handler didn't send a response, or 500
-// Internal Server Error if it threw before it did. A request canceled before its final response was sent (its
-// http::server_request::stop stopped), whatever the handler did (the server sends no response it didn't send, nor a
-// 500), is recorded as 499 Client Closed Request (as nginx logs it) if the client's side stopped it (e.g. it reset its
-// HTTP/2 stream, or the connection ended), or 503 Service Unavailable if the server was aborted
+// Each is a few lines of coroutine around the rest of the chain, calling out-of-line functions before and after it (so
+// a chain's inner layers are still elided into its outer one's frame). They rethrow what the rest of the chain throws.
+//
+// The response status they see is the one the server sends: 200 OK if the rest of the chain didn't send a response, or
+// 500 Internal Server Error if it threw before it did. A request canceled before its final response was sent (its
+// http::server_request::stop stopped), whatever the rest of the chain did (the server sends no response it didn't send,
+// nor a 500), is recorded as 499 Client Closed Request (as nginx logs it) if the client's side stopped it (e.g. it
+// reset its HTTP/2 stream, or the connection ended), or 503 Service Unavailable if the server was aborted
 // (http::server_request::aborted: abort(), its destructor, or the scheduler's request_stop()). The route is the pattern
-// of the route that matched (see http::server_request::route): wrapping a router, rather than being wrapped by one,
-// means it's been set.
+// of the route that matched (see http::server_request::route), which a router in the rest of the chain sets, so they
+// read it once that returns.
 namespace net::instrument
 {
 
@@ -34,26 +38,53 @@ struct http_metrics_options
     std::vector<double> buckets = prometheus::default_buckets();
 };
 
-// http_metrics measures the requests its handler handles, with Prometheus metrics (which are registered when it's
-// constructed):
+// http_metrics measures the requests the rest of its chain handles, with Prometheus metrics (which are registered when
+// it's constructed):
 //
 //   http_server_active_requests                               Number of HTTP requests being handled.
 //   http_server_request_duration_seconds{method,route,code}  Duration of HTTP requests in seconds.
 //
 // method is the request's method ("_OTHER" if it's unknown), route the pattern of the route that matched (empty if
 // none did, so that unmatched paths don't each make a series), and code the response's status. A request's duration
-// is until the handler returns (before the response is flushed), and the histogram's count is the number of requests.
+// is until the rest of the chain returns (before the response is flushed), and the histogram's count is the number of
+// requests.
 //
-// Copies share their metrics, and the handler.
+// Copies share their metrics.
 class http_metrics
 {
 public:
-    explicit http_metrics(http::request_handler next, http_metrics_options options = {});
-    explicit http_metrics(http::router&& next, http_metrics_options options = {});
+    explicit http_metrics(http_metrics_options options = {});
 
-    coro::task<void> operator()(http::server_request& req, http::response_writer& resp) const;
+    template<class Next>
+    coro::task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        const auto start = begin();
+
+        // NOTE: a co_await can't be in a catch block, so a failure is rethrown after it.
+        std::exception_ptr failure;
+        try
+        {
+            co_await next(req, resp);
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+
+        end(start, req, resp, failure != nullptr);
+        if (failure != nullptr) std::rethrow_exception(failure);
+    }
 
 private:
+    // begin counts a request as active, and returns when it started.
+    [[nodiscard]] std::chrono::steady_clock::time_point begin() const;
+
+    // end records a request that started at start, and whether the rest of the chain threw.
+    void end(std::chrono::steady_clock::time_point start,
+             const http::server_request&           req,
+             const http::response_writer&          resp,
+             bool                                  threw) const;
+
     struct state;
     std::shared_ptr<state> shared;
 };
@@ -74,7 +105,7 @@ using span_handler = std::function<void(opentelemetry::span&&)>;
 //   auto resp = co_await client.send(out);
 //   trace->end(std::move(child));
 //
-// It's only valid until the handler returns, when http_tracing removes it.
+// It's only valid until the rest of the chain returns, when http_tracing removes it.
 class trace
 {
 public:
@@ -101,7 +132,8 @@ private:
     const span_handler*  on_end;
 };
 
-// http_tracing makes a server span for each request its handler handles: the child of the span in the request's trace
+// http_tracing makes a server span for each request the rest of its chain handles: the child of the span in the
+// request's trace
 // context (its traceparent and tracestate headers, see opentelemetry::tracecontext), or else the root of a new trace,
 // which is sampled. Every finished span is passed to on_end, sampled or not (its flags say).
 //
@@ -114,18 +146,44 @@ private:
 // The handler can get the trace from the request's extensions (see trace): e.g. to propagate it to the requests it
 // makes.
 //
-// Copies share the handler and on_end.
+// Copies share on_end.
 class http_tracing
 {
 public:
-    http_tracing(http::request_handler next, span_handler on_end);
-    http_tracing(http::router&& next, span_handler on_end);
+    explicit http_tracing(span_handler on_end);
 
-    coro::task<void> operator()(http::server_request& req, http::response_writer& resp) const;
+    template<class Next>
+    coro::task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        opentelemetry::span span;
+        begin(req, span);
+
+        std::exception_ptr failure;
+        try
+        {
+            co_await next(req, resp);
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+
+        end(req, resp, std::move(span), failure);
+        if (failure != nullptr) std::rethrow_exception(failure);
+    }
 
 private:
-    struct state;
-    std::shared_ptr<const state> shared;
+    // begin starts span, the request's server span, and puts its trace in the request's extensions.
+    void begin(http::server_request& req, opentelemetry::span& span) const;
+
+    // end removes the trace from the request's extensions, ends span (with what the rest of the chain did, and the
+    // exception it threw, if it did), and passes it to on_end.
+    void end(http::server_request&        req,
+             const http::response_writer& resp,
+             opentelemetry::span&&        span,
+             const std::exception_ptr&    failure) const;
+
+    std::shared_ptr<const span_handler> on_end;
 };
 
 }
