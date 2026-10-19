@@ -1,14 +1,14 @@
 # Plan: a standard shape for HTTP server middleware
 
 Status: planned (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
-questions at the end were decided.
+questions at the end were decided. Stage 1 (measuring) is done: B kept, with the costs corrected (Costs).
 
 ## Goal
 
 One way to write middleware: code that runs around a request's handler (measuring it, tracing it, checking its
 credentials, giving it a deadline), whether it wraps everything a server serves or only some of its routes. It should
-cost nothing per request beyond what the middleware itself does (no allocation, no `std::function` per layer), as
-`bench_request` measures the rest of a request. The existing middleware (`instrument::http_metrics` and
+cost as little per request beyond what the middleware itself does as the compiler allows (no allocation or
+`std::function` per layer: Costs has what's left), as `bench_request` measures the rest of a request. The existing middleware (`instrument::http_metrics` and
 `http_tracing`) are rewritten to it; the timeout middleware (stage 5 of `handler-cancellation.md`) is the first new
 one.
 
@@ -59,9 +59,13 @@ used on several routers or groups.
 `http::chain(a, b, handler)` returns one value (a type holding `a`, `b` and `handler`, by value) that's itself a
 handler (`operator()(req, resp)`): `a` runs outermost, then `b`, then `handler`. Each layer's `next` is a small object
 of the chain's that calls the following layer directly, so `co_await next(req, resp)` is a direct call of a coroutine
-in a `co_await`, which Clang's `coro-elide` can elide into the calling layer's frame: the chain should allocate one
-frame for its outermost layer (the server calls it through `request_handler`, an indirect call, as it does a router
-today), with the inner layers and the router elided into it. **That's the expectation to measure first** (Costs).
+in a `co_await` once the `next` object's call is inlined, which Clang's `coro-elide` elides into the calling layer's
+frame (measured: Costs). The `next` objects aren't coroutines themselves (that would double the frames where nothing's
+elided, as on GCC): empty bases of the chain (CRTP), reaching the following layer with `std::get`, so the chain stays
+copyable and nothing in it points into itself. The chain allocates one frame for its outermost layer (the server calls
+it through `request_handler`, an indirect call), with the inner layers elided into it; a handler the innermost layer
+calls directly is elided too, but a router never is (below), so a chain around a router costs one allocation per
+request more than the router alone, however many layers it has.
 
 The server's constructor already takes a `request_handler`; a chain converts to one (`make_handler` if it isn't
 copyable). No change to the server.
@@ -116,12 +120,31 @@ sent) is decided then too.
 
 ## Costs
 
-The point of B over A is the allocations. Before the shape is built on, measure with `bench_request` (a Release build,
-alternating runs, as stage 4 of the cancellation plan did): the socket test with no middleware, one layer and three
-layers (layers that do nothing but `co_await next`), as option A (today's: `std::function` per layer) and as B. B
-should add no allocations per request and be within noise of no middleware. If Clang doesn't elide the inner layers
-(it elides only calls not in loops; GCC doesn't elide at all, so it's Clang's builds that are measured), B's case
-rests on the rest (no `shared_ptr`, no `std::function`, reuse), and that goes back to the user before going on.
+The point of B over A is the allocations. Stage 1 measured them (2026-10-18; Clang 23.1.3, `-O3`, its
+`-Rpass=coro-elide` remarks, and `bench_request` in Release with 2 workers, 7 rounds of each configuration, median;
+throwaway layers that do nothing but `co_await next`; the prototype is not in the repo):
+
+| Configuration | Socket test | Pipelined, in memory | Allocations per request (pipelined) |
+|---|---|---|---|
+| No middleware (the router, through a `request_handler`) | 27.4 us | 1116 ns | 1.4 |
+| A, 1 layer / 3 layers | 27.6 / 27.8 us | 1196 / 1333 ns | 2.4 / 4.4 |
+| B around the router, 1 layer / 3 layers | 28.2 / 27.8 us | 1197 / 1283 ns | 2.4 / 2.4 |
+| A, 3 layers, calling the handler directly | 27.7 us | 1309 ns | 4.4 |
+| B, 3 layers, calling the handler directly | 27.7 us | 1146 ns | 1.4 |
+| The handler alone, no router | 27.3 us | 1090 ns | 1.4 |
+
+- **B's inner layers are elided**, and so is a handler the innermost layer calls directly, and a layer that returns
+  `next`'s task without a coroutine of its own costs no frame; the hooks' shape (opaque calls before and after, a
+  `try`/`catch`) keeps elision.
+- **A router is never elided into the layer that calls it:** `static_router` dispatches through a table of function
+  pointers, and even a `switch` between direct calls isn't elided (Clang doesn't elide a task chosen among several
+  coroutines). So `chain(layers..., router)` costs one allocation per request, flat, where A costs one per layer; the
+  allocation-free way is middleware on routes (stage 3's `use()`), whose innermost layer calls the handler. Frame
+  pooling, not the router's dispatch, is what would take the last one.
+- **An elided layer isn't free:** in memory, about 18 ns per layer in front of a handler called directly, about 50 ns in
+  front of the router (why the two differ wasn't found). On a socket, every configuration is within noise: the round
+  trip through the kernel hides them.
+- **GCC elides nothing**, so there B costs a frame per layer, as A does, saving only the `std::function` call.
 
 ## Testing
 
@@ -135,7 +158,8 @@ rests on the rest (no `shared_ptr`, no `std::function`, reuse), and that goes ba
 
 ## Stages
 
-1. **Measure:** the benchmark above, with throwaway middleware of both shapes. Report before going on.
+1. **Measure:** the benchmark above, with throwaway middleware of both shapes. Report before going on. Done as above
+   (Costs): B kept, on the user's decision, with the claims corrected (a router isn't elided).
 2. **The shape:** the concept, `chain`, `next_handler`, the tests; the instrumentation rewritten (hooks), the example,
    the guide.
 3. **Some routes only:** `static_router`'s `use()` in groups, the runtime router's `use()` on subrouters.
