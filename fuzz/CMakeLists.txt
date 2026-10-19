@@ -52,3 +52,7 @@ add_fuzzer(
   "${PROJECT_SOURCE_DIR}/src/io/limit_writer.cpp"
   "${PROJECT_SOURCE_DIR}/src/io/util.cpp"
 )
+add_fuzzer(
+  fuzz_dns dns.cpp "${PROJECT_SOURCE_DIR}/src/exception.cpp"
+  "${PROJECT_SOURCE_DIR}/src/dns/error.cpp" "${PROJECT_SOURCE_DIR}/src/dns/message.cpp"
+)

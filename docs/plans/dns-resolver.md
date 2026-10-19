@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 3 are
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 4 are
 done (2026-10-19); "Where things stand" describes the code before them.
 
 ## Goal
@@ -326,6 +326,19 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
    (with the OPT record), and responses decoded defensively (bounds; compression pointers only backwards, at most a
    fixed number per name, so loops can't hang it); only A, AAAA and CNAME data decoded, other records skipped by
    length; the other 1987 record types dropped. `fuzz_dns`. Independent of 1 to 3; can land any time.
+   **Done** as above, internal as HPACK's codec is (in `include/`, for the native back end and the tests, not for
+   applications). `dns::errc` and `condition` moved to `dns/error.hpp` (which `resolver.hpp` includes), so the codec
+   doesn't pull in the scheduler. Names are text, labels joined by dots, without a final dot: a label with a dot in it
+   is `bad_response`, as it couldn't be told apart (host names have none). A `record`'s data is a `std::variant` of
+   `ipv4_addr`, `ipv6_addr` and `cname`, which is its type; the OPT record is `message::edns` (its UDP size, version and
+   DO bit; options skipped), its extended RCODE joined to the header's 12-bit `rcode`. `make_query()` sets RD and class
+   IN. `encode()` doesn't compress (as HPACK's encoder never indexes), and fails with `std::errc::invalid_argument` for
+   what it can't encode. `decode()` requires each pointer to point before the last one's target (before the name's
+   start, for the first), so targets strictly decrease, and follows at most 10 per name (Go's dnsmessage's limit);
+   it ignores bytes after the last record, skips an OPT record outside the additional section, and rejects a second.
+   `rcode_error()`: NXDOMAIN is `name_not_found`, REFUSED `refused`, and the rest (FORMERR, NOTIMP, unknown codes)
+   `server_failure`; stage 5 checks for FORMERR first, to retry without EDNS(0). The tests are on hand-made messages
+   (RFC 1035's compression example among them), not captured replies.
 5. **The native back end**, opt-in (`backend::native`): configuration and its parsers, queries over UDP and TCP, IDs,
    EDNS(0), retries, search, `hosts`, CNAMEs, RFC 6724 order. The fake nameserver.
 6. **`automatic`**: Go's rule, and `NET_DNS`. Until this lands, `automatic` is the system back end.
