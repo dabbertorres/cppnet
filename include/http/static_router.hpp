@@ -16,10 +16,12 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "http/middleware.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/route_pattern.hpp"
 #include "util/fixed_string.hpp"
+#include "util/small_vector.hpp"
 
 // static_router is a router whose routes are known at compile time: their patterns are template arguments, so that
 // the routing tree is built while compiling, as tables (each node's literal segments in a perfect hash table), and
@@ -39,6 +41,25 @@
 //         group("/api"_route, GET("/health"_route, health)));
 //
 // Only the patterns need to be known at compile time: handlers are values (e.g. lambdas with captures).
+//
+// Middleware (see http/middleware.hpp) runs around some routes only with use(), first in a group: it applies to every
+// route in the group, and in the groups within it, but not to the group's 404s and 405s, which have no route:
+//
+//     auto routes = make_static_router(
+//         GET("/health"_route, health),
+//         group("/api"_route, use(auth{}, limits{}),
+//               GET("/users/:id"_route, get_user),
+//               group("/admin"_route, use(audit{}), POST("/reset"_route, reset))));
+//
+// A route's middleware is composed with its handler at compile time, as chain() composes it: its outermost group's
+// middleware runs first (auth, limits, then audit, for /api/admin/reset), and the innermost layer calls the handler
+// (with its params, if it takes them) directly, so that Clang puts the layers' and the handler's coroutine frames in
+// the outermost layer's: middleware on routes costs no allocation per request over the handler alone. (A chain around
+// the whole router costs one, as a router's handlers aren't elided into the layer that calls it. So does a handler
+// given as a function, which is a pointer, called indirectly: a lambda calling the function is elided.) use() first in
+// make_static_router applies to every route. Each route holds its own copies of its middleware (one value used on
+// several routes is copied to each, so its state is shared as its copies share it, e.g. by a shared_ptr), made once,
+// with the router: middleware that can't be copied can be used on one route only.
 
 namespace net::http
 {
@@ -136,6 +157,30 @@ private:
     std::size_t           offset = 0;
 };
 
+namespace detail
+{
+
+    // uses is the middleware use() gives a group.
+    template<typename... Middleware>
+    struct uses
+    {
+        std::tuple<Middleware...> layers;
+    };
+
+}
+
+// use is middleware for a group's routes (see the top of this header): the first argument of group(), or of
+// make_static_router(). The first middleware runs outermost.
+template<typename... Middleware>
+constexpr detail::uses<std::decay_t<Middleware>...> use(Middleware&&... layers)
+{
+    static_assert((middleware<std::decay_t<Middleware>> && ...),
+                  "use() takes middleware: values with a const operator()(server_request&, response_writer&, Next&) "
+                  "returning coro::task<void> (see http/middleware.hpp)");
+
+    return {{std::forward<Middleware>(layers)...}};
+}
+
 // route_entry is one route: a method and pattern, and the handler for them.
 template<request_method Method, util::fixed_string Pattern, typename Handler>
 struct route_entry
@@ -219,6 +264,30 @@ namespace detail
     struct is_route_entry<route_entry<M, P, H>> : std::true_type
     {};
 
+    template<typename T>
+    struct is_uses : std::false_type
+    {};
+
+    template<typename... Middleware>
+    struct is_uses<uses<Middleware...>> : std::true_type
+    {};
+
+    // layered is a route's handler with the middleware it runs in (from use()), outermost first.
+    template<typename Layers, typename Handler>
+    struct layered
+    {
+        Layers  layers;
+        Handler handler;
+    };
+
+    template<typename T>
+    struct is_layered : std::false_type
+    {};
+
+    template<typename Layers, typename Handler>
+    struct is_layered<layered<Layers, Handler>> : std::true_type
+    {};
+
     // flatten makes one tuple of route entries, from entries and tuples of them (from group).
     template<typename... Args>
     constexpr auto flatten(Args&&... args)
@@ -227,11 +296,80 @@ namespace detail
         const auto as_tuple = []<typename A>(A&& arg)
         {
             if constexpr (is_route_entry<std::decay_t<A>>::value)
+            {
                 return std::tuple<std::decay_t<A>>{std::forward<A>(arg)};
-            else return std::forward<A>(arg);
+            }
+            else if constexpr (is_uses<std::decay_t<A>>::value)
+            {
+                static_assert(!is_uses<std::decay_t<A>>::value,
+                              "use() comes first in a group (or in make_static_router), before its routes");
+                return std::tuple<>{};
+            }
+            else
+            {
+                return std::forward<A>(arg);
+            }
         };
 
         return std::tuple_cat(as_tuple(std::forward<Args>(args))...);
+    }
+
+    // add_layers puts layers around entry's handler, outside any it has already (from a group within).
+    template<typename... Middleware, request_method M, util::fixed_string P, typename H>
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): its handler is moved from.
+    constexpr auto add_layers(std::tuple<Middleware...>&& layers, route_entry<M, P, H>&& entry)
+    {
+        if constexpr (is_layered<H>::value)
+        {
+            auto all = std::tuple_cat(std::move(layers), std::move(entry.handler.layers));
+            return route_entry<M, P, layered<decltype(all), decltype(entry.handler.handler)>>{
+                {.layers = std::move(all), .handler = std::move(entry.handler.handler)}
+            };
+        }
+        else
+        {
+            return route_entry<M, P, layered<std::tuple<Middleware...>, H>>{
+                {.layers = std::move(layers), .handler = std::move(entry.handler)}
+            };
+        }
+    }
+
+    // layers_for is the middleware for one of a group's routes: a copy, or (for the last) the middleware itself.
+    template<bool Last, typename Layers>
+    constexpr Layers layers_for(Layers& layers)
+    {
+        if constexpr (Last) return std::move(layers);
+        else return layers;
+    }
+
+    // apply_uses puts used's middleware around each of entries' handlers.
+    template<typename... Middleware, typename... Entries>
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): its entries are moved from.
+    constexpr auto apply_uses(uses<Middleware...> used, std::tuple<Entries...>&& entries)
+    {
+        constexpr auto count = sizeof...(Entries);
+
+        static_assert(count <= 1 || (std::copy_constructible<Middleware> && ...),
+                      "use() copies its middleware to each of the group's routes: middleware that can't be copied can "
+                      "be used on one route only");
+
+        return [&]<std::size_t... I>(std::index_sequence<I...>)
+        {
+            // NOTE: a braced list is evaluated in order, so the last route's layers, moved from used, are taken last.
+            return std::tuple{add_layers(layers_for<I + 1 == count>(used.layers), std::move(std::get<I>(entries)))...};
+        }(std::index_sequence_for<Entries...>{});
+    }
+
+    // flatten_group is flatten for a group's (or make_static_router's) arguments: the first may be use()'s
+    // middleware, which is put around each of the rest's routes.
+    constexpr std::tuple<> flatten_group() { return {}; }
+
+    template<typename First, typename... Rest>
+    constexpr auto flatten_group(First&& first, Rest&&... rest)
+    {
+        if constexpr (is_uses<std::decay_t<First>>::value)
+            return apply_uses(std::decay_t<First>{std::forward<First>(first)}, flatten(std::forward<Rest>(rest)...));
+        else return flatten(std::forward<First>(first), std::forward<Rest>(rest)...);
     }
 
     template<util::fixed_string Prefix, request_method M, util::fixed_string P, typename H>
@@ -244,12 +382,13 @@ namespace detail
 }
 
 // group prefixes routes (or other groups) with prefix: e.g. group("/api"_route, GET("/health"_route, h)) is
-// GET("/api/health"_route, h).
+// GET("/api/health"_route, h). Its first argument may be use(...): middleware for each of its routes (see the top of
+// this header).
 template<util::fixed_string Prefix, typename... Entries>
 constexpr auto group(route<Prefix> /*unused*/, Entries&&... entries)
 {
     return std::apply([](auto&&... flat) { return std::tuple{detail::prefixed<Prefix>(std::move(flat))...}; },
-                      detail::flatten(std::forward<Entries>(entries)...));
+                      detail::flatten_group(std::forward<Entries>(entries)...));
 }
 
 namespace detail
@@ -559,6 +698,64 @@ namespace detail
     concept takes_params_by_reference = requires { typename handler_traits<H>::params_type; }
                                      && std::is_reference_v<typename handler_traits<H>::params_type>;
 
+    // route_call calls a route's handler, with the route's params if it takes them. It isn't a coroutine: calling it
+    // calls the handler.
+    template<util::fixed_string Pattern, typename Handler>
+    struct route_call
+    {
+        Handler handler;
+
+        coro::task<void> operator()(server_request& req, response_writer& resp) const
+        {
+            if constexpr (std::invocable<const Handler&, server_request&, response_writer&, params<Pattern>>)
+            {
+                // the params are made for the call, which returns the handler's task before it runs: a reference
+                // would dangle.
+                static_assert(!takes_params_by_reference<Handler>,
+                              "a handler takes its params by value (they're a pointer and an index)");
+
+                return handler(req, resp, params<Pattern>{req});
+            }
+            else
+            {
+                static_assert(std::invocable<const Handler&, server_request&, response_writer&>,
+                              "a route's handler is called with (server_request&, response_writer&), and its route's "
+                              "params if it takes them");
+
+                return std::invoke(handler, req, resp);
+            }
+        }
+    };
+
+    // make_route makes what the router calls for a route: its handler, or a chain of its middleware around it.
+    template<request_method M, util::fixed_string P, typename H>
+    // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved): its handler is moved from.
+    constexpr auto make_route(route_entry<M, P, H>&& entry)
+    {
+        if constexpr (is_layered<H>::value)
+        {
+            using call_type = route_call<P, decltype(entry.handler.handler)>;
+
+            return std::apply(
+                // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward): they are, into the chain.
+                [&entry]<typename... Layers>(Layers&&... items)
+                {
+                    return chained_handler<std::decay_t<Layers>..., call_type>{
+                        std::in_place,
+                        std::forward<Layers>(items)...,
+                        call_type{std::move(entry.handler.handler)}};
+                },
+                std::move(entry.handler.layers));
+        }
+        else
+        {
+            return route_call<P, H>{std::move(entry.handler)};
+        }
+    }
+
+    template<typename Entry>
+    using route_type = decltype(make_route(std::declval<Entry>()));
+
     // allowed_methods lists the methods n handles, for an Allow header.
     std::string allowed_methods(const node& n);
 
@@ -584,7 +781,7 @@ class static_router
 
 public:
     explicit constexpr static_router(Entries... entries)
-        : entries{std::move(entries)...}
+        : routes{detail::make_route(std::move(entries))...}
     {}
 
     // operator() routes the request: it calls the handler for the request's method and path, or responds 404 Not
@@ -606,35 +803,11 @@ public:
     }
 
 private:
-    template<std::size_t I>
-    using entry_type = std::tuple_element_t<I, std::tuple<Entries...>>;
-
-    template<std::size_t I>
-    using handler_type = decltype(entry_type<I>::handler);
-
-    template<std::size_t I>
-    static constexpr bool takes_params =
-        std::invocable<const handler_type<I>&, server_request&, response_writer&, params<entry_type<I>::pattern>>;
-
-    // call calls the handler of route I, with its params if it takes them.
+    // call calls route I: its handler, or the chain of its middleware around it.
     template<std::size_t I>
     static coro::task<void> call(const static_router& self, server_request& req, response_writer& resp)
     {
-        const auto& handler = std::get<I>(self.entries).handler;
-
-        if constexpr (takes_params<I>)
-        {
-            // the params are made for the call, which returns the handler's task before it runs: a reference would
-            // dangle.
-            static_assert(!detail::takes_params_by_reference<handler_type<I>>,
-                          "a handler takes its params by value (they're a pointer and an index)");
-
-            return handler(req, resp, params<entry_type<I>::pattern>{req});
-        }
-        else
-        {
-            return std::invoke(handler, req, resp);
-        }
+        return std::get<I>(self.routes)(req, resp);
     }
 
     using handler_call = coro::task<void> (*)(const static_router&, server_request&, response_writer&);
@@ -643,16 +816,17 @@ private:
     static constexpr auto handlers = []<std::size_t... I>(std::index_sequence<I...>)
     { return std::array<handler_call, sizeof...(I)>{&call<I>...}; }(std::index_sequence_for<Entries...>{});
 
-    std::tuple<Entries...> entries;
+    std::tuple<detail::route_type<Entries>...> routes;
 };
 
-// make_static_router makes a static_router of routes (and groups of them).
+// make_static_router makes a static_router of routes (and groups of them). Its first argument may be use(...):
+// middleware for every route (but not the router's 404s and 405s).
 template<typename... Args>
 constexpr auto make_static_router(Args&&... args)
 {
     return std::apply([](auto&&... entries)
                       { return static_router<std::decay_t<decltype(entries)>...>{std::move(entries)...}; },
-                      detail::flatten(std::forward<Args>(args)...));
+                      detail::flatten_group(std::forward<Args>(args)...));
 }
 
 }

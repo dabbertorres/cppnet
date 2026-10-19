@@ -2,7 +2,7 @@
 
 Status: planned (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
 questions at the end were decided. Stage 1 (measuring) is done: B kept, with the costs corrected (Costs). Stage 2 (the
-shape) is done.
+shape) and stage 3 (some routes only) are done.
 
 ## Goal
 
@@ -171,7 +171,24 @@ throwaway layers that do nothing but `co_await next`; the prototype is not in th
    `next_handler` middleware is elided into the layer that calls it, but what it calls isn't. `bench_request` measures
    `chain(http_metrics{}, router)`, pipelined: 2.4 allocations per request (the router alone's 1.4, plus the metrics'
    frame).
-3. **Some routes only:** `static_router`'s `use()` in groups, the runtime router's `use()` on subrouters.
+3. **Some routes only:** `static_router`'s `use()` in groups, the runtime router's `use()` on subrouters. Done as above.
+   `static_router`: `use(...)` comes first in a group, or first in `make_static_router` (every route, but not 404s and
+   405s); anywhere else a `static_assert` says so. Each of a group's routes gets its own copies of the middleware (so
+   move-only middleware may be on one route only, also a `static_assert`), outer groups' first, made once with the
+   router into a `chained_handler` that ends in `detail::route_call` (calling the handler with its `params`, if it
+   takes them; it isn't a coroutine). The remarks (Clang 23, `-O3`): three groups' layers and a function object handler
+   (a lambda, with captures and `params`, or a struct) are one frame, each elided into the layer outside it; only the
+   outermost layer's frame is allocated, by the router's jump table, as the handler's would be without middleware. A
+   handler given as a function is a pointer in the route, called indirectly, so it isn't elided (a lambda calling it
+   is): with middleware, that's one frame more. `bench_request`, pipelined: `http_metrics` on the route is 1.4
+   allocations per request, as the router alone (around it, through `chain`, 2.4). The runtime router: `use()` applies
+   to every route under the router or subrouter it's called on, however and whenever the route was added (also
+   `router.GET("/api/x", h)` beside a `"/api"` subrouter). Each node holds its layers (its parents', then its own),
+   type-erased (a `std::function` behind a `shared_ptr`), and each route a `route_handler` on the heap, holding the
+   layers and a `next_handler` to each of its steps (so they stay put as the router moves); `use()` inserts its layer
+   into the layers of everything under it. A layer gets a `const next_handler&` to the route's next step, so nothing is
+   built per request, but each layer is called indirectly: one frame each. `bench_request`, pipelined: the runtime
+   router alone is 2.4 allocations per request (its own frame and the handler's), 3.4 with `http_metrics` on its route.
 4. **The timeout middleware**, with the source-linking helper (measuring its timer first): `handler-cancellation.md`'s
    stage 5 points here.
 

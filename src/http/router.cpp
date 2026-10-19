@@ -1,6 +1,7 @@
 #include "http/router.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -10,10 +11,12 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "http/headers.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "url.hpp"
+#include "util/small_vector.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http
@@ -24,9 +27,50 @@ using namespace std::string_view_literals;
 router& router::add(request_method method, route_pattern route, handler_func&& h)
 {
     auto& sub                   = get_subrouter(route.view());
-    sub.method_handlers[method] = std::move(h);
+    sub.method_handlers[method] = std::make_unique<route_handler>(std::move(h), sub.layers);
 
     return *this;
+}
+
+router::route_handler::route_handler(handler_func&& h, const std::vector<layer_ptr>& layers)
+    : handler{std::move(h)}
+{
+    set_layers(layers);
+}
+
+void router::route_handler::set_layers(const std::vector<layer_ptr>& from)
+{
+    layers = from;
+
+    steps.clear();
+    nexts.clear();
+    steps.reserve(layers.size() + 1);
+    nexts.reserve(layers.size() + 1);
+
+    // NOTE: the steps are all made before the next_handlers that refer to them.
+    for (std::size_t i = 0; i <= layers.size(); ++i) steps.push_back({.owner = this, .index = i});
+    for (const auto& s : steps) nexts.emplace_back(s);
+}
+
+coro::task<void> router::route_handler::step::operator()(server_request& req, response_writer& resp) const
+{
+    if (index == owner->layers.size()) return std::invoke(owner->handler, req, resp);
+
+    // NOTE: the layer's coroutine may hold the next_handler it's given by reference: it's the route's own.
+    return std::invoke(*owner->layers[index], req, resp, owner->nexts[index + 1]);
+}
+
+void router::add_layer(const layer_ptr& l) { insert_layer(layers.size(), l); }
+
+void router::insert_layer(std::size_t index, const layer_ptr& l)
+{
+    // everything under this router has its layers first (as they were made from them), so index is the same place in
+    // each: after this router's, before its subrouters' own.
+    layers.insert(layers.begin() + static_cast<std::ptrdiff_t>(index), l);
+
+    for (auto& [_, h] : method_handlers) h->set_layers(layers);
+    for (auto& [_, child] : children) child.insert_layer(index, l);
+    if (wildcard != nullptr) wildcard->insert_layer(index, l);
 }
 
 coro::task<void> router::operator()(server_request& req, response_writer& resp) const
@@ -94,7 +138,7 @@ coro::task<void> router::operator()(server_request& req, response_writer& resp) 
         co_return;
     }
 
-    co_await std::invoke(iter->second, req, resp);
+    co_await (*iter->second)(req, resp);
 }
 
 std::string router::allowed_methods() const
@@ -132,6 +176,7 @@ router& router::get_subrouter(std::string_view route)
                 current->wildcard          = std::make_unique<router>();
                 current->wildcard_name     = part.substr(1);
                 current->wildcard->pattern = current->pattern + '/' + std::string{part};
+                current->wildcard->layers  = current->layers;
             }
             else if (current->wildcard_name != part.substr(1))
             {
@@ -145,7 +190,11 @@ router& router::get_subrouter(std::string_view route)
         else
         {
             auto [iter, added] = current->children.try_emplace(std::string{part});
-            if (added) iter->second.pattern = current->pattern + '/' + std::string{part};
+            if (added)
+            {
+                iter->second.pattern = current->pattern + '/' + std::string{part};
+                iter->second.layers  = current->layers;
+            }
 
             current = &iter->second;
         }

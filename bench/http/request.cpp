@@ -11,7 +11,8 @@
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
 //   allocations are counted with the server's (as they share the process): for what a stream costs.
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
-// costs (see docs/plans/middleware.md), with the metrics' own work.
+// costs (see docs/plans/middleware.md), with the metrics' own work; and with the metrics on the route instead (use()),
+// with each router: for what middleware on routes costs.
 #include "http/request.hpp"
 
 #include <algorithm>
@@ -50,6 +51,7 @@
 #include "http/http11.hpp"
 #include "http/middleware.hpp"
 #include "http/response.hpp"
+#include "http/router.hpp"
 #include "http/server.hpp"
 #include "http/static_router.hpp"
 #include "instrument/middleware.hpp"
@@ -487,5 +489,25 @@ int main()
     measure_http2(router);
     measure("pipelined, through http_metrics",
             http::chain(net::instrument::http_metrics{}, router),
+            [](std::string_view input) { return net::io::string_reader{input}; });
+
+    // NOTE: a lambda rather than plaintext itself, whose pointer would be called indirectly: its frame not elided.
+    const auto on_route = http::make_static_router(
+        http::use(net::instrument::http_metrics{}),
+        http::GET("/plaintext"_route,
+                  [](const http::server_request& req, http::response_writer& resp) { return plaintext(req, resp); }));
+    measure("pipelined, http_metrics on the route",
+            on_route,
+            [](std::string_view input) { return net::io::string_reader{input}; });
+
+    http::router runtime;
+    runtime.GET("/plaintext", plaintext);
+    measure("pipelined, the runtime router",
+            runtime,
+            [](std::string_view input) { return net::io::string_reader{input}; });
+
+    runtime.use(net::instrument::http_metrics{});
+    measure("pipelined, the runtime router, http_metrics on the route",
+            runtime,
             [](std::string_view input) { return net::io::string_reader{input}; });
 }

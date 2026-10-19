@@ -244,7 +244,8 @@ scheduler.spawn(server.serve());
 
 - **Routes** (`http/router.hpp`) are paths whose `:name` segments are parameters (`req.path_value("name")`).
   Literal segments win over parameters. `router.subrouter("/api", [](auto& api) { api.GET(...); })` groups routes.
-  `http::static_router` (`http/static_router.hpp`) routes the same way, checked at compile time.
+  `http::static_router` (`http/static_router.hpp`) routes the same way, checked at compile time. Either can run
+  middleware around some of its routes only (below).
 - **A handler** gets the request (as `const`, or not) and a `response_writer`. `resp.send(status, length)` sends the
   head, and returns the writer for a body of that length; `resp.send(status)` is for a body whose length isn't known
   (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500. `send()` throws
@@ -318,6 +319,34 @@ scheduler.spawn(server.serve());
   `http::next_handler` instead, in an `operator()` that isn't a template: a reference to the rest of the chain, called
   indirectly (so the rest's frame is allocated, as a `std::function`'s would be). Or it keeps a few lines of template
   in its header, calling functions in the `.cpp` before and after `next`, as the instrumentation does.
+
+  Middleware can also run around some routes only, after routing (so it sees `req.route` and the path values), and
+  not for 404s and 405s. In a `static_router`, `use(...)` comes first in a group (or first in `make_static_router`,
+  for every route), and nested groups' middleware runs outermost first:
+
+  ```cpp
+  using net::http::literals::operator""_route;
+
+  auto routes = net::http::make_static_router(
+      net::http::GET("/health"_route, health),
+      net::http::group("/api"_route,
+                       net::http::use(require_key{"secret"}),
+                       net::http::GET("/users/:id"_route, get_user)));
+  ```
+
+  Each route's middleware is composed with its handler at compile time, and Clang puts the layers' and the handler's
+  coroutine frames in one: middleware on routes costs no allocation per request beyond the handler's own, where
+  `chain()` around a router costs one (a router's handlers aren't elided into the layer that calls them). That holds
+  for a handler that's a lambda or a function object: one given as a function is called through a pointer, so its
+  frame is allocated (a lambda calling it isn't). Each route holds its own copy of the middleware. In the runtime
+  router, `use()` on the router or a subrouter applies to all of its routes, and its subrouters', whenever they were
+  added:
+
+  ```cpp
+  router.subrouter("/api", [](net::http::router& api) { api.use(require_key{"secret"}).GET("/users/:id", get_user); });
+  ```
+
+  Its handlers are type-erased, and so is its middleware: each layer costs an allocation per request.
 
   `instrument::http_metrics` (`instrument/middleware.hpp`) measures requests with Prometheus metrics, and
   `instrument::http_tracing{on_end}` traces them. Both record a request canceled before its response was sent as 499

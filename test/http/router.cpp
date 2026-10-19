@@ -1,8 +1,13 @@
 #include "http/router.hpp"
 
 #include <exception> // IWYU pragma: keep
+#include <expected>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -10,11 +15,13 @@
 #include "coro/task.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/middleware.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/route_pattern.hpp"
 #include "io/string_writer.hpp"
+#include "util/type_map.hpp"
 
 namespace http = net::http;
 
@@ -254,4 +261,280 @@ TEST_CASE("routes can be made at runtime, by parsing them", "[http][router][rout
     router.GET(*pattern, ok);
 
     CHECK(route(router, http::request_method::GET, "/items/7").route == "/items/:id");
+}
+
+// middleware on routes, with use().
+namespace
+{
+
+using steps = std::vector<std::string>;
+
+// recording records its name before and after the rest of the route's chain.
+struct recording
+{
+    std::string name;
+    steps*      out;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(name + " before");
+        co_await next(req, resp);
+        out->push_back(name + " after");
+    }
+};
+
+// out_of_line is a middleware that takes a next_handler, so that its body can be out of line (as in a .cpp).
+struct out_of_line
+{
+    steps* out;
+
+    task<void> operator()(http::server_request& req, http::response_writer& resp, http::next_handler next) const;
+};
+
+task<void>
+out_of_line::operator()(http::server_request& req, http::response_writer& resp, http::next_handler next) const
+{
+    out->emplace_back("out of line before");
+    co_await next(req, resp);
+    out->emplace_back("out of line after");
+}
+
+// denying answers 401 Unauthorized itself, without calling the rest of the chain.
+struct denying
+{
+    template<class Next>
+    task<void> operator()(http::server_request& /*req*/, http::response_writer& resp, Next& /*next*/) const
+    {
+        co_await resp.send(http::status::UNAUTHORIZED, 0);
+    }
+};
+
+// seeing records the route and the "org" parameter, as middleware on a route sees them, and returns the rest's task
+// without a coroutine of its own.
+struct seeing
+{
+    steps* out;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(std::string{req.route} + " " + std::string{req.path_value("org")});
+        return next(req, resp);
+    }
+};
+
+// move_only is a middleware that can't be copied.
+struct move_only
+{
+    std::unique_ptr<std::string> name = std::make_unique<std::string>("move only");
+    steps*                       out;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(*name);
+        return next(req, resp);
+    }
+};
+
+// recorded is a handler that records that it ran, and answers 200 OK.
+struct recorded
+{
+    steps* out;
+
+    task<void> operator()(const http::server_request& /*req*/, http::response_writer& resp) const
+    {
+        out->emplace_back("handler");
+        co_await resp.send(http::status::OK, 0);
+    }
+};
+
+}
+
+TEST_CASE("a subrouter's middleware runs only for its routes", "[http][router][middleware]")
+{
+    struct test_case
+    {
+        std::string          name;
+        http::request_method method;
+        std::string          path;
+        http::status         status;
+        steps                calls;
+    };
+
+    auto tc = GENERATE(
+        test_case{
+            .name   = "the subrouter's route",
+            .method = http::request_method::GET,
+            .path   = "/api/users/1",
+            .status = http::status::OK,
+            .calls  = {"api before", "handler", "api after"}
+    },
+        test_case{.name   = "the subrouter's route, with a method it doesn't have",
+                  .method = http::request_method::POST,
+                  .path   = "/api/users/1",
+                  .status = http::status::METHOD_NOT_ALLOWED,
+                  .calls  = {}},
+        test_case{.name   = "no route in the subrouter",
+                  .method = http::request_method::GET,
+                  .path   = "/api/nope",
+                  .status = http::status::NOT_FOUND,
+                  .calls  = {}},
+        test_case{.name   = "the subrouter's prefix",
+                  .method = http::request_method::GET,
+                  .path   = "/api",
+                  .status = http::status::NOT_FOUND,
+                  .calls  = {}},
+        test_case{.name   = "another subrouter",
+                  .method = http::request_method::GET,
+                  .path   = "/other/x",
+                  .status = http::status::OK,
+                  .calls  = {"handler"}},
+        test_case{.name   = "the root",
+                  .method = http::request_method::GET,
+                  .path   = "/",
+                  .status = http::status::OK,
+                  .calls  = {"handler"}});
+    CAPTURE(tc.name);
+
+    steps calls;
+
+    http::router router;
+    router.GET("/", recorded{&calls})
+        .subrouter("/api",
+                   [&calls](http::router& api)
+                   { api.use(recording{.name = "api", .out = &calls}).GET("/users/:id", recorded{&calls}); })
+        .subrouter("/other", [&calls](http::router& other) { other.GET("/x", recorded{&calls}); });
+
+    CHECK(route(router, tc.method, tc.path).status == tc.status);
+    CHECK(calls == tc.calls);
+}
+
+TEST_CASE("subrouters' middleware runs outermost first, whenever it was added", "[http][router][middleware]")
+{
+    struct test_case
+    {
+        std::string path;
+        steps       calls;
+    };
+
+    auto tc = GENERATE(
+        test_case{
+            .path  = "/a/b/c",
+            .calls = {"top before",
+                      "a1 before", "out of line before",
+                      "b before", "handler",
+                      "b after", "out of line after",
+                      "a1 after", "top after"}
+    },
+        test_case{.path  = "/a/d",
+                  .calls = {"top before",
+                            "a1 before",
+                            "out of line before",
+                            "handler",
+                            "out of line after",
+                            "a1 after",
+                            "top after"}},
+        // added to the root under /a, outside the subrouter: it's in the subrouter all the same.
+        test_case{.path  = "/a/f",
+                  .calls = {"top before",
+                            "a1 before",
+                            "out of line before",
+                            "handler",
+                            "out of line after",
+                            "a1 after",
+                            "top after"}},
+        test_case{.path = "/e", .calls = {"top before", "handler", "top after"}},
+        // the root's use() is for its routes, not for its 404s.
+        test_case{.path = "/nope", .calls = {}});
+    CAPTURE(tc.path);
+
+    steps calls;
+
+    // every use() follows the routes it applies to.
+    http::router router;
+    router.GET("/e", recorded{&calls})
+        .subrouter("/a",
+                   [&calls](http::router& a)
+                   {
+                       a.subrouter("/b",
+                                   [&calls](http::router& b)
+                                   { b.GET("/c", recorded{&calls}).use(recording{.name = "b", .out = &calls}); })
+                           .GET("/d", recorded{&calls})
+                           .use(recording{.name = "a1", .out = &calls}, out_of_line{&calls});
+                   })
+        .GET("/a/f", recorded{&calls})
+        .use(recording{.name = "top", .out = &calls});
+
+    route(router, http::request_method::GET, tc.path);
+    CHECK(calls == tc.calls);
+}
+
+TEST_CASE("a subrouter's middleware sees the route and its parameters", "[http][router][middleware][path_value]")
+{
+    steps       calls;
+    std::string id;
+
+    http::router router;
+    router.subrouter("/orgs/:org",
+                     [&](http::router& org)
+                     {
+                         org.use(seeing{&calls})
+                             .GET("/users/:id",
+                                  [&](const http::server_request& req, http::response_writer& resp) -> task<void>
+                                  {
+                                      id = req.path_value("id");
+                                      co_await resp.send(http::status::OK, 0);
+                                  });
+                     });
+
+    CHECK(route(router, http::request_method::GET, "/orgs/acme/users/3").status == http::status::OK);
+    CHECK(id == "3");
+    CHECK(calls == steps{"/orgs/:org/users/:id acme"});
+}
+
+TEST_CASE("a subrouter's middleware may answer without calling the rest", "[http][router][middleware]")
+{
+    steps calls;
+
+    http::router router;
+    router.subrouter(
+        "/api",
+        [&calls](http::router& api)
+        {
+            api.use(recording{.name = "outer", .out = &calls}, denying{}, recording{.name = "inner", .out = &calls})
+                .GET("/x", recorded{&calls});
+        });
+
+    CHECK(route(router, http::request_method::GET, "/api/x").status == http::status::UNAUTHORIZED);
+    CHECK(calls == steps{"outer before", "outer after"});
+}
+
+TEST_CASE("HEAD handled by GET goes through the subrouter's middleware", "[http][router][middleware]")
+{
+    steps calls;
+
+    http::router router;
+    router.subrouter("/api",
+                     [&calls](http::router& api)
+                     { api.use(recording{.name = "api", .out = &calls}).GET("/x", recorded{&calls}); });
+
+    CHECK(route(router, http::request_method::HEAD, "/api/x").status == http::status::OK);
+    CHECK(calls == steps{"api before", "handler", "api after"});
+}
+
+TEST_CASE("a router's middleware may be move-only, and the router moved", "[http][router][middleware]")
+{
+    steps calls;
+
+    http::router router;
+    router.use(move_only{.out = &calls}).GET("/x", recorded{&calls}).GET("/y", recorded{&calls});
+
+    // the routes' chains refer to themselves: moving the router keeps them where they are.
+    const auto moved = std::move(router);
+
+    CHECK(route(moved, http::request_method::GET, "/x").status == http::status::OK);
+    CHECK(route(moved, http::request_method::GET, "/y").status == http::status::OK);
+    CHECK(calls == steps{"move only", "handler", "move only", "handler"});
 }

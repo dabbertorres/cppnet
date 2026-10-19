@@ -1,7 +1,9 @@
 #include "http/static_router.hpp"
 
 #include <array>
+#include <concepts>
 #include <exception> // IWYU pragma: keep
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,10 +18,12 @@
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "io/string_writer.hpp"
 #include "util/fixed_string.hpp"
+#include "util/type_map.hpp"
 
 namespace http = net::http;
 
@@ -240,6 +244,255 @@ TEST_CASE("decoded parameters stay valid as later ones are decoded", "[http][sta
         CHECK(res.path_values[2].second == "plain");
     }
 }
+
+// middleware on routes, with use().
+namespace
+{
+
+using steps = std::vector<std::string>;
+
+// recording records its name before and after the rest of the route's chain.
+struct recording
+{
+    std::string name;
+    steps*      out = nullptr;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(name + " before");
+        co_await next(req, resp);
+        out->push_back(name + " after");
+    }
+};
+
+// denying answers 401 Unauthorized itself, without calling the rest of the chain.
+struct denying
+{
+    template<class Next>
+    task<void> operator()(http::server_request& /*req*/, http::response_writer& resp, Next& /*next*/) const
+    {
+        co_await resp.send(http::status::UNAUTHORIZED, 0);
+    }
+};
+
+// seeing records the route and the "org" parameter, as middleware on a route sees them, and returns the rest's task
+// without a coroutine of its own.
+struct seeing
+{
+    steps* out;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(std::string{req.route} + " " + std::string{req.path_value("org")});
+        return next(req, resp);
+    }
+};
+
+// move_only is a middleware that can't be copied.
+struct move_only
+{
+    std::unique_ptr<std::string> name = std::make_unique<std::string>("move only");
+    steps*                       out  = nullptr;
+
+    template<class Next>
+    task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
+    {
+        out->push_back(*name);
+        return next(req, resp);
+    }
+};
+
+// recorded is a handler that records that it ran, and answers 200 OK.
+struct recorded
+{
+    steps* out;
+
+    task<void> operator()(const http::server_request& /*req*/, http::response_writer& resp) const
+    {
+        out->emplace_back("handler");
+        co_await resp.send(http::status::OK, 0);
+    }
+};
+
+}
+
+TEST_CASE("a group's middleware runs only for its routes", "[http][static_router][middleware]")
+{
+    struct test_case
+    {
+        std::string          name;
+        http::request_method method;
+        std::string          path;
+        http::status         status;
+        steps                calls;
+    };
+
+    auto tc = GENERATE(
+        test_case{
+            .name   = "the group's route",
+            .method = http::request_method::GET,
+            .path   = "/api/users/1",
+            .status = http::status::OK,
+            .calls  = {"api before", "handler", "api after"}
+    },
+        test_case{.name   = "the group's route, with a method it doesn't have",
+                  .method = http::request_method::POST,
+                  .path   = "/api/users/1",
+                  .status = http::status::METHOD_NOT_ALLOWED,
+                  .calls  = {}},
+        test_case{.name   = "no route in the group",
+                  .method = http::request_method::GET,
+                  .path   = "/api/nope",
+                  .status = http::status::NOT_FOUND,
+                  .calls  = {}},
+        test_case{.name   = "the group's prefix",
+                  .method = http::request_method::GET,
+                  .path   = "/api",
+                  .status = http::status::NOT_FOUND,
+                  .calls  = {}},
+        test_case{.name   = "another group",
+                  .method = http::request_method::GET,
+                  .path   = "/other/x",
+                  .status = http::status::OK,
+                  .calls  = {"handler"}},
+        test_case{.name   = "the root",
+                  .method = http::request_method::GET,
+                  .path   = "/",
+                  .status = http::status::OK,
+                  .calls  = {"handler"}});
+    CAPTURE(tc.name);
+
+    steps calls;
+
+    const auto routes = http::make_static_router(http::GET("/"_route, recorded{&calls}),
+                                                 http::group("/api"_route,
+                                                             http::use(recording{.name = "api", .out = &calls}),
+                                                             http::GET("/users/:id"_route, recorded{&calls})),
+                                                 http::group("/other"_route, http::GET("/x"_route, recorded{&calls})));
+
+    CHECK(route(routes, tc.method, tc.path).status == tc.status);
+    CHECK(calls == tc.calls);
+}
+
+TEST_CASE("nested groups' middleware runs outermost first", "[http][static_router][middleware]")
+{
+    struct test_case
+    {
+        std::string path;
+        steps       calls;
+    };
+
+    auto tc = GENERATE(
+        test_case{
+            .path  = "/a/b/c",
+            .calls = {"top before",
+                      "a1 before", "a2 before",
+                      "b before", "handler",
+                      "b after", "a2 after",
+                      "a1 after", "top after"}
+    },
+        test_case{.path  = "/a/d",
+                  .calls = {"top before", "a1 before", "a2 before", "handler", "a2 after", "a1 after", "top after"}},
+        test_case{.path = "/e", .calls = {"top before", "handler", "top after"}},
+        // use() in make_static_router is for its routes, not for its 404s.
+        test_case{.path = "/nope", .calls = {}});
+    CAPTURE(tc.path);
+
+    steps calls;
+
+    const auto routes = http::make_static_router(
+        http::use(recording{.name = "top", .out = &calls}),
+        http::group("/a"_route,
+                    http::use(recording{.name = "a1", .out = &calls}, recording{.name = "a2", .out = &calls}),
+                    http::group("/b"_route,
+                                http::use(recording{.name = "b", .out = &calls}),
+                                http::GET("/c"_route, recorded{&calls})),
+                    http::GET("/d"_route, recorded{&calls})),
+        http::GET("/e"_route, recorded{&calls}));
+
+    route(routes, http::request_method::GET, tc.path);
+    CHECK(calls == tc.calls);
+}
+
+TEST_CASE("a group's middleware sees the route, and handlers still get their params",
+          "[http][static_router][middleware][params]")
+{
+    steps       calls;
+    std::string id;
+    std::string full_id;
+
+    const auto routes = http::make_static_router(http::group(
+        "/orgs/:org"_route,
+        http::use(seeing{&calls}),
+        http::GET(
+            "/users/:id"_route,
+            [&](const http::server_request&, http::response_writer& resp, http::params<"/users/:id"> p) -> task<void>
+            {
+                id = p.get<"id">();
+                co_await resp.send(http::status::OK, 0);
+            }),
+        // the params of the route's whole pattern.
+        http::GET("/teams/:id"_route,
+                  [&](const http::server_request&, http::response_writer& resp, http::params<"/orgs/:org/teams/:id"> p)
+                      -> task<void>
+                  {
+                      full_id = std::string{p.get<"org">()} + "/" + std::string{p.get<"id">()};
+                      co_await resp.send(http::status::OK, 0);
+                  })));
+
+    CHECK(route(routes, http::request_method::GET, "/orgs/acme/users/3").status == http::status::OK);
+    CHECK(id == "3");
+
+    CHECK(route(routes, http::request_method::GET, "/orgs/acme/teams/7").status == http::status::OK);
+    CHECK(full_id == "acme/7");
+
+    CHECK(calls == steps{"/orgs/:org/users/:id acme", "/orgs/:org/teams/:id acme"});
+}
+
+TEST_CASE("a group's middleware may answer without calling the rest", "[http][static_router][middleware]")
+{
+    steps calls;
+
+    const auto routes = http::make_static_router(http::group(
+        "/api"_route,
+        http::use(recording{.name = "outer", .out = &calls}, denying{}, recording{.name = "inner", .out = &calls}),
+        http::GET("/x"_route, recorded{&calls})));
+
+    CHECK(route(routes, http::request_method::GET, "/api/x").status == http::status::UNAUTHORIZED);
+    CHECK(calls == steps{"outer before", "outer after"});
+}
+
+TEST_CASE("HEAD handled by GET goes through the group's middleware", "[http][static_router][middleware]")
+{
+    steps calls;
+
+    const auto routes = http::make_static_router(http::group("/api"_route,
+                                                             http::use(recording{.name = "api", .out = &calls}),
+                                                             http::GET("/x"_route, recorded{&calls})));
+
+    CHECK(route(routes, http::request_method::HEAD, "/api/x").status == http::status::OK);
+    CHECK(calls == steps{"api before", "handler", "api after"});
+}
+
+TEST_CASE("middleware that can't be copied can be used on one route", "[http][static_router][middleware]")
+{
+    steps calls;
+
+    auto routes = http::make_static_router(
+        http::group("/api"_route, http::use(move_only{.out = &calls}), http::GET("/x"_route, recorded{&calls})));
+
+    // and the router can still be moved, as into a server.
+    const auto moved = std::move(routes);
+
+    CHECK(route(moved, http::request_method::GET, "/api/x").status == http::status::OK);
+    CHECK(calls == steps{"move only", "handler"});
+}
+
+// a router whose routes have middleware is copyable if its middleware and handlers are.
+static_assert(std::copy_constructible<decltype(http::make_static_router(http::group(
+                  "/api"_route, http::use(denying{}), http::GET("/x"_route, ok), http::GET("/y"_route, ok))))>);
 
 // handlers take their params by value: a reference would outlive them. (A generic lambda can't be checked.)
 namespace
