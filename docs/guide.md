@@ -453,6 +453,13 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   "Certificate does not match provided name").
 - A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()` (as
   `http::server` does).
+- Both contexts allow TLS 1.2 and 1.3 by default. `min_version` and `max_version` (in `client_options` and
+  `server_options`, as Go's `MinVersion` and `MaxVersion`; e.g. `.min_version = net::tls::version::tls13`) narrow that,
+  and `make()` fails with `std::errc::invalid_argument` if the minimum is after the maximum. The client offers the
+  latest it allows, and the server agrees on the latest of those it allows; with none in common, the server fails the
+  handshake with `protocol_version` (so the client's error is that alert from the peer). `stream::version()` is the
+  version agreed on. The HTTP client's `client_options::tls` and the server's `server_context` (in `server_config::tls`)
+  carry them.
 - `stream::connect()` takes an optional `std::stop_token`, as `stream::accept()` does in its `accept_options` (`stop`):
   requesting stop ends a handshake that's waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does
   the same for reads and writes (as a socket's): a canceled read can be tried again, but a canceled write fails the

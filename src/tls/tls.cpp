@@ -37,6 +37,7 @@
 #include <botan/tls_policy.h>
 #include <botan/tls_server.h>
 #include <botan/tls_server_info.h>
+#include <botan/tls_session.h>
 #include <botan/tls_session_manager.h>
 #include <botan/tls_session_manager_memory.h>
 #include <botan/tls_session_manager_noop.h>
@@ -182,19 +183,40 @@ load_certificates(const std::filesystem::path& path)
 //
 // Nor does it require the Extended Master Secret extension of TLS 1.2 peers (as Botan's does, but browsers, Go and
 // OpenSSL don't), unless asked to.
+//
+// It allows the TLS versions from min to max. (Botan's TLS channels follow allow_tls12() and allow_tls13(): a client
+// offers the latest allowed, and a server agrees on the latest the client offers that it allows, or fails the handshake
+// with protocol_version. DTLS isn't used.)
 class policy final : public Botan::TLS::Policy
 {
 public:
-    explicit policy(bool require_ems) noexcept
+    policy(bool require_ems, net::tls::version min, net::tls::version max) noexcept
         : require_ems{require_ems}
+        , min{min}
+        , max{max}
     {}
 
     [[nodiscard]] bool require_cert_revocation_info() const override { return false; }
     [[nodiscard]] bool require_extended_master_secret() const override { return require_ems; }
 
+    [[nodiscard]] bool allow_tls12() const override { return allows(net::tls::version::tls12); }
+    [[nodiscard]] bool allow_tls13() const override { return allows(net::tls::version::tls13); }
+
 private:
-    bool require_ems;
+    [[nodiscard]] bool allows(net::tls::version v) const noexcept { return min <= v && v <= max; }
+
+    bool              require_ems;
+    net::tls::version min;
+    net::tls::version max;
 };
+
+// valid_versions is whether min to max are versions there are, in order.
+bool valid_versions(net::tls::version min, net::tls::version max) noexcept
+{
+    const auto known = [](net::tls::version v)
+    { return v == net::tls::version::tls12 || v == net::tls::version::tls13; };
+    return known(min) && known(max) && min <= max;
+}
 
 // client_credentials gives a client the certificate authorities it trusts.
 class client_credentials final : public Botan::Credentials_Manager
@@ -292,6 +314,7 @@ public:
     void tls_record_received(std::uint64_t seq_no, std::span<const std::uint8_t> data) override;
     void tls_alert(Botan::TLS::Alert alert) override;
     bool tls_peer_closed_connection() override;
+    void tls_session_established(const Botan::TLS::Session_Summary& session) override;
 
     // record_verification_failure keeps why the peer's certificate was rejected.
     void record_verification_failure(Botan::Certificate_Status_Code status) noexcept;
@@ -676,6 +699,10 @@ struct connection
     std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
     std::string                                   alpn;
 
+    // the version the handshake agreed on. NOTE: set by the handshake, before the stream is made, and never after (the
+    //       policy refuses renegotiation), so it's read without mu.
+    version negotiated = version::tls13;
+
     // the record the channel has been fed part of: the part of its header (header_have bytes of it) or how much of its
     // fragment is still to come.
     std::array<std::uint8_t, 5> record_header{};
@@ -723,6 +750,11 @@ void callbacks::tls_alert(Botan::TLS::Alert alert)
     else if (alert.is_fatal() && !conn->failure) conn->failure = peer_alert(alert.type());
 }
 
+void callbacks::tls_session_established(const Botan::TLS::Session_Summary& session)
+{
+    conn->negotiated = session.version() == Botan::TLS::Protocol_Version::TLS_V13 ? version::tls13 : version::tls12;
+}
+
 // NOTE: TLS 1.3's channel answers the peer's close_notify only if this returns true; TLS 1.2's always does (as RFC 5246
 //       requires), whatever it returns.
 bool callbacks::tls_peer_closed_connection() { return !conn->hold_reply; }
@@ -757,6 +789,9 @@ client_context::client_context(std::shared_ptr<detail::client_state> state) noex
 
 std::expected<client_context, std::error_code> client_context::make(const client_options& options)
 {
+    if (!valid_versions(options.min_version, options.max_version))
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
     try
     {
         std::unique_ptr<Botan::Certificate_Store> store;
@@ -779,7 +814,9 @@ std::expected<client_context, std::error_code> client_context::make(const client
             .rng               = rng,
             .credentials       = std::make_shared<client_credentials>(std::move(store)),
             .sessions          = std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng),
-            .policy            = std::make_shared<policy>(options.require_extended_master_secret),
+            .policy            = std::make_shared<policy>(options.require_extended_master_secret,
+                                                          options.min_version,
+                                                          options.max_version),
             .skip_verification = options.insecure_skip_verification,
             .alpn              = options.alpn,
         });
@@ -799,6 +836,9 @@ server_context::server_context(std::shared_ptr<detail::server_state> state) noex
 
 std::expected<server_context, std::error_code> server_context::make(const server_options& options)
 {
+    if (!valid_versions(options.min_version, options.max_version))
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
     try
     {
         auto chain = load_certificates(options.certificate_chain);
@@ -821,7 +861,9 @@ std::expected<server_context, std::error_code> server_context::make(const server
             .rng         = rng,
             .credentials = std::make_shared<server_credentials>(std::move(*chain), std::move(key)),
             .sessions    = std::make_shared<Botan::TLS::Session_Manager_Noop>(),
-            .policy      = std::make_shared<policy>(options.require_extended_master_secret),
+            .policy      = std::make_shared<policy>(options.require_extended_master_secret,
+                                                    options.min_version,
+                                                    options.max_version),
             .alpn        = options.alpn,
         });
 
@@ -862,7 +904,7 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
                                                           ctx.state->policy,
                                                           ctx.state->rng,
                                                           Botan::TLS::Server_Information{host},
-                                                          Botan::TLS::Protocol_Version::latest_tls_version(),
+                                                          ctx.state->policy->latest_supported_version(false),
                                                           ctx.state->alpn);
     }
     catch (const std::exception&)
@@ -982,6 +1024,8 @@ coro::task<> stream::close()
 }
 
 std::string_view stream::alpn() const noexcept { return conn->alpn; }
+
+version stream::version() const noexcept { return conn->negotiated; }
 
 void stream::release_close_reply() noexcept
 {

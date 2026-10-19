@@ -462,6 +462,147 @@ TEST_CASE("a server context's key must be its certificate's", "[tls]")
     CHECK(mismatched.error() == std::errc::invalid_argument);
 }
 
+TEST_CASE("a TLS version is agreed on that both sides allow: the latest", "[tls][version]")
+{
+    struct test_case
+    {
+        std::string_view name{};
+        tls::version     client_min = tls::version::tls12;
+        tls::version     client_max = tls::version::tls13;
+        tls::version     server_min = tls::version::tls12;
+        tls::version     server_max = tls::version::tls13;
+        tls::version     agreed     = tls::version::tls13;
+    };
+
+    const auto tc = GENERATE(test_case{.name = "both allow either"},
+                             test_case{.name       = "the client allows TLS 1.2 only",
+                                       .client_min = tls::version::tls12,
+                                       .client_max = tls::version::tls12,
+                                       .agreed     = tls::version::tls12},
+                             test_case{.name       = "the server allows TLS 1.2 only",
+                                       .server_min = tls::version::tls12,
+                                       .server_max = tls::version::tls12,
+                                       .agreed     = tls::version::tls12},
+                             test_case{.name       = "the client allows TLS 1.3 only",
+                                       .client_min = tls::version::tls13,
+                                       .client_max = tls::version::tls13,
+                                       .agreed     = tls::version::tls13},
+                             test_case{.name       = "the server allows TLS 1.3 only",
+                                       .server_min = tls::version::tls13,
+                                       .server_max = tls::version::tls13,
+                                       .agreed     = tls::version::tls13});
+    CAPTURE(tc.name);
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    auto server_ctx = tls::server_context::make({.certificate_chain = pki().localhost_chain,
+                                                 .private_key       = pki().localhost_key,
+                                                 .min_version       = tc.server_min,
+                                                 .max_version       = tc.server_max});
+    REQUIRE(server_ctx.has_value());
+
+    auto client_ctx = tls::client_context::make(
+        {.trusted_ca_file = pki().ca, .min_version = tc.client_min, .max_version = tc.client_max});
+    REQUIRE(client_ctx.has_value());
+
+    // the server says which version it agreed on, then closes.
+    const auto say_version = [](tls::stream& s) -> task<>
+    {
+        co_await net::io::write_all(s, s.version() == tls::version::tls12 ? "1.2"sv : "1.3"sv);
+        co_await s.close();
+    };
+    REQUIRE(sched.spawn(serve_once(&listener, *server_ctx, say_version)));
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx) -> task<std::pair<std::string, std::string>>
+    {
+        auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value()) co_return std::pair{"connect failed: " + s.error().message(), std::string{}};
+
+        const std::string client_version = s->version() == tls::version::tls12 ? "1.2" : "1.3";
+        auto [server_version, err]       = co_await read_to_end(*s);
+        if (err != net::io::errc::end_of_stream) server_version += " then " + err.message();
+
+        co_await s->close();
+        co_return std::pair{client_version, server_version};
+    };
+
+    const auto [client_version, server_version] =
+        sched.run_to_completion(client(&sched, listener.local_port(), *client_ctx));
+
+    const auto expected = tc.agreed == tls::version::tls12 ? "1.2"sv : "1.3"sv;
+    CHECK(client_version == expected);
+    CHECK(server_version == expected);
+}
+
+TEST_CASE("a client and server that allow no TLS version in common fail the handshake", "[tls][version]")
+{
+    // either way, the server finds that the client offers nothing it allows, and sends protocol_version.
+    const bool client_tls12 = GENERATE(true, false);
+    CAPTURE(client_tls12);
+
+    const auto client_version = client_tls12 ? tls::version::tls12 : tls::version::tls13;
+    const auto server_version = client_tls12 ? tls::version::tls13 : tls::version::tls12;
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    auto server_ctx = tls::server_context::make({.certificate_chain = pki().localhost_chain,
+                                                 .private_key       = pki().localhost_key,
+                                                 .min_version       = server_version,
+                                                 .max_version       = server_version});
+    REQUIRE(server_ctx.has_value());
+
+    auto client_ctx = tls::client_context::make(
+        {.trusted_ca_file = pki().ca, .min_version = client_version, .max_version = client_version});
+    REQUIRE(client_ctx.has_value());
+
+    server_outcome server{.sched = &sched, .err = {}};
+    REQUIRE(sched.spawn(serve_once(&listener, *server_ctx, echo, &server)));
+
+    // the client's result, once the server's handshake has ended too.
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx,
+                           server_outcome*     server) -> task<std::error_code>
+    {
+        auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        co_await server->wait();
+        co_return s.has_value() ? std::error_code{} : s.error();
+    };
+
+    const auto err = sched.run_to_completion(client(&sched, listener.local_port(), *client_ctx, &server));
+    CAPTURE(err.message(), server.err.message());
+
+    CHECK(err == tls::alert::protocol_version);
+    CHECK(tls::from_peer(err));
+    CHECK(err.message() == "protocol_version (from the peer)");
+
+    CHECK(server.done.load() == 1);
+    CHECK(server.err == tls::alert::protocol_version);
+    CHECK_FALSE(tls::from_peer(server.err));
+    CHECK(server.err.message() == "protocol_version (sent to the peer)");
+}
+
+TEST_CASE("contexts refuse a minimum TLS version after the maximum", "[tls][version]")
+{
+    auto client = tls::client_context::make(
+        {.trusted_ca_file = pki().ca, .min_version = tls::version::tls13, .max_version = tls::version::tls12});
+    REQUIRE_FALSE(client.has_value());
+    CHECK(client.error() == std::errc::invalid_argument);
+
+    auto server = tls::server_context::make({.certificate_chain = pki().localhost_chain,
+                                             .private_key       = pki().localhost_key,
+                                             .min_version       = tls::version::tls13,
+                                             .max_version       = tls::version::tls12});
+    REQUIRE_FALSE(server.has_value());
+    CHECK(server.error() == std::errc::invalid_argument);
+}
+
 TEST_CASE("a client needs the server's name to verify its certificate", "[tls][verification]")
 {
     net::io::scheduler sched{make_pool()};

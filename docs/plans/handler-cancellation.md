@@ -380,7 +380,9 @@ pays nothing. Done as above, with that, and these details settled in the code:
   their behavior. Over TLS 1.2 Botan answers at once, as RFC 5246 7.2.1 requires (and discards pending writes), so a
   handler stopped by its client's close_notify can't respond: those connections are watched all the same, and nothing
   tells the versions apart (so nothing needs deleting when TLS 1.2 goes). Every other close_notify path (the client's,
-  `idle_clean()`) is unchanged.
+  `idle_clean()`) is unchanged. Both versions are tested (`test/tls/server.cpp`, the TLS 1.2 side with a client that
+  allows only it, `tls::client_options::max_version`): close_notify, or the TCP stream ending, stops the handler's
+  token, and over TLS 1.2 close_notify leaves the client nothing but the server's answer.
 - **Half-close**: a client that ends what it sends (`shutdown(SHUT_WR)`) after its request has its handler's token
   stopped, as Go's server does (it can't be told from a client that's gone); its response is still sent.
 - **Measured**, against master (`bench_request`, Release, 2 workers, six alternating runs each, minimum / median):

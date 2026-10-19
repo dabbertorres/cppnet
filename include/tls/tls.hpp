@@ -23,6 +23,14 @@
 namespace net::tls
 {
 
+// version is a TLS protocol version, by its value on the wire (as Go's VersionTLS12 and VersionTLS13), so versions
+// compare in the order they came.
+enum class version : std::uint16_t
+{
+    tls12 = 0x0303,
+    tls13 = 0x0304,
+};
+
 // client_options configures a client_context.
 struct client_options
 {
@@ -41,6 +49,11 @@ struct client_options
     // to the triple handshake attack, refusing those that don't (with handshake_failure). Off by default, as in
     // browsers, Go and OpenSSL, as some servers still lack it. TLS 1.3 doesn't need it.
     bool require_extended_master_secret = false;
+
+    // The protocol versions to allow, from min_version to max_version (as Go's MinVersion and MaxVersion): both, by
+    // default. The handshake offers the latest; a server that allows none of them fails it with protocol_version.
+    version min_version = version::tls12;
+    version max_version = version::tls13;
 };
 
 class stream;
@@ -64,7 +77,8 @@ namespace detail
 class client_context
 {
 public:
-    // make loads the trusted certificate authorities, failing if trusted_ca_file can't be read.
+    // make loads the trusted certificate authorities, failing if trusted_ca_file can't be read, or (with
+    // std::errc::invalid_argument) if min_version is after max_version.
     static std::expected<client_context, std::error_code> make(const client_options& options = {});
 
 private:
@@ -88,6 +102,11 @@ struct server_options
 
     // Require TLS 1.2 clients to support the Extended Master Secret extension (see client_options).
     bool require_extended_master_secret = false;
+
+    // The protocol versions to allow (see client_options): the latest the client offers is agreed on. A client that
+    // offers none of them fails the handshake with protocol_version.
+    version min_version = version::tls12;
+    version max_version = version::tls13;
 };
 
 // server_context holds what a server's connections share: its certificate and key, and the policy. It's cheap to copy,
@@ -95,7 +114,8 @@ struct server_options
 class server_context
 {
 public:
-    // make loads the certificate chain and private key, failing if either can't be read.
+    // make loads the certificate chain and private key, failing if either can't be read, or (with
+    // std::errc::invalid_argument) if min_version is after max_version.
     static std::expected<server_context, std::error_code> make(const server_options& options);
 
 private:
@@ -178,6 +198,9 @@ public:
 
     // alpn is the protocol the handshake agreed on: empty if none.
     [[nodiscard]] std::string_view alpn() const noexcept;
+
+    // version is the protocol version the handshake agreed on.
+    [[nodiscard]] tls::version version() const noexcept;
 
     // release_close_reply answers the peer's close_notify as the stream does by default (undoing accept_options'
     // hold_close_reply): if it was read already, with the next write (or shutdown()), and otherwise as it's read.

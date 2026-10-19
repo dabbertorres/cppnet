@@ -146,12 +146,25 @@ http::server_config tls_config(std::chrono::seconds header_read_timeout = 5s)
     return {.header_read_timeout = header_read_timeout, .tls = server_with(pki().localhost_chain, pki().localhost_key)};
 }
 
-http::client_options trusting_options()
+// tls_config_up_to is tls_config, with a server that allows TLS versions up to max_version.
+http::server_config tls_config_up_to(tls::version max_version)
+{
+    auto ctx = tls::server_context::make(
+        {.certificate_chain = pki().localhost_chain, .private_key = pki().localhost_key, .max_version = max_version});
+    REQUIRE(ctx.has_value());
+    return {.header_read_timeout = 5s, .tls = std::move(*ctx)};
+}
+
+http::client_options trusting_options(tls::version max_version = tls::version::tls13)
 {
     http::client_options options;
     options.tls.trusted_ca_file = pki().ca;
+    options.tls.max_version     = max_version;
     return options;
 }
+
+// version_name is how a test's captures name a TLS version.
+std::string_view version_name(tls::version v) { return v == tls::version::tls12 ? "TLS 1.2" : "TLS 1.3"; }
 
 // fetch GETs url, returning the body, or the error.
 task<std::string> fetch(http::client* client, std::string url)
@@ -216,10 +229,15 @@ TEST_CASE("an HTTPS server serves requests over TLS", "[tls][http][server]")
 
 TEST_CASE("an HTTPS server serves HTTP/1.1 to clients that don't speak HTTP/2", "[tls][http][server][client]")
 {
+    // and the client's pool reuses the idle connection (once tls::detail::idle_clean() says it may), over either
+    // version: the client allows TLS 1.2 only, or 1.3 too.
+    const auto max_version = GENERATE(tls::version::tls13, tls::version::tls12);
+    CAPTURE(version_name(max_version));
+
     net::io::scheduler sched{make_pool()};
     https_server       server{&sched, tls_config()};
 
-    auto options  = trusting_options();
+    auto options  = trusting_options(max_version);
     options.http2 = false;
     http::client client{&sched, options};
 
@@ -263,8 +281,12 @@ TEST_CASE("an HTTPS server serves HTTP/1.1 to clients that don't speak HTTP/2", 
 
 TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][http][client][http2]")
 {
+    // agreed on with ALPN, over either version: the server allows TLS 1.2 only, or 1.3 too.
+    const auto max_version = GENERATE(tls::version::tls13, tls::version::tls12);
+    CAPTURE(version_name(max_version));
+
     net::io::scheduler sched{make_pool()};
-    https_server       server{&sched, tls_config()};
+    https_server       server{&sched, tls_config_up_to(max_version)};
     http::client       client{&sched, trusting_options()};
 
     const auto test = [](http::client* client, std::string url) -> task<std::string>
@@ -580,7 +602,8 @@ TEST_CASE("closing an HTTPS server lets a request in progress finish", "[tls][ht
     CHECK(err == net::io::errc::end_of_stream);
 }
 
-TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is still answered",
+TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is still answered, unless by TLS 1.2's "
+          "close_notify",
           "[tls][http][server][cancel][watch]")
 {
     // NOTE: before the scheduler, as the handler sets them.
@@ -608,16 +631,21 @@ TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is sti
     const bool close_notify = GENERATE(true, false);
     CAPTURE(close_notify);
 
+    // over TLS 1.3, or 1.2 (the client allowing only that), whose close_notify Botan answers at once.
+    const auto version = GENERATE(tls::version::tls13, tls::version::tls12);
+    CAPTURE(version_name(version));
+
+    auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .alpn = {"http/1.1"}, .max_version = version});
+    REQUIRE(ctx.has_value());
+
     const auto test = [&] -> task<std::pair<std::string, std::error_code>>
     {
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
         if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), *ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
+        if (s->version() != version) co_return std::pair{"another version", std::error_code{}};
 
         (void)co_await net::io::write_all(*s, "GET /wait HTTP/1.1\r\nHost: x\r\n\r\n"sv);
 
@@ -634,8 +662,17 @@ TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is sti
     CHECK(stopped.load() == 1);
     CHECK(std::chrono::steady_clock::now() - start < 3s);
 
-    // and then close_notify.
-    CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
-    CHECK(received.ends_with("\r\n\r\nstopped"));
+    // over TLS 1.2, the server answered the client's close_notify as it read it, so it couldn't respond: only its
+    // close_notify came.
+    if (close_notify && version == tls::version::tls12)
+    {
+        CHECK(received.empty());
+    }
+    else
+    {
+        // and then close_notify.
+        CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(received.ends_with("\r\n\r\nstopped"));
+    }
     CHECK(err == net::io::errc::end_of_stream);
 }
