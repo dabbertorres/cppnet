@@ -46,6 +46,7 @@
 #include "tcp.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
+#include "tls/version.hpp"
 
 namespace http = net::http;
 namespace tls  = net::tls;
@@ -62,10 +63,30 @@ namespace
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
+// version_name is how a test's captures (and tls_version's responses) name a TLS version.
+std::string_view version_name(tls::version v)
+{
+    switch (v)
+    {
+    case tls::version::none: return "none";
+    case tls::version::tls12: return "TLS 1.2";
+    case tls::version::tls13: return "TLS 1.3";
+    }
+    return "unknown";
+}
+
+// tls_version answers with the TLS version the request's connection agreed on.
+task<void> tls_version(const http::server_request& req, http::response_writer& resp)
+{
+    const auto msg  = version_name(req.tls_version);
+    auto*      body = co_await resp.send(http::status::OK, msg.size());
+    co_await net::io::write_all(*body, msg);
+}
+
 // hello says whether the request came over TLS.
 task<void> hello(const http::server_request& req, http::response_writer& resp)
 {
-    const auto msg  = req.tls ? "hello over TLS"sv : "hello over TCP"sv;
+    const auto msg  = req.tls_version != tls::version::none ? "hello over TLS"sv : "hello over TCP"sv;
     auto*      body = co_await resp.send(http::status::OK, msg.size());
     co_await net::io::write_all(*body, msg);
 }
@@ -133,6 +154,7 @@ struct https_server
     {
         http::router r;
         r.GET("/", hello);
+        r.GET("/tls-version", tls_version);
         return r;
     }
 
@@ -162,9 +184,6 @@ http::client_options trusting_options(tls::version max_version = tls::version::t
     options.tls.max_version     = max_version;
     return options;
 }
-
-// version_name is how a test's captures name a TLS version.
-std::string_view version_name(tls::version v) { return v == tls::version::tls12 ? "TLS 1.2" : "TLS 1.3"; }
 
 // fetch GETs url, returning the body, or the error.
 task<std::string> fetch(http::client* client, std::string url)
@@ -301,6 +320,55 @@ TEST_CASE("the HTTP client speaks HTTP/2 to an HTTPS server that does", "[tls][h
 
     CHECK(sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"))
           == "HTTP/2 hello over TLS");
+}
+
+TEST_CASE("a handler sees the TLS version its connection agreed on", "[tls][http][server][version]")
+{
+    struct test_case
+    {
+        // none: cleartext.
+        tls::version version = tls::version::none;
+        bool         http2   = false;
+    };
+
+    const auto tc = GENERATE(test_case{.version = tls::version::tls13, .http2 = false},
+                             test_case{.version = tls::version::tls13, .http2 = true},
+                             test_case{.version = tls::version::tls12, .http2 = false},
+                             test_case{.version = tls::version::tls12, .http2 = true},
+                             test_case{.version = tls::version::none, .http2 = false},
+                             test_case{.version = tls::version::none, .http2 = true});
+    CAPTURE(version_name(tc.version), tc.http2);
+
+    const bool use_tls = tc.version != tls::version::none;
+
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, use_tls ? tls_config() : http::server_config{}};
+
+    // the client allows only the version (the server both): over TLS, HTTP/2 is agreed on with ALPN, and in
+    // cleartext spoken with prior knowledge.
+    auto options = trusting_options();
+    if (use_tls)
+    {
+        options.tls.min_version = tc.version;
+        options.tls.max_version = tc.version;
+    }
+    options.http2                 = tc.http2;
+    options.http2_prior_knowledge = tc.http2 && !use_tls;
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::string>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        co_return std::format("HTTP/{} {}", resp->version.major, *body);
+    };
+
+    const std::string url = (use_tls ? "https://localhost:" : "http://localhost:") + server.port() + "/tls-version";
+    const auto        out = sched.run_to_completion(test(&client, url));
+    CHECK(out == std::format("HTTP/{} {}", tc.http2 ? 2 : 1, version_name(tc.version)));
 }
 
 TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 shares the connection being made",

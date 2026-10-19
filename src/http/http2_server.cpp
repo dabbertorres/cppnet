@@ -460,9 +460,9 @@ namespace
         }
         if (!req.target.host.empty()) req.host.assign(req.target.host);
 
-        req.version = {.major = 2, .minor = 0};
-        req.tls     = is_tls(conn);
-        req.body    = std::make_unique<stream_reader>(stream.get());
+        req.version     = {.major = 2, .minor = 0};
+        req.tls_version = tls_version(conn);
+        req.body        = std::make_unique<stream_reader>(stream.get());
 
         // its handler's token: stopped when the stream fails (see fail_stream()), or by abort (at once, after
         // receiving, if it came first); and the server's abort token, for middleware to tell the two apart.

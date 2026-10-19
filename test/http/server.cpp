@@ -52,6 +52,7 @@
 #include "io/util.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "tls/version.hpp"
 #include "url.hpp"
 #include "util/defer.hpp"
 
@@ -193,6 +194,32 @@ TEST_CASE("a server serves with the listener it's given", "[http][server]")
     auto resp = sched.run_to_completion(get(&sched, server.local_port(), "/hello"));
     CHECK(resp.status == http::status::OK);
     CHECK(resp.body == "hello");
+}
+
+TEST_CASE("a cleartext request has no TLS version", "[http][server][tls_version]")
+{
+    // in every build, with TLS or without (test/tls/server.cpp has the versions TLS agrees on, and HTTP/2).
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/version",
+               [](const http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   const auto msg  = req.tls_version == net::tls::version::none ? "none"sv : "TLS"sv;
+                   auto*      body = co_await resp.send(http::status::OK, msg.size());
+                   co_await net::io::write_all(*body, msg);
+               });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    auto resp = sched.run_to_completion(get(&sched, server.local_port(), "/version"));
+    CHECK(resp.status == http::status::OK);
+    CHECK(resp.body == "none");
 }
 
 TEST_CASE("a response's body needn't have a known length", "[http][server]")

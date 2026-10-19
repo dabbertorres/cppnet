@@ -197,7 +197,7 @@ const std::error_category& category() noexcept;
   for what they do differently (`socket_of()`, `shutdown()`, `close()`). It was a class implementing `io::reader` and `io::writer` by forwarding to the variant; but
   both alternatives already are those, so the buffered reader and writer now use them directly (`as_reader()`,
   `as_writer()`), without the extra virtual call and `std::visit` per read and write. `server_request::tls` tells
-  handlers which it is.
+  handlers which it is (since replaced by `server_request::tls_version`, the version agreed on, or `none`).
 - `server::close()` ended connections by shutting down the reading side of each one's socket, from a set of socket
   pointers. During a TLS handshake, the socket is inside `stream::accept()` (moved to the stream's state), out of the
   server's reach, so `close()` couldn't end one (and `~server` would wait out its deadline, or without

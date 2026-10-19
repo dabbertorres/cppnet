@@ -19,6 +19,7 @@
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
 #include "io/writer.hpp"
+#include "tls/version.hpp"
 #include "url.hpp"
 #include "util/small_vector.hpp"
 #include "util/string_util.hpp"
@@ -123,8 +124,10 @@ struct server_request
     // The host the request is for: from the target, if it has one, otherwise the Host header.
     std::string host{};
 
-    // Whether the request came over TLS (HTTPS): e.g. for building absolute URLs, or Secure cookies.
-    bool tls = false;
+    // The TLS version the request's connection agreed on, if it came over TLS (HTTPS), or tls::version::none if it
+    // didn't (always, in builds without TLS): e.g. tls_version != tls::version::none for building absolute URLs, or
+    // Secure cookies.
+    tls::version tls_version = tls::version::none;
 
     // stop is stopped once the request is no longer wanted: over HTTP/2, when the client resets its stream, the stream
     // times out, or its connection ends; over HTTP/1.1, when its connection ends; and for either, when the server is
@@ -180,8 +183,8 @@ struct server_request
     void add_path_value(std::string_view name, std::string_view encoded);
 
     // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces), and
-    // tls, stop and aborted, as the next request comes over the same connection (whose server sets stop for each
-    // request).
+    // tls_version, stop and aborted, as the next request comes over the same connection (whose server sets stop for
+    // each request).
     void clear() noexcept
     {
         method  = request_method::NONE;

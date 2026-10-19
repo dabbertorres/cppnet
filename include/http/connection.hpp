@@ -8,6 +8,7 @@
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "tls/version.hpp"
 
 #ifdef NET_HAS_TLS
 #    include <variant>
@@ -86,6 +87,15 @@ inline bool is_tls([[maybe_unused]] const connection& conn) noexcept
 #else
     return false;
 #endif
+}
+
+// tls_version is the TLS version the connection agreed on (none if it's not TLS).
+inline tls::version tls_version([[maybe_unused]] const connection& conn) noexcept
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->version();
+#endif
+    return tls::version::none;
 }
 
 // shutdown ends the outgoing side of the connection (over TLS, after close_notify), while reads still work.

@@ -18,18 +18,11 @@
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "tls/version.hpp"
 
 // TLS (with Botan, which stays private: see docs/plans/tls.md). Only built if NET_HAS_TLS is defined.
 namespace net::tls
 {
-
-// version is a TLS protocol version, by its value on the wire (as Go's VersionTLS12 and VersionTLS13), so versions
-// compare in the order they came.
-enum class version : std::uint16_t
-{
-    tls12 = 0x0303,
-    tls13 = 0x0304,
-};
 
 // client_options configures a client_context.
 struct client_options
@@ -78,7 +71,7 @@ class client_context
 {
 public:
     // make loads the trusted certificate authorities, failing if trusted_ca_file can't be read, or (with
-    // std::errc::invalid_argument) if min_version is after max_version.
+    // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none).
     static std::expected<client_context, std::error_code> make(const client_options& options = {});
 
 private:
@@ -115,7 +108,7 @@ class server_context
 {
 public:
     // make loads the certificate chain and private key, failing if either can't be read, or (with
-    // std::errc::invalid_argument) if min_version is after max_version.
+    // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none).
     static std::expected<server_context, std::error_code> make(const server_options& options);
 
 private:

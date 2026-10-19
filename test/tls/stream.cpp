@@ -31,6 +31,7 @@
 #include "tcp.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
+#include "tls/version.hpp"
 
 namespace tls = net::tls;
 
@@ -599,6 +600,33 @@ TEST_CASE("contexts refuse a minimum TLS version after the maximum", "[tls][vers
                                              .private_key       = pki().localhost_key,
                                              .min_version       = tls::version::tls13,
                                              .max_version       = tls::version::tls12});
+    REQUIRE_FALSE(server.has_value());
+    CHECK(server.error() == std::errc::invalid_argument);
+}
+
+TEST_CASE("contexts refuse no TLS version as a minimum or maximum", "[tls][version]")
+{
+    struct test_case
+    {
+        tls::version min_version = tls::version::tls12;
+        tls::version max_version = tls::version::tls13;
+    };
+
+    // none as both is in order, so it's refused as no version, not as out of order.
+    const auto tc = GENERATE(test_case{.min_version = tls::version::none, .max_version = tls::version::tls13},
+                             test_case{.min_version = tls::version::tls12, .max_version = tls::version::none},
+                             test_case{.min_version = tls::version::none, .max_version = tls::version::none});
+    CAPTURE(std::to_underlying(tc.min_version), std::to_underlying(tc.max_version));
+
+    auto client = tls::client_context::make(
+        {.trusted_ca_file = pki().ca, .min_version = tc.min_version, .max_version = tc.max_version});
+    REQUIRE_FALSE(client.has_value());
+    CHECK(client.error() == std::errc::invalid_argument);
+
+    auto server = tls::server_context::make({.certificate_chain = pki().localhost_chain,
+                                             .private_key       = pki().localhost_key,
+                                             .min_version       = tc.min_version,
+                                             .max_version       = tc.max_version});
     REQUIRE_FALSE(server.has_value());
     CHECK(server.error() == std::errc::invalid_argument);
 }

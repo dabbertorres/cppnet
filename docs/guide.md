@@ -429,7 +429,9 @@ scheduler.spawn(server.serve());
   ```
 
   Each connection's handshake has `header_read_timeout` to finish (and each of its waits for the client is limited by
-  `body_read_timeout` and `write_timeout`), and `req.tls` tells a handler its request came over TLS. The server offers
+  `body_read_timeout` and `write_timeout`), and `req.tls_version` tells a handler the TLS version its request's
+  connection agreed on (`net::tls::version::tls12` or `tls13`; `none` in cleartext, and in builds without TLS, so
+  `req.tls_version != net::tls::version::none` is whether it came over TLS). The server offers
   `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off). `example/http-server` serves HTTPS with
   `--cert` and `--key`.
 
@@ -458,8 +460,9 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   and `make()` fails with `std::errc::invalid_argument` if the minimum is after the maximum. The client offers the
   latest it allows, and the server agrees on the latest of those it allows; with none in common, the server fails the
   handshake with `protocol_version` (so the client's error is that alert from the peer). `stream::version()` is the
-  version agreed on. The HTTP client's `client_options::tls` and the server's `server_context` (in `server_config::tls`)
-  carry them.
+  version agreed on, and a server's handlers see it in `server_request::tls_version`. The HTTP client's
+  `client_options::tls` and the server's `server_context` (in `server_config::tls`) carry them. `tls::version` is in
+  `tls/version.hpp`, which builds without TLS too; its `none` (no TLS) isn't a version a context may allow.
 - `stream::connect()` takes an optional `std::stop_token`, as `stream::accept()` does in its `accept_options` (`stop`):
   requesting stop ends a handshake that's waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does
   the same for reads and writes (as a socket's): a canceled read can be tried again, but a canceled write fails the
@@ -499,6 +502,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
 | `tls/tls.hpp`                          | TLS                                                       |
+| `tls/version.hpp`                      | `tls::version` (included by `tls/tls.hpp` and `http/request.hpp`; without TLS too) |
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |
 

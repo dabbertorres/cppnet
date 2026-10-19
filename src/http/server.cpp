@@ -46,6 +46,7 @@
 #include "io/writer.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+#include "tls/version.hpp"
 #include "util/defer.hpp"
 
 #ifdef NET_HAS_TLS
@@ -803,7 +804,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
     auto&            req  = state.req;
     auto&            resp = state.resp;
 
-    req.tls = detail::is_tls(conn);
+    req.tls_version = detail::tls_version(conn);
 
     // the server's, for the connection's requests (which reuse req).
     req.aborted = aborting.get_token();
@@ -813,7 +814,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
     auto deadline = head_deadline();
 
     // a cleartext client may start with HTTP/2's preface, knowing the server speaks it (RFC 9113, section 3.3).
-    if (http2_enabled && !req.tls)
+    if (http2_enabled && req.tls_version == tls::version::none)
     {
         detail::socket_of(conn).set_read_deadline(deadline);
         if (co_await starts_with_preface(state.reader))
