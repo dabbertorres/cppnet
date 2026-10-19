@@ -17,9 +17,9 @@ one.
 - `http::request_handler` is a `std::function<coro::task<void>(server_request&, response_writer&)>`
   (`http/router.hpp`): what the server calls, and what the runtime router's routes hold.
 - Middleware is a convention of the two in `instrument/middleware.hpp`: a class constructed with the handler it wraps
-  (`request_handler next`, or `router&&`) and options, a `const` `operator()(server_request&, response_writer&)`, and its
-  state behind a `shared_ptr` (as `std::function` copies it). They compose by nesting constructors. Nothing names the
-  convention, and nothing applies middleware to some routes only.
+  (`request_handler next`, or `router&&`) and options, a `const` `operator()(server_request&, response_writer&)`, and
+  its state behind a `shared_ptr` (as `std::function` copies it). They compose by nesting constructors. Nothing names
+  the convention, and nothing applies middleware to some routes only.
 - Each layer calls the next through a `std::function`: an indirect call, so Clang never elides the next coroutine's
   frame into its own (CLAUDE.md's HALO notes): a heap allocation per layer per request.
 - Middleware passes values to handlers in `req.extensions` (a `util::type_map`), and may swap `req.stop` for the
