@@ -21,10 +21,12 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
 #include "coro/task.hpp"
+#include "dns/resolver.hpp"
 #include "exception.hpp"
 #include "io/io.hpp"
 #include "io/poll.hpp"
@@ -36,45 +38,8 @@
 namespace
 {
 
-using addrinfo_ptr = std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)>;
-
-std::expected<addrinfo_ptr, std::error_code>
-resolve(const std::string& host, const std::string& port, net::protocol proto) noexcept
-{
-    addrinfo hints{};
-    hints.ai_socktype = SOCK_STREAM;
-
-    switch (proto)
-    {
-    case net::protocol::not_care: hints.ai_family = AF_UNSPEC; break;
-    case net::protocol::ipv4: hints.ai_family = AF_INET; break;
-    case net::protocol::ipv6: hints.ai_family = AF_INET6; break;
-    }
-
-    // An IP address is used as is (e.g. one with an IPv6 zone, or in a form literal() leaves to getaddrinfo()). A name
-    // only resolves to the kinds of address this host has (AI_ADDRCONFIG), but that would also reject an IPv6 address
-    // (even "::1") when there's no IPv6 network configured: glibc doesn't count loopback addresses.
-    addrinfo* found = nullptr;
-
-    hints.ai_flags = AI_NUMERICHOST;
-    auto err       = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found);
-    if (err == EAI_NONAME)
-    {
-        hints.ai_flags = AI_ADDRCONFIG;
-        err            = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &found);
-    }
-
-    if (err != 0) return std::unexpected(net::make_gai_error_code(err));
-
-    return addrinfo_ptr{found, &::freeaddrinfo};
-}
-
-// literal is host's address and port, if host is an IP address and port a number, so connecting needn't resolve them.
-//
-// An IPv4 address must be in its usual form (as to_string() gives it): getaddrinfo() also takes others, which it reads
-// differently (e.g. "010.0.0.1" as octal, 8.0.0.1, where ip_addr::parse() reads 10.0.0.1, and "127.1" as 127.0.0.1),
-// so they're left to it. So are IPv6 addresses with a zone ("fe80::1%en0"), which ip_addr doesn't have.
-std::optional<net::detail::socket_address> literal(const std::string& host, const std::string& port) noexcept
+// port_number is port as a number, if it is one (from 0 to 65535): service names (e.g. "http") aren't looked up.
+std::optional<std::uint16_t> port_number(const std::string& port) noexcept
 {
     std::uint16_t number = 0;
 
@@ -82,19 +47,34 @@ std::optional<net::detail::socket_address> literal(const std::string& host, cons
     auto [ptr, failed] = std::from_chars(port.data(), end, number);
     if (port.empty() || failed != std::errc{} || ptr != end) return std::nullopt;
 
-    auto addr = net::ip_addr::parse(host);
-    if (!addr.has_value()) return std::nullopt;
+    return number;
+}
 
-    try
-    {
-        if (addr->is_ipv4() && addr->to_string() != host) return std::nullopt;
-    }
-    catch (...)
-    {
-        return std::nullopt; // to_string() can only fail to allocate: getaddrinfo() decides, as it did before.
-    }
+// zoned is the address of host, an IPv6 address with a zone (e.g. "fe80::1%en0"), which ip_addr (and so the resolver)
+// doesn't have, so it's read by getaddrinfo(), which takes the zone's name or number. As it's numeric, nothing is
+// looked up, so it doesn't block.
+std::expected<net::detail::socket_address, std::error_code> zoned(const std::string& host, std::uint16_t port) noexcept
+{
+    addrinfo hints{};
+    hints.ai_family   = AF_INET6;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_NUMERICHOST;
 
-    return net::detail::to_sockaddr(*addr, number);
+    addrinfo* found = nullptr;
+    if (auto err = ::getaddrinfo(host.c_str(), nullptr, &hints, &found); err != 0)
+        return std::unexpected(net::make_gai_error_code(err));
+
+    const std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> owned{found, &::freeaddrinfo};
+    if (found == nullptr || found->ai_addrlen > sizeof(sockaddr_storage) || found->ai_family != AF_INET6)
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    net::detail::socket_address addr;
+    std::memcpy(&addr.storage, found->ai_addr, found->ai_addrlen);
+    addr.size = found->ai_addrlen;
+
+    auto* sin6      = reinterpret_cast<sockaddr_in6*>(&addr.storage);
+    sin6->sin6_port = htons(port);
+    return addr;
 }
 
 bool of_protocol(const net::detail::socket_address& addr, net::protocol proto) noexcept
@@ -137,11 +117,12 @@ net::coro::task<std::error_code> wait_connected(net::io::scheduler*        sched
     }
 }
 
-// connect_to connects to the first of addresses (those of options.proto's family) that accepts, in order, each attempt
-// getting its share of options.timeout (see net::detail::attempt_deadline()).
+// connect_to connects to the first of addresses (those of options.proto's family) that accepts, in order, by deadline,
+// each attempt getting its share of what's left (see net::detail::attempt_deadline()).
 net::coro::task<std::expected<net::tcp_socket, std::error_code>>
 connect_to(net::io::scheduler*                      scheduler,
            std::vector<net::detail::socket_address> addresses,
+           net::io::clock::time_point               deadline,
            net::tcp_socket::connect_options         options)
 {
     const auto given = addresses.size();
@@ -151,8 +132,6 @@ connect_to(net::io::scheduler*                      scheduler,
         co_return std::unexpected(
             std::make_error_code(given == 0 ? std::errc::invalid_argument : std::errc::address_family_not_supported));
     }
-
-    const auto deadline = net::io::clock::now() + options.timeout;
 
     std::error_code last_err;
 
@@ -247,39 +226,35 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
 {
     if (options.stop.stop_requested()) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
 
+    const auto number = port_number(port);
+    if (!number.has_value()) co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    // the timeout covers resolving the host, as well as connecting.
+    const auto deadline = io::clock::now() + options.timeout;
+
     std::vector<detail::socket_address> addresses;
 
-    if (auto addr = literal(host, port); addr.has_value())
+    if (host.contains('%'))
     {
+        auto addr = zoned(host, *number);
+        if (!addr.has_value()) co_return std::unexpected(addr.error());
         addresses.push_back(*addr);
     }
     else
     {
-        // getaddrinfo() blocks, so keep it off the worker threads.
-        auto resolved =
-            co_await scheduler->run_blocking([host, port, proto = options.proto] { return resolve(host, port, proto); },
-                                             options.stop);
-        if (!resolved.has_value()) co_return std::unexpected(resolved.error());
+        // NOTE: an IP address is returned at once, without a thread.
+        const auto& resolver = options.resolver != nullptr ? *options.resolver : dns::default_resolver();
 
-        // resolving can't be interrupted, so its result is dropped if stop was requested meanwhile.
-        if (options.stop.stop_requested())
-            co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
-
-        auto& found = *resolved;
+        auto found = co_await resolver.resolve(scheduler,
+                                               std::move(host),
+                                               {.proto = options.proto, .deadline = deadline, .stop = options.stop});
         if (!found.has_value()) co_return std::unexpected(found.error());
 
-        // NOTE: the addresses as getaddrinfo() gave them, so an IPv6 address keeps its zone.
-        for (const auto* info = found->get(); info != nullptr; info = info->ai_next)
-        {
-            if (info->ai_addrlen > sizeof(sockaddr_storage)) continue;
-
-            auto& addr = addresses.emplace_back();
-            std::memcpy(&addr.storage, info->ai_addr, info->ai_addrlen);
-            addr.size = info->ai_addrlen;
-        }
+        addresses.reserve(found->size());
+        for (const auto& addr : *found) addresses.push_back(detail::to_sockaddr(addr, *number));
     }
 
-    co_return co_await connect_to(scheduler, std::move(addresses), std::move(options));
+    co_return co_await connect_to(scheduler, std::move(addresses), deadline, std::move(options));
 }
 
 coro::task<std::expected<tcp_socket, std::error_code>> tcp_socket::connect(io::scheduler*           scheduler,
@@ -292,7 +267,7 @@ coro::task<std::expected<tcp_socket, std::error_code>> tcp_socket::connect(io::s
     converted.reserve(addresses.size());
     for (const auto& addr : addresses) converted.push_back(detail::to_sockaddr(addr, port));
 
-    return connect_to(scheduler, std::move(converted), options);
+    return connect_to(scheduler, std::move(converted), io::clock::now() + options.timeout, options);
 }
 
 }

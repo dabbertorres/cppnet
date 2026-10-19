@@ -27,6 +27,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "dns/blocking_lookup.hpp"
 #include "http/connection_pool.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
@@ -42,6 +43,7 @@
 #include "listen.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
+#include "util/defer.hpp"
 
 namespace
 {
@@ -1069,6 +1071,80 @@ TEST_CASE("a request canceled while it connects counts its connection out", "[ht
     CHECK(result.starts_with("error: "));
     CHECK(elapsed < 5s);
     if (result == canceled()) CHECK(elapsed >= 100ms);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a request canceled while its host is resolved fails at once", "[http][client][cancel]")
+{
+    test::blocking_lookup lookup;
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    net::http::client client{&sched, {.resolver = &lookup.resolver}};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         net::http::client*     client,
+                         test::blocking_lookup* lookup) -> task<std::pair<std::string, net::io::clock::duration>>
+    {
+        std::stop_source source;
+
+        // stops once the lookup has started (or the scheduler has).
+        REQUIRE(sched->spawn(
+            [](net::io::scheduler* sched, test::blocking_lookup* lookup, std::stop_source source) -> task<>
+            {
+                while (lookup->started.load() == 0)
+                {
+                    if (co_await sched->sleep_until(net::io::clock::now() + 1ms)) co_return;
+                }
+                source.request_stop();
+            }(sched, lookup, source)));
+
+        const auto start  = net::io::clock::now();
+        auto       result = co_await fetch_until(client, "slow.test", "80", source.get_token());
+        const auto took   = net::io::clock::now() - start;
+
+        lookup->release();
+        co_return std::pair{std::move(result), took};
+    };
+
+    const auto [result, elapsed] = sched.run_to_completion(test(&sched, &client, &lookup));
+
+    CHECK(result == canceled());
+    CHECK(elapsed < 5s);
+    CHECK(lookup.started.load() == 1);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("connect_timeout bounds resolving the host", "[http][client][timeout]")
+{
+    test::blocking_lookup lookup;
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    net::http::client client{
+        &sched,
+        {.connect_timeout = 200ms, .resolver = &lookup.resolver}
+    };
+
+    const auto test = [](net::http::client*     client,
+                         test::blocking_lookup* lookup) -> task<std::pair<std::string, net::io::clock::duration>>
+    {
+        const auto start  = net::io::clock::now();
+        auto       result = co_await fetch(client, "slow.test", "80");
+        const auto took   = net::io::clock::now() - start;
+
+        lookup->release();
+        co_return std::pair{std::move(result), took};
+    };
+
+    const auto [result, elapsed] = sched.run_to_completion(test(&client, &lookup));
+
+    CHECK(result == "error: " + std::make_error_code(std::errc::timed_out).message());
+    CHECK(elapsed >= 200ms);
+    CHECK(elapsed < 5s);
+    CHECK(lookup.started.load() == 1);
     CHECK(client.stats() == net::http::connection_stats{});
 }
 

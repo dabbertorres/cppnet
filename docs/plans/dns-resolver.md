@@ -2,8 +2,8 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stage 1 is done
-(2026-10-19); "Where things stand" describes the code before it.
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 and 2 are
+done (2026-10-19); "Where things stand" describes the code before them.
 
 ## Goal
 
@@ -304,6 +304,14 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
    `client_options::resolver`, `connect`'s timeout covering resolving (Decided question 2). `dns_lookup()` and `dns.hpp`
    go (the example uses `run_to_completion`); the guide's "resolving can't be interrupted" lines, CLAUDE.md's `connect`
    and module notes, and `test/dns.cpp`/`test/tcp.cpp`'s category checks change.
+   **Done** as above. `backend` has only `automatic` and `system`, and `options` no `conf`, until stage 5; the test hook
+   is `options::system_lookup`. `resolve()` isn't a coroutine: a stopped token, a literal (its usual form, as in stage
+   1) and an invalid name are ready tasks; a lookup's task is spawned when the caller's is awaited, and runs
+   `run_blocking(func, stop)` with the lookup's token, so one whose caller left before it had a thread doesn't start.
+   Other numeric forms (`127.1`) are valid names, read by `getaddrinfo()` as before (so Go's "a name has a non-digit"
+   isn't kept); a zone isn't (`invalid_argument`), so `connect` reads a host with one inline with
+   `getaddrinfo(AI_NUMERICHOST)`, keeping the zone. `temporary_failure` matches `EAI_FAIL` too; `refused` and
+   `bad_response` match neither condition. `io::scheduler::options::blocking_threads` (4) sizes `run_blocking`'s pool.
 3. **Merging lookups in flight**, Go's `singleflight` with `ForgetUnshared`.
 4. **The message codec.** `dns/message.hpp` rewritten: a header encoded field by field (no bit-field layout), queries
    (with the OPT record), and responses decoded defensively (bounds; compression pointers only backwards, at most a

@@ -87,10 +87,11 @@ co_await work(source.get_token());   // stopped after 5 seconds, or with the req
 ```
 
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
-`scheduler.run_blocking(func)` runs a blocking function on threads set aside for that, and returns a task of its
-result. `run_blocking(func, stop)` doesn't run `func` if stop was requested before it starts (its result, a
-`std::expected`, is then `operation_canceled`), and passes the token to a `func` that takes one; nothing interrupts
-`func` once it has started.
+`scheduler.run_blocking(func)` runs a blocking function on threads set aside for that (4, unless the scheduler is made
+with `io::scheduler::options{.blocking_threads = n}`; the rest wait for one), and returns a task of its result.
+`run_blocking(func, stop)` doesn't run `func` if stop was requested before it starts (its result, a `std::expected`, is
+then `operation_canceled`), and passes the token to a `func` that takes one; nothing interrupts `func` once it has
+started, and `shutdown()` waits for it, as for any task.
 
 ## Lifetimes
 
@@ -121,7 +122,7 @@ The objects that coroutines use must outlive them too:
 
 Failures are reported, not thrown: functions that can fail return `std::expected<T, std::error_code>`, and reads and
 writes return an `io::result{count, err}`. Errors are `std::error_code`s: the OS's (`std::system_category()`), or the
-library's own (`io::errc`, `tls::errc`, `gai_category()`'s, ...).
+library's own (`io::errc`, `tls::errc`, `dns::errc`, `gai_category()`'s, ...).
 
 Compare an error against a condition, which matches every error that means the same, rather than a particular code:
 
@@ -136,6 +137,8 @@ if (res.err == net::io::errc::end_of_stream) { /* only the clean end of the stre
   matches that, the connection being reset or aborted, and TLS's `stream_truncated`.
 - Timeouts are `std::errc::timed_out`, and stopping the scheduler (or a stop token given to a wait, a socket or a
   request) `std::errc::operation_canceled`.
+- A name that doesn't resolve compares equal to `dns::condition::not_found` (and a failure that might pass to
+  `dns::condition::temporary_failure`), whichever resolver reported it (see DNS).
 - `error.message()` says what happened, for logs.
 
 Exceptions are for programming errors (e.g. a second final response to a request, or an invalid metric name), and
@@ -162,7 +165,7 @@ if (!listener) { /* e.g. listener.error() == std::errc::address_in_use */ }
 auto conn = co_await listener->accept();          // std::expected<tcp_socket, std::error_code>
 
 // a client's side: resolves the host, and connects, within connect_options' timeout (10s), until its stop token (if
-// any) is stopped.
+// any) is stopped. The port is a number.
 auto sock = co_await net::tcp_socket::connect(&scheduler, "example.com", "80");
 
 // or connects to addresses, in order, without resolving anything.
@@ -172,11 +175,12 @@ auto local = co_await net::tcp_socket::connect(&scheduler, addresses, 7777);
 
 `connect` tries a host's addresses in order, until one accepts. Each attempt gets a share of the timeout, as Go's
 dialer gives it: what's left over the addresses left, but at least 2 seconds (never past the end), so an address that
-doesn't answer leaves time for the rest. Resolving a name blocks (`getaddrinfo()`, on one of the scheduler's threads for
-blocking calls), and the timeout doesn't cover it; an IP address (e.g. `"127.0.0.1"` or `"::1"`) with a numeric port
-isn't resolved, so it's connected to without that thread. `connect_options::proto` limits it to IPv4's or IPv6's
-addresses. It fails with the last address's error (e.g. `std::errc::connection_refused`), `timed_out`, or
-`operation_canceled`.
+doesn't answer leaves time for the rest. A name is resolved first, with `connect_options::resolver` (by default
+`dns::default_resolver()`, see DNS), within the same timeout, and stop token; an IP address (e.g. `"127.0.0.1"` or
+`"::1"`, or `"fe80::1%en0"` with its zone) isn't, so it's connected to without a thread. A port that isn't a number
+(e.g. `"http"`) fails with `std::errc::invalid_argument`. `connect_options::proto` limits it to IPv4's or IPv6's
+addresses. It fails with the resolver's error, the last address's (e.g. `std::errc::connection_refused`), `timed_out`,
+or `operation_canceled`.
 
 A socket's reads and writes can be limited by a **deadline** (a time by which they must finish:
 `set_read_deadline()`, `set_write_deadline()`, `set_deadline()`) or a **timeout** (how long each may go without
@@ -184,8 +188,26 @@ progress: `set_read_timeout()`, ...), and fail with `std::errc::timed_out` if it
 them fail with `std::errc::operation_canceled` when stop is requested; as with a deadline, only reads and writes that
 have to wait for the socket are affected. A read canceled while it waits has read nothing, so the socket can be read
 again; a canceled write's result counts what it wrote. `shutdown_write()` ends the outgoing side (the peer reads the
-end of the stream). `dns_lookup(host)` (`dns.hpp`) resolves a name's addresses, and blocks: call it with
-`run_blocking` from a task.
+end of the stream).
+
+## DNS
+
+```cpp
+// a name's addresses: std::expected<std::vector<ip_addr>, std::error_code>.
+auto addrs = co_await net::dns::default_resolver().resolve(
+    &scheduler, "example.com", {.deadline = net::io::clock::now() + std::chrono::seconds{5}, .stop = stop});
+if (!addrs && addrs.error() == net::dns::condition::not_found) { /* no such name, or no addresses */ }
+```
+
+A `dns::resolver` (`dns/resolver.hpp`) looks names up with the system's resolver (`getaddrinfo()`), on the scheduler's
+threads for blocking calls; `dns::default_resolver()` is the one `connect` and the HTTP client use unless given
+another. `resolve_options::proto` limits it to IPv4's or IPv6's addresses. An IP address is returned as it is, without
+a thread or a lookup, and a name that isn't valid (labels of letters, digits, `-` and `_`) fails with
+`std::errc::invalid_argument` without one. A caller gives up at its deadline (`timed_out`) or when stop is requested
+(`operation_canceled`, as when the scheduler is stopped), at once: `getaddrinfo()` can't be interrupted, so it goes on
+holding its thread until it returns, and its result is dropped (a lookup whose caller gave up before it got a thread
+isn't started), and the scheduler's `shutdown()` waits for it. Errors are `getaddrinfo()`'s (in `gai_category()`):
+compare them with `dns::condition`.
 
 ## UDP
 
@@ -210,8 +232,9 @@ TCP's sockets.
 ## HTTP client
 
 `http::client` (`http/client.hpp`) sends HTTP/1.1 and HTTP/2 requests, to `http://` and `https://` URLs, reusing
-connections within `client_options`' limits (per host, altogether, idle time), with timeouts for connecting, the TLS
-handshake, the response's head, and stalled reads and writes.
+connections within `client_options`' limits (per host, altogether, idle time), with timeouts for connecting
+(`connect_timeout`, which resolving the host counts towards, with `client_options::resolver`, by default
+`dns::default_resolver()`), the TLS handshake, the response's head, and stalled reads and writes.
 
 ```cpp
 net::http::client client{&scheduler};
@@ -256,12 +279,12 @@ once idle for `idle_timeout` (at once, if it's 0), and fail if their writes stal
 client lets the bodies being read finish.
 
 A request is canceled by its `stop` token (`client_request::stop`, or `get(url, stop)`): requesting stop ends it
-wherever it is (waiting for a connection or an HTTP/2 stream, connecting and the TLS handshake, sending the request,
-waiting for the response's head), failing with `std::errc::operation_canceled`, and once `send()` has returned, the
-response's body reads fail the same way, unless it was read to its end first. A canceled HTTP/1.1 request's connection
-is closed, as it may be part way through a request or a response; an HTTP/2 request's stream is reset (CANCEL), and
-the connection goes on. A canceled request isn't sent again. Resolving the host, and reading the request's body, can't
-be interrupted: stop requested meanwhile is seen once they return. A handler passes its own request's token on, so its
+wherever it is (waiting for a connection or an HTTP/2 stream, resolving the host, connecting and the TLS handshake,
+sending the request, waiting for the response's head), failing with `std::errc::operation_canceled`, and once `send()`
+has returned, the response's body reads fail the same way, unless it was read to its end first. A canceled HTTP/1.1
+request's connection is closed, as it may be part way through a request or a response; an HTTP/2 request's stream is
+reset (CANCEL), and the connection goes on. A canceled request isn't sent again. Reading the request's body can't be
+interrupted: stop requested meanwhile is seen once it returns. A handler passes its own request's token on, so its
 outgoing requests end with it:
 
 ```cpp
@@ -530,7 +553,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `io/io.hpp`                            | `io::result`, `io::errc`, `io::status_condition`          |
 | `listen.hpp`, `tcp.hpp`                | TCP sockets                                                 |
 | `udp.hpp`                              | UDP sockets                                               |
-| `dns.hpp`, `ip_addr.hpp`, `url.hpp`    | names, addresses and URLs                                 |
+| `dns/resolver.hpp`, `ip_addr.hpp`, `url.hpp` | names, addresses and URLs                           |
 | `http/client.hpp`                      | the HTTP client                                           |
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "dns/resolver.hpp"
 #include "http/connection.hpp"
 #include "http/http2_config.hpp"
 #include "io/scheduler.hpp"
@@ -30,8 +31,13 @@ namespace net::http
 
 struct client_options
 {
-    // How long to wait for a connection: both to connect, and for one to be free when at a limit.
+    // How long to wait for a connection: both to connect (resolving the host's name, then connecting to its
+    // addresses), and for one to be free when at a limit.
     std::chrono::milliseconds connect_timeout = std::chrono::seconds{10};
+
+    // What resolves hosts' names: null is dns::default_resolver(). It must outlive the client (and its copies, and the
+    // responses whose bodies are being read).
+    dns::resolver* resolver = nullptr;
 
     // Whether to turn on TCP keepalives (SO_KEEPALIVE), which detect connections to hosts that have gone away.
     bool tcp_keepalive = true;

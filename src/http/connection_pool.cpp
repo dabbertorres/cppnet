@@ -351,8 +351,9 @@ std::shared_ptr<http2_client_connection> connection_pool::available_http2(const 
 coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connection_pool::connect(
     bool tls, std::string host, std::string port, io::clock::time_point deadline, std::stop_token stop)
 {
-    // connect within what's left of the timeout.
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - io::clock::now());
+    // connect (resolving the host, then connecting to its addresses) within what's left of the timeout: rounded up, so
+    // it doesn't give up before the deadline.
+    auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - io::clock::now());
     auto conn      = co_await tcp_socket::connect(scheduler,
                                                   host,
                                                   port,
@@ -360,6 +361,7 @@ coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connecti
                                                       .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
                                                       .keepalive = config.tcp_keepalive,
                                                       .stop      = stop,
+                                                      .resolver  = config.resolver,
                                                   });
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 

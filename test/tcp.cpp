@@ -28,13 +28,15 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
-#include "exception.hpp"
+#include "dns/blocking_lookup.hpp"
+#include "dns/resolver.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
 #include "ipv4_addr.hpp"
 #include "ipv6_addr.hpp"
 #include "listen.hpp"
 #include "socket.hpp"
+#include "util/defer.hpp"
 
 namespace
 {
@@ -75,13 +77,105 @@ TEST_CASE("connecting to a port nothing listens on is refused", "[tcp][connect]"
     CHECK(sched.run_to_completion(connect_error(&sched, "127.0.0.1", port, 5s)) == std::errc::connection_refused);
 }
 
-TEST_CASE("connecting to an unknown host fails to resolve", "[tcp][connect]")
+TEST_CASE("connecting to an unknown host fails to resolve", "[tcp][connect][network]")
 {
     net::io::scheduler sched{make_pool()};
 
     // ".invalid" names never resolve (RFC 6761).
     auto err = sched.run_to_completion(connect_error(&sched, "nonexistent.invalid", "80", 5s));
-    CHECK(err.category() == net::gai_category());
+    CAPTURE(err.message());
+    CHECK(err == net::dns::condition::not_found);
+}
+
+TEST_CASE("connecting takes only numeric ports", "[tcp][connect]")
+{
+    test::blocking_lookup lookup;
+    lookup.release(); // answers at once
+
+    net::io::scheduler sched{make_pool()};
+
+    struct test_case
+    {
+        std::string host{};
+        std::string port{};
+    };
+
+    // names as well as addresses: neither is looked up.
+    auto tc = GENERATE(test_case{.host = "127.0.0.1", .port = "http"},
+                       test_case{.host = "localhost.test", .port = "http"},
+                       test_case{.host = "127.0.0.1", .port = ""},
+                       test_case{.host = "127.0.0.1", .port = "80x"},
+                       test_case{.host = "127.0.0.1", .port = "-1"},
+                       test_case{.host = "127.0.0.1", .port = "65536"},
+                       test_case{.host = "127.0.0.1", .port = " 80"});
+    CAPTURE(tc.host, tc.port);
+
+    const auto connect =
+        [](net::io::scheduler* sched, test_case tc, net::dns::resolver* resolver) -> net::coro::task<std::error_code>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, tc.host, tc.port, {.resolver = resolver});
+        co_return conn.has_value() ? std::error_code{} : conn.error();
+    };
+
+    CHECK(sched.run_to_completion(connect(&sched, tc, &lookup.resolver)) == std::errc::invalid_argument);
+    CHECK(lookup.started.load() == 0);
+}
+
+TEST_CASE("connecting resolves names with the resolver given", "[tcp][connect]")
+{
+    // the name resolves to 127.0.0.1, where a listener is.
+    test::blocking_lookup lookup;
+    lookup.release();
+
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+    const auto port = std::to_string(listener->local_port());
+
+    const auto connect = [](net::io::scheduler* sched,
+                            std::string         port,
+                            net::dns::resolver* resolver) -> net::coro::task<std::error_code>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "listener.test", std::move(port), {.resolver = resolver});
+        co_return conn.has_value() ? std::error_code{} : conn.error();
+    };
+
+    auto err = sched.run_to_completion(connect(&sched, port, &lookup.resolver));
+    CAPTURE(err.message());
+    CHECK_FALSE(err);
+    CHECK(lookup.finished.load() == 1);
+}
+
+TEST_CASE("connecting's timeout covers resolving", "[tcp][connect][timeout]")
+{
+    test::blocking_lookup lookup;
+
+    net::io::scheduler sched{make_pool()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto connect =
+        [](net::io::scheduler*    sched,
+           test::blocking_lookup* lookup) -> net::coro::task<std::pair<std::error_code, net::io::clock::duration>>
+    {
+        const auto start   = net::io::clock::now();
+        auto       conn    = co_await net::tcp_socket::connect(sched,
+                                                               "slow.test",
+                                                               "80",
+                                                               {.timeout = 200ms, .resolver = &lookup->resolver});
+        const auto elapsed = net::io::clock::now() - start;
+
+        lookup->release();
+        co_return std::pair{conn.has_value() ? std::error_code{} : conn.error(), elapsed};
+    };
+
+    const auto [err, elapsed] = sched.run_to_completion(connect(&sched, &lookup));
+
+    CAPTURE(err.message());
+    CHECK(err == std::errc::timed_out);
+    CHECK(elapsed >= 200ms);
+    CHECK(elapsed < 5s);
+    CHECK(lookup.started.load() == 1);
 }
 
 TEST_CASE("connecting gives up at its timeout", "[tcp][connect]")
@@ -155,6 +249,46 @@ TEST_CASE("an unbound Unix socket's address is empty", "[tcp][addr]")
 
     CHECK(a.local_addr().empty());
     CHECK(b.remote_addr().empty());
+}
+
+TEST_CASE("requesting stop ends resolving", "[tcp][connect][stop]")
+{
+    test::blocking_lookup lookup;
+
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto connect = [](net::io::scheduler*    sched,
+                            test::blocking_lookup* lookup,
+                            std::stop_token        stop) -> net::coro::task<std::error_code>
+    {
+        auto conn =
+            co_await net::tcp_socket::connect(sched,
+                                              "slow.test",
+                                              "80",
+                                              {.timeout = 10s, .stop = std::move(stop), .resolver = &lookup->resolver});
+
+        lookup->release();
+        co_return conn.has_value() ? std::error_code{} : conn.error();
+    };
+
+    // NOTE: declared after the scheduler, so it's joined first, once it has stopped the connect (which it does even if
+    //       the lookup never starts: then its wait gives up).
+    std::jthread stopper{[&]
+                         {
+                             (void)lookup.wait_started(1);
+                             source.request_stop();
+                         }};
+
+    const auto start   = net::io::clock::now();
+    const auto err     = sched.run_to_completion(connect(&sched, &lookup, source.get_token()));
+    const auto elapsed = net::io::clock::now() - start;
+
+    CAPTURE(err.message());
+    CHECK(err == std::errc::operation_canceled);
+    CHECK(elapsed < 5s);
+    CHECK(lookup.started.load() == 1);
 }
 
 TEST_CASE("connecting with a stopped token fails without resolving", "[tcp][connect][stop]")

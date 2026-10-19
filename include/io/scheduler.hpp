@@ -473,10 +473,23 @@ public:
         F func;
     };
 
+    struct options
+    {
+        // How many threads run_blocking() has (at least 1): the most blocking calls that run at once, e.g. the system
+        // resolver's lookups (dns::resolver), the rest waiting for one to finish. A few by default, so that one slow
+        // lookup doesn't hold up the rest.
+        std::size_t blocking_threads = 4;
+    };
+
     // NOTE: the default logger isn't registered with spdlog, which only allows one logger per name.
     explicit scheduler(std::shared_ptr<coro::thread_pool>     workers,
                        const std::shared_ptr<spdlog::logger>& logger = std::make_shared<spdlog::logger>(
                            "scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
+
+    scheduler(std::shared_ptr<coro::thread_pool>     workers,
+              options                                opts,
+              const std::shared_ptr<spdlog::logger>& logger =
+                  std::make_shared<spdlog::logger>("scheduler", std::make_shared<spdlog::sinks::null_sink_mt>()));
 
     scheduler(const scheduler&)            = delete;
     scheduler& operator=(const scheduler&) = delete;
@@ -585,8 +598,10 @@ public:
         return {this, deadline, std::forward<F>(func)};
     }
 
-    // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo()), so it doesn't hold up the
-    // worker threads, and then continues on the worker threads. Stopping the scheduler doesn't interrupt func.
+    // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo(); options::blocking_threads of
+    // them, func waiting for one to be free), so it doesn't hold up the worker threads, and then continues on the
+    // worker threads. Stopping the scheduler doesn't interrupt func, and shutdown() waits for the task awaiting it, as
+    // for any task.
     template<std::invocable F>
     coro::task<std::invoke_result_t<F>> run_blocking(F func)
     {

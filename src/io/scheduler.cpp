@@ -45,8 +45,14 @@ namespace net::io
 {
 
 scheduler::scheduler(std::shared_ptr<coro::thread_pool> workers, const std::shared_ptr<spdlog::logger>& logger)
-    : workers{std::move(workers)} // a few threads, so that one slow lookup doesn't hold up the rest.
-    , blocking{std::make_unique<coro::thread_pool>(4)}
+    : scheduler{std::move(workers), options{}, logger}
+{}
+
+scheduler::scheduler(std::shared_ptr<coro::thread_pool>     workers,
+                     options                                opts,
+                     const std::shared_ptr<spdlog::logger>& logger)
+    : workers{std::move(workers)}
+    , blocking{std::make_unique<coro::thread_pool>(std::max<std::size_t>(opts.blocking_threads, 1))}
     , logger{logger}
     , scope{[this](const std::exception_ptr& ex)
             {
