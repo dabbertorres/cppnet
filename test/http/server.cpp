@@ -747,6 +747,9 @@ public:
         }
     }
 
+    // shutdown_write ends what the client sends (the server reads the end of the stream), while it can still read.
+    void shutdown_write() const { REQUIRE(::shutdown(fd, SHUT_WR) == 0); }
+
 private:
     int fd;
 };
@@ -1738,4 +1741,225 @@ TEST_CASE("join() completes at once for a server that isn't serving", "[http][se
 
     const auto test = [](http::server* server) -> task<> { co_await server->join(); };
     sched.run_to_completion(test(&server));
+}
+
+namespace
+{
+
+// waiting_handler waits (with its token) for up to wait, then answers with how the wait ended: "slept" or "stopped".
+struct waiting_handler
+{
+    net::io::scheduler*       sched;
+    std::chrono::milliseconds wait;
+
+    std::atomic<bool> started = false;
+    std::atomic<int>  stopped = -1; // -1 until it's woken
+
+    task<void> operator()(const http::server_request& req, http::response_writer& resp)
+    {
+        started.store(true);
+        const auto err = co_await sched->sleep_until(net::io::clock::now() + wait, req.stop);
+        stopped.store(err == std::errc::operation_canceled ? 1 : 0);
+
+        const auto msg  = err ? "stopped"sv : "slept"sv;
+        auto*      body = co_await resp.send(http::status::OK, msg.size());
+        co_await net::io::write_all(*body, msg);
+    }
+
+    // wait_stopped waits (up to 5s) for the handler to have woken, returning whether it was stopped.
+    [[nodiscard]] bool wait_stopped() const
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (stopped.load() == -1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+        return stopped.load() == 1;
+    }
+
+    [[nodiscard]] bool wait_started() const
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+        return started.load();
+    }
+};
+
+}
+
+TEST_CASE("the client leaving stops a waiting HTTP/1.1 handler's token", "[http][server][cancel][watch]")
+{
+    running_scheduler running;
+    waiting_handler   handler{.sched = &running.sched, .wait = 5s};
+
+    http::router router;
+    router.GET("/wait",
+               [&handler](const http::server_request& req, http::response_writer& resp) { return handler(req, resp); });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+    conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(handler.wait_started());
+
+    const auto start = std::chrono::steady_clock::now();
+
+    SECTION("closing the connection")
+    {
+        conn.close();
+        CHECK(handler.wait_stopped());
+        CHECK(std::chrono::steady_clock::now() - start < 2s);
+    }
+
+    SECTION("ending what it sends (as Go's server, which can't tell that from closing), still reading the response")
+    {
+        conn.shutdown_write();
+        CHECK(handler.wait_stopped());
+        CHECK(std::chrono::steady_clock::now() - start < 2s);
+
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.ends_with("\r\n\r\nstopped"));
+    }
+}
+
+TEST_CASE("requests that arrive while an HTTP/1.1 handler waits are served after it", "[http][server][cancel][watch]")
+{
+    running_scheduler running;
+    waiting_handler   handler{.sched = &running.sched, .wait = 200ms};
+
+    http::router router;
+    router.GET("/wait",
+               [&handler](const http::server_request& req, http::response_writer& resp) { return handler(req, resp); });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0", .header_read_timeout = 1s}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+
+    // the second while the first's handler waits (and its connection's watched), or with the first.
+    const bool spaced = GENERATE(true, false);
+    CAPTURE(spaced);
+
+    if (spaced)
+    {
+        conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+        std::this_thread::sleep_for(50ms);
+        conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    else
+    {
+        conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\nGET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    std::string out;
+    while (count(out, "\r\n\r\nslept") < 2)
+    {
+        auto chunk = conn.read_some();
+        if (chunk.empty()) break;
+        out += chunk;
+    }
+
+    CAPTURE(out);
+    CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 2);
+    CHECK(count(out, "\r\n\r\nslept") == 2);
+
+    // and the next request's head has header_read_timeout from the last response, whose wait was the watch's read.
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(conn.read_to_end().empty());
+    const auto took = std::chrono::steady_clock::now() - start;
+    CHECK(took > 700ms);
+    CHECK(took < 2s);
+}
+
+TEST_CASE("an HTTP/1.1 request is watched once its body has been read to its end", "[http][server][cancel][watch]")
+{
+    running_scheduler running;
+
+    std::atomic<int> before_body = -1; // whether the wait before reading the body was stopped
+    std::atomic<int> after_body  = -1; // and the one after
+
+    http::router router;
+    router.POST("/read",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    const auto first = co_await running.sched.sleep_until(net::io::clock::now() + 300ms, req.stop);
+                    before_body.store(first ? 1 : 0);
+
+                    auto body = co_await net::io::read_all(*req.body);
+
+                    const auto second = co_await running.sched.sleep_until(net::io::clock::now() + 5s, req.stop);
+                    after_body.store(second ? 1 : 0);
+
+                    const auto msg    = body.has_value() ? *body : std::string{"failed"};
+                    auto*      writer = co_await resp.send(http::status::OK, msg.size());
+                    co_await net::io::write_all(*writer, msg);
+                });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    // the client stops sending while the handler waits with its body unread (so reading the connection would read the
+    // body, which is the handler's: it isn't watched), then reads it, and waits again (now watched).
+    blocking_client conn{server.local_port()};
+    conn.send("POST /read HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    std::this_thread::sleep_for(100ms);
+    conn.shutdown_write();
+
+    const auto out = conn.read_to_end();
+    CAPTURE(out);
+    CHECK(out.ends_with("\r\n\r\nhello"));
+    CHECK(before_body.load() == 0);
+    CHECK(after_body.load() == 1);
+}
+
+TEST_CASE("an HTTP/1.1 handler that doesn't suspend isn't watched", "[http][server][cancel][watch]")
+{
+    running_scheduler running;
+
+    std::atomic<bool> started = false;
+    std::atomic<int>  stopped = -1;
+
+    // NOTE: it blocks its worker, deliberately, checking its token, but never waits for anything: a watch would only
+    //       delay the responses of handlers that don't, so the server doesn't watch it.
+    http::router router;
+    router.GET("/busy",
+               [&](const http::server_request& req, http::response_writer& /*resp*/) -> task<void>
+               {
+                   started.store(true);
+                   const auto until = std::chrono::steady_clock::now() + 500ms;
+                   while (!req.stop.stop_requested() && std::chrono::steady_clock::now() < until)
+                       std::this_thread::sleep_for(1ms);
+                   stopped.store(req.stop.stop_requested() ? 1 : 0);
+                   co_return;
+               });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+    conn.send("GET /busy HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    REQUIRE(started.load());
+    conn.close();
+
+    while (stopped.load() == -1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    CHECK(stopped.load() == 0);
 }

@@ -1,9 +1,10 @@
 # Plan: canceling HTTP server handlers
 
-Status: stage 1 (waits that take a token) done (2026-10-18); stage 2 (the server's token), with stage 5's 499/503, done
-(2026-10-18); stage 3 (the client) done (2026-10-18); stage 4 planned. Where things stand describes what was there before (HTTP/1.1's graceful
-`close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they added. The
-questions below (under Decided questions) were decided as recommended.
+Status: done (2026-10-18): stage 1 (waits that take a token), stage 2 (the server's token, with stage 5's 499/503),
+stage 3 (the client) and stage 4 (HTTP/1.1 noticing the client leave, watching only handlers that wait); stage 5's
+timeout middleware and source-linking helper are later. Where things stand describes what was there before (HTTP/1.1's
+graceful `close()`, and the `aborting` source the destructor stops), and the stages' "Done as above" notes, what they
+added. The questions below (under Decided questions) were decided as recommended.
 
 ## Goal
 
@@ -340,6 +341,53 @@ questions (3); the recommended design:
 - The body readers must not touch the connection once at their end (`chunked_reader` keeps `done`; `limit_reader`
   stops at its limit): checked, and tested, as the watcher would race with them otherwise.
 
+Measured first, as above, it cost too much (`bench_request`, Release, 2 workers, the minimum over alternating runs):
+watching every request from its handler's start took the socket test from 27.1 to 29.6 us per request (+9%; 3.0
+allocations per request to 2.0, as the watch's read buffers the next head, so decoding it needs no `decode_reading`
+frame). Its `recv()` (which would block), its wait's registration and `fill_after`'s frame moved in front of the
+handler, onto the path from a request to its response, where they had come after the response was sent; starting the
+watcher on the pool instead took it to 33.2 us (a worker woken per request). So (decided 2026-10-18) a request is
+watched only once its handler has **suspended**: one that runs straight through is done before a watch could help, and
+pays nothing. Done as above, with that, and these details settled in the code:
+
+- **When**: the second of two marks (an atomic `watch_gate`, so exactly one side begins it, on whichever thread): the
+  handler suspending (`handler_runs`, an awaiter for the handler's task that does what `task`'s does, and marks the
+  gate when the task suspends), and the request's body at its end (an `io::end_callback` the body readers call as they
+  reach it: `limit_reader::call_at_end()`, `chunked_reader::call_at_end()`, set by `http11::call_at_body_end()` after
+  decoding rather than passed through `request_decode`, whose frame then grew enough to cost the in-memory one-per-read
+  test 7%). Nothing may be buffered after the body. A handler that never suspends (e.g. a computation checking
+  `stop_requested()` between steps, without waiting for anything) isn't watched: tested, as the limitation it is.
+- **How**: the watcher (`connection_state::watch`, one frame per connection, made by `serve_http1()`) is resumed on the
+  pool, as its first read on the handler's thread would delay the handler. It reads with `reader.fill()`, `input` held,
+  and the socket's read timeout off (the handler may take as long as it likes); the end of the stream, a reset, any
+  other failure (but a timeout: the server's) stops the connection's source. It publishes its result through an atomic
+  handoff (null, the state once it's ended, or the server's coroutine waiting for it, which it then resumes by
+  symmetric transfer), and parks; nothing locks, and nothing's allocated per request but the frames there were.
+- **Handing over**: the server sends the response itself, then sets the read deadline (the head's, or the read timeout
+  from now, whichever's sooner) on the read already waiting, and waits for the result. A socket's read deadline is now
+  its read operation's `handle_operation::limit_deadline()`, kept under the handle's shard lock, which a wait reads as
+  it begins (the earlier of it and the wait's own, the timeout's), and which moves the timer of a wait in progress: so
+  `set_read_deadline()` applies to a read waiting on another thread (taking that lock: twice per request, as before).
+  A request whose connection ends (a handler that threw, `Connection: close`, `close()`, ...) abandons the watch by
+  setting the deadline to now.
+- **close_notify**: Botan's TLS 1.3 channel answers the peer's close_notify only if
+  `Callbacks::tls_peer_closed_connection()` returns true; its TLS 1.2 channel always answers at once, whatever that
+  returns. So `tls::stream::accept()` takes `accept_options` (its stop token and ALPN list, which were trailing
+  parameters, and `hold_close_reply`, for which the callback returns false): the server sets it from the handshake, as
+  a TLS 1.3 client's close_notify may come with its first request, and `shutdown()`/`close()` answer it once the server
+  is done, as RFC 8446 6.1 allows, so the response still goes out; HTTP/2 connections `release_close_reply()`, keeping
+  their behavior. Over TLS 1.2 Botan answers at once, as RFC 5246 7.2.1 requires (and discards pending writes), so a
+  handler stopped by its client's close_notify can't respond: those connections are watched all the same, and nothing
+  tells the versions apart (so nothing needs deleting when TLS 1.2 goes). Every other close_notify path (the client's,
+  `idle_clean()`) is unchanged.
+- **Half-close**: a client that ends what it sends (`shutdown(SHUT_WR)`) after its request has its handler's token
+  stopped, as Go's server does (it can't be told from a client that's gone); its response is still sent.
+- **Measured**, against master (`bench_request`, Release, 2 workers, six alternating runs each, minimum / median):
+  the socket test (whose handler doesn't suspend) 27.1 / 27.7 us before, 27.3 / 27.6 after, 3.0 allocations per
+  request both; `bench_request`'s new socket test to a handler that waits once (for another pool), so watched, 34.9 /
+  35.2 us before, 35.3 / 35.6 after (+1%), 3.0 allocations per request to 2.0; the in-memory tests unchanged (pipelined
+  1097 / 1103 ns and 1093 / 1116; one per read 1291 / 1298 and 1273 / 1310).
+
 ### Middleware and routers
 
 The routers and `http_metrics`/`http_tracing` pass the request through, so the token reaches the handler without them
@@ -358,7 +406,7 @@ being assignable is what allows it. A timeout middleware itself is later (it nee
   token copy (two atomic reference-count changes), and the hard-stop callback is registered once per connection.
   `bench_request`'s in-memory tests don't go through the server, so they don't change; its socket test should show
   the same allocations per request (a few: the frames CLAUDE.md lists, `decode_reading`, `fill_after` and the
-  handler's). Stage 4's watcher: one frame per connection, and a hand-over per request (to measure).
+  handler's). Stage 4's watcher: one frame per connection, and a hand-over per watched request (measured: see stage 4).
 - **HTTP/2: one allocation per stream**, against the several a stream makes already (the `http2_stream`, its
   `stream_reader`, the handler's task and the scope's frame, the stream maps' nodes, header strings past the small
   buffers): about one more in ten, to be measured (a loopback count of allocations per stream, before and after,
@@ -441,7 +489,7 @@ Each was decided as recommended (2026-10-18); the options are kept for the reaso
    stage 4 (Go's background read, through the connection's buffer: exact for TLS too; one frame per connection, a
    hand-over per request). (c) A readiness wait and `recv(MSG_PEEK)`: no read to hand back, but over TLS a close_notify
    is just bytes, so a client that sends one before its FIN isn't noticed. **Recommended: (b), as its own stage after
-   measuring; (a) until then.**
+   measuring; (a) until then.** Measured, it watches only handlers that suspend (see stage 4).
 4. **Should the handler learn why it was stopped?** (a) No: the token says only that it was; HTTP/2's body I/O
    already returns the stream's failure. (b) `server_request` gets the reason as an `std::error_code` (e.g.
    `connection_reset`, `timed_out`, `connection_aborted`, `operation_canceled` for the server's stop), set before the

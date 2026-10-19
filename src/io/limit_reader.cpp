@@ -26,7 +26,10 @@ coro::task<result> limit_reader::count_after(coro::task<result> inner) { co_retu
 
 result limit_reader::counted(result res) noexcept
 {
+    const bool before = progress < limit;
     progress += res.count;
+
+    if (before && progress >= limit) at_end();
 
     // NOTE: exactly the end of the stream: any other failure is reported as it is.
     if (how == mode::exact && progress < limit && res.err == errc::end_of_stream)

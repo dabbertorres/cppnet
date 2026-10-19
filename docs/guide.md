@@ -253,11 +253,12 @@ scheduler.spawn(server.serve());
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).
-- **Canceling:** `req.stop`, a `std::stop_token`, is stopped once the request is no longer wanted: over HTTP/2, when
-  the client resets its stream, the stream times out, or its connection ends; over HTTP/1.1, when its connection
-  ends; and when the server is aborted (below). Canceling is cooperative: a handler checks `req.stop.stop_requested()`
-  between steps, registers a `std::stop_callback` (quick, and not blocking: it runs on whichever thread stopped the
-  token), or passes the token on to the waits that take one, which then fail with `std::errc::operation_canceled`:
+- **Canceling:** `req.stop`, a `std::stop_token`, is stopped once the request is no longer wanted: over HTTP/2, when the
+  client resets its stream, the stream times out, or its connection ends; over HTTP/1.1, when the client leaves (below),
+  or the connection ends; and when the server is aborted (below). Canceling is cooperative: a handler checks
+  `req.stop.stop_requested()` between steps, registers a `std::stop_callback` (quick, and not blocking: it runs on
+  whichever thread stopped the token), or passes the token on to the waits that take one, which then fail with
+  `std::errc::operation_canceled`:
 
   ```cpp
   if (auto err = co_await scheduler->sleep_until(net::io::clock::now() + 1s, req.stop)) co_return;   // canceled
@@ -269,6 +270,14 @@ scheduler.spawn(server.serve());
   middleware can swap in a token of its own (e.g. stopped by a deadline, or by the server's through a
   `std::stop_callback`) for the handler it wraps. `req.aborted` is stopped once the server is aborted: not a reason,
   only whether the server's own stop came, for telling it from the client's side.
+
+  An HTTP/1.1 server reads the connection while a handler waits (once it has suspended, and has read the request's
+  body to its end), so that the client leaving stops `req.stop`: the end of the stream (as Go's server, which can't
+  tell a client that has only stopped sending from one that has gone: its response is still sent), a reset, or TLS's
+  close_notify. Over TLS 1.3 the server holds its answer to that back until it has responded (as RFC 8446 6.1 allows),
+  so a response still goes out; over TLS 1.2 it's answered at once (as RFC 5246 requires), after which a handler
+  stopped that way can't respond. A request that arrives meanwhile isn't a leaving, and is served next. A handler that
+  runs straight through, never suspending, isn't watched: it's done before a watch would help.
 - **Middleware** wraps a handler: e.g. `instrument::http_metrics{std::move(router)}` (`instrument/middleware.hpp`)
   measures requests with Prometheus metrics, and `instrument::http_tracing` traces them. Both record a request
   canceled before its response was sent as 499 Client Closed Request (not an error) if the client's side stopped it,
@@ -338,9 +347,14 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   "Certificate does not match provided name").
 - A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()` (as
   `http::server` does).
-- `stream::connect()` and `stream::accept()` take an optional `std::stop_token`: requesting stop ends a handshake that's
-  waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does the same for reads and writes (as a
-  socket's): a canceled read can be tried again, but a canceled write fails the writes after it, as any failed write.
+- `stream::connect()` takes an optional `std::stop_token`, as `stream::accept()` does in its `accept_options` (`stop`):
+  requesting stop ends a handshake that's waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does
+  the same for reads and writes (as a socket's): a canceled read can be tried again, but a canceled write fails the
+  writes after it, as any failed write.
+- The peer's close_notify is answered at once, after which nothing more can be written. `accept_options`'
+  `hold_close_reply` holds the answer to the client's back, so the stream can still be written after it, until
+  `shutdown()` or `close()` (TLS 1.3 only: TLS 1.2 requires the answer at once); `release_close_reply()` goes back to
+  answering at once. `accept_options::alpn` offers other ALPN protocols than the context's.
 - A read and writes may run at once (e.g. HTTP/2's reader and writer), but only one read. A write returns once what it
   wrote has gone to the socket (after what was queued before it, e.g. another write, or a read's reply to the peer), so
   the socket's write deadline and timeout limit it; a write that fails fails every write after it (part of a record

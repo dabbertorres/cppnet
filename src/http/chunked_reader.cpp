@@ -63,6 +63,7 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
             if (auto err = co_await read_trailers(); err) co_return {.err = err};
 
             done = true;
+            at_end();
             co_return {.count = 0, .err = make_error_code(io::errc::end_of_stream)};
         }
     }

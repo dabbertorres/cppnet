@@ -178,6 +178,10 @@ private:
     // (see header_read_timeout).
     [[nodiscard]] std::optional<io::clock::time_point> head_deadline() const;
 
+    // read_timeout is how long a connection's reads may go without progress (see body_read_timeout), if they're
+    // limited.
+    [[nodiscard]] std::optional<io::clock::duration> read_timeout() const;
+
     // start_response readies the connection's response for the request it has just decoded, with no_body for its body
     // if it's to a HEAD request.
     static void start_response(connection_state& state, io::discard_writer& no_body);

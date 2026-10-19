@@ -5,7 +5,9 @@
 // - one per read: the same, but each read hands over just one request, and has to wait for it (a coroutine, as a
 //   socket's read that has to wait is): as for a client that waits for each response, apart from the socket.
 // - over a socket: the server itself, and a client on another thread sending a request at a time (as TechEmpower's
-//   JSON test does), so with the socket, scheduler and kernel's round trip too.
+//   JSON test does), so with the socket, scheduler and kernel's round trip too. And again with a handler that waits
+//   once (for another pool, as for a database's driver), whose connection the server watches meanwhile, to notice the
+//   client leaving.
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
 //   allocations are counted with the server's (as they share the process): for what a stream costs.
 #include "http/request.hpp"
@@ -94,6 +96,14 @@ constexpr auto request =
     "Connection: keep-alive\r\n"
     "\r\n"sv;
 
+// the same, to a handler that waits once.
+constexpr auto waiting_request =
+    "GET /waiting HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Accept: text/plain,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.7\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n"sv;
+
 constexpr auto body = "Hello, World!"sv;
 
 constexpr std::size_t pipelined       = 16;
@@ -110,6 +120,18 @@ task<void> plaintext(const http::server_request& /*req*/, http::response_writer&
     auto* out = co_await resp.send(http::status::OK, body.size());
     co_await net::io::write_all(*out, body);
 }
+
+// waits_once answers as plaintext does, after waiting once: for a turn on another pool.
+struct waits_once
+{
+    net::coro::thread_pool* elsewhere;
+
+    task<void> operator()(const http::server_request& req, http::response_writer& resp) const
+    {
+        co_await elsewhere->yield();
+        co_await plaintext(req, resp);
+    }
+};
 
 // one_request_per_read hands over its input a request at a time, each through a coroutine (as a socket's read that has
 // to wait for data is).
@@ -258,8 +280,9 @@ void measure(std::string_view name, const Router& router, MakeInput make_input)
 class client
 {
 public:
-    explicit client(std::uint16_t port)
+    client(std::uint16_t port, std::string_view request)
         : fd{::socket(AF_INET, SOCK_STREAM, 0)}
+        , request{request}
     {
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
@@ -303,12 +326,14 @@ public:
 
 private:
     int                     fd;
+    std::string_view        request;
     std::array<char, 4'096> buf{};
 };
 
-// measure_socket serves requests over a socket, a request at a time, and prints the time and allocations per request.
+// measure_socket serves requests (each request) over a socket, a request at a time, and prints the time and allocations
+// per request.
 template<typename Router>
-void measure_socket(const Router& router)
+void measure_socket(std::string_view name, const Router& router, std::string_view request)
 {
     auto               workers = std::make_shared<net::coro::thread_pool>(2);
     net::io::scheduler scheduler{workers};
@@ -323,7 +348,7 @@ void measure_socket(const Router& router)
     std::thread runner{[&] { scheduler.run(); }};
 
     {
-        client conn{server.local_port()};
+        client conn{server.local_port(), request};
 
         // warms up: e.g. the connection's buffers, and its request and response, which are kept for it.
         for (int i = 0; i < 1'000; ++i)
@@ -346,7 +371,7 @@ void measure_socket(const Router& router)
         const auto took    = std::chrono::steady_clock::now() - start;
         const auto counted = allocations.load() - at;
 
-        std::println("over a socket (a request at a time, {} workers):", workers->concurrency());
+        std::println("{} ({} workers):", name, workers->concurrency());
         std::println("{:>10.1f} us per request",
                      std::chrono::duration<double, std::micro>(took).count() / socket_requests);
         std::println("{:>10.1f} allocations per request",
@@ -446,10 +471,14 @@ int main()
 {
     spdlog::set_level(spdlog::level::warn);
 
-    const auto router = http::make_static_router(http::GET("/plaintext"_route, plaintext));
+    net::coro::thread_pool elsewhere{1};
+
+    const auto router  = http::make_static_router(http::GET("/plaintext"_route, plaintext));
+    const auto waiting = http::make_static_router(http::GET("/waiting"_route, waits_once{&elsewhere}));
 
     measure("pipelined", router, [](std::string_view input) { return net::io::string_reader{input}; });
     measure("one per read", router, [](std::string_view input) { return one_request_per_read{input}; });
-    measure_socket(router);
+    measure_socket("over a socket, a request at a time", router, request);
+    measure_socket("over a socket, to a handler that waits once", waiting, waiting_request);
     measure_http2(router);
 }

@@ -291,6 +291,7 @@ public:
     void tls_emit_data(std::span<const std::uint8_t> data) override;
     void tls_record_received(std::uint64_t seq_no, std::span<const std::uint8_t> data) override;
     void tls_alert(Botan::TLS::Alert alert) override;
+    bool tls_peer_closed_connection() override;
 
     // record_verification_failure keeps why the peer's certificate was rejected.
     void record_verification_failure(Botan::Certificate_Status_Code status) noexcept;
@@ -670,6 +671,7 @@ struct connection
     std::vector<std::uint8_t>                     received; // decrypted data not read yet, from received_start
     std::size_t                                   received_start = 0;
     bool                                          peer_closed    = false; // the peer's close_notify
+    bool                                          hold_reply     = false; // see accept_options::hold_close_reply
     std::error_code                               failure;                // a fatal alert, or a broken protocol
     std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
     std::string                                   alpn;
@@ -720,6 +722,10 @@ void callbacks::tls_alert(Botan::TLS::Alert alert)
     if (alert.type() == Botan::TLS::Alert::CloseNotify) conn->peer_closed = true;
     else if (alert.is_fatal() && !conn->failure) conn->failure = peer_alert(alert.type());
 }
+
+// NOTE: TLS 1.3's channel answers the peer's close_notify only if this returns true; TLS 1.2's always does (as RFC 5246
+//       requires), whatever it returns.
+bool callbacks::tls_peer_closed_connection() { return !conn->hold_reply; }
 
 }
 
@@ -868,17 +874,15 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
     co_return stream{std::move(c)};
 }
 
-coro::task<std::expected<stream, std::error_code>> stream::accept(tcp_socket                              conn,
-                                                                  server_context                          ctx,
-                                                                  io::clock::time_point                   deadline,
-                                                                  std::stop_token                         stop,
-                                                                  std::optional<std::vector<std::string>> alpn)
+coro::task<std::expected<stream, std::error_code>>
+stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, accept_options options)
 {
-    auto c = std::make_unique<detail::connection>(std::move(conn));
+    auto c        = std::make_unique<detail::connection>(std::move(conn));
+    c->hold_reply = options.hold_close_reply;
 
     try
     {
-        auto protocols = alpn.has_value() ? std::move(*alpn) : ctx.state->alpn;
+        auto protocols = options.alpn.has_value() ? std::move(*options.alpn) : ctx.state->alpn;
         c->cb          = std::make_shared<detail::callbacks>(c.get(), false, std::move(protocols));
 
         std::scoped_lock lock{c->mu};
@@ -893,7 +897,7 @@ coro::task<std::expected<stream, std::error_code>> stream::accept(tcp_socket    
         co_return std::unexpected(make_error_code(errc::protocol_error));
     }
 
-    if (auto err = co_await c->handshake(deadline, std::move(stop)); err) co_return std::unexpected(err);
+    if (auto err = co_await c->handshake(deadline, std::move(options.stop)); err) co_return std::unexpected(err);
     co_return stream{std::move(c)};
 }
 
@@ -978,6 +982,22 @@ coro::task<> stream::close()
 }
 
 std::string_view stream::alpn() const noexcept { return conn->alpn; }
+
+void stream::release_close_reply() noexcept
+{
+    std::scoped_lock lock{conn->mu};
+    conn->hold_reply = false;
+
+    try
+    {
+        // NOTE: as the channel would have, as it read it (but sent with the next write or flush).
+        if (conn->peer_closed && !conn->channel->is_closed_for_writing()) conn->channel->close();
+    }
+    catch (const std::exception&)
+    {
+        if (!conn->write_failure) conn->write_failure = make_error_code(errc::protocol_error);
+    }
+}
 
 void stream::set_stop_token(std::stop_token stop) noexcept { conn->socket.set_stop_token(std::move(stop)); }
 

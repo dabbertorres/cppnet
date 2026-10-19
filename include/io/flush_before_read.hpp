@@ -33,6 +33,12 @@ public:
     // which ends the connection as its closing would.
     coro::task<result> read(std::span<std::byte> data) override;
 
+    // hold makes reads not send what's been written first, while it's on: for a read that runs while another task
+    // writes through writer (e.g. a server's handler), which flushing would race with. Whoever turns it off then sends
+    // what's been written (e.g. with writer's flush()), if the reader may wait for the other end, which may be waiting
+    // for that.
+    void hold(bool on) noexcept { held = on; }
+
     using reader::read;
 
     [[nodiscard]] handle native_handle() const noexcept override { return conn->native_handle(); }
@@ -45,6 +51,7 @@ private:
 
     reader*          conn;
     buffered_writer* writer;
+    bool             held = false;
 };
 
 }

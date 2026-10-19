@@ -23,6 +23,7 @@
 #include <spdlog/common.h>
 
 #include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
 #include "exception.hpp"
 #include "http/connection.hpp"
 #include "http/headers.hpp"
@@ -413,11 +414,12 @@ coro::task<bool> server::room_for_connection()
 // that their memory (e.g. for header values) is.
 struct server::connection_state
 {
-    connection_state(detail::connection* conn, std::stop_token closing)
+    connection_state(detail::connection* conn, std::stop_token closing, std::optional<io::clock::duration> read_timeout)
         : writer{&detail::as_writer(*conn), buffer_size}
         , input{&detail::as_reader(*conn), &writer}
         , reader{&input, buffer_size}
         , conn{conn}
+        , read_timeout{read_timeout}
         , closing{std::move(closing)}
         , on_close{std::in_place, this->closing, close_now{this}}
     {}
@@ -458,13 +460,177 @@ struct server::connection_state
     };
 
     // serve_http1 readies the connection to serve HTTP/1.x requests (once it isn't HTTP/2): its handlers' stop source,
-    // which abort() stops (as does the connection ending), and abort()'s callback.
+    // which abort() stops (as does the connection ending, or the client leaving: see the watch, below), abort()'s
+    // callback, and the watcher.
     // NOTE: not before, as close() (which abort() calls first) ends a connection waiting for HTTP/2's preface anyway,
     //       and an HTTP/2 connection needs no source of its own.
     void serve_http1(const std::stop_token& aborting)
     {
         stop = std::stop_source{};
         on_abort.emplace(aborting, abort_now{this});
+
+        watcher        = watch(this);
+        watcher_parked = watcher.get_handle();
+    }
+
+    // The watch: while a handler waits, the connection is read, so that the client leaving (the end of the stream, a
+    // reset, or TLS's close_notify) stops the handler's token. A coroutine of the connection's own (the watcher) reads
+    // once per watch, into reader's buffer, and parks in between. A request is watched once its handler has suspended
+    // (one that runs straight through isn't: watching it would only delay its response) and its body has been read to
+    // its end (at once, for one without), with nothing buffered after it (a pipelined request shows the client was
+    // there). Meanwhile the connection's input is held (see io::flush_before_read::hold()), as the handler may be
+    // writing. Data ends the watch, and stays buffered for the next request. Once the handler's done, the server takes
+    // the watch's read over as its wait for the next request's head (sending the response, and setting the head's
+    // deadline on the read already waiting), so nothing's allocated per request, and no syscall's added.
+
+    // watch is the watcher: a read per watch, after which it parks (see watch_done).
+    static coro::task<> watch(connection_state* state)
+    {
+        while (true)
+        {
+            std::error_code err;
+            try
+            {
+                err = co_await state->reader.fill();
+            }
+            catch (const std::bad_alloc&)
+            {
+                err = std::make_error_code(std::errc::not_enough_memory);
+            }
+
+            // the client's gone, or the connection's failed. (A timeout is the server's deadline, once the handler's
+            // done, or abandon_watch().)
+            if (err && err != std::errc::timed_out) state->stop.request_stop();
+
+            co_await watch_done{.state = state, .err = err};
+        }
+    }
+
+    // watch_done publishes a watch's result, continuing the server if it's waiting for it, and parks the watcher.
+    struct watch_done
+    {
+        connection_state* state = nullptr;
+        std::error_code   err;
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> watcher) const noexcept
+        {
+            state->watcher_parked = watcher;
+            state->watch_result   = err;
+
+            // NOTE: once it's published, the server may start the next watch at once, on another thread: nothing here
+            //       may be touched after.
+            void* waiting = state->watch_handoff.exchange(state, std::memory_order::acq_rel);
+            if (waiting != nullptr) return std::coroutine_handle<>::from_address(waiting);
+            return std::noop_coroutine();
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    // watch_ended waits for the watch's result.
+    struct watch_ended
+    {
+        connection_state* state = nullptr;
+
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return state->watch_handoff.load(std::memory_order::acquire) == state;
+        }
+
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<> server) const noexcept
+        {
+            void* none = nullptr;
+            return state->watch_handoff.compare_exchange_strong(none,
+                                                                server.address(),
+                                                                std::memory_order::acq_rel,
+                                                                std::memory_order::acquire);
+        }
+
+        [[nodiscard]] std::error_code await_resume() const noexcept { return state->watch_result; }
+    };
+
+    // The marks a watch waits for: whichever comes second (on whichever thread, as the handler may be running on
+    // another by then) begins it.
+    static constexpr std::uint8_t handler_waited = 1;
+    static constexpr std::uint8_t body_read      = 2;
+
+    // gate_open marks one of them, returning whether it was the second.
+    bool gate_open(std::uint8_t mark) noexcept
+    {
+        const auto before = watch_gate.fetch_or(mark, std::memory_order::acq_rel);
+        return (before & mark) == 0 && (before | mark) == (handler_waited | body_read);
+    }
+
+    // body_ended is the request body's end_callback.
+    static void body_ended(void* context) noexcept
+    {
+        auto* state = static_cast<connection_state*>(context);
+        if (state->gate_open(body_read)) state->begin_watch();
+    }
+
+    // handler_runs awaits the handler's task, as task's awaiter does, marking the gate if the handler suspends.
+    struct handler_runs
+    {
+        connection_state*                          state = nullptr;
+        std::coroutine_handle<coro::promise<void>> handler;
+
+        [[nodiscard]] bool await_ready() const noexcept { return handler.done(); }
+
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<> server) const noexcept
+        {
+            auto& promise = handler.promise();
+            promise.set_continuation(server);
+            handler.resume();
+            if (promise.finished()) return false;
+
+            // NOTE: the handler may be running on another thread already, but it doesn't touch what a watch does.
+            if (state->gate_open(handler_waited)) state->begin_watch();
+
+            return !promise.mark_awaiter_or_finished();
+        }
+
+        void await_resume() const { handler.promise().result(); }
+    };
+
+    // begin_watch begins a watch, unless there's no need (see the watch, above).
+    void begin_watch() noexcept
+    {
+        if (reader.size() != 0 || stop.stop_requested()) return;
+
+        watching = true;
+        watch_handoff.store(nullptr, std::memory_order::relaxed);
+        input.hold(true);
+
+        // the handler may take as long as it likes: the server's deadline applies once it's done.
+        auto& sock = detail::socket_of(*conn);
+        sock.set_read_timeout(std::nullopt);
+
+        // on the pool, as the watch's first read (and its wait) would otherwise delay the handler.
+        auto* pool = sock.get_scheduler()->pool();
+        if (auto watcher = std::exchange(watcher_parked, nullptr); !pool->resume(watcher)) watcher.resume();
+    }
+
+    // after_watch puts the connection back as it was before the watch, once its result's been taken.
+    void after_watch() noexcept
+    {
+        watching = false;
+        input.hold(false);
+        detail::socket_of(*conn).set_read_timeout(read_timeout);
+    }
+
+    // abandon_watch ends a watch the server won't take over (the connection's ending): at once, as its read times out.
+    coro::task<> abandon_watch()
+    {
+        if (!watching) return coro::ready_task<>();
+
+        detail::socket_of(*conn).set_read_deadline(io::clock::now());
+        return [](connection_state* state) -> coro::task<>
+        {
+            (void)co_await watch_ended{.state = state};
+            state->after_watch();
+        }(this);
     }
 
     // start_request is whether to serve the request whose head (or HTTP/2's preface) was just read: not if close()
@@ -504,6 +670,9 @@ struct server::connection_state
 
     detail::connection* conn;
 
+    // the socket's read timeout (body_read_timeout), which a watch's read goes without.
+    std::optional<io::clock::duration> read_timeout;
+
     // the server's close(), which responses check, to say the connection closes after them.
     std::stop_token    closing;
     std::atomic<phase> current = phase::idle;
@@ -522,6 +691,20 @@ struct server::connection_state
 
     // for reading what's left of a request's body, to drop it.
     std::array<std::byte, 4'096> scratch{};
+
+    // The watch's (see above). Only the gate and the handoff are shared: the rest is touched by whoever begins a watch
+    // (while the server waits for the handler), the watcher (until it publishes its result), and then the server.
+    bool                      watching = false; // a watch was begun for the request, and not yet ended
+    std::atomic<std::uint8_t> watch_gate{0};    // see gate_open()
+    std::coroutine_handle<>   watcher_parked;   // the watcher, between watches
+    std::error_code           watch_result;     // the last watch's, once watch_handoff says it's ended
+
+    // watch_handoff is null while a watch's read is in progress, this state once it's ended, or the server's coroutine
+    // if it's waiting for that.
+    std::atomic<void*> watch_handoff{nullptr};
+
+    // NOTE: last, so it's destroyed first (parked: the watch is always ended first), as it uses the rest.
+    coro::task<> watcher;
 };
 
 coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease /*held*/) noexcept
@@ -578,11 +761,16 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
     std::vector<std::string> protocols{"http/1.1"};
     if (http2_enabled) protocols.insert(protocols.begin(), "h2");
 
+    // the answer to the client's close_notify is held back (as TLS 1.3 allows), so that an HTTP/1.1 response can
+    // still be sent after it (see connection_state's watch).
     auto stream = co_await tls::stream::accept(std::move(conn),
                                                std::move(ctx),
                                                deadline,
-                                               closing.get_token(),
-                                               std::move(protocols));
+                                               {
+                                                   .stop             = closing.get_token(),
+                                                   .alpn             = std::move(protocols),
+                                                   .hold_close_reply = true,
+                                               });
     if (!stream.has_value())
     {
         logger->debug("TLS handshake failed: {}", stream.error().message());
@@ -598,15 +786,20 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
         co_return std::nullopt;
     }
 
+    // HTTP/2 answers it as it's read, as the stream does by default.
+    if (stream->alpn() == "h2"sv) stream->release_close_reply();
+
     co_return std::optional<detail::connection>{std::in_place, std::move(*stream)};
 }
 #endif
 
+// NOTE: each request is served here, rather than by coroutines of its own (see below), so it's long.
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 coro::task<> server::serve_requests(detail::connection& conn)
 {
     // close() ends the connection gracefully: at once if it's waiting for a request, or after the request it's serving
     // (see connection_state::phase). abort() (and the destructor) ends it either way.
-    connection_state state{&conn, closing.get_token()};
+    connection_state state{&conn, closing.get_token(), read_timeout()};
     auto&            req  = state.req;
     auto&            resp = state.resp;
 
@@ -653,6 +846,10 @@ coro::task<> server::serve_requests(detail::connection& conn)
             break;
         }
 
+        // (for a request without a body, at once.)
+        state.watch_gate.store(0, std::memory_order::relaxed);
+        http11::call_at_body_end(req, {.call = &connection_state::body_ended, .context = &state});
+
         if (!state.start_request())
         {
             logger->debug("closing connection: the server was closed as it waited for this request");
@@ -686,25 +883,40 @@ coro::task<> server::serve_requests(detail::connection& conn)
         std::exception_ptr failure;
         try
         {
-            co_await handler(req, rw);
+            // the connection's watched while the handler waits (see connection_state's watch).
+            auto handling = handler(req, rw);
+            if (auto running = handling.get_handle())
+                co_await connection_state::handler_runs{.state = &state, .handler = running};
+            else co_await std::move(handling);
         }
         catch (...)
         {
             failure = std::current_exception();
         }
 
+        // (discarding the body doesn't begin a watch.)
+        state.watch_gate.store(0, std::memory_order::relaxed);
+
+        // NOTE: nothing below reads the connection while a watch is in progress: a watched request's body has been read
+        //       to its end, so discarding the rest of it reads nothing.
         if (failure)
         {
+            co_await state.abandon_watch();
             co_await end_after_handler_failure(conn, state, rw, failure);
             break;
         }
 
-        if (!co_await default_response(state, rw)) break;
+        if (!co_await default_response(state, rw))
+        {
+            co_await state.abandon_watch();
+            break;
+        }
 
         // ends a body sent without a Content-Length, chunked.
         if (auto finished = co_await rw.finish(); finished.err)
         {
             logger->debug("failed to end the response's body: {}", finished.err.message());
+            co_await state.abandon_watch();
             break;
         }
 
@@ -715,22 +927,58 @@ coro::task<> server::serve_requests(detail::connection& conn)
                          method_string(req.method),
                          req.target.path,
                          rw.body_remaining());
+            co_await state.abandon_watch();
             break;
         }
 
-        // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read).
+        // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read), or
+        //       as the watch ends (below).
 
         // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
         if (!co_await discard_body(*req.body, state.scratch))
         {
             logger->debug("closing connection rather than discarding the rest of the request body");
+            co_await state.abandon_watch();
             break;
         }
 
-        if (!state.end_request()) break;
+        if (!state.end_request())
+        {
+            co_await state.abandon_watch();
+            break;
+        }
 
         // the next request's head, from now.
         deadline = head_deadline();
+
+        // The watch's read becomes the wait for the next request's head: the response is sent now (as the watch held
+        // it: see io::flush_before_read), and the head's deadline (and the read timeout, which the watch's read went
+        // without) applies to the read already waiting.
+        if (state.watching)
+        {
+            const auto flushed = co_await state.writer.flush();
+
+            const auto now   = io::clock::now();
+            auto       until = deadline;
+            if (const auto timeout = read_timeout()) until = until ? std::min(*until, now + *timeout) : now + *timeout;
+            detail::socket_of(conn).set_read_deadline(flushed.err ? now : until);
+
+            const auto watched = co_await connection_state::watch_ended{.state = &state};
+            state.after_watch();
+
+            if (flushed.err)
+            {
+                logger->debug("failed to send the response: {}", flushed.err.message());
+                break;
+            }
+
+            // e.g. the client closed the connection, or its next request's head didn't come in time.
+            if (watched)
+            {
+                co_await end_after_decode_error(conn, state, watched);
+                break;
+            }
+        }
     }
 
     co_await state.writer.flush();
@@ -764,6 +1012,12 @@ std::optional<io::clock::time_point> server::head_deadline() const
 {
     if (header_read_timeout <= std::chrono::seconds::zero()) return std::nullopt;
     return io::clock::now() + header_read_timeout;
+}
+
+std::optional<io::clock::duration> server::read_timeout() const
+{
+    if (body_read_timeout <= std::chrono::seconds::zero()) return std::nullopt;
+    return body_read_timeout;
 }
 
 void server::start_response(connection_state& state, io::discard_writer& no_body)

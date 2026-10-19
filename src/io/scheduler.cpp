@@ -138,6 +138,9 @@ bool scheduler::suspend_handle(waiter& state, std::coroutine_handle<> awaiting) 
     auto it = sh.registrations.find(state.fd);
     if (it == sh.registrations.end()) return fail(std::errc::bad_file_descriptor);
 
+    // NOTE: read under the lock, as limit_deadline() sets it: so either this sees its new limit, or it sees this wait.
+    if (state.operation != nullptr) state.deadline = earliest(state.deadline, state.operation->limit);
+
     if (state.deadline && *state.deadline <= clock::now()) return fail(std::errc::timed_out);
 
     auto& slot = state.op == poll_op::read ? it->second.read : it->second.write;
@@ -392,13 +395,33 @@ bool scheduler::handle_operation::begin(scheduler&                       sched,
                                         std::coroutine_handle<>          awaiting,
                                         const std::stop_token&           stop) noexcept
 {
-    state       = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
-    this->sched = &sched;
+    state        = waiter{.fd = fd, .op = op, .deadline = deadline, .operation = this};
+    own_deadline = deadline;
+    this->sched  = &sched;
 
     // NOTE: registered before the wait takes the shard's lock (see stoppable_wait_operation), and after state is reset
     //       (above), which would forget that a callback that ran at once canceled it.
     if (stop.stop_possible()) on_stop.emplace(stop, canceler{.sched = &sched, .state = &state});
     return sched.suspend(state, awaiting);
+}
+
+void scheduler::handle_operation::limit_deadline(scheduler&                       sched,
+                                                 handle                           fd,
+                                                 std::optional<clock::time_point> new_limit) noexcept
+{
+    auto&            sh = sched.shard_for(fd);
+    std::scoped_lock lock{sh.mu};
+
+    limit = new_limit;
+
+    // the wait in progress, if this operation's is: its deadline (and the rest of state) is only touched under the lock
+    // while it waits.
+    auto it = sh.registrations.find(fd);
+    if (it == sh.registrations.end()) return;
+    if (it->second.read.waiting != &state && it->second.write.waiting != &state) return;
+
+    state.deadline = earliest(own_deadline, limit);
+    sched.retime(sh, state);
 }
 
 void scheduler::handle_operation::cancel_wait() noexcept

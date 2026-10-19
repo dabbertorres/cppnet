@@ -44,6 +44,10 @@ public:
 
     [[nodiscard]] io::handle native_handle() const noexcept override { return parent->native_handle(); }
 
+    // call_at_end sets what's called once the body has been read to its end (its last chunk and trailers), by the read
+    // that finds it (before it returns).
+    void call_at_end(io::end_callback callback) noexcept { at_end = callback; }
+
 private:
     coro::task<std::error_code> read_chunk_size();
     coro::task<std::error_code> read_trailers();
@@ -54,6 +58,7 @@ private:
     std::size_t                          chunk_remaining = 0;
     bool                                 after_chunk     = false; // a chunk was read, but not the CRLF after it
     bool                                 done            = false; // the last chunk and trailers have been read
+    io::end_callback                     at_end;
 };
 
 }

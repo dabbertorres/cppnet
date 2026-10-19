@@ -579,3 +579,63 @@ TEST_CASE("closing an HTTPS server lets a request in progress finish", "[tls][ht
     CHECK(received.ends_with("\r\n\r\nwhole: helloworld"));
     CHECK(err == net::io::errc::end_of_stream);
 }
+
+TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is still answered",
+          "[tls][http][server][cancel][watch]")
+{
+    // NOTE: before the scheduler, as the handler sets them.
+    std::atomic<int> stopped = -1;
+
+    net::io::scheduler sched{make_pool()};
+
+    http::router router;
+    router.GET("/wait",
+               [&](const http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   const auto err = co_await sched.sleep_until(net::io::clock::now() + 5s, req.stop);
+                   stopped.store(err ? 1 : 0);
+
+                   const auto msg  = err ? "stopped"sv : "slept"sv;
+                   auto*      body = co_await resp.send(http::status::OK, msg.size());
+                   co_await net::io::write_all(*body, msg);
+               });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    // with close_notify (which, over TLS 1.3, the server answers only once it has responded), or just the end of the
+    // TCP stream (a TLS stream cut short).
+    const bool close_notify = GENERATE(true, false);
+    CAPTURE(close_notify);
+
+    const auto test = [&] -> task<std::pair<std::string, std::error_code>>
+    {
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
+
+        (void)co_await net::io::write_all(*s, "GET /wait HTTP/1.1\r\nHost: x\r\n\r\n"sv);
+
+        if (close_notify) (void)co_await s->shutdown();
+        else s->socket().shutdown_write();
+
+        co_return co_await read_to_end(*s);
+    };
+
+    const auto start     = std::chrono::steady_clock::now();
+    auto [received, err] = sched.run_to_completion(test());
+    CAPTURE(received, err.message());
+
+    CHECK(stopped.load() == 1);
+    CHECK(std::chrono::steady_clock::now() - start < 3s);
+
+    // and then close_notify.
+    CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(received.ends_with("\r\n\r\nstopped"));
+    CHECK(err == net::io::errc::end_of_stream);
+}

@@ -246,8 +246,23 @@ public:
         // scheduler's lock for the handle), so e.g. a read canceled while it waits has read nothing.
         [[nodiscard]] std::error_code error() const noexcept { return state.result; }
 
-        // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress.
-        void set_deadline(std::optional<clock::time_point> deadline) noexcept { state.deadline = deadline; }
+        // set_deadline moves the wait's deadline: only from perform(), e.g. as it has made progress. (The limit, if
+        // any, still applies: see limit_deadline().)
+        void set_deadline(std::optional<clock::time_point> deadline) noexcept
+        {
+            own_deadline   = deadline;
+            state.deadline = earliest(deadline, limit);
+        }
+
+        // limit_deadline limits the deadlines of this operation's waits for fd (the earlier of the two applies): those
+        // that begin from now, and the wait in progress, if any, whose timer it moves. A wait reads the limit under the
+        // scheduler's lock for the handle as it begins, which this holds too, so it may be called from another thread
+        // than the waiting one, at any moment: e.g. to give a read that's already waiting a deadline (see
+        // socket::set_read_deadline()). std::nullopt removes it.
+        void limit_deadline(scheduler& sched, handle fd, std::optional<clock::time_point> limit) noexcept;
+
+        // take_limit takes other's limit (e.g. as the object they belong to is moved): neither may be waiting.
+        void take_limit(handle_operation& other) noexcept { limit = std::exchange(other.limit, std::nullopt); }
 
         // cancel_wait stops waiting (if it still is), without resuming the coroutine that began it, and calls
         // end_wait(): for when that's being destroyed. NOTE: it must not race with the wait finishing (which resumes
@@ -260,6 +275,11 @@ public:
         waiter                           state{};
         scheduler*                       sched = nullptr;
         std::optional<stop_registration> on_stop;
+
+        // own_deadline is the deadline begin() was given (or set_deadline() moved it to), and limit, limit_deadline()'s
+        // (guarded by the scheduler's lock for the handle): a wait's deadline is the earlier of the two.
+        std::optional<clock::time_point> own_deadline;
+        std::optional<clock::time_point> limit;
     };
 
     // wait_operation waits for a handle to be ready for an operation, returning the error that stopped it, if any:
@@ -609,6 +629,15 @@ private:
     bool suspend_other(waiter& state, std::coroutine_handle<> awaiting) noexcept;
 
     shard& shard_for(handle fd) noexcept { return shards[static_cast<std::size_t>(fd) % shard_count]; }
+
+    // earliest is the earlier of two deadlines, either of which may be none.
+    [[nodiscard]] static std::optional<clock::time_point> earliest(std::optional<clock::time_point> a,
+                                                                   std::optional<clock::time_point> b) noexcept
+    {
+        if (!a) return b;
+        if (!b) return a;
+        return *b < *a ? b : a;
+    }
 
     // ready_for completes the waiter that slot (in sh) holds, now its handle's ready, or performs its operation, which
     // may keep it waiting (see handle_operation). Must be called holding sh's lock.

@@ -12,7 +12,7 @@ namespace net::io
 
 coro::task<result> flush_before_read::read(std::span<std::byte> data)
 {
-    if (writer->size() == 0) return conn->read(data);
+    if (held || writer->size() == 0) return conn->read(data);
 
     // usually, the flush doesn't wait: then there's no need for a coroutine of its own (see coro::ready_task).
     auto flushing = writer->flush();

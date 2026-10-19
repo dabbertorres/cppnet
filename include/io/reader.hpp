@@ -37,4 +37,17 @@ protected:
     reader() = default;
 };
 
+// end_callback is called by a reader that reads part of a stream (e.g. a message's body), once it has read to the end
+// of its part: to tell its owner, without a coroutine, or anything allocated.
+struct end_callback
+{
+    void (*call)(void* context) noexcept = nullptr;
+    void* context                        = nullptr;
+
+    void operator()() const noexcept
+    {
+        if (call != nullptr) call(context);
+    }
+};
+
 }

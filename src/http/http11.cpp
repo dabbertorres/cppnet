@@ -846,6 +846,19 @@ request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server
     return decode_reading(reader, max_header_bytes, req);
 }
 
+void call_at_body_end(const server_request& req, io::end_callback callback) noexcept
+{
+    // NOTE: the bodies request_decode() makes (see set_request_body()), told apart as reuse_or_make() does, rather
+    //       than with a dynamic_cast for each request.
+    auto* body = req.body.get();
+    if (body == nullptr) return;
+
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast): the type is checked first.
+    if (typeid(*body) == typeid(io::limit_reader)) static_cast<io::limit_reader*>(body)->call_at_end(callback);
+    else if (typeid(*body) == typeid(chunked_reader)) static_cast<chunked_reader*>(body)->call_at_end(callback);
+    // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
+}
+
 coro::task<response_decoder_result>
 response_decode(io::buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
 {

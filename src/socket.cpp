@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <iterator>
 #include <optional>
-#include <ratio>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -111,12 +110,13 @@ socket::socket(io::scheduler* scheduler, io::handle fd)
 socket::socket(socket&& other) noexcept
     : scheduler{std::exchange(other.scheduler, nullptr)}
     , fd{std::exchange(other.fd, invalid_fd)}
-    , read_deadline{std::exchange(other.read_deadline, std::nullopt)}
     , write_deadline{std::exchange(other.write_deadline, std::nullopt)}
     , read_timeout{std::exchange(other.read_timeout, std::nullopt)}
     , write_timeout{std::exchange(other.write_timeout, std::nullopt)}
     , stop{std::exchange(other.stop, {})}
-{}
+{
+    reading.take_deadline(other.reading);
+}
 
 socket& socket::operator=(socket&& other) noexcept
 {
@@ -126,11 +126,11 @@ socket& socket::operator=(socket&& other) noexcept
 
         scheduler      = std::exchange(other.scheduler, nullptr);
         fd             = std::exchange(other.fd, invalid_fd);
-        read_deadline  = std::exchange(other.read_deadline, std::nullopt);
         write_deadline = std::exchange(other.write_deadline, std::nullopt);
         read_timeout   = std::exchange(other.read_timeout, std::nullopt);
         write_timeout  = std::exchange(other.write_timeout, std::nullopt);
         stop           = std::exchange(other.stop, {});
+        reading.take_deadline(other.reading);
     }
 
     return *this;
@@ -171,11 +171,14 @@ std::string socket::remote_addr() const
 
 void socket::set_deadline(std::optional<io::clock::time_point> deadline) noexcept
 {
-    read_deadline  = deadline;
+    set_read_deadline(deadline);
     write_deadline = deadline;
 }
 
-void socket::set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept { read_deadline = deadline; }
+void socket::set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept
+{
+    reading.set_read_deadline(deadline);
+}
 
 void socket::set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept { write_deadline = deadline; }
 
@@ -231,11 +234,22 @@ bool socket::read_operation::claim(std::span<std::byte> into) noexcept
 {
     if (!try_claim()) return false;
 
+    // NOTE: the timeout's deadline: the socket's read deadline is the operation's limit, which the scheduler applies
+    //       (see set_read_deadline()).
     data     = into;
-    deadline = wait_deadline(sock->read_deadline, sock->read_timeout);
+    deadline = wait_deadline(std::nullopt, sock->read_timeout);
     res      = {};
     return true;
 }
+
+void socket::read_operation::set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept
+{
+    // NOTE: under the scheduler's lock for the socket, which a read waiting (or beginning to) holds as it reads it. (A
+    //       socket without either can't be read.)
+    if (sock->scheduler != nullptr && sock->fd != invalid_fd) limit_deadline(*sock->scheduler, sock->fd, deadline);
+}
+
+void socket::read_operation::take_deadline(read_operation& other) noexcept { take_limit(other); }
 
 bool socket::read_operation::start(std::coroutine_handle<> awaiting) noexcept
 {

@@ -53,6 +53,14 @@ public:
 
     [[nodiscard]] handle native_handle() const noexcept override { return parent->native_handle(); }
 
+    // call_at_end sets what's called once the limit's reached: by the read that reaches it (before it returns), or now,
+    // if it has been already (e.g. a limit of 0).
+    void call_at_end(end_callback callback) noexcept
+    {
+        at_end = callback;
+        if (progress >= limit) at_end();
+    }
+
 private:
     coro::task<result> count_after(coro::task<result> inner);
 
@@ -64,6 +72,7 @@ private:
     std::size_t             limit    = 0;
     std::size_t             progress = 0;
     mode                    how      = mode::exact;
+    end_callback            at_end;
 };
 
 }

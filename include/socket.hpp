@@ -42,6 +42,10 @@ public:
 
     // Deadlines limit how long reads and writes wait for the socket to be ready: once one has passed, they fail with
     // std::errc::timed_out (until the deadline is changed). std::nullopt removes it.
+    //
+    // A read deadline also applies to a read that's already waiting (moving its timer), and may be set from another
+    // thread than the reading one, while it waits: e.g. by a server that takes a read another task began over, as its
+    // wait for the next request. (A write deadline applies to the writes that begin after it's set.)
     void set_deadline(std::optional<io::clock::time_point> deadline) noexcept;
     void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
     void set_write_deadline(std::optional<io::clock::time_point> deadline) noexcept;
@@ -113,6 +117,12 @@ private:
         // claim readies it to read into into, returning false if it's already in use.
         [[nodiscard]] bool claim(std::span<std::byte> into) noexcept;
 
+        // set_read_deadline is the socket's: the operation's waits are limited by it (see limit_deadline()).
+        void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept;
+
+        // take_deadline takes other's read deadline, as its socket's moved: neither may be waiting.
+        void take_deadline(read_operation& other) noexcept;
+
         bool       start(std::coroutine_handle<> awaiting) noexcept override;
         io::result result() noexcept override;
         void       cancel() noexcept override;
@@ -160,9 +170,9 @@ private:
     [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte> data,
                                                       std::size_t&               written) const noexcept;
 
+    // NOTE: the read deadline is the read operation's (see read_operation::set_read_deadline()).
     io::scheduler*                       scheduler;
     io::handle                           fd;
-    std::optional<io::clock::time_point> read_deadline;
     std::optional<io::clock::time_point> write_deadline;
     std::optional<io::clock::duration>   read_timeout;
     std::optional<io::clock::duration>   write_timeout;

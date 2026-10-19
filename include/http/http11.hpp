@@ -9,6 +9,7 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
+#include "io/reader.hpp"
 #include "io/writer.hpp"
 
 namespace net::http::http11
@@ -47,6 +48,11 @@ request_decode(io::buffered_reader* reader,
 // decoded.
 task<std::error_code>
 request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept;
+
+// call_at_body_end sets what's called once the body of a request that request_decode() decoded has been read to its
+// end: by the body's read that reaches it, or now, if it's there already (e.g. it has none). For a server to watch the
+// connection from then, e.g.
+void call_at_body_end(const server_request& req, io::end_callback callback) noexcept;
 
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
 // HEAD requests have no body. The body owns reader.

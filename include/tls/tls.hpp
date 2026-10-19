@@ -106,6 +106,23 @@ private:
     std::shared_ptr<detail::server_state> state;
 };
 
+// accept_options are stream::accept()'s.
+struct accept_options
+{
+    // Requesting stop (from another task or thread) ends the handshake, failing with std::errc::operation_canceled.
+    std::stop_token stop{};
+
+    // The ALPN protocols to offer instead of the context's, if set (e.g. a server's, which decides what it speaks).
+    std::optional<std::vector<std::string>> alpn{};
+
+    // Don't answer the client's close_notify as it's read, so the stream can still be written after it (e.g. a server's
+    // response to a request its client sent before closing), until shutdown() or close() answer it: from the
+    // handshake, as a TLS 1.3 client may send it with its first request. Only TLS 1.3 lets a side write after the
+    // peer's close_notify (RFC 8446, section 6.1); TLS 1.2 requires the answer at once (RFC 5246, section 7.2.1), which
+    // Botan sends whatever this says.
+    bool hold_close_reply = false;
+};
+
 // stream is a TLS connection over a TCP socket, which it owns: it reads and writes the application's data.
 //
 // A read and a write may run at once (e.g. on different threads), as with a socket; and as with a socket, only one
@@ -116,9 +133,9 @@ private:
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends
-// the stream (io::errc::end_of_stream), and is answered with close_notify, so nothing more can be written either. Both
-// compare equal to io::status_condition::closed. A write that fails (e.g. times out) may have sent part of a record, so
-// every write after it fails the same way.
+// the stream (io::errc::end_of_stream), and is answered with close_notify, so nothing more can be written either
+// (unless the answer's held: see accept_options). Both compare equal to io::status_condition::closed. A write that
+// fails (e.g. times out) may have sent part of a record, so every write after it fails the same way.
 class stream final
     : public io::reader
     , public io::writer
@@ -133,13 +150,9 @@ public:
                                                                       io::clock::time_point deadline,
                                                                       std::stop_token       stop = {});
 
-    // accept runs a server's handshake over conn, until deadline, or stop is requested (as connect). alpn, if it's
-    // given, is the ALPN protocols to offer instead of ctx's (e.g. a server's, which decides what it speaks).
-    static coro::task<std::expected<stream, std::error_code>> accept(tcp_socket                              conn,
-                                                                     server_context                          ctx,
-                                                                     io::clock::time_point                   deadline,
-                                                                     std::stop_token                         stop = {},
-                                                                     std::optional<std::vector<std::string>> alpn = {});
+    // accept runs a server's handshake over conn, until deadline, or options.stop is requested (as connect).
+    static coro::task<std::expected<stream, std::error_code>>
+    accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, accept_options options = {});
 
     stream(const stream&)            = delete;
     stream& operator=(const stream&) = delete;
@@ -165,6 +178,10 @@ public:
 
     // alpn is the protocol the handshake agreed on: empty if none.
     [[nodiscard]] std::string_view alpn() const noexcept;
+
+    // release_close_reply answers the peer's close_notify as the stream does by default (undoing accept_options'
+    // hold_close_reply): if it was read already, with the next write (or shutdown()), and otherwise as it's read.
+    void release_close_reply() noexcept;
 
     // set_stop_token makes reads and writes that wait for the socket end when stop is requested, failing with
     // std::errc::operation_canceled (see socket::set_stop_token(), which this calls). A canceled read leaves the
