@@ -1,7 +1,7 @@
 # Plan: a standard shape for HTTP server middleware
 
-Status: planned (2026-10-18). The shape (option B below) and middleware for some routes only (in the plan) were
-decided; the open questions at the end are still to be decided.
+Status: planned (2026-10-18). The shape (option B below), middleware for some routes only (in the plan), and the
+questions at the end were decided.
 
 ## Goal
 
@@ -50,9 +50,9 @@ coro::task<void> operator()(server_request& req, response_writer& resp, Next& ne
 - not call it, answering itself (e.g. 401);
 - return `next(req, resp)` without a coroutine of its own, if it only works before (e.g. sets an extension): no frame.
 
-A concept, `http::middleware<M, Next>`, names it. A middleware is `const`-callable and copyable (or movable: see the
-open questions), and is configured independently of what it wraps, so one value can be used on several routers or
-groups.
+A concept, `http::middleware<M, Next>`, names it. A middleware is `const`-callable and movable (copyable or not: Decided
+questions (2)); `next` is called at most once (3). It is configured independently of what it wraps, so one value can be
+used on several routers or groups.
 
 ### Composing: `http::chain`
 
@@ -101,8 +101,8 @@ the router (through `chain`) runs for every request, including 404s and 405s.
   handler with its `params`). Nested groups' middleware runs outermost first.
 - **The runtime router:** `subrouter("/api", [](router& r) { r.use(auth{}); r.GET(...); })`. Its handlers are
   `std::function`s already, so the middleware is too: a node's middleware (type-erased, each called with a
-  `next_handler`) runs around the matched handler, outer subrouters' first. When `use()` applies (open question 1)
-  decides how it's stored.
+  `next_handler`) runs around the matched handler, outer subrouters' first, applying to the whole subrouter whatever
+  order its routes and `use()` were added in (Decided questions (1)).
 
 ### The timeout middleware (from `handler-cancellation.md`, stage 5)
 
@@ -142,16 +142,16 @@ rests on the rest (no `shared_ptr`, no `std::function`, reuse), and that goes ba
 4. **The timeout middleware**, with the source-linking helper (measuring its timer first): `handler-cancellation.md`'s
    stage 5 points here.
 
-## Open questions
+## Decided questions
 
-1. **When the runtime router's `use()` applies:** (a) to every route of the subrouter, and its subrouters, whatever
-   the order they were added in (recommended: the tree decides, as `static_router`'s groups do); or (b) only to
-   routes added after it (Echo's and chi's order; chi panics if `Use` follows a route).
-2. **Copyable or movable-only middleware:** `request_handler` is a `std::function`, which needs copies; `make_handler`
-   already wraps what isn't copyable in a `shared_ptr`. Recommended: allow move-only, and wrap as `make_handler` does.
-3. **`next` called more than once** (e.g. a retry): recommended, documented as at most once (a request's body is read
-   once, and its response sent once), not enforced.
-4. **Names:** `chain`, `use`, `next_handler`, the `middleware` concept.
+1. **When the runtime router's `use()` applies:** to every route of the subrouter, and its subrouters, whatever the
+   order they were added in: the tree decides, as `static_router`'s groups do. (Not Echo's and chi's order, where it
+   applies only to routes added after it, and chi panics if `Use` follows a route.)
+2. **Move-only middleware is allowed:** `request_handler` is a `std::function`, which needs copies, so a chain that
+   isn't copyable is wrapped as `make_handler` wraps what isn't (a `shared_ptr`).
+3. **`next` is called at most once** (a request's body is read once, and its response sent once): documented, not
+   enforced.
+4. **Names:** `http::chain`, `use`, `http::next_handler`, and the `http::middleware` concept.
 
 ## Out of scope
 
