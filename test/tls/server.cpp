@@ -529,10 +529,10 @@ TEST_CASE("an HTTPS server resumes its clients' sessions", "[tls][http][server][
         options.client_auth    = tls::client_auth::required;
         options.client_ca_file = pki().client_ca;
     }
-    tls::detail::server_hooks hooks{.handshake_done = [&mu, &handshakes](bool resumed)
+    tls::detail::server_hooks hooks{.handshake_done = [&mu, &handshakes](const tls::detail::handshake_details& done)
                                     {
                                         std::scoped_lock lock{mu};
-                                        handshakes.push_back(resumed);
+                                        handshakes.push_back(done.resumed);
                                     }};
     auto                      ctx = tls::detail::make_server_context(options, std::move(hooks));
     REQUIRE(ctx.has_value());

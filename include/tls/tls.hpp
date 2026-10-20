@@ -82,11 +82,29 @@ namespace detail
         std::vector<std::uint16_t> groups{};
         // TLS Cipher Suites (e.g. 0x1301 for TLS_AES_128_GCM_SHA256).
         std::vector<std::uint16_t> cipher_suites{};
+        // The groups to send TLS 1.3 key shares for in the first ClientHello, instead of the policy's choice (its first
+        // hybrid post-quantum group and its first elliptic curve one): e.g. X25519's alone, as Botan's default policy
+        // sends, so that a server preferring a hybrid asks for its share with a HelloRetryRequest. Those not among the
+        // groups offered are left out.
+        std::vector<std::uint16_t> key_shares{};
     };
 
     // make_client_context is client_context::make(), with what the client offers narrowed to limits.
     std::expected<client_context, std::error_code> make_client_context(const client_options& options,
                                                                        const policy_limits&  limits);
+
+    // handshake_details are what a server's handshake agreed on, for tests.
+    struct handshake_details
+    {
+        // whether it resumed a session.
+        bool resumed = false;
+        // the key exchange group, by its code point in IANA's TLS Supported Groups (as policy_limits'): TLS 1.3's (0
+        // over TLS 1.2).
+        std::uint16_t group = 0;
+        // whether the server sent a HelloRetryRequest, asking the client for a key share for the group it chose, as the
+        // first ClientHello had none.
+        bool hello_retry = false;
+    };
 
     // server_hooks are hooks into a server context, for tests.
     struct server_hooks
@@ -95,8 +113,8 @@ namespace detail
         // certificates.
         std::function<std::chrono::system_clock::time_point()> clock{};
 
-        // called (on the thread running the handshake) as each handshake is done, with whether it resumed a session.
-        std::function<void(bool resumed)> handshake_done{};
+        // called (on the thread running the handshake) as each handshake is done, with what it agreed on.
+        std::function<void(const handshake_details&)> handshake_done{};
     };
 
     // make_server_context is server_context::make(), with hooks.

@@ -571,9 +571,9 @@ handshake in the field. The network tests (public servers) exercise interoperabi
 - **The policy** (`src/tls/tls.cpp`) offers the groups decided (X25519, P-256, the three ML-KEM hybrids, P-384, P-521,
   in Botan's order), of those the Botan it's built against has (`Group_Params::is_available()`), and only ECDH as TLS
   1.2's key exchange (no DHE suites). Unchanged: Botan's ciphers (already only AES-GCM and ChaCha20-Poly1305), its
-  signature methods and hashes, and its client's offer of a key share for X25519 only (the hybrids listed, so a server
-  that prefers one asks for it with a HelloRetryRequest). Against servers that speak only DHE (e.g. `dh2048.badssl.com`)
-  handshakes now fail, as Go's do.
+  signature methods and hashes, and (until after part 3: see below) its client's offer of a key share for X25519 only
+  (the hybrids listed, so a server that prefers one asks for it with a HelloRetryRequest). Against servers that speak
+  only DHE (e.g. `dh2048.badssl.com`) handshakes now fail, as Go's do.
 - **The tests** narrow what the client offers through an internal hook, `tls::detail::make_client_context(options,
   policy_limits)` (groups and cipher suites by IANA code point; each narrows the policy's, so one the policy doesn't
   offer leaves nothing, and fails too, as checked by hand with X448, brainpool, FFDHE and TLS_AES_128_CCM_SHA256).
@@ -724,7 +724,41 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   cppnet's server prefers X25519MLKEM768, which its client supports but sends no share for (only X25519's, part 1), so
   every handshake between them, resumed too, takes a HelloRetryRequest round trip and an ML-KEM exchange; with the
   client limited to X25519 (the tests' hook), a resumption took 633 / 617 us and a full ECDSA handshake 1260 / 1231.
-  Whether cppnet's client should send a hybrid share too (as Chrome and Go do) is a question for later.
+  Whether cppnet's client should send a hybrid share too (as Chrome and Go do) was left for later: done since, below.
+
+### Key shares (after part 3)
+
+- **What the client sends:** its first ClientHello (TLS 1.3) has key shares for the first hybrid group and the first
+  elliptic curve group of those it offers, so X25519MLKEM768 and X25519 with the policy's groups, as Go (since 1.24) and
+  Chrome send; never more than two. The policy overrides Botan's `key_exchange_groups_to_offer()` (whose default is the
+  first pure-ECC group's share alone). Botan sends the shares in the order of `supported_groups` (X25519's first, as the
+  policy lists it), as RFC 8446 4.2.8 requires; Go and Chrome list the hybrid first, which doesn't change what Botan's
+  server picks (below). With the groups narrowed (`policy_limits`, the tests' hook) it's the same rule over what's left:
+  e.g. {P-256, SecP256r1MLKEM768} sends both, the hybrids alone the first hybrid's, one group its own; with none,
+  Botan's choice (which fails, as before). The versions allowed don't matter (TLS 1.2 has no shares).
+  `policy_limits::key_shares` overrides the choice, for tests (e.g. X25519's alone, as before).
+- **What Botan's server (so cppnet's) does** (`Policy::choose_key_exchange_group()`, unchanged): a post-quantum group
+  the client sent a share for and the server allows, first; else a post-quantum group the client lists (with a
+  HelloRetryRequest, as there's no share for it); else a group the client sent a share for; else the server's
+  preference among those the client lists (with a HelloRetryRequest). So it picks X25519MLKEM768 without a
+  HelloRetryRequest from cppnet's client (and Go's, Chrome's); a client without the hybrids (e.g. Go before 1.24)
+  gets the group it sent a share for (X25519), also without one; a client that lists a hybrid but sends only X25519's
+  share (Botan's default policy, as cppnet's client did) is asked for the hybrid's. RFC 8446 lets a server choose by its
+  own preference; preferring the hybrid at a round trip's cost is Botan's choice, and kept.
+- **Observed** through `tls::detail::server_hooks::handshake_done`, which now gets a `handshake_details` (resumed, the
+  group's code point from Botan's `Session_Summary::kex_parameters()`, 0 over TLS 1.2, and whether a HelloRetryRequest
+  was sent, seen by the callbacks' `tls_inspect_handshake_msg()`, which Botan calls for the messages a side sends as
+  well as those it receives). `test/tls/stream.cpp`: the per-group and per-suite handshakes (`[tls][policy]`) check the
+  group agreed on (the one narrowed to, or X25519MLKEM768) and that there was no HelloRetryRequest; a new test checks
+  the shares' choice over a full handshake and a resumption each (the policy's groups, X25519 and P-256, P-256 and its
+  hybrid, the hybrids alone, P-384 and P-521), and that X25519's share alone gets a HelloRetryRequest for the hybrid.
+- **Measured** (`bench_tls`, Release, alternating runs of the two shares' choices on a loaded machine; us per
+  connection, time): within the runs' noise over loopback (medians of five, the new choice first: ECDSA full 1518 and
+  1642, resumed 1083 and 1076; RSA full 3666 and 3342, resumed 1095 and 1055; mutual TLS full 2127 and 2249, resumed
+  1078 and 1234), as a round trip over loopback costs little and the client made both shares before too (the hybrid's
+  after the HelloRetryRequest). What it saves is a network round trip per handshake, resumed or not. The ML-KEM exchange
+  still costs about 0.4 ms of CPU a handshake here (the client limited to X25519: resumed 617 to 735, full ECDSA 1114
+  to 1338).
 
 ## Stages
 

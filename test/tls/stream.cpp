@@ -7,7 +7,10 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <format>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -131,6 +134,69 @@ task<> echo(tls::stream& s)
     }
 
     co_await s.close();
+}
+
+// say_hello connects to the listener over TLS (as localhost) and says hello, which the server echoes: returning what
+// was echoed and the version agreed on (e.g. "hello over TLS 1.3"), or what failed.
+task<std::string> say_hello(net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx)
+{
+    auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+    if (!s.has_value()) co_return "handshake: " + s.error().message();
+
+    if (auto res = co_await net::io::write_all(*s, "hello"sv); res.err) co_return "write: " + res.err.message();
+
+    std::string               echoed;
+    std::array<std::byte, 16> buf{};
+    while (echoed.size() < 5)
+    {
+        auto res = co_await s->read(buf);
+        echoed += as_string(std::span{buf}.first(res.count));
+        if (res.err) co_return "read: " + res.err.message();
+    }
+
+    echoed += s->version() == tls::version::tls12 ? " over TLS 1.2" : " over TLS 1.3";
+    co_await s->close();
+    co_return echoed;
+}
+
+// handshakes records how a server's handshakes went (see recording_server()). It must outlive the server's contexts,
+// and their streams.
+struct handshakes
+{
+    std::mutex               mu;
+    std::vector<std::string> done;
+
+    [[nodiscard]] std::vector<std::string> taken()
+    {
+        std::scoped_lock lock{mu};
+        return done;
+    }
+};
+
+// described is how a handshake went: whether it resumed, the key exchange group agreed on (its code point; 0 over TLS
+// 1.2), and whether the server sent a HelloRetryRequest, e.g. "full, 0x11ec" or "resumed, 0x11ec, after a
+// HelloRetryRequest".
+std::string described(const tls::detail::handshake_details& d)
+{
+    return std::format("{}, {:#x}{}",
+                       d.resumed ? "resumed" : "full",
+                       d.group,
+                       d.hello_retry ? ", after a HelloRetryRequest" : "");
+}
+
+// recording_server is a server context with chain and key, recording how its handshakes went in record.
+tls::server_context
+recording_server(const std::filesystem::path& chain, const std::filesystem::path& key, handshakes* record)
+{
+    tls::detail::server_hooks hooks{.handshake_done = [record](const tls::detail::handshake_details& d)
+                                    {
+                                        std::scoped_lock lock{record->mu};
+                                        record->done.push_back(described(d));
+                                    }};
+
+    auto ctx = tls::detail::make_server_context({.certificate_chain = chain, .private_key = key}, std::move(hooks));
+    REQUIRE(ctx.has_value());
+    return *ctx;
 }
 
 }
@@ -695,12 +761,15 @@ TEST_CASE("handshakes work with every key exchange group and cipher suite offere
                   .rsa           = true});
     CAPTURE(tc.name);
 
+    // NOTE: before the scheduler, as the server's handshake records into it.
+    handshakes record;
+
     net::io::scheduler sched{make_pool()};
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
 
-    const auto server_ctx = tc.rsa ? server_with(pki().rsa_localhost_chain, pki().rsa_localhost_key)
-                                   : server_with(pki().localhost_chain, pki().localhost_key);
+    const auto server_ctx = tc.rsa ? recording_server(pki().rsa_localhost_chain, pki().rsa_localhost_key, &record)
+                                   : recording_server(pki().localhost_chain, pki().localhost_key, &record);
     REQUIRE(sched.spawn(serve_once(&listener, server_ctx, echo)));
 
     auto client_ctx = tls::detail::make_client_context(
@@ -709,29 +778,81 @@ TEST_CASE("handshakes work with every key exchange group and cipher suite offere
     REQUIRE(client_ctx.has_value());
 
     // the client says hello, which the server echoes, and the version agreed on.
-    const auto client = [](net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx) -> task<std::string>
+    const auto expected = tc.version == tls::version::tls12 ? "hello over TLS 1.2"sv : "hello over TLS 1.3"sv;
+    CHECK(sched.run_to_completion(say_hello(&sched, listener.local_port(), *client_ctx)) == expected);
+
+    // TLS 1.3's group is the one the client was narrowed to (or the hybrid, by default), whose share it sent, so the
+    // server didn't ask for another.
+    std::uint16_t group = 0;
+    if (tc.version == tls::version::tls13) group = tc.groups.empty() ? std::uint16_t{0x11EC} : tc.groups.front();
+    CHECK(record.taken() == std::vector{described({.group = group})});
+}
+
+TEST_CASE("a client sends key shares for X25519MLKEM768 and X25519, so a server that prefers the hybrid needn't ask "
+          "for its share",
+          "[tls][policy]")
+{
+    // The client's first ClientHello has shares for the first hybrid group and the first elliptic curve one it offers
+    // (of the policy's, or those it's narrowed to). Botan's server (so cppnet's) chooses a hybrid whenever the client
+    // offers one, with a HelloRetryRequest if the client sent no share for it; otherwise a group the client sent a
+    // share for. Each case connects twice, the second resuming the first's session, as resumptions exchange keys too.
+    struct test_case
     {
-        auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
-        if (!s.has_value()) co_return "handshake: " + s.error().message();
-
-        if (auto res = co_await net::io::write_all(*s, "hello"sv); res.err) co_return "write: " + res.err.message();
-
-        std::string               echoed;
-        std::array<std::byte, 16> buf{};
-        while (echoed.size() < 5)
-        {
-            auto res = co_await s->read(buf);
-            echoed += as_string(std::span{buf}.first(res.count));
-            if (res.err) co_return "read: " + res.err.message();
-        }
-
-        echoed += s->version() == tls::version::tls12 ? " over TLS 1.2" : " over TLS 1.3";
-        co_await s->close();
-        co_return echoed;
+        std::string_view           name{};
+        std::vector<std::uint16_t> groups{};
+        std::vector<std::uint16_t> key_shares{};
+        std::uint16_t              group       = 0;
+        bool                       hello_retry = false;
     };
 
-    const auto expected = tc.version == tls::version::tls12 ? "hello over TLS 1.2"sv : "hello over TLS 1.3"sv;
-    CHECK(sched.run_to_completion(client(&sched, listener.local_port(), *client_ctx)) == expected);
+    const auto tc = GENERATE(
+        // X25519MLKEM768's share and X25519's.
+        test_case{
+            .name  = "the policy's groups",
+            .group = 0x11EC
+    },
+        // a client without the hybrids (as an older one): X25519's share, and no HelloRetryRequest.
+        test_case{.name = "X25519 and P-256", .groups = {29, 23}, .group = 29},
+        test_case{.name = "P-256 and SecP256r1MLKEM768", .groups = {23, 0x11EB}, .group = 0x11EB},
+        // no elliptic curve group: the first hybrid's share alone.
+        test_case{.name = "the hybrids", .groups = {0x11EC, 0x11EB, 0x11ED}, .group = 0x11EC},
+        test_case{.name = "P-384 and P-521", .groups = {24, 25}, .group = 24},
+        // X25519's share alone, as Botan's default policy sends: the server asks for the hybrid's.
+        test_case{.name = "X25519's share alone", .key_shares = {29}, .group = 0x11EC, .hello_retry = true});
+    CAPTURE(tc.name);
+
+    // NOTE: before the scheduler, as the server's handshakes record into it.
+    handshakes record;
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    const auto server_ctx = recording_server(pki().localhost_chain, pki().localhost_key, &record);
+
+    auto client_ctx = tls::detail::make_client_context({.trusted_ca_file = pki().ca},
+                                                       {.groups = tc.groups, .key_shares = tc.key_shares});
+    REQUIRE(client_ctx.has_value());
+
+    const auto test = [](net::io::scheduler* sched,
+                         net::listener*      listener,
+                         tls::server_context server_ctx,
+                         tls::client_context client_ctx) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> out;
+        for (int i = 0; i < 2; ++i)
+        {
+            if (!sched->spawn(serve_once(listener, server_ctx, echo))) co_return out;
+            out.push_back(co_await say_hello(sched, listener->local_port(), client_ctx));
+        }
+        co_return out;
+    };
+
+    CHECK(sched.run_to_completion(test(&sched, &listener, server_ctx, *client_ctx))
+          == std::vector<std::string>{"hello over TLS 1.3", "hello over TLS 1.3"});
+    CHECK(record.taken()
+          == std::vector{described({.group = tc.group, .hello_retry = tc.hello_retry}),
+                         described({.resumed = true, .group = tc.group, .hello_retry = tc.hello_retry})});
 }
 
 TEST_CASE("a client needs the server's name to verify its certificate", "[tls][verification]")

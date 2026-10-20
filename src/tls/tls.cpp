@@ -53,6 +53,8 @@
 #include <botan/tls_ciphersuite.h>
 #include <botan/tls_client.h>
 #include <botan/tls_exceptn.h>
+#include <botan/tls_handshake_msg.h>
+#include <botan/tls_magic.h>
 #include <botan/tls_policy.h>
 #include <botan/tls_server.h>
 #include <botan/tls_server_info.h>
@@ -236,6 +238,11 @@ constexpr std::array groups{
 // It offers only the key exchange groups above (those of them the Botan it's built against has), and so only ECDHE in
 // TLS 1.2, not finite field DHE. Botan's default ciphers are already only AEADs (AES-GCM and ChaCha20-Poly1305), and
 // its signatures only ECDSA and RSA, with SHA-256 to SHA-512.
+//
+// A client's first ClientHello (TLS 1.3) has key shares for two of them, as Go's and Chrome's do: the first hybrid
+// post-quantum group (X25519MLKEM768) and the first elliptic curve one (X25519). Botan's default sends only the latter,
+// so a server that prefers the hybrid (Botan's, so cppnet's, does whenever the client supports one; Cloudflare's too)
+// asks for its share with a HelloRetryRequest, a round trip more.
 class policy final : public Botan::TLS::Policy
 {
 public:
@@ -277,6 +284,30 @@ public:
         {
             if (group.is_available() && within(limits.groups, group.wire_code())) out.push_back(group);
         }
+        return out;
+    }
+
+    // NOTE: Botan sends the shares in the order of key_exchange_groups() (as RFC 8446 4.2.8 requires), whatever the
+    //       order here; and leaves out those that aren't among them.
+    [[nodiscard]] std::vector<Botan::TLS::Group_Params> key_exchange_groups_to_offer() const override
+    {
+        std::vector<Botan::TLS::Group_Params> out;
+        if (!limits.key_shares.empty())
+        {
+            for (const std::uint16_t code : limits.key_shares) out.emplace_back(code);
+            return out;
+        }
+
+        // the first hybrid and the first elliptic curve group of those allowed (so with the groups narrowed, e.g. to
+        // one, only those there are); if there's neither (no groups at all), Botan's choice, which fails.
+        const auto allowed = key_exchange_groups();
+        if (const auto hybrid = std::ranges::find_if(allowed, &Botan::TLS::Group_Params::is_pqc_hybrid);
+            hybrid != allowed.end())
+            out.push_back(*hybrid);
+        if (const auto ecc = std::ranges::find_if(allowed, &Botan::TLS::Group_Params::is_pure_ecc_group);
+            ecc != allowed.end())
+            out.push_back(*ecc);
+        if (out.empty()) return Botan::TLS::Policy::key_exchange_groups_to_offer();
         return out;
     }
 
@@ -960,6 +991,12 @@ public:
     bool tls_peer_closed_connection() override;
     void tls_session_established(const Botan::TLS::Session_Summary& session) override;
 
+    // NOTE: only for server_hooks::handshake_done (a server's): it sees the messages sent as well as those received.
+    void tls_inspect_handshake_msg(const Botan::TLS::Handshake_Message& message) override
+    {
+        if (message.type() == Botan::TLS::Handshake_Type::HelloRetryRequest) hello_retry = true;
+    }
+
     // record_verification_failure keeps why the peer's certificate was rejected.
     void record_verification_failure(Botan::Certificate_Status_Code status) noexcept;
 
@@ -1013,6 +1050,7 @@ private:
     bool                                skip_verification;
     std::vector<std::string>            server_alpn;
     std::shared_ptr<const server_hooks> hooks;
+    bool                                hello_retry = false; // whether a HelloRetryRequest was sent (or received)
 };
 
 struct connection
@@ -1416,7 +1454,16 @@ void callbacks::tls_session_established(const Botan::TLS::Session_Summary& sessi
     conn->negotiated = session.version() == Botan::TLS::Protocol_Version::TLS_V13 ? version::tls13 : version::tls12;
     conn->resumed    = session.was_resumption();
 
-    if (hooks && hooks->handshake_done) hooks->handshake_done(conn->resumed);
+    if (!hooks || !hooks->handshake_done) return;
+
+    // TLS 1.3's group, by name (none over TLS 1.2).
+    const auto params = session.kex_parameters();
+    const auto group  = params.has_value() ? Botan::TLS::Group_Params::from_string(*params) : std::nullopt;
+    hooks->handshake_done({
+        .resumed     = conn->resumed,
+        .group       = group.has_value() ? group->wire_code() : std::uint16_t{0},
+        .hello_retry = hello_retry,
+    });
 }
 
 // NOTE: TLS 1.3's channel answers the peer's close_notify only if this returns true; TLS 1.2's always does (as RFC 5246

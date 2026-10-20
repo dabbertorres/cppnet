@@ -20,11 +20,12 @@
 // (Under load, as when another build ran, all are up to half as much again.) Making a ticket costs a full handshake
 // little (its AES-GCM and HMACs, against the signatures: within the runs' noise); resuming saves the certificates'
 // work: about 0.4 ms with ECDSA, 1.1 ms with a client's certificate too, 2.5 ms with RSA. Half of what a resumption
-// still costs is its key exchange's: cppnet's server prefers X25519MLKEM768, which its client supports but sends no
-// share for (only X25519's), so every handshake between them, resumed too, takes a HelloRetryRequest and an ML-KEM
-// exchange (with the client limited to X25519, by tls::detail::make_client_context()'s limits, a resumption took
-// 633 / 617 us, and a full ECDSA handshake 1260 / 1231). The CPU time includes the pool's threads spinning as they wait
-// for each other.
+// still costs is its key exchange's: cppnet's server prefers X25519MLKEM768 (with the client limited to X25519, by
+// tls::detail::make_client_context()'s limits, a resumption took 633 / 617 us, and a full ECDSA handshake 1260 / 1231).
+// When this was written the client sent a key share for X25519 alone, so the server asked for the hybrid's with a
+// HelloRetryRequest; it now sends both (as Go and Chrome do), which saves that round trip: within these runs' noise
+// over loopback (where a round trip costs little, and the client made both shares before too), but a network's round
+// trip per handshake, resumed or not. The CPU time includes the pool's threads spinning as they wait for each other.
 //
 // See docs/plans/tls.md, "Learned in stage 4".
 #include <algorithm>
