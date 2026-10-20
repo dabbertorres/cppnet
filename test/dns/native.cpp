@@ -1179,3 +1179,76 @@ TEST_CASE("native lookups finish whichever way their callers leave", "[dns][nati
         CHECK(answer_or(results[i].stopped, std::errc::operation_canceled));
     }
 }
+
+// The native back end against the machine's own configuration (/etc's files, not one the test gives it) and real
+// nameservers, as the system back end's [network] tests in resolver.cpp. (CI's back end is the system's on its Linux
+// and on macOS, but automatic picks the native one on e.g. Debian's and Ubuntu's servers.)
+
+TEST_CASE("the native resolver finds a public name", "[dns][native][.network]")
+{
+    struct test_case
+    {
+        net::protocol proto = net::protocol::not_care;
+    };
+
+    // asking for AAAA records doesn't need the machine to have IPv6 (only sorting them does, which mustn't fail
+    // without it).
+    auto tc = GENERATE(test_case{.proto = net::protocol::not_care},
+                       test_case{.proto = net::protocol::ipv4},
+                       test_case{.proto = net::protocol::ipv6});
+    CAPTURE(tc.proto);
+
+    const dns::resolver resolver{{.use = dns::resolver::backend::native}};
+    net::io::scheduler  sched{make_pool()};
+
+    auto out = sched.run_to_completion(timed_resolve(&sched, &resolver, "google.com", {.proto = tc.proto}));
+    CAPTURE(out.result.has_value() ? std::string{} : out.result.error().message());
+    REQUIRE(out.result.has_value());
+    CHECK_FALSE(out.result->empty());
+
+    for (const auto& addr : *out.result)
+    {
+        CAPTURE(addr.to_string());
+        if (tc.proto == net::protocol::ipv4) CHECK(addr.is_ipv4());
+        if (tc.proto == net::protocol::ipv6) CHECK(addr.is_ipv6());
+        if (addr.is_ipv4()) CHECK_FALSE(addr.to_ipv4().is_loopback());
+        if (addr.is_ipv6()) CHECK_FALSE(addr.to_ipv6().is_loopback());
+    }
+
+    // both families' records, whichever order RFC 6724 puts them in.
+    if (tc.proto == net::protocol::not_care)
+    {
+        CHECK(std::ranges::any_of(*out.result, [](const net::ip_addr& addr) { return addr.is_ipv4(); }));
+        CHECK(std::ranges::any_of(*out.result, [](const net::ip_addr& addr) { return addr.is_ipv6(); }));
+    }
+}
+
+TEST_CASE("the native resolver reports names that don't exist", "[dns][native][.network]")
+{
+    const dns::resolver resolver{{.use = dns::resolver::backend::native}};
+    net::io::scheduler  sched{make_pool()};
+
+    // .invalid never resolves (RFC 6761), nor does it under a search domain.
+    auto out = sched.run_to_completion(timed_resolve(&sched, &resolver, "nothing.invalid"));
+    REQUIRE_FALSE(out.result.has_value());
+    CAPTURE(out.result.error().message());
+    CHECK(out.result.error() == dns::condition::not_found);
+}
+
+TEST_CASE("the native resolver follows a public name's CNAME chain", "[dns][native][cname][.network]")
+{
+    // names that have been CNAMEs for years: one link (to github.com, which has no AAAA records: that family's
+    // question finds no address, and the other's answer stands), and several (through Akamai's names). Were one to stop
+    // being a CNAME, it would still resolve, testing less.
+    auto host = GENERATE(as<std::string>{}, "www.github.com", "www.microsoft.com");
+    CAPTURE(host);
+
+    const dns::resolver resolver{{.use = dns::resolver::backend::native}};
+    net::io::scheduler  sched{make_pool()};
+
+    auto out = sched.run_to_completion(timed_resolve(&sched, &resolver, host));
+    CAPTURE(out.result.has_value() ? std::string{} : out.result.error().message());
+    REQUIRE(out.result.has_value());
+    CHECK_FALSE(out.result->empty());
+    CHECK(std::ranges::any_of(*out.result, [](const net::ip_addr& addr) { return addr.is_ipv4(); }));
+}
