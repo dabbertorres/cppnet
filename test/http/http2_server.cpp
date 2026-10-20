@@ -1109,3 +1109,247 @@ TEST_CASE("closing the server doesn't stop HTTP/2 handlers' tokens; aborting it 
                                             }));
     }
 }
+
+TEST_CASE("an HTTP/2 interim response is sent at once, as a HEADERS frame before the final one",
+          "[http][http2][server][interim]")
+{
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+
+    // sends Early Hints, then waits for the client to have read them, before the final response (which keeps their
+    // fields).
+    r.GET("/hint",
+          [&g](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              resp.headers().set("Link", "</style.css>; rel=preload");
+              co_await resp.send(http::status::EARLY_HINTS);
+              resp.headers().add("Link", "</app.js>; rel=preload");
+              co_await resp.send(http::status::EARLY_HINTS);
+              co_await g.pass();
+
+              auto* body = co_await resp.send(http::status::OK, 4);
+              co_await net::io::write_all(*body, "done"sv);
+          });
+
+    test_server server{&sched, std::move(r)};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&g](h2_client& c) -> task<>
+                                        {
+                                            const auto id = c.request("GET", "/hint");
+                                            const bool hinted =
+                                                co_await c.pump([&] { return c.responses[id].interims.size() == 2; });
+                                            REQUIRE(hinted);
+
+                                            const auto& r = c.responses[id];
+                                            CHECK(r.interims[0].status == "103");
+                                            CHECK(header(r.interims[0], "link") == "</style.css>; rel=preload");
+                                            CHECK(header(r.interims[0], "content-length") == "(none)");
+                                            CHECK(r.interims[1].status == "103");
+                                            CHECK(r.interims[1].headers.size() == r.interims[0].headers.size() + 1);
+
+                                            // not the end of the stream, nor the final response.
+                                            CHECK_FALSE(r.done);
+                                            CHECK(r.status.empty());
+
+                                            g.open();
+                                            const bool finished = co_await c.wait_for(id);
+                                            REQUIRE(finished);
+                                            CAPTURE(r.reset.message());
+                                            CHECK(r.status == "200");
+                                            CHECK(header(r, "link") == "</style.css>; rel=preload");
+                                            CHECK(r.body == "done");
+                                            CHECK(r.interims.size() == 2);
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 handler can't send 101 Switching Protocols", "[http][http2][server][interim]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto r = make_router(&sched);
+    r.GET("/switch",
+          [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              std::string outcome = "sent";
+              try
+              {
+                  co_await resp.send(http::status::SWITCHING_PROTOCOLS);
+              }
+              catch (const std::system_error& e)
+              {
+                  outcome = e.code() == std::errc::not_supported ? "refused" : e.what();
+              }
+
+              auto* body = co_await resp.send(http::status::OK, outcome.size());
+              co_await net::io::write_all(*body, outcome);
+          });
+
+    test_server server{&sched, std::move(r)};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            const auto id       = c.request("GET", "/switch");
+                                            const bool finished = co_await c.wait_for(id);
+                                            REQUIRE(finished);
+
+                                            const auto& r = c.responses[id];
+                                            CHECK(r.interims.empty());
+                                            CHECK(r.status == "200");
+                                            CHECK(r.body == "refused");
+                                        }));
+}
+
+TEST_CASE("an HTTP/2 request that expects 100 Continue gets one when its handler reads the body",
+          "[http][http2][server][expect]")
+{
+    // NOTE: before the scheduler, which waits for the tasks that use it.
+    std::atomic<std::uint64_t> started{0};
+
+    net::io::scheduler sched{make_pool()};
+    gate               g{&sched};
+
+    auto r = make_router(&sched);
+
+    // waits to be let through before reading the body.
+    r.POST("/wait",
+           [&](http::server_request& req, http::response_writer& resp) -> task<void>
+           {
+               stop_probe::bump(&sched, started);
+               co_await g.pass();
+               co_await echo(req, resp);
+           });
+
+    // answers without reading the body.
+    r.POST("/refuse",
+           [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+           { co_await resp.send(http::status::PAYLOAD_TOO_LARGE, 0); });
+
+    // sends Early Hints, then reads the body.
+    r.POST("/hint",
+           [](http::server_request& req, http::response_writer& resp) -> task<void>
+           {
+               resp.headers().set("Link", "</style.css>; rel=preload");
+               co_await resp.send(http::status::EARLY_HINTS);
+               co_await echo(req, resp);
+           });
+
+    test_server server{&sched, std::move(r)};
+
+    const std::array expect{
+        hpack::field{.name = "expect", .value = "100-continue"}
+    };
+
+    SECTION("only once the handler reads, before the client sends the body")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                // (the request goes with the PING.)
+                                                const auto id   = c.request("POST", "/wait", {}, false, expect);
+                                                const bool sent = co_await c.sync();
+                                                REQUIRE(sent);
+                                                const bool in = co_await stop_probe::reach(&sched, started, 1);
+                                                REQUIRE(in);
+
+                                                // by the PING's answer, whatever the server sent before it is here.
+                                                const bool synced = co_await c.sync();
+                                                REQUIRE(synced);
+                                                CHECK(c.responses[id].interims.empty());
+
+                                                g.open();
+                                                const bool asked =
+                                                    co_await c.pump([&] { return !c.responses[id].interims.empty(); });
+                                                REQUIRE(asked);
+
+                                                // just the status.
+                                                const auto& cont = c.responses[id].interims.front();
+                                                CHECK(cont.status == "100");
+                                                CHECK(cont.headers.empty());
+
+                                                c.send(id, "hello", true);
+                                                const bool finished = co_await c.wait_for(id);
+                                                REQUIRE(finished);
+
+                                                const auto& resp = c.responses[id];
+                                                CAPTURE(resp.reset.message());
+                                                CHECK(resp.status == "200");
+                                                CHECK(resp.body == "hello");
+                                                CHECK(resp.interims.size() == 1);
+                                            }));
+    }
+
+    SECTION("one after the handler's Early Hints, which don't stop it")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id    = c.request("POST", "/hint", {}, false, expect);
+                                                const bool asked = co_await c.pump(
+                                                    [&] { return c.responses[id].interims.size() == 2; });
+                                                REQUIRE(asked);
+
+                                                // the 103, then the 100 (just the status), before the body's sent.
+                                                const auto& resp = c.responses[id];
+                                                CHECK(resp.interims[0].status == "103");
+                                                CHECK(header(resp.interims[0], "link") == "</style.css>; rel=preload");
+                                                CHECK(resp.interims[1].status == "100");
+                                                CHECK(resp.interims[1].headers.empty());
+                                                CHECK_FALSE(resp.done);
+                                                CHECK(resp.status.empty());
+
+                                                c.send(id, "hello", true);
+                                                const bool finished = co_await c.wait_for(id);
+                                                REQUIRE(finished);
+
+                                                CAPTURE(resp.reset.message());
+                                                CHECK(resp.status == "200");
+                                                CHECK(header(resp, "link") == "</style.css>; rel=preload");
+                                                CHECK(resp.body == "hello");
+                                                CHECK(resp.interims.size() == 2);
+                                            }));
+    }
+
+    SECTION("none for a handler that answers without reading")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const auto id       = c.request("POST", "/refuse", {}, false, expect);
+                                                const bool finished = co_await c.wait_for(id);
+                                                REQUIRE(finished);
+
+                                                const auto& resp = c.responses[id];
+                                                CHECK(resp.status == "413");
+                                                CHECK(resp.interims.empty());
+                                            }));
+    }
+
+    SECTION("417 for another expectation, without running the handler")
+    {
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            [&](h2_client& c) -> task<>
+                                            {
+                                                const std::array other{
+                                                    hpack::field{.name = "expect", .value = "something"}
+                                                };
+                                                const auto id       = c.request("POST", "/wait", "hello", true, other);
+                                                const bool finished = co_await c.wait_for(id);
+                                                REQUIRE(finished);
+
+                                                const auto& resp = c.responses[id];
+                                                CHECK(resp.status == "417");
+                                                CHECK(resp.interims.empty());
+                                                CHECK(started.load() == 0);
+                                            }));
+    }
+}

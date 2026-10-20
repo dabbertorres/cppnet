@@ -10,6 +10,7 @@
 #include <exception>
 #include <expected>
 #include <memory>
+#include <new>
 #include <optional>
 #include <ratio>
 #include <span>
@@ -226,6 +227,13 @@ net::coro::task<bool> sent_after(net::coro::task<net::io::writer*> sending)
 {
     (void)co_await std::move(sending);
     co_return true;
+}
+
+// body_to_come is whether an HTTP/1.1 request has a body to read: chunked, or with a Content-Length over 0 (which
+// decoding checked).
+bool body_to_come(const net::http::server_request& req)
+{
+    return req.headers.get_all("Transfer-Encoding"sv).has_value() || req.headers.get_content_length().value_or(0) > 0;
 }
 
 // decode_error_status is the response to a request that couldn't be decoded.
@@ -875,10 +883,24 @@ coro::task<> server::serve_requests(detail::connection& conn)
             break;
         }
 
+        // an expectation the server can't meet is refused (RFC 9110, section 10.1.1, says it MAY be, as Go's server
+        // does), closing the connection, as what follows may be the body the client meant to send only if it was met.
+        const auto expected = detail::expectation_of(req);
+        if (expected == detail::expectation::unknown)
+        {
+            logger->debug("closing connection: the request has an expectation that can't be met");
+            co_await respond_and_close(conn, state, status::EXPECTATION_FAILED);
+            break;
+        }
+
         io::discard_writer no_body;
         start_response(state, no_body);
 
         response_writer rw{&state.writer, &resp, http11::response_encode, &state.closing};
+
+        // the client may wait for 100 Continue before it sends the body: it's sent when the handler first reads it.
+        if (expected == detail::expectation::continue_100 && body_to_come(req))
+            http11::call_at_body_start(req, rw.expect_continue());
 
         // NOTE: set for each request, as middleware may have replaced it for the handler it wrapped.
         req.stop = state.stop.get_token();
@@ -937,6 +959,17 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
         // NOTE: the response is sent when the server next reads from the connection (see io::flush_before_read), or
         //       as the watch ends (below).
+
+        // the client waits for a 100 Continue it didn't get, so the body the handler didn't read may never come: rather
+        // than waiting for it, the connection closes (as the response said), lingering, in case it's sent after all.
+        // NOTE: a request whose body's unread isn't watched, so there's no watch in progress.
+        if (rw.continue_unmet())
+        {
+            logger->debug("closing connection rather than asking for the rest of the request body");
+            co_await state.writer.flush();
+            co_await linger_before_close(conn);
+            break;
+        }
 
         // Whatever of the body the handler didn't read must be skipped, or it would be parsed as the next request.
         if (!co_await discard_body(*req.body, state.scratch))
@@ -1109,8 +1142,9 @@ coro::task<> server::end_after_handler_failure(detail::connection& conn,
         logger->log(level, "handler for {} {} threw", method_string(req.method), req.target.path);
     }
 
-    // whatever the handler sent of the response can't be finished, so the connection is closed.
-    if (rw.status_code() == status::NONE && !stopped)
+    // whatever the handler sent of the response can't be finished, so the connection is closed: after a 500, if it
+    // sent nothing but interim responses.
+    if (!rw.sent() && !stopped)
     {
         co_await respond_and_close(conn, state, status::INTERNAL_SERVER_ERROR);
         co_return;

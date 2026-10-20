@@ -859,6 +859,18 @@ void call_at_body_end(const server_request& req, io::end_callback callback) noex
     // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
+void call_at_body_start(const server_request& req, io::start_callback callback) noexcept
+{
+    // NOTE: as call_at_body_end().
+    auto* body = req.body.get();
+    if (body == nullptr) return;
+
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast): the type is checked first.
+    if (typeid(*body) == typeid(io::limit_reader)) static_cast<io::limit_reader*>(body)->call_at_start(callback);
+    else if (typeid(*body) == typeid(chunked_reader)) static_cast<chunked_reader*>(body)->call_at_start(callback);
+    // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
+}
+
 coro::task<response_decoder_result>
 response_decode(io::buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
 {

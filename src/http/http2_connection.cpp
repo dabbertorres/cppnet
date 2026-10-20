@@ -28,6 +28,7 @@
 #include "http/http2.hpp"
 #include "http/http2_session.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
 #include "util/string_util.hpp"
@@ -114,6 +115,12 @@ append_fields(const headers& from, std::vector<std::string>& names, std::vector<
 
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 {
+    if (at_start && !data.empty()) [[unlikely]]
+    {
+        const auto callback = std::exchange(at_start, {});
+        if (auto err = co_await callback.call(callback.context); err) co_return io::result{.err = err};
+    }
+
     auto& c = *stream->conn;
     while (true)
     {

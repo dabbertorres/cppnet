@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -30,6 +31,7 @@
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
 #include "io/string_writer.hpp"
+#include "io/util.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
@@ -992,4 +994,220 @@ TEST_CASE("a request gets one final response, after any interim ones", "[http][1
     CHECK_THROWS_AS(test::sync_wait(rw.send(net::http::status::NOT_FOUND, 0)), std::logic_error);
     CHECK(out.build().contains("HTTP/1.1 200 OK"));
     CHECK_FALSE(out.build().contains("404"));
+}
+
+TEST_CASE("an interim response is flushed at once; a final one waits in the buffer",
+          "[http][1.1][response_writer][interim]")
+{
+    net::io::string_writer<char> out;
+    net::io::buffered_writer     buffered{&out, 4'096};
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 1},
+        .body    = &buffered
+    };
+    net::http::response_writer rw{&buffered, &resp, net::http::http11::response_encode};
+
+    CHECK(net::http::reason_phrase(net::http::status::EARLY_HINTS) == "Early Hints");
+
+    rw.headers().set("Link", "</style.css>; rel=preload");
+    (void)test::sync_wait(rw.send(net::http::status::EARLY_HINTS));
+    CHECK(out.build() == "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n");
+    CHECK(buffered.size() == 0);
+    CHECK(rw.status_code() == net::http::status::EARLY_HINTS);
+    CHECK_FALSE(rw.sent());
+
+    (void)test::sync_wait(rw.send(net::http::status::OK, 0));
+    CHECK(buffered.size() > 0);
+    CHECK_FALSE(out.build().contains("200"));
+    CHECK(rw.sent());
+}
+
+TEST_CASE("an HTTP/1.0 client gets no interim response", "[http][1.1][response_writer][interim]")
+{
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 0},
+        .body    = &out
+    };
+    net::http::response_writer rw{&out, &resp, net::http::http11::response_encode};
+
+    auto* body = test::sync_wait(rw.send(net::http::status::EARLY_HINTS));
+    REQUIRE(body != nullptr);
+    CHECK(test::sync_wait(body->write("dropped"sv)).count == 7);
+    CHECK(out.build().empty());
+    CHECK(rw.status_code() == net::http::status::NONE);
+
+    (void)test::sync_wait(rw.send(net::http::status::OK, 0));
+    CHECK(out.build().starts_with("HTTP/1.0 200 OK\r\n"));
+}
+
+TEST_CASE("101 Switching Protocols can't be sent", "[http][1.1][response_writer][interim]")
+{
+    net::io::string_writer<char> out;
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 1},
+        .body    = &out
+    };
+    net::http::response_writer rw{&out, &resp, net::http::http11::response_encode};
+
+    try
+    {
+        (void)test::sync_wait(rw.send(net::http::status::SWITCHING_PROTOCOLS));
+        FAIL("sent 101");
+    }
+    catch (const std::system_error& e)
+    {
+        CHECK(e.code() == std::errc::not_supported);
+    }
+
+    CHECK(out.build().empty());
+    CHECK(rw.status_code() == net::http::status::NONE);
+}
+
+TEST_CASE("an expected 100 Continue is sent at the body's first read, unless its own or the final response was first",
+          "[http][1.1][response_writer][expect]")
+{
+    net::io::string_writer<char> out;
+    net::io::buffered_writer     buffered{&out, 4'096};
+    net::http::server_response   resp{
+        .version = {.major = 1, .minor = 1},
+        .body    = &buffered
+    };
+    net::http::response_writer rw{&buffered, &resp, net::http::http11::response_encode};
+    rw.headers().set("X-Handler", "its own");
+
+    const auto callback = rw.expect_continue();
+    REQUIRE(callback);
+
+    SECTION("just the status, flushed, once")
+    {
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        CHECK(out.build() == "HTTP/1.1 100 Continue\r\n\r\n");
+        CHECK(rw.status_code() == net::http::status::NONE);
+
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        CHECK(out.build() == "HTTP/1.1 100 Continue\r\n\r\n");
+
+        (void)test::sync_wait(rw.send(net::http::status::OK, 0));
+        CHECK_FALSE(rw.continue_unmet());
+        CHECK_FALSE(resp.headers.get("Connection").has_value());
+    }
+
+    SECTION("none after the final response, which says the connection closes")
+    {
+        (void)test::sync_wait(rw.send(net::http::status::PAYLOAD_TOO_LARGE, 0));
+        CHECK(resp.headers.get("Connection") == "close");
+        CHECK(rw.continue_unmet());
+
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        (void)test::sync_wait(buffered.flush());
+        CHECK_FALSE(out.build().contains("100"));
+
+        // the body's being read regardless.
+        CHECK_FALSE(rw.continue_unmet());
+    }
+
+    SECTION("one after another interim response, which leaves it owed")
+    {
+        (void)test::sync_wait(rw.send(net::http::status::EARLY_HINTS));
+        CHECK_FALSE(rw.continue_unmet());
+        CHECK(out.build() == "HTTP/1.1 103 Early Hints\r\nX-Handler: its own\r\n\r\n");
+
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        CHECK(out.build() == "HTTP/1.1 103 Early Hints\r\nX-Handler: its own\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n");
+        CHECK(rw.status_code() == net::http::status::EARLY_HINTS);
+
+        // met: the connection goes on after the final response.
+        (void)test::sync_wait(rw.send(net::http::status::OK, 0));
+        CHECK_FALSE(rw.continue_unmet());
+        CHECK_FALSE(resp.headers.get("Connection").has_value());
+    }
+
+    SECTION("none after another interim response, then the final one, which says the connection closes")
+    {
+        (void)test::sync_wait(rw.send(net::http::status::EARLY_HINTS));
+        CHECK_FALSE(resp.headers.get("Connection").has_value());
+
+        (void)test::sync_wait(rw.send(net::http::status::PAYLOAD_TOO_LARGE, 0));
+        CHECK(resp.headers.get("Connection") == "close");
+        CHECK(rw.continue_unmet());
+
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        (void)test::sync_wait(buffered.flush());
+        CHECK_FALSE(out.build().contains("100"));
+    }
+
+    SECTION("nor a second after the handler's own")
+    {
+        (void)test::sync_wait(rw.send(net::http::status::CONTINUE));
+        CHECK_FALSE(rw.continue_unmet());
+
+        CHECK_FALSE(test::sync_wait(callback.call(callback.context)));
+        CHECK(out.build().starts_with("HTTP/1.1 100 "));
+        CHECK_FALSE(out.build().substr(1).contains("HTTP/1.1 "));
+        CHECK_FALSE(rw.continue_unmet());
+    }
+}
+
+TEST_CASE("a request body's start callback is awaited before its first read", "[http][1.1][request_decode][expect]")
+{
+    struct test_case
+    {
+        std::string_view framing;
+        std::string_view body;
+        bool             called;
+    };
+
+    const auto tc =
+        GENERATE(test_case{.framing = "Content-Length: 5", .body = "hello", .called = true},
+                 test_case{.framing = "Transfer-Encoding: chunked", .body = "5\r\nhello\r\n0\r\n\r\n", .called = true},
+                 test_case{.framing = "Content-Length: 0", .body = "", .called = false});
+    CAPTURE(tc.framing);
+
+    const auto                   text = std::format("POST / HTTP/1.1\r\nHost: a\r\n{}\r\n\r\n{}", tc.framing, tc.body);
+    net::io::string_reader<char> content(text);
+    net::io::buffered_reader     reader(&content);
+    net::http::server_request    req;
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+
+    int calls = 0;
+    net::http::http11::call_at_body_start(req,
+                                          {.call =
+                                               [](void* context)
+                                           {
+                                               ++*static_cast<int*>(context);
+                                               return net::coro::ready_task<std::error_code>();
+                                           },
+                                           .context = &calls});
+
+    // an empty read reads nothing, so it isn't the first.
+    std::array<std::byte, 0> none{};
+    (void)test::sync_wait(req.body->read(none));
+    CHECK(calls == 0);
+
+    const auto body = test::sync_wait(net::io::read_all(*req.body));
+    REQUIRE(body.has_value());
+    CHECK(*body == (tc.called ? "hello"sv : ""sv));
+    CHECK(calls == (tc.called ? 1 : 0));
+}
+
+TEST_CASE("a request body's first read fails with its start callback's error", "[http][1.1][request_decode][expect]")
+{
+    net::io::string_reader<char> content("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello");
+    net::io::buffered_reader     reader(&content);
+    net::http::server_request    req;
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+
+    net::http::http11::call_at_body_start(
+        req,
+        {.call = [](void*)
+         { return net::coro::ready_task<std::error_code>(std::make_error_code(std::errc::broken_pipe)); },
+         .context = nullptr});
+
+    std::array<std::byte, 8> buf{};
+    CHECK(test::sync_wait(req.body->read(buf)).err == std::errc::broken_pipe);
+
+    // only the first.
+    const auto res = test::sync_wait(req.body->read(buf));
+    CHECK(res.count == 5);
 }

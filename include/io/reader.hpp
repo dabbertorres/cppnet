@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <span>
+#include <system_error>
 
 #include "coro/task.hpp"
 #include "io.hpp"
@@ -48,6 +49,18 @@ struct end_callback
     {
         if (call != nullptr) call(context);
     }
+};
+
+// start_callback is awaited by a reader that reads part of a stream (e.g. a message's body) before its first read (into
+// a non-empty span) reads anything: to tell its owner, which may have to write something first (e.g. HTTP's 100
+// Continue, which a client waits for before it sends the body). An error it returns fails that read. It's a task (a
+// coroutine only when it must wait), as it's for what's rare: an end_callback is for what's common.
+struct start_callback
+{
+    coro::task<std::error_code> (*call)(void* context) = nullptr;
+    void* context                                      = nullptr;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return call != nullptr; }
 };
 
 }

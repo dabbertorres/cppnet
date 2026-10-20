@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
 
 #include "coro/task.hpp"
@@ -61,8 +62,15 @@ public:
         if (progress >= limit) at_end();
     }
 
+    // call_at_start sets what's awaited before the first read that reads anything (see start_callback): none, if the
+    // limit's been reached already (e.g. a limit of 0).
+    void call_at_start(start_callback callback) noexcept { at_start = callback; }
+
 private:
     coro::task<result> count_after(coro::task<result> inner);
+
+    // start_then_read awaits at_start (once), then reads.
+    coro::task<result> start_then_read(std::span<std::byte> data);
 
     // counted counts what a read of the parent read, and reports the stream ending before the limit as mode says.
     result counted(result res) noexcept;
@@ -73,6 +81,7 @@ private:
     std::size_t             progress = 0;
     mode                    how      = mode::exact;
     end_callback            at_end;
+    start_callback          at_start;
 };
 
 }

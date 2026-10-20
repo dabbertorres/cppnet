@@ -35,6 +35,7 @@ enum class status : std::uint16_t
     CONTINUE            = 100,
     SWITCHING_PROTOCOLS = 101,
     PROCESSING          = 102,
+    EARLY_HINTS         = 103,
 
     // 2×× Success
     OK                            = 200,
@@ -119,6 +120,7 @@ constexpr std::string_view reason_phrase(status s) noexcept
     case CONTINUE: return "Continue";
     case SWITCHING_PROTOCOLS: return "Switching Protocols";
     case PROCESSING: return "Processing";
+    case EARLY_HINTS: return "Early Hints";
 
     case OK: return "OK";
     case CREATED: return "Created";
@@ -304,6 +306,15 @@ public:
     // if the final response was sent already: any number of interim (1xx) responses may come before it, but one
     // request gets one final response.
     //
+    // An interim response (e.g. status::EARLY_HINTS, with Link fields) is sent at once, flushing the connection over
+    // HTTP/1.1, and keeps the headers, which the final response then sends too (as RFC 8297 expects of Early Hints).
+    // It isn't sent to an HTTP/1.0 client, which doesn't know them (RFC 9110, section 15.2): send() then returns a
+    // writer that drops what's written. status::SWITCHING_PROTOCOLS can't be sent (std::system_error, with
+    // std::errc::not_supported), as nothing can switch protocols: it would tell an HTTP/1.1 client the connection had
+    // switched, and HTTP/2 has no 101 (RFC 9113, section 8.6). A request that expects 100 Continue gets one from the
+    // server, when the handler first reads its body, unless the handler sent its own 100 or the final response before
+    // (another interim response doesn't count; see expect_continue()).
+    //
     // NOTE: when the encoder finishes without a coroutine (e.g. the head fits in the connection's buffer), so does
     //       send(), which then throws when it's called, rather than when it's awaited.
     coro::task<io::writer*> send(status status_code, std::size_t content_length);
@@ -328,7 +339,38 @@ public:
     // sent is whether the final (not 1xx) response has been sent.
     [[nodiscard]] bool sent() const noexcept { return final_sent; }
 
+    // expect_continue is the server's: the request expects 100 (Continue) before its client sends the body (Expect:
+    // 100-continue, RFC 9110, section 10.1.1), which is to come. It returns the callback for the body's first read to
+    // await (see io::start_callback), which sends the 100 then (just the status, without the response's headers),
+    // unless the handler has sent its own 100, or the final response, by then: another interim response (e.g. Early
+    // Hints) doesn't stop it, as in Go's server, so a handler may send a 103 and then read the body. Over HTTP/1.1, a
+    // final response sent before the body was asked for says the connection closes after it (Connection: close), as
+    // the client may never send the body (see continue_unmet()).
+    [[nodiscard]] io::start_callback expect_continue() noexcept;
+
+    // continue_unmet is whether the request expected 100 Continue, and its body hasn't been asked for: the final
+    // response was sent first, and the handler hasn't read it since. The server then closes the connection after the
+    // response, rather than waiting for a body that may never come, to discard it.
+    [[nodiscard]] bool continue_unmet() const noexcept { return continuation == continue_state::unmet; }
+
 private:
+    // continue_state is how a request's expectation of 100 Continue stands.
+    enum class continue_state : std::uint8_t
+    {
+        none,  // there was none, or it's been met: a 100 was sent, or the body's being read regardless
+        owed,  // no 100 nor final response has been sent: the body's first read sends a 100
+        unmet, // the final response was sent first, and the body hasn't been read
+    };
+
+    // body_starts is expect_continue()'s callback (its context the response_writer), which has send_continue() send
+    // the 100, if it's owed.
+    static coro::task<std::error_code> body_starts(void* context);
+    coro::task<std::error_code>        send_continue();
+
+    // send_interim finishes sending an interim response over HTTP/1.1, flushing it once encoding (which may need a
+    // coroutine) does.
+    coro::task<io::writer*> send_interim(coro::task<response_encoder_result> encoding);
+
     // how a response's body is framed: by its Content-Length, chunks, or closing the connection.
     enum class framing : std::uint8_t
     {
@@ -368,7 +410,8 @@ private:
     server_response*                            resp;
     std::variant<http11_backend, http2_backend> backend;
     io::limit_writer                            body;
-    bool                                        final_sent = false;
+    bool                                        final_sent   = false;
+    continue_state                              continuation = continue_state::none;
 };
 
 }

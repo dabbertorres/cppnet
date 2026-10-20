@@ -6,7 +6,8 @@ server (`coro/notifier.hpp` and `bench_notifier`, `http/http2_server.hpp`, `test
 client (`http/http2_connection.hpp`, the machinery both sides share, `http/http2_client.hpp`, the pool's HTTP/2
 connections, `test/http/http2_client.cpp`). Stage 5 decided (2026-10-20): interim responses (Early Hints) checked
 end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's priorities, in ten pull requests (see "Stage
-5"); its questions (at the end) all as recommended.
+5"); its questions (at the end) all as recommended. Its first part, interim responses on the server (and 100 Continue),
+done (2026-10-20; see Learned in stage 5).
 
 ## Goal
 
@@ -440,6 +441,56 @@ idle stream would be a connection error for the peer.
   allocation, against a network round trip) stays.
 - No public servers in the tests: the HTTPS test is against the loopback server, which agrees on `h2`.
 
+## Learned in stage 5
+
+### Part 1: interim responses, the server (done 2026-10-20)
+
+- The body's "first read" hook is `io::start_callback` (`io/reader.hpp`), `io::end_callback`'s sibling: awaited by the
+  first read into a non-empty span of `io::limit_reader`, `http11::chunked_reader` and HTTP/2's `stream_reader`, before
+  it reads, its error failing that read. It's a task, not a plain function as `end_callback` is, as sending the 100 may
+  have to wait (over HTTP/1.1, the connection's buffer may hold pipelined responses, which go first). The server sets it
+  with `http11::call_at_body_start()` (beside `call_at_body_end()`), or on the stream's reader. Unset, it's a branch per
+  read; the server looks for an `Expect` field once per request (`detail::expectation_of()`, in `http/request.hpp`).
+- `response_writer` keeps the expectation, so both versions share the rule: the server calls `expect_continue()`
+  (for a request with `Expect: 100-continue` whose body is to come: chunked, or a Content-Length over 0, over HTTP/1.1;
+  a head without END_STREAM over HTTP/2), which returns the callback, and `continue_unmet()` says how it ended. The
+  100 is just the status (no `Date`, nor the headers the handler has set so far), as Go's, and isn't the handler's:
+  `status_code()` doesn't change. A body partly sent already still gets one at its first read (as Go's: RFC 9110's
+  MAY omit isn't taken).
+- A handler's own `send(status::CONTINUE)` meets the expectation. A final response first leaves it unmet, and the
+  body's first read then sends nothing; reading the body after that clears it: the client sends the body once it stops
+  waiting (curl after a second). Another interim response (a 103) does neither: the 100 is still owed, and the body's
+  first read sends it after the 103. Decided question 3 said "if nothing has been sent yet", which part 1 first
+  followed (a 103 stopped the 100 too); but Go's server only stops its own 100 for the handler's 100 or the body's first
+  write (its final response), so a 103 then a read gets a 100 there. The user chose Go's rule (2026-10-20).
+- Over HTTP/1.1, a final response sent while the 100 is owed or unmet says `Connection: close` (RFC 9110, section
+  10.1.1: a server answering before reading the content SHOULD say whether it closes; Go's `closeAfterReply`); and if
+  the handler hasn't read the body by the time it's done, the server doesn't discard it (the client may never send it,
+  and discarding would wait up to `body_read_timeout`): it flushes, lingers as after an error response (FIN, then reads
+  and drops for up to 2 s, so a body sent after all doesn't reset the connection before the response is read), and
+  closes. Over HTTP/2, the stream's reset (NO_ERROR) as for any body left unread.
+- `Expect` is a list: each member must be `100-continue` (in any case; it has no parameters) or the expectation is
+  unknown, answered 417 before the handler runs (so neither it nor middleware sees it, as with a 400): over HTTP/1.1
+  with `Connection: close`, then lingering (Go's `sendExpectationFailed`); over HTTP/2 as the server refuses a stream
+  (with RST_STREAM(NO_ERROR) if the request hadn't ended). An empty `Expect` is none. HTTP/1.0's `Expect` is ignored
+  altogether, an unknown expectation too (HTTP/1.0 has none; Go answers 417 to that one).
+- An interim response over HTTP/1.1 is a coroutine (`send_interim()`): the head's encoded into the connection's
+  buffer as before, then flushed (through a `dynamic_cast` to `io::buffered_writer`, as the encoder already does);
+  a flush that fails throws `std::system_error`, as a head HTTP/2 can't send does. To an HTTP/1.0 client, `send()` of
+  a 1xx returns a `discard_writer` and sends nothing (`status_code()` unchanged, the headers kept for the final
+  response). `send(status::SWITCHING_PROTOCOLS)` throws before anything, over either version, to an HTTP/1.0 client
+  too. Interim responses still carry the response's headers so far, `Date` among them.
+- (A fix found on the way:) an HTTP/1.1 handler that threw after sending only interim responses got no 500 (the server
+  checked `status_code() == status::NONE`, which a 1xx changes), so the client saw the 1xx and then the connection
+  close; it now gets the 500 (checking `sent()`), as over HTTP/2.
+- The tests' `test::h2_client` records each stream's informational heads (`interims`).
+- `bench_request`'s own serving loop (for its pipelined runs) looks for the expectation as the server does. Measured
+  (Release, five alternating runs of the binaries before and after, best of each, on a noisy laptop): allocations
+  unchanged everywhere (1.4 per request pipelined, 4.2 one per read, 3.0 over a socket, 2.0 to a handler that waits,
+  about 52 over HTTP/2); times within the runs' spread (pipelined 1314 ns before, 1353 after, each varying by 15%
+  from run to run; one per read 1446 and 1412; over a socket 33.0 and 32.8 us). The `Expect` lookup is at most a few
+  tens of nanoseconds of the pipelined 1.3 us.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -510,9 +561,11 @@ an HTTP/1.1 client that takes a 1xx for the final response would misread the res
   `std::errc::not_supported` (as for a head that can't be sent), until something can switch protocols (Decided question
   2).
 - Server, both versions: 100 Continue sent by itself (Decided question 3): for a request with `Expect: 100-continue`
-  (not HTTP/1.0, whose expectation is ignored) whose body is to come, when the handler first reads the body, if nothing
-  (no 1xx, no final response) has been sent yet, as Go does; over HTTP/1.1 written and flushed before the read, over
-  HTTP/2 a HEADERS frame. A handler that answers without reading (e.g. 413 for a body too large) sends no 100, and its
+  (not HTTP/1.0, whose expectation is ignored) whose body is to come, when the handler first reads the body, unless the
+  handler has sent its own 100 or the final response by then (another 1xx, e.g. a 103, doesn't stop it), as Go does
+  (this said "if nothing (no 1xx, no final response) has been sent yet", which isn't Go's rule: corrected 2026-10-20,
+  the user choosing Go's; see Learned in stage 5); over HTTP/1.1 written and flushed before the read, over HTTP/2 a
+  HEADERS frame. A handler that answers without reading (e.g. 413 for a body too large) sends no 100, and its
   connection closes after the response if the body's left unread (as now). An expectation other than `100-continue`
   is answered 417 (RFC 9110 says MAY; Go does) before the handler runs. The body readers learn of it through the
   callback they already take at their end (`io::end_callback`), generalized to a "first read" hook on the request's body
@@ -547,14 +600,14 @@ an HTTP/1.1 client that takes a 1xx for the final response would misread the res
 of its own, which is its point.
 
 **Tests** (no network). HTTP/1.1, over a socket with `blocking_client`: a handler sends 103 with a `Link`, then waits
-for a signal the test gives once it has read the 103 (so it can't arrive with the final response), then a 200 that
-still has the `Link`; several 103s; a 100 Continue by itself, before the body's read, for a request with the
-expectation (and none without it, none to HTTP/1.0, none after a final response that didn't read the body); 417 for an
-unknown expectation; no 1xx to an HTTP/1.0 request; `send(101)` throws. HTTP/2 the same with `test::h2_client` (the
+for a signal the test gives once it has read the 103 (so it can't arrive with the final response), then a 200 that still
+has the `Link`; several 103s; a 100 Continue by itself, before the body's read, for a request with the expectation
+(after a 103 too; and none without it, none to HTTP/1.0, none after a final response that didn't read the body); 417 for
+an unknown expectation; no 1xx to an HTTP/1.0 request; `send(101)` throws. HTTP/2 the same with `test::h2_client` (the
 103's HEADERS before the final one's, and no END_STREAM on it). The client, over both versions against the server:
 `on_informational` sees each 103's status and fields in order, before `send()` returns; without it they're skipped; an
-exception from it fails the request; an HTTP/2 server sending more interim heads than the limit (by
-`test::h2_client` in its server role) fails the request with `value_too_large`.
+exception from it fails the request; an HTTP/2 server sending more interim heads than the limit (by `test::h2_client` in
+its server role) fails the request with `value_too_large`.
 
 ### Trailers
 
@@ -964,9 +1017,10 @@ throughput isn't changed (by frame count and order).
 4. **The client.** The pool's shared connections, ALPN, stream limits (and the second connection), retries, PING
    checks. Loopback tests, and public servers (needs the network).
 5. **Decided (2026-10-20), in ten pull requests, in this order** (see "Stage 5"; each mergeable and tested alone):
-   1. **Interim responses, the server.** HTTP/1.1 flushes a 1xx at once; none to HTTP/1.0; `send(101)` refused; 100
-      Continue sent by itself (and 417); `status::EARLY_HINTS`; tests over both versions; the guide. First: small, a
-      fix (Early Hints don't work over HTTP/1.1 now), and independent of the rest.
+   1. **Interim responses, the server.** Done (2026-10-20; see Learned in stage 5). HTTP/1.1 flushes a 1xx at once;
+      none to HTTP/1.0; `send(101)` refused; 100 Continue sent by itself (and 417); `status::EARLY_HINTS`; tests over
+      both versions; the guide. First: small, a fix (Early Hints don't work over HTTP/1.1 now), and independent of the
+      rest.
    2. **Interim responses, the client.** `client_request::on_informational`, over both versions, and HTTP/2's bound on
       interim heads. Split from 1 as it's an API of its own (Decided question 4), tested against 1's server.
    3. **Trailers in the codecs.** `chunked_reader` keeping a trailer section, `chunked_writer::finish(trailers)`,
@@ -1015,10 +1069,12 @@ All decided as recommended (2026-10-20); the options are kept for the reasoning.
    protocols (extended CONNECT, or an Upgrade API); (b) left as it is. **Recommended: (a)**: as an interim response it
    makes an HTTP/1.1 client think the connection switched, and over HTTP/2 it's malformed.
 3. **100 Continue.** (a) The server sends it by itself, when the handler first reads the body of a request that expects
-   it (and nothing's been sent), over both versions, with 417 for other expectations (Go's); (b) left to handlers (they
-   can `send(status::CONTINUE)` now, but none will think to); (c) later, with the client's side. **Recommended: (a)**:
-   RFC 9110 requires an origin server to answer the expectation, and without it curl's uploads (from memory: over 1 MiB)
-   wait a second each; it's small, and shares part 1's flushing.
+   it (unless the handler sent its own 100 or the final response first: an interim response such as a 103 doesn't stop
+   it), over both versions, with 417 for other expectations (Go's); (b) left to handlers (they can
+   `send(status::CONTINUE)` now, but none will think to); (c) later, with the client's side. **Recommended: (a)**: RFC
+   9110 requires an origin server to answer the expectation, and without it curl's uploads (from memory: over 1 MiB)
+   wait a second each; it's small, and shares part 1's flushing. (Corrected 2026-10-20: this said "and nothing's been
+   sent", which stopped the 100 after a 103 too; part 1 found that isn't Go's rule, and the user chose Go's.)
 4. **How interim responses reach a client caller.** (a) Skipped, as now (documented); (b) a callback,
    `client_request::on_informational(status, const headers&)`, for each before the final response (Go's
    `Got1xxResponse`, hyper's `on_informational`); (c) collected in `client_response` (a vector of heads).

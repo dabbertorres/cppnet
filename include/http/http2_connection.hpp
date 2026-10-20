@@ -101,8 +101,13 @@ public:
 
     [[nodiscard]] io::handle native_handle() const noexcept override;
 
+    // call_at_start sets what's awaited before the first read into a non-empty span reads anything (see
+    // io::start_callback): e.g. the server's 100 Continue. It's awaited without the connection's lock.
+    void call_at_start(io::start_callback callback) noexcept { at_start = callback; }
+
 private:
     http2_stream_base* stream;
+    io::start_callback at_start;
 };
 
 // stream_writer writes what a stream sends (a response's body, or a request's) as DATA, waiting for the

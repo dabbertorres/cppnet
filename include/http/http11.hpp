@@ -54,6 +54,11 @@ request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server
 // connection from then, e.g.
 void call_at_body_end(const server_request& req, io::end_callback callback) noexcept;
 
+// call_at_body_start sets what's awaited before the first read of the body of a request that request_decode() decoded
+// (see io::start_callback): e.g. for a server to send 100 Continue then. A body that's empty is never read, so there's
+// nothing to call.
+void call_at_body_start(const server_request& req, io::start_callback callback) noexcept;
+
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
 // HEAD requests have no body. The body owns reader.
 task<response_decoder_result>

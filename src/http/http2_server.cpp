@@ -94,6 +94,12 @@ public:
 
     bool head_request = false;
 
+    // the request expects 100 Continue before its client sends the body, which is to come (see run_stream()).
+    bool expects_continue = false;
+
+    // req.body, as start_stream() made it.
+    stream_reader* body = nullptr;
+
     io::discard_writer discard;
 
     // for sending heads, reused.
@@ -465,10 +471,22 @@ namespace
         }
         if (!req.target.host.empty()) req.host.assign(req.target.host);
 
-        req.version           = {.major = 2, .minor = 0};
+        req.version = {.major = 2, .minor = 0};
+
+        // an expectation the server can't meet is refused, as over HTTP/1.1.
+        const auto expected = expectation_of(req);
+        if (expected == expectation::unknown)
+        {
+            refuse(id, status::EXPECTATION_FAILED, end_stream);
+            return nullptr;
+        }
+        stream->expects_continue = expected == expectation::continue_100 && !end_stream;
+
         req.tls_version       = tls_version(conn);
         req.peer_certificates = peer_certs;
-        req.body              = std::make_unique<stream_reader>(stream.get());
+        auto body             = std::make_unique<stream_reader>(stream.get());
+        stream->body          = body.get();
+        req.body              = std::move(body);
 
         // its handler's token: stopped when the stream fails (see fail_stream()), or by abort (at once, after
         // receiving, if it came first); and the server's abort token, for middleware to tell the two apart.
@@ -527,6 +545,9 @@ namespace
         co_await pool->schedule();
 
         response_writer rw{stream, &http2_ops, &stream->resp};
+
+        // the client may wait for 100 Continue before it sends the body: it's sent when the handler first reads it.
+        if (stream->expects_continue) stream->body->call_at_start(rw.expect_continue());
 
         std::exception_ptr failure;
         try

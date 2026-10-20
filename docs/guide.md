@@ -453,6 +453,25 @@ scheduler.spawn(server.serve());
   (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500. `send()` throws
   `std::system_error` (`std::errc::invalid_argument`) if a header can't be sent (e.g. a value with a line break),
   over HTTP/1.1 and HTTP/2 alike.
+- **Interim responses:** `resp.send(status)` with a 1xx status (e.g. `status::EARLY_HINTS`), before the final
+  response, sends an interim one at once, with the headers set so far, which the final response then sends too:
+
+  ```cpp
+  resp.headers().add("Link", "</style.css>; rel=preload");
+  co_await resp.send(net::http::status::EARLY_HINTS);   // the client can start fetching the stylesheet
+  const auto page = co_await render(req);              // meanwhile
+  auto*      body = co_await resp.send(net::http::status::OK, page.size());
+  co_await net::io::write_all(*body, page);
+  ```
+
+  An HTTP/1.0 client gets none (it doesn't know them: `send()` then returns a writer that drops what's written).
+  `status::SWITCHING_PROTOCOLS` can't be sent (`std::system_error`, `std::errc::not_supported`), as nothing can switch
+  protocols. A request with `Expect: 100-continue`, whose client may wait before it sends the body, gets a 100
+  (Continue) from the server when the handler first reads the body, unless the handler has sent its own 100 or the
+  final response by then (as Go's server: another interim response, e.g. a 103, doesn't stop it); a handler that
+  answers without reading it (e.g. a 413, for a body too large) sends none, and over HTTP/1.1 the connection closes
+  after its response, rather than waiting for a body that may never come. Any other expectation is answered 417
+  (Expectation Failed), without calling the handler.
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).

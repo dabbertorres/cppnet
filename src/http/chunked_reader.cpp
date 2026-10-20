@@ -3,16 +3,19 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <expected>
 #include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "io/io.hpp"
+#include "io/reader.hpp"
 #include "io/util.hpp"
 
 namespace
@@ -46,6 +49,12 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
 
     // don't read past the end of the body, into whatever follows it.
     if (done) co_return {.count = 0, .err = make_error_code(io::errc::end_of_stream)};
+
+    if (at_start) [[unlikely]]
+    {
+        const auto callback = std::exchange(at_start, {});
+        if (auto err = co_await callback.call(callback.context); err) co_return {.err = err};
+    }
 
     if (chunk_remaining == 0)
     {

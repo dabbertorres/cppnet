@@ -1990,3 +1990,415 @@ TEST_CASE("an HTTP/1.1 handler that doesn't suspend isn't watched", "[http][serv
     while (stopped.load() == -1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     CHECK(stopped.load() == 0);
 }
+
+namespace
+{
+
+// set_by waits (up to 5s, on the test's thread) for f to be set, returning whether it was.
+bool set_by_deadline(const flag& f)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (f.word.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    return f.word.load() != 0;
+}
+
+// read_head reads from conn until it has read a whole head (up to the empty line after its fields), returning it.
+std::string read_head(const blocking_client& conn)
+{
+    std::string out;
+    while (!out.contains("\r\n\r\n"))
+    {
+        auto chunk = conn.read_some();
+        if (chunk.empty()) break;
+        out += chunk;
+    }
+    return out;
+}
+
+}
+
+TEST_CASE("an HTTP/1.1 interim response is sent at once, before the final one", "[http][server][interim]")
+{
+    // NOTE: before the scheduler, which waits for the tasks that use them.
+    flag hinted;
+
+    running_scheduler running;
+
+    http::router router;
+
+    // sends Early Hints, then waits for the client to have read them, before the final response (which keeps their
+    // fields).
+    router.GET("/hint",
+               [&](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+               {
+                   resp.headers().set("Link", "</style.css>; rel=preload");
+                   co_await resp.send(http::status::EARLY_HINTS);
+                   const bool read = co_await hinted.wait(&running.sched);
+
+                   const auto msg  = read ? "done"sv : "not read"sv;
+                   auto*      body = co_await resp.send(http::status::OK, msg.size());
+                   co_await net::io::write_all(*body, msg);
+               });
+
+    // sends several, the second with a field of its own.
+    router.GET("/hints",
+               [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+               {
+                   resp.headers().set("Link", "</a.css>; rel=preload");
+                   co_await resp.send(http::status::EARLY_HINTS);
+                   resp.headers().add("Link", "</b.js>; rel=preload");
+                   co_await resp.send(http::status::EARLY_HINTS);
+                   co_await resp.send(http::status::PROCESSING);
+                   auto* body = co_await resp.send(http::status::OK, 4);
+                   co_await net::io::write_all(*body, "done"sv);
+               });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+
+    SECTION("a 103 reaches the client while the handler waits")
+    {
+        conn.send("GET /hint HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        const auto hints = read_head(conn);
+        CAPTURE(hints);
+        CHECK(hints.starts_with("HTTP/1.1 103 Early Hints\r\n"));
+        CHECK(hints.contains("\r\nLink: </style.css>; rel=preload\r\n"));
+        CHECK_FALSE(hints.contains("Content-Length"));
+        CHECK(hints.ends_with("\r\n\r\n"));
+
+        hinted.set(&running.sched);
+
+        std::string out;
+        while (!out.ends_with("done") && !out.ends_with("not read"))
+        {
+            auto chunk = conn.read_some();
+            if (chunk.empty()) break;
+            out += chunk;
+        }
+
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.contains("\r\nLink: </style.css>; rel=preload\r\n"));
+        CHECK(out.ends_with("\r\n\r\ndone"));
+    }
+
+    SECTION("several interim responses, in order, then the final one")
+    {
+        conn.send("GET /hints HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+
+        const auto first   = out.find("HTTP/1.1 103 Early Hints\r\n");
+        const auto second  = out.find("HTTP/1.1 103 Early Hints\r\n", first + 1);
+        const auto process = out.find("HTTP/1.1 102 Processing\r\n");
+        const auto final   = out.find("HTTP/1.1 200 OK\r\n");
+        CHECK(first == 0);
+        CHECK(second != std::string::npos);
+        CHECK(second < process);
+        CHECK(process != std::string::npos);
+        CHECK(process < final);
+        CHECK(final != std::string::npos);
+        CHECK(count(out, "Link: </b.js>; rel=preload\r\n") == 3); // the second 103's, the 102's and the 200's
+        CHECK(out.ends_with("\r\n\r\ndone"));
+    }
+
+    SECTION("none to an HTTP/1.0 client, which doesn't know them")
+    {
+        conn.send("GET /hints HTTP/1.0\r\n\r\n");
+
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.0 200 OK\r\n"));
+        CHECK_FALSE(out.contains("103"));
+        CHECK_FALSE(out.contains("102"));
+        CHECK(out.contains("\r\nLink: </b.js>; rel=preload\r\n"));
+        CHECK(out.ends_with("\r\n\r\ndone"));
+    }
+}
+
+TEST_CASE("an HTTP/1.1 handler can't send 101 Switching Protocols", "[http][server][interim]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/switch",
+               [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+               {
+                   std::string outcome = "sent";
+                   resp.headers().set("Upgrade", "websocket");
+                   try
+                   {
+                       co_await resp.send(http::status::SWITCHING_PROTOCOLS);
+                   }
+                   catch (const std::system_error& e)
+                   {
+                       outcome = e.code() == std::errc::not_supported ? "refused" : e.what();
+                   }
+
+                   resp.headers().remove("Upgrade");
+                   auto* body = co_await resp.send(http::status::OK, outcome.size());
+                   co_await net::io::write_all(*body, outcome);
+               });
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    const auto out = sched.run_to_completion(
+        exchange(&sched, server.local_port(), "GET /switch HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+    CAPTURE(out);
+    CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK_FALSE(out.contains("101"));
+    CHECK(out.ends_with("\r\n\r\nrefused"));
+}
+
+TEST_CASE("an HTTP/1.1 request that expects 100 Continue gets one when its handler reads the body",
+          "[http][server][expect]")
+{
+    // NOTE: before the scheduler, which waits for the tasks that use them.
+    flag started;
+    flag release;
+
+    running_scheduler running;
+
+    http::router router;
+
+    // waits to be released before reading its body.
+    router.POST("/wait",
+                [&](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    started.set(&running.sched);
+                    co_await release.wait(&running.sched);
+                    co_await read_body(req, resp);
+                });
+
+    // answers without reading the body.
+    router.POST("/refuse",
+                [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+                { co_await resp.send(http::status::PAYLOAD_TOO_LARGE, 0); });
+
+    // sends its own 100, then reads the body.
+    router.POST("/continue",
+                [](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    co_await resp.send(http::status::CONTINUE);
+                    co_await read_body(req, resp);
+                });
+
+    // sends Early Hints, then reads the body.
+    router.POST("/hint",
+                [](http::server_request& req, http::response_writer& resp) -> task<void>
+                {
+                    resp.headers().set("Link", "</style.css>; rel=preload");
+                    co_await resp.send(http::status::EARLY_HINTS);
+                    co_await read_body(req, resp);
+                });
+
+    http::server server{
+        &running.sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(running.sched.spawn(server.serve()));
+
+    blocking_client conn{server.local_port()};
+
+    SECTION("only once the handler reads, before the client sends the body")
+    {
+        conn.send("POST /wait HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+        REQUIRE(set_by_deadline(started));
+
+        // nothing yet: the handler hasn't read.
+        conn.set_receive_timeout(100ms);
+        CHECK(conn.read_some().empty());
+        conn.set_receive_timeout(5s);
+
+        release.set(&running.sched);
+        const auto cont = read_head(conn);
+        CHECK(cont == "HTTP/1.1 100 Continue\r\n\r\n");
+
+        conn.send("hello");
+        std::string out;
+        while (!out.ends_with("whole: hello"))
+        {
+            auto chunk = conn.read_some();
+            if (chunk.empty()) break;
+            out += chunk;
+        }
+
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK_FALSE(out.contains("Connection: close"));
+
+        // and the connection goes on.
+        conn.send("POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        const auto next = conn.read_to_end();
+        CAPTURE(next);
+        CHECK(next.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(next.ends_with("whole: hi"));
+    }
+
+    SECTION("none for a handler that answers without reading, which closes the connection rather than wait for it")
+    {
+        conn.send("POST /refuse HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+
+        const auto start = std::chrono::steady_clock::now();
+        const auto out   = conn.read_to_end();
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+        CHECK_FALSE(out.contains("100 Continue"));
+        CHECK(std::chrono::steady_clock::now() - start < 2s);
+    }
+
+    SECTION("one, from a handler that sends its own")
+    {
+        conn.send("POST /continue HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+
+        // (with the response's headers so far, as any interim response the handler sends.)
+        const auto cont = read_head(conn);
+        CAPTURE(cont);
+        CHECK(cont.starts_with("HTTP/1.1 100 Continue\r\nDate: "));
+
+        conn.send("hello");
+        conn.shutdown_write();
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK_FALSE(out.contains("100 Continue"));
+        CHECK(out.ends_with("whole: hello"));
+    }
+
+    SECTION("one after the handler's Early Hints, which don't stop it, and the connection goes on")
+    {
+        conn.send("POST /hint HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+
+        // the 103, then the 100, before the client sends the body.
+        std::string heads;
+        while (!heads.ends_with("HTTP/1.1 100 Continue\r\n\r\n"))
+        {
+            auto chunk = conn.read_some();
+            if (chunk.empty()) break;
+            heads += chunk;
+        }
+
+        CAPTURE(heads);
+        CHECK(heads.starts_with("HTTP/1.1 103 Early Hints\r\n"));
+        CHECK(heads.contains("\r\nLink: </style.css>; rel=preload\r\n"));
+        CHECK_FALSE(heads.contains("Connection"));
+        CHECK(heads.ends_with("\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n"));
+        CHECK(count(heads, "HTTP/1.1 ") == 2);
+
+        conn.send("hello");
+        std::string out;
+        while (!out.ends_with("whole: hello"))
+        {
+            auto chunk = conn.read_some();
+            if (chunk.empty()) break;
+            out += chunk;
+        }
+
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.contains("\r\nLink: </style.css>; rel=preload\r\n"));
+        CHECK_FALSE(out.contains("Connection: close"));
+        CHECK(out.ends_with("whole: hello"));
+
+        // and the connection goes on.
+        conn.send("POST /hint HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        const auto next = conn.read_to_end();
+        CAPTURE(next);
+        CHECK(next.starts_with("HTTP/1.1 103 Early Hints\r\n"));
+        CHECK_FALSE(next.contains("100 Continue"));
+        CHECK(next.contains("\r\n\r\nHTTP/1.1 200 OK\r\n"));
+        CHECK(next.ends_with("whole: hi"));
+    }
+
+    SECTION("none without the expectation, nor for a body that's empty")
+    {
+        conn.send("POST /continue HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+                  "POST /wait HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n"
+                  "POST /wait HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+        release.set(&running.sched);
+
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+
+        // the first is the handler's own.
+        CHECK(count(out, "HTTP/1.1 100 Continue\r\n") == 1);
+        CHECK(out.starts_with("HTTP/1.1 100 Continue\r\n"));
+        CHECK(count(out, "HTTP/1.1 200 OK\r\n") == 3);
+        CHECK(out.ends_with("whole: hello"));
+    }
+
+    SECTION("none to HTTP/1.0, whose expectation is ignored")
+    {
+        conn.send("POST /wait HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
+        release.set(&running.sched);
+
+        const auto out = conn.read_to_end();
+        CAPTURE(out);
+        CHECK(out.starts_with("HTTP/1.0 200 OK\r\n"));
+        CHECK_FALSE(out.contains("100 Continue"));
+        CHECK(out.ends_with("whole: hello"));
+    }
+}
+
+TEST_CASE("an HTTP/1.1 request with an expectation other than 100-continue gets 417", "[http][server][expect]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.POST("/", read_body);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    struct test_case
+    {
+        std::string_view version;
+        std::string_view expect;
+        std::string_view starts;
+    };
+
+    const auto tc =
+        GENERATE(test_case{.version = "1.1", .expect = "something", .starts = "HTTP/1.1 417 Expectation"},
+                 test_case{.version = "1.1", .expect = "100-continue, x", .starts = "HTTP/1.1 417 Expectation"},
+                 test_case{.version = "1.1", .expect = "100-continue; a=b", .starts = "HTTP/1.1 417"},
+                 test_case{.version = "1.1", .expect = "100-Continue", .starts = "HTTP/1.1 100 Continue"},
+                 test_case{.version = "1.0", .expect = "something", .starts = "HTTP/1.0 200 OK"});
+    CAPTURE(tc.version, tc.expect);
+
+    const auto out = sched.run_to_completion(exchange(&sched,
+                                                      server.local_port(),
+                                                      std::format("POST / HTTP/{}\r\nHost: x\r\nExpect: {}\r\n"
+                                                                  "Content-Length: 5\r\nConnection: close\r\n\r\nhello",
+                                                                  tc.version,
+                                                                  tc.expect)));
+    CAPTURE(out);
+    CHECK(out.starts_with(tc.starts));
+    if (tc.starts.contains("417"))
+    {
+        CHECK(out.contains("\r\nConnection: close\r\n"));
+        CHECK_FALSE(out.contains("whole"));
+    }
+    else
+    {
+        CHECK(out.ends_with("whole: hello"));
+    }
+}

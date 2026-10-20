@@ -205,6 +205,9 @@ task<void> serve(const Router& router, net::io::reader& input, net::io::writer& 
 
         if (auto err = co_await http::http11::request_decode(&reader, 8'192, req); err) break;
 
+        // as the server does (none, here).
+        if (http::detail::expectation_of(req) != http::detail::expectation::none) break;
+
         counted.decode += allocations.load(std::memory_order::relaxed) - at;
         at = allocations.load(std::memory_order::relaxed);
 

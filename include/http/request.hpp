@@ -228,6 +228,21 @@ struct server_request
     }
 };
 
+namespace detail
+{
+    // expectation is what a request's Expect field asks of the server (RFC 9110, section 10.1.1).
+    enum class expectation : std::uint8_t
+    {
+        none,         // nothing: no Expect field (or an empty one); or an HTTP/1.0 request, which has no expectations
+        continue_100, // 100-continue: the client may wait for a 100 (Continue) before it sends the body
+        unknown,      // anything else, which the server can't meet: it answers 417 (Expectation Failed)
+    };
+
+    // expectation_of is what req expects. Its Expect field is a list: each of its members must be 100-continue (in
+    // any case, without parameters, which it has none of), or the expectation is unknown.
+    [[nodiscard]] expectation expectation_of(const server_request& req);
+}
+
 using request_decoder_result = std::expected<server_request, std::error_code>;
 using request_encoder_result = std::expected<io::writer*, std::error_code>;
 

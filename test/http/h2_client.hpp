@@ -38,10 +38,18 @@ namespace hpack = net::http::hpack;
 // role::server, it's a minimal server instead (for the client's tests), whose responses are the requests it receives.
 struct h2_client final : http2::session_events
 {
+    // interim is an informational (1xx) head.
+    struct interim
+    {
+        std::string                                      status;
+        std::vector<std::pair<std::string, std::string>> headers;
+    };
+
     struct response
     {
         std::string                                      status;
         std::vector<std::pair<std::string, std::string>> headers;
+        std::vector<interim>                             interims; // before the final head, in order
         std::string                                      body;
         bool                                             done = false;
         std::error_code                                  reset;
@@ -87,6 +95,15 @@ struct h2_client final : http2::session_events
             {
                 if (f.name == ":status") r.status = f.value;
                 else r.headers.emplace_back(f.name, f.value);
+            }
+        }
+        else if (kind == http2::block_kind::informational)
+        {
+            auto& head = r.interims.emplace_back();
+            for (const auto& f : fields)
+            {
+                if (f.name == ":status") head.status = f.value;
+                else head.headers.emplace_back(f.name, f.value);
             }
         }
         if (end) done(r);
@@ -328,6 +345,16 @@ struct stop_probe
 
 // header is a response's field's value, or "(none)".
 inline std::string header(const h2_client::response& r, std::string_view name)
+{
+    for (const auto& [n, v] : r.headers)
+    {
+        if (n == name) return v;
+    }
+    return "(none)";
+}
+
+// header is an interim head's field's value, or "(none)".
+inline std::string header(const h2_client::interim& r, std::string_view name)
 {
     for (const auto& [n, v] : r.headers)
     {
