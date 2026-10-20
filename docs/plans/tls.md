@@ -2,8 +2,8 @@
 
 Status: stages 1 to 3 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`;
 `https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`); and HTTPS in `http::server`
-(`server_config::tls`, `test/tls/server.cpp`). Stage 4 proposed (2026-10-20): client certificates, session tickets
-for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) are open.
+(`server_config::tls`, `test/tls/server.cpp`). Stage 4 decided (2026-10-20): client certificates, session tickets
+for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) all as recommended.
 
 ## Goal
 
@@ -424,7 +424,7 @@ using session_ticket_key = std::array<std::byte, 32>;
 struct server_options
 {
     // ... as above, and:
-    // Session resumption with tickets: on by default, for TLS 1.3 (Open question 8). A ticket is good for
+    // Session resumption with tickets: on by default, for TLS 1.3 (Decided question 8). A ticket is good for
     // session_ticket_lifetime (at most 7 days, TLS 1.3's limit), and a resumption for as long.
     bool                 session_tickets         = true;
     std::chrono::seconds session_ticket_lifetime = std::chrono::hours{24};
@@ -456,16 +456,16 @@ class stream
 server's state:
 
 - `establish(session, id, tls12_no_ticket)` returns a ticket, `session.encrypt(current key)`, for a TLS 1.3 session (and
-  none for TLS 1.2's, nor session IDs: Open question 8); `retrieve_one(handle)` decrypts with each key in turn (the key
-  name rejects the others before any decryption); `find_some()` is empty (it's a server's), and `store()`/`remove()` do
-  nothing. `emits_session_tickets()` is whether there's a key.
+  none for TLS 1.2's, nor session IDs: Decided question 8); `retrieve_one(handle)` decrypts with each key in turn (the
+  key name rejects the others before any decryption); `find_some()` is empty (it's a server's), and `store()`/`remove()`
+  do nothing. `emits_session_tickets()` is whether there's a key.
 - Keys: the given ones, or a random one made with the context, and, when it's a lifetime old, another made in its place
   (lazily, under the manager's mutex, as Go does, so there's no timer), the previous one kept for a lifetime more: every
   ticket within its lifetime can still be decrypted, and a key is gone two lifetimes after it began.
 - The key Botan uses is derived from the configured one and the context's client authentication: HMAC-SHA-256 over
   `client_auth` and a hash of the client CAs' certificates. So a ticket made where client certificates were verified
   against other CAs (another context sharing the keys, or a restart with a new CA file) doesn't decrypt, which is what
-  Go's re-verification guards against, without verifying the chain again on each resumption (Open question 10). Then
+  Go's re-verification guards against, without verifying the chain again on each resumption (Decided question 10). Then
   `retrieve_one()` refuses what Go refuses: a session whose client leaf has expired, or without a client certificate
   where one is required.
 - The policy's `session_ticket_lifetime()` comes from the options; the client's policy keeps Botan's default.
@@ -547,8 +547,8 @@ handshake in the field. The network tests (public servers) exercise interoperabi
 2. **`https://` in `http::client`**, with the pool's keys, and tests against a TLS server in the tests.
 3. **TLS in `http::server`**: `server_config`'s options, the handshake in `serve_connection`, and tests (the client from
    stage 2 talking to it).
-4. **Proposed (2026-10-20), in three pull requests, in this order** (see "Stage 4"):
-   1. **A trimmed Botan.** The overlay port configures `--minimized-build` with the modules cppnet uses (Open
+4. **Decided (2026-10-20), in three pull requests, in this order** (see "Stage 4"):
+   1. **A trimmed Botan.** The overlay port configures `--minimized-build` with the modules cppnet uses (Decided
       questions 11 and 12), and stops building Botan's command-line tool; the policy offers only what's built (the
       key exchange groups, Go's set), so cppnet behaves the same over a whole Botan (e.g. a project's own vcpkg's).
       First, as it's independent, and halves the dependency's build for every CI run after it (once its cache is
@@ -565,7 +565,9 @@ handshake in the field. The network tests (public servers) exercise interoperabi
    HTTP/2 over ALPN (`h2`), listed here before, is done: the server's in the HTTP/2 plan's stage 3, the client's in its
    stage 4. OCSP is dropped (see "Out of scope").
 
-## Open questions (stage 4)
+## Decided questions (stage 4)
+
+All decided as recommended (2026-10-20); the options are kept for the reasoning.
 
 1. **Which client authentication modes.** (a) Go's five (with `request` and `require_any`, which don't verify what's
    sent); (b) three that verify: `none`, `optional`, `required`; (c) two: `none` and `required`. **Recommended: (b)**:
@@ -639,7 +641,7 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   stapling one from cppnet's server isn't planned.
 - **HTTP/2 over ALPN**: done (see Stages).
 - Go's verification hooks (`VerifyPeerCertificate`, `VerifyConnection`) and the unverifying client authentication modes
-  (Open question 1); post-handshake client authentication; raw public keys.
+  (Decided question 1); post-handshake client authentication; raw public keys.
 - Choosing a certificate per SNI (Go's `GetCertificate`), and replacing a server's certificate while it runs (e.g. after
   an ACME renewal): a context is fixed once made, so a server restarts with a new one. Worth a stage of its own if
   certificates get shorter-lived (the CA/Browser Forum's 47-day limit is coming).
