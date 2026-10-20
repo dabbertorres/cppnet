@@ -5,6 +5,7 @@ sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's 
 throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 6 are
 done (2026-10-19); "Where things stand" describes the code before them. Stage 7 (Happy Eyeballs) was decided
 (2026-10-19): RFC 8305, its racing and its resolution delay, on both back ends, on by default (Decided question 10).
+Its first part (racing the attempts) is done (2026-10-19).
 
 ## Goal
 
@@ -419,6 +420,27 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
       `attempt_delay` 0 keeps today's behaviour: one at a time, each with its share (`attempt_deadline()`).
       `client_options::attempt_delay` passes it through. The error, when all fail, is the last attempt's (or
       `timed_out`).
+      **Done** (2026-10-19) as above. Decided along the way, where the plan was silent:
+      - The delay is neither a `call_at` nor a `sleep_until`: `connect` waits for the attempts' news with `wait_on()`
+        on the race's word, with the stop token and, as its deadline, when the next attempt is due (or the overall
+        deadline). The race has to wake on two things, an attempt ending and the delay; a `sleep_until` can't wake on
+        the first, and a `call_at` would only notify the same word from the polling thread, for what the wait's own
+        deadline does.
+      - Attempts are spawned tasks sharing the race (`race`, behind a `shared_ptr`: the stop source, linked to
+        `options.stop`; the word; under its own lock, the winner, whether the race is over, the failures and the last
+        error), so one may outlive `connect` (a loser being stopped) without anything it touches going: `connect`
+        doesn't wait for the losers, it ends the race (closing a winner it didn't take, then stopping the source,
+        holding no locks), and each loser closes its own socket, as does one that connects after the race is over.
+      - Racing is only paid for when an attempt is slow: each attempt is waited for inline (as before) until the next
+        is due, and only one that outlasts the delay is handed to a task, with the race made then. So a host whose
+        first address connects within 250 ms costs what it did (the addresses are interleaved in place); a race costs
+        the shared state (one allocation, and the stop source's), and per attempt in it, a task (its frame and
+        `spawn()`'s).
+      - "At once when the latest fails" is the latest started: an earlier one failing doesn't start the next early.
+        One that fails as it starts (e.g. `connect()` refused at once) starts the next at once too.
+      - A single address, like `attempt_delay` 0, takes the one-at-a-time path (its share is the whole timeout anyway).
+      - The tests replace `connect()` (an internal hook, `connect_options::system_connect`, as `system_lookup` is),
+        so attempts hang, fail or connect (for real, to loopback) as each test needs, whatever the network.
    2. **The resolution delay** (RFC 8305 section 3): `connect` starts on the first family's answer: at once for AAAA,
       or for A after 50 ms (the Resolution Delay) without AAAA; addresses arriving later join the attempts not yet
       made, sorted in (section 4). The resolver reports each family as it arrives, to `connect` (the public

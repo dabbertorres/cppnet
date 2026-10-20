@@ -2,17 +2,22 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <compare>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ratio>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -30,11 +35,13 @@
 #include "coro/thread_pool.hpp"
 #include "dns/blocking_lookup.hpp"
 #include "dns/resolver.hpp"
+#include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
 #include "ipv4_addr.hpp"
 #include "ipv6_addr.hpp"
 #include "listen.hpp"
+#include "sockaddr.hpp"
 #include "socket.hpp"
 #include "util/defer.hpp"
 
@@ -422,12 +429,13 @@ TEST_CASE("connecting to addresses leaves time for the next if one doesn't answe
     auto listener = net::listener::make(&sched, "127.0.0.1", "0");
     REQUIRE(listener.has_value());
 
-    // the first attempt gets 2 of the 4 seconds, rather than all of them, as it would if they weren't shared.
+    // the first attempt gets 2 of the 4 seconds, rather than all of them, as it would if they weren't shared. (Without
+    // racing them, which would start the second after the attempt delay.)
     const std::vector<net::ip_addr> addresses{non_routable_1, net::ipv4_addr::loopback()};
 
     auto start = net::io::clock::now();
-    auto err =
-        sched.run_to_completion(connect_addresses_error(&sched, addresses, listener->local_port(), {.timeout = 4s}));
+    auto err   = sched.run_to_completion(
+        connect_addresses_error(&sched, addresses, listener->local_port(), {.timeout = 4s, .attempt_delay = 0ms}));
     auto elapsed = net::io::clock::now() - start;
 
     CAPTURE(err.message());
@@ -570,4 +578,576 @@ TEST_CASE("connecting to an IP address doesn't use a blocking thread", "[tcp][co
     CAPTURE(err.message());
     CHECK_FALSE(err);
     CHECK_FALSE(released_first);
+}
+
+namespace
+{
+
+// fake_network stands in for connect() (connect_options::system_connect), so attempts to connect fail, hang or connect
+// as a test needs, whatever the network: each address it's given (e.g. one of the documentation's, 192.0.2.0/24 and
+// 2001:db8::/32, never actually connected to) does what its behaviour says, and the attempts are recorded.
+class fake_network
+{
+public:
+    enum class behaviour : std::uint8_t
+    {
+        // fails at once, with std::errc::connection_refused.
+        refuse,
+        // connecting never ends (connect() isn't called, so the socket never connects), unless it's connected for
+        // real (see connect_hanging()).
+        hang,
+        // connects to 127.0.0.1 on the listening port (for an IPv4 address): connected, or connecting.
+        answer,
+        // connects to 127.0.0.1 on a port nothing listens on (for an IPv4 address): refused, usually once connecting
+        // has started.
+        refuse_later,
+        // fails at once, with std::errc::network_unreachable.
+        unreachable,
+    };
+
+    struct attempt
+    {
+        net::ip_addr               addr;
+        net::io::clock::time_point when;
+    };
+
+    explicit fake_network(std::vector<std::pair<net::ip_addr, behaviour>> addresses,
+                          std::uint16_t                                   listening = 0,
+                          std::uint16_t                                   closed    = 0)
+        : addresses{std::move(addresses)}
+        , listening{listening}
+        , closed{closed}
+    {}
+
+    // hook is what connect_options::system_connect is set to. It refers to the network, which must outlive the
+    // connects given it.
+    net::detail::connect_function hook()
+    {
+        return [this](net::io::handle fd, const sockaddr* addr, socklen_t size) { return connect(fd, addr, size); };
+    }
+
+    // addresses_given are the network's addresses, in its order.
+    [[nodiscard]] std::vector<net::ip_addr> addresses_given() const
+    {
+        std::vector<net::ip_addr> given;
+        given.reserve(addresses.size());
+        for (const auto& [addr, _] : addresses) given.push_back(addr);
+        return given;
+    }
+
+    [[nodiscard]] std::vector<attempt> attempts() const
+    {
+        const std::scoped_lock lock{mu};
+        return made;
+    }
+
+    [[nodiscard]] std::vector<net::ip_addr> tried() const
+    {
+        const auto                all = attempts();
+        std::vector<net::ip_addr> addrs;
+        addrs.reserve(all.size());
+        for (const auto& a : all) addrs.push_back(a.addr);
+        return addrs;
+    }
+
+    // hanging are the sockets of the attempts that hang, in the order they were made.
+    [[nodiscard]] std::vector<net::io::handle> hanging() const
+    {
+        const std::scoped_lock lock{mu};
+        return hung;
+    }
+
+    // on_attempt is called (on the connecting thread, before the attempt's behaviour) with the number of attempts made
+    // so far, this one included. (Catch2's assertions aren't for other threads: it records what to check after.)
+    std::function<void(std::size_t)> on_attempt;
+
+    // connect_hanging connects the first attempt that hung for real, to 127.0.0.1 on port, when the count'th attempt
+    // starts (see on_attempt), recording connect()'s result in result.
+    void connect_hanging(std::size_t count, std::uint16_t port, std::error_code* result)
+    {
+        on_attempt = [this, count, port, result](std::size_t made)
+        {
+            if (made != count) return;
+
+            const auto fds = hanging();
+            *result        = fds.empty() ? std::make_error_code(std::errc::bad_file_descriptor)
+                                         : connect_loopback(fds.front(), port);
+        };
+    }
+
+    // connect_loopback connects fd for real, to 127.0.0.1 on port.
+    static std::error_code connect_loopback(net::io::handle fd, std::uint16_t port)
+    {
+        sockaddr_in sin{};
+        sin.sin_family      = AF_INET;
+        sin.sin_port        = htons(port);
+        sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&sin), sizeof(sin)) == 0) return {};
+        return {errno, std::system_category()};
+    }
+
+private:
+    std::error_code connect(net::io::handle fd, const sockaddr* addr, socklen_t size)
+    {
+        auto to = net::detail::from_sockaddr(addr, size);
+        if (!to.has_value()) return to.error();
+
+        auto what = behaviour::refuse;
+        for (const auto& [a, b] : addresses)
+        {
+            if (a == to->addr) what = b;
+        }
+
+        std::size_t count = 0;
+        {
+            const std::scoped_lock lock{mu};
+            made.push_back({.addr = to->addr, .when = net::io::clock::now()});
+            if (what == behaviour::hang) hung.push_back(fd);
+            count = made.size();
+        }
+
+        if (on_attempt) on_attempt(count);
+
+        switch (what)
+        {
+        case behaviour::refuse: return std::make_error_code(std::errc::connection_refused);
+        case behaviour::hang: return std::make_error_code(std::errc::operation_in_progress);
+        case behaviour::answer: return connect_loopback(fd, listening);
+        case behaviour::refuse_later: return connect_loopback(fd, closed);
+        case behaviour::unreachable: return std::make_error_code(std::errc::network_unreachable);
+        }
+
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+
+    std::vector<std::pair<net::ip_addr, behaviour>> addresses;
+    std::uint16_t                                   listening;
+    std::uint16_t                                   closed;
+
+    mutable std::mutex           mu;
+    std::vector<attempt>         made;
+    std::vector<net::io::handle> hung;
+};
+
+net::ip_addr addr(std::string_view text)
+{
+    auto parsed = net::ip_addr::parse(text);
+    REQUIRE(parsed.has_value());
+    return *parsed;
+}
+
+// connect_through connects to the network's addresses through it (on port 80, which it ignores), with options, and
+// returns the connection or why it failed, and how long it took.
+net::coro::task<std::pair<connect_result, net::io::clock::duration>>
+connect_through(net::io::scheduler* sched, fake_network* network, net::tcp_socket::connect_options options)
+{
+    options.system_connect = network->hook();
+
+    const auto start = net::io::clock::now();
+    auto       conn  = co_await net::tcp_socket::connect(sched, network->addresses_given(), 80, options);
+    co_return std::pair{std::move(conn), net::io::clock::now() - start};
+}
+
+using enum fake_network::behaviour;
+
+}
+
+TEST_CASE("racing attempts interleaves the addresses by family", "[tcp][connect][happy-eyeballs]")
+{
+    struct test_case
+    {
+        std::vector<std::string_view> given;
+        std::vector<std::string_view> expected;
+    };
+
+    auto tc = GENERATE(
+        // the first address's family first...
+        test_case{
+            .given    = {"2001:db8::1", "2001:db8::2", "2001:db8::3", "192.0.2.1",   "192.0.2.2"},
+            .expected = {"2001:db8::1",   "192.0.2.1", "2001:db8::2", "192.0.2.2", "2001:db8::3"},
+    },
+        test_case{
+            .given    = {"192.0.2.1", "192.0.2.2", "2001:db8::1", "2001:db8::2"},
+            .expected = {"192.0.2.1", "2001:db8::1", "192.0.2.2", "2001:db8::2"},
+        },
+        // ... each family's in their order, alternating while both have some left.
+        test_case{
+            .given    = {"2001:db8::1", "192.0.2.1", "192.0.2.2", "192.0.2.3", "2001:db8::2"},
+            .expected = {"2001:db8::1", "192.0.2.1", "2001:db8::2", "192.0.2.2", "192.0.2.3"},
+        },
+        test_case{
+            .given    = {"192.0.2.1", "192.0.2.2", "192.0.2.3"},
+            .expected = {"192.0.2.1", "192.0.2.2", "192.0.2.3"},
+        });
+
+    std::vector<std::pair<net::ip_addr, fake_network::behaviour>> addresses;
+    addresses.reserve(tc.given.size());
+    for (auto text : tc.given) addresses.emplace_back(addr(text), refuse);
+
+    std::vector<net::ip_addr> expected;
+    expected.reserve(tc.expected.size());
+    for (auto text : tc.expected) expected.push_back(addr(text));
+
+    fake_network       network{addresses};
+    net::io::scheduler sched{make_pool()};
+
+    // each fails at once, so the next starts at once: the attempt delay is never waited for.
+    auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = 10s}));
+
+    REQUIRE_FALSE(conn.has_value());
+    CAPTURE(conn.error().message());
+    CHECK(conn.error() == std::errc::connection_refused);
+    CHECK(network.tried() == expected);
+    CHECK(elapsed < 5s);
+}
+
+TEST_CASE("an attempt delay of 0 tries the addresses in their order, one at a time", "[tcp][connect][happy-eyeballs]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    SECTION("in their order")
+    {
+        fake_network network{
+            {{addr("192.0.2.1"), refuse}, {addr("192.0.2.2"), refuse}, {addr("2001:db8::1"), refuse}}
+        };
+
+        auto [conn, _] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = 0ms}));
+
+        REQUIRE_FALSE(conn.has_value());
+        CHECK(conn.error() == std::errc::connection_refused);
+        CHECK(network.tried() == network.addresses_given());
+    }
+
+    SECTION("one at a time")
+    {
+        // the first attempt's share is all of the second (at least 2 seconds, but no more than is left), so the
+        // second is never tried.
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), answer}},
+            listener->local_port()
+        };
+
+        auto [conn, elapsed] =
+            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 1s, .attempt_delay = 0ms}));
+
+        REQUIRE_FALSE(conn.has_value());
+        CAPTURE(conn.error().message());
+        CHECK(conn.error() == std::errc::timed_out);
+        CHECK(elapsed >= 1s);
+        CHECK(network.tried() == std::vector{addr("192.0.2.1")});
+    }
+}
+
+TEST_CASE("racing attempts starts the next after the attempt delay", "[tcp][connect][happy-eyeballs]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    // the first hangs: the second starts once it has had the delay, and connects, though the first goes on.
+    fake_network network{
+        {{addr("2001:db8::1"), hang}, {addr("192.0.2.1"), answer}},
+        listener->local_port()
+    };
+
+    constexpr auto delay = 100ms;
+
+    auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = delay}));
+
+    REQUIRE(conn.has_value());
+    CHECK(elapsed < 5s);
+
+    const auto attempts = network.attempts();
+    REQUIRE(attempts.size() == 2);
+    CHECK(attempts[0].addr == addr("2001:db8::1"));
+    CHECK(attempts[1].addr == addr("192.0.2.1"));
+
+    // NOTE: the delay is counted from just before the first attempt, so a little of it may have passed by then.
+    CHECK(attempts[1].when - attempts[0].when >= delay - 10ms);
+}
+
+TEST_CASE("racing attempts starts the next at once when the latest fails", "[tcp][connect][happy-eyeballs]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+
+    constexpr auto delay = 500ms;
+
+    SECTION("while it's the only one")
+    {
+        // the first is refused (once it started, or at once): the second starts then, not after the delay.
+        fake_network network{
+            {{addr("192.0.2.1"), refuse_later}, {addr("192.0.2.2"), answer}},
+            listener->local_port(),
+            closed
+        };
+
+        auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = delay}));
+
+        REQUIRE(conn.has_value());
+        CHECK(elapsed < delay);
+        CHECK(network.tried().size() == 2);
+    }
+
+    SECTION("while others go on")
+    {
+        // the first hangs, so the second starts after the delay; it's refused, so the third starts then, not after
+        // another delay.
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), refuse_later}, {addr("192.0.2.3"), answer}},
+            listener->local_port(),
+            closed
+        };
+
+        auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = delay}));
+
+        REQUIRE(conn.has_value());
+        CHECK(elapsed < 2 * delay);
+
+        const auto attempts = network.attempts();
+        REQUIRE(attempts.size() == 3);
+        CHECK(attempts[1].when - attempts[0].when >= delay - 10ms);
+        CHECK(attempts[2].when - attempts[1].when < delay / 2);
+    }
+
+    SECTION("but not when an earlier one fails")
+    {
+        // the second hangs, so the first failing doesn't start the third: it starts after the delay.
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), hang}, {addr("192.0.2.3"), answer}},
+            listener->local_port(),
+            closed
+        };
+
+        // the first attempt is refused as the second starts: connected for real, to the closed port.
+        std::error_code refusing;
+        network.connect_hanging(2, closed, &refusing);
+
+        auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = delay}));
+
+        CAPTURE(refusing.message());
+        CHECK(refusing == std::errc::operation_in_progress);
+        REQUIRE(conn.has_value());
+
+        const auto attempts = network.attempts();
+        REQUIRE(attempts.size() == 3);
+        CHECK(attempts[2].when - attempts[1].when >= delay - 10ms);
+    }
+}
+
+TEST_CASE("racing attempts takes the first to connect, and closes the rest", "[tcp][connect][happy-eyeballs]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const auto port = listener->local_port();
+
+    // the first hangs until the second starts, then both connect (for real, to the listener) at once: whichever is
+    // first wins, and the other is closed (stopped, or closed once it connected).
+    fake_network network{
+        {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), answer}},
+        port
+    };
+
+    std::error_code connecting;
+    network.connect_hanging(2, port, &connecting);
+
+    struct outcome
+    {
+        std::error_code              connected;
+        std::error_code              wrote;
+        std::vector<net::io::result> read;
+    };
+
+    // connects, writes a byte to the connection it got, then reads from each connection the listener accepted: the
+    // winner's gets the byte, the loser's ends.
+    const auto run =
+        [](net::io::scheduler* sched, fake_network* network, const net::listener* listener) -> net::coro::task<outcome>
+    {
+        outcome result;
+
+        auto [conn, _] = co_await connect_through(sched, network, {.attempt_delay = 50ms});
+        if (!conn.has_value())
+        {
+            result.connected = conn.error();
+            co_return result;
+        }
+
+        const std::array<std::byte, 1> hello{std::byte{'x'}};
+        auto                           wrote = co_await conn->write(hello);
+        result.wrote                         = wrote.err;
+
+        for (int i = 0; i < 2; ++i)
+        {
+            auto accepted = co_await listener->accept();
+            if (!accepted.has_value())
+            {
+                result.read.push_back({.err = accepted.error()});
+                continue;
+            }
+            accepted->set_read_timeout(5s);
+
+            std::array<std::byte, 1> buf{};
+            result.read.push_back(co_await accepted->read(buf));
+        }
+
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(run(&sched, &network, &*listener));
+
+    CAPTURE(connecting.message(), result.connected.message(), result.wrote.message());
+    CHECK((!connecting || connecting == std::errc::operation_in_progress));
+    REQUIRE_FALSE(result.connected);
+    REQUIRE_FALSE(result.wrote);
+    REQUIRE(result.read.size() == 2);
+
+    std::size_t won  = 0;
+    std::size_t lost = 0;
+    for (const auto& read : result.read)
+    {
+        CAPTURE(read.count, read.err.message());
+        if (read.count == 1 && !read.err) ++won;
+        else if (read.count == 0 && read.err == net::io::status_condition::closed) ++lost;
+    }
+    CHECK(won == 1);
+    CHECK(lost == 1);
+}
+
+TEST_CASE("racing attempts fails with the last attempt's error", "[tcp][connect][happy-eyeballs]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+
+    SECTION("one after another")
+    {
+        // the first fails once it's started (usually), the second at once.
+        fake_network network{
+            {{addr("192.0.2.1"), refuse_later}, {addr("2001:db8::1"), unreachable}},
+            0,
+            closed
+        };
+
+        auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = 5s}));
+
+        REQUIRE_FALSE(conn.has_value());
+        CAPTURE(conn.error().message());
+        CHECK(conn.error() == std::errc::network_unreachable);
+        CHECK(elapsed < 5s);
+        CHECK(network.tried().size() == 2);
+    }
+
+    SECTION("while racing")
+    {
+        // the first hangs until the second starts, then both are refused (connected for real to the closed port), each
+        // once it's started, going on together.
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), refuse_later}},
+            0,
+            closed
+        };
+
+        std::error_code refusing;
+        network.connect_hanging(2, closed, &refusing);
+
+        auto [conn, elapsed] =
+            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 5s, .attempt_delay = 50ms}));
+
+        CAPTURE(refusing.message());
+        CHECK(refusing == std::errc::operation_in_progress);
+        REQUIRE_FALSE(conn.has_value());
+        CAPTURE(conn.error().message());
+        CHECK(conn.error() == std::errc::connection_refused);
+        CHECK(elapsed < 5s);
+        CHECK(network.tried().size() == 2);
+    }
+}
+
+TEST_CASE("racing attempts ends at the timeout", "[tcp][connect][happy-eyeballs][timeout]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    SECTION("with several going")
+    {
+        fake_network network{
+            {{addr("2001:db8::1"), hang}, {addr("192.0.2.1"), hang}}
+        };
+
+        auto [conn, elapsed] =
+            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 300ms, .attempt_delay = 50ms}));
+
+        REQUIRE_FALSE(conn.has_value());
+        CAPTURE(conn.error().message());
+        CHECK(conn.error() == std::errc::timed_out);
+        CHECK(elapsed >= 300ms);
+        CHECK(elapsed < 3s);
+        CHECK(network.tried().size() == 2);
+    }
+
+    SECTION("with one address")
+    {
+        // the one attempt has all of the time.
+        fake_network network{{{addr("192.0.2.1"), hang}}};
+
+        auto [conn, elapsed] =
+            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 300ms, .attempt_delay = 50ms}));
+
+        REQUIRE_FALSE(conn.has_value());
+        CAPTURE(conn.error().message());
+        CHECK(conn.error() == std::errc::timed_out);
+        CHECK(elapsed >= 300ms);
+        CHECK(elapsed < 3s);
+        CHECK(network.tried().size() == 1);
+    }
+}
+
+TEST_CASE("requesting stop ends racing attempts", "[tcp][connect][happy-eyeballs][stop]")
+{
+    std::stop_source   source;
+    net::io::scheduler sched{make_pool()};
+
+    // none of the attempts ends by itself: stop is requested once all three have started (at 0, 50 and 100 ms), and
+    // connecting waits for them.
+    fake_network network{
+        {{addr("2001:db8::1"), hang}, {addr("192.0.2.1"), hang}, {addr("2001:db8::2"), hang}}
+    };
+
+    std::atomic<std::size_t> started{0};
+    network.on_attempt = [&](std::size_t count)
+    {
+        started.store(count);
+        started.notify_all();
+    };
+
+    std::jthread stopper{[&]
+                         {
+                             for (auto seen = started.load(); seen < 3; seen = started.load()) started.wait(seen);
+                             std::this_thread::sleep_for(50ms);
+                             source.request_stop();
+                         }};
+
+    auto [conn, elapsed] = sched.run_to_completion(
+        connect_through(&sched, &network, {.timeout = 10s, .attempt_delay = 50ms, .stop = source.get_token()}));
+
+    // lets the stopper go, should connecting have ended before all three started.
+    started.store(3);
+    started.notify_all();
+
+    REQUIRE_FALSE(conn.has_value());
+    CAPTURE(conn.error().message());
+    CHECK(conn.error() == std::errc::operation_canceled);
+    CHECK(elapsed < 5s);
+    CHECK(network.tried().size() == 3);
 }

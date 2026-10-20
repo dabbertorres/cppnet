@@ -4,11 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <system_error>
 #include <utility>
+
+#include <sys/socket.h>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -24,6 +27,16 @@ namespace dns
     class resolver;
 }
 
+namespace detail
+{
+
+    // connect_function starts connecting fd to addr, as connect() does on a non-blocking socket: it returns nothing if
+    // fd is connected, std::errc::operation_in_progress if it's connecting (and will be writable once it's done), or
+    // why it failed.
+    using connect_function = std::function<std::error_code(io::handle fd, const sockaddr* addr, socklen_t size)>;
+
+}
+
 class tcp_socket : public socket
 {
 public:
@@ -33,9 +46,19 @@ public:
         protocol proto = protocol::not_care;
 
         // How long to wait for a connection: resolving the host (if it's a name), then connecting to its addresses.
-        // Each attempt to connect gets a share of what's left (Go's rule: the time left over the addresses left, but at
-        // least 2 seconds, and never past the end), so one that doesn't answer leaves time for the rest.
         std::chrono::milliseconds timeout = std::chrono::seconds{10};
+
+        // How long an attempt to connect has before the next starts alongside it (RFC 8305's Connection Attempt
+        // Delay; Go's is 300 ms): Happy Eyeballs. The addresses are tried in their order (the resolver's, sorted by
+        // RFC 6724), but interleaved by family, the first address's first (e.g. IPv6, IPv4, IPv6, ...; RFC 8305 section
+        // 4). Each attempt starts once the one before has had attempt_delay, or at once if it failed; attempts go on
+        // together, each until the timeout's end, and the first to connect wins: the rest are stopped, their sockets
+        // closed. So an address that doesn't answer (e.g. a broken IPv6 route) costs attempt_delay, not the timeout.
+        //
+        // 0 tries the addresses one at a time, in their order, each with a share of what's left of the timeout (Go's
+        // rule: the time left over the addresses left, but at least 2 seconds, and never past the end), so one that
+        // doesn't answer leaves time for the rest.
+        std::chrono::milliseconds attempt_delay = std::chrono::milliseconds{250};
 
         bool keepalive = true;
 
@@ -46,6 +69,10 @@ public:
 
         // What resolves the host, if it's a name: null is dns::default_resolver(). It must outlive the connect.
         dns::resolver* resolver = nullptr;
+
+        // Internal (for tests): replaces connect() for each attempt, if set. It's called on the connecting task's
+        // thread, and mustn't throw.
+        detail::connect_function system_connect{};
     };
 
     explicit tcp_socket(io::scheduler* scheduler) noexcept;
@@ -60,7 +87,7 @@ public:
     // - std::errc::address_family_not_supported if the host is an IP address that options.proto rules out.
     // - std::errc::timed_out if resolving the host and connecting took longer than options.timeout altogether.
     // - std::errc::operation_canceled if the scheduler is stopped, or options.stop is.
-    // - otherwise, the error from the last address tried (e.g. std::errc::connection_refused).
+    // - otherwise, the error of the last attempt to fail (e.g. std::errc::connection_refused).
     static coro::task<std::expected<tcp_socket, std::error_code>>
     connect(io::scheduler* scheduler, std::string host, std::string port, connect_options options);
 
@@ -70,10 +97,10 @@ public:
         return connect(scheduler, std::move(host), std::move(port), connect_options{});
     }
 
-    // connect connects to the first of addresses (those of options.proto's family) that accepts, trying them in order,
-    // on port, without resolving anything. The addresses are copied before it returns, so they needn't outlive the
-    // task. It fails as connect(host, ...) does once that has resolved, and with
-    // std::errc::address_family_not_supported if no address is of options.proto's family, or
+    // connect connects to the first of addresses (those of options.proto's family) that accepts, trying them in order
+    // (interleaved by family, see connect_options::attempt_delay), on port, without resolving anything. The addresses
+    // are copied before it returns, so they needn't outlive the task. It fails as connect(host, ...) does once that has
+    // resolved, and with std::errc::address_family_not_supported if no address is of options.proto's family, or
     // std::errc::invalid_argument if there are none.
     static coro::task<std::expected<tcp_socket, std::error_code>> connect(io::scheduler*           scheduler,
                                                                           std::span<const ip_addr> addresses,

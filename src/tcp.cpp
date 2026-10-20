@@ -1,6 +1,7 @@
 #include "tcp.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -9,7 +10,9 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -34,6 +37,8 @@
 #include "ip_addr.hpp"
 #include "sockaddr.hpp"
 #include "socket.hpp"
+#include "util/defer.hpp"
+#include "util/linked_stop_source.hpp"
 
 namespace
 {
@@ -117,22 +122,49 @@ net::coro::task<std::error_code> wait_connected(net::io::scheduler*        sched
     }
 }
 
-// connect_to connects to the first of addresses (those of options.proto's family) that accepts, in order, by deadline,
-// each attempt getting its share of what's left (see net::detail::attempt_deadline()).
-net::coro::task<std::expected<net::tcp_socket, std::error_code>>
-connect_to(net::io::scheduler*                      scheduler,
-           std::vector<net::detail::socket_address> addresses,
-           net::io::clock::time_point               deadline,
-           net::tcp_socket::connect_options         options)
+// started is an attempt to connect that has started: its socket, and whether it's connected already.
+struct started
 {
-    const auto given = addresses.size();
-    std::erase_if(addresses, [&](const auto& addr) { return !of_protocol(addr, options.proto); });
-    if (addresses.empty())
+    net::tcp_socket conn;
+    bool            connected = false;
+};
+
+// start starts connecting to addr: it fails if connecting failed at once.
+std::expected<started, std::error_code> start(net::io::scheduler*                     scheduler,
+                                              const net::detail::socket_address&      addr,
+                                              const net::tcp_socket::connect_options& options)
+{
+    net::io::handle fd = ::socket(addr.family(), SOCK_STREAM, 0);
+    if (fd == -1) return std::unexpected(from_errno(errno));
+
+    // makes the socket non-blocking before connecting, and owns it from here on.
+    net::tcp_socket conn{scheduler, fd};
+
+    if (options.keepalive)
     {
-        co_return std::unexpected(
-            std::make_error_code(given == 0 ? std::errc::invalid_argument : std::errc::address_family_not_supported));
+        const int yes = 1;
+        ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
     }
 
+    std::error_code err;
+    if (options.system_connect) err = options.system_connect(fd, addr.get(), addr.size);
+    else if (::connect(fd, addr.get(), addr.size) == -1) err = from_errno(errno);
+
+    if (!err) return started{.conn = std::move(conn), .connected = true};
+    if (err == std::errc::operation_in_progress) return started{.conn = std::move(conn), .connected = false};
+
+    conn.close(false);
+    return std::unexpected(err);
+}
+
+// one_at_a_time connects to the first of addresses that accepts, trying them in order, by deadline, each attempt
+// getting its share of what's left (see net::detail::attempt_deadline()).
+net::coro::task<std::expected<net::tcp_socket, std::error_code>>
+one_at_a_time(net::io::scheduler*                      scheduler,
+              std::vector<net::detail::socket_address> addresses,
+              net::io::clock::time_point               deadline,
+              net::tcp_socket::connect_options         options)
+{
     std::error_code last_err;
 
     for (std::size_t i = 0; i < addresses.size(); ++i)
@@ -144,36 +176,20 @@ connect_to(net::io::scheduler*                      scheduler,
         const auto now = net::io::clock::now();
         if (now >= deadline) co_return std::unexpected(std::make_error_code(std::errc::timed_out));
 
-        const auto&     addr = addresses[i];
-        net::io::handle fd   = ::socket(addr.family(), SOCK_STREAM, 0);
-        if (fd == -1)
+        auto attempt = start(scheduler, addresses[i], options);
+        if (!attempt.has_value())
         {
-            last_err = from_errno(errno);
+            last_err = attempt.error();
             continue;
         }
+        if (attempt->connected) co_return std::move(attempt->conn);
 
-        // makes the socket non-blocking before connecting, and owns it from here on.
-        net::tcp_socket conn{scheduler, fd};
-
-        if (options.keepalive)
-        {
-            const int yes = 1;
-            ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-        }
-
-        if (::connect(fd, addr.get(), addr.size) == 0) co_return conn;
-
-        if (errno != EINPROGRESS)
-        {
-            last_err = from_errno(errno);
-            conn.close(false);
-            continue;
-        }
-
-        const auto attempt = net::detail::attempt_deadline(now, deadline, addresses.size() - i);
-
-        auto result = co_await wait_connected(scheduler, fd, attempt, options.stop);
-        if (!result) co_return conn;
+        auto& conn   = attempt->conn;
+        auto  result = co_await wait_connected(scheduler,
+                                               conn.native_handle(),
+                                               net::detail::attempt_deadline(now, deadline, addresses.size() - i),
+                                               options.stop);
+        if (!result) co_return std::move(conn);
 
         conn.close(false);
 
@@ -184,6 +200,318 @@ connect_to(net::io::scheduler*                      scheduler,
     }
 
     co_return std::unexpected(last_err);
+}
+
+// interleave orders addresses by family alternately, the first address's family first, keeping each family's in their
+// order (RFC 8305 section 4, with a First Address Family Count of 1): e.g. 6a 6b 4a 4b 6c is 6a 4a 6b 4b 6c.
+void interleave(std::vector<net::detail::socket_address>& addresses) noexcept
+{
+    for (auto it = addresses.begin(); it != addresses.end() && std::next(it) != addresses.end(); ++it)
+    {
+        const auto other = it->family() == AF_INET ? AF_INET6 : AF_INET;
+        const auto found =
+            std::find_if(std::next(it), addresses.end(), [&](const auto& a) { return a.family() == other; });
+        if (found == addresses.end()) return;
+
+        // the other family's next address comes next, the rest moving up behind it.
+        std::rotate(std::next(it), found, std::next(found));
+    }
+}
+
+// after is delay after now, but no later than deadline (after now).
+net::io::clock::time_point
+after(net::io::clock::time_point now, std::chrono::milliseconds delay, net::io::clock::time_point deadline) noexcept
+{
+    // NOTE: compared in milliseconds, so a long delay (e.g. milliseconds::max()) doesn't overflow.
+    if (delay >= std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)) return deadline;
+    return now + delay;
+}
+
+// race is what a race of attempts to connect shares: racing() (and keep_racing(), which it hands the race to) and the
+// attempts spawned (see racing_attempt()), each holding it, so an attempt may outlive them (e.g. a loser that's still
+// being stopped). The attempts tell keep_racing() what happened (under mu), then bump changes, which it waits on.
+struct race
+{
+    race(net::io::scheduler* scheduler, const std::stop_token& stop)
+        : scheduler{scheduler}
+        , stop{stop}
+    {}
+
+    // claim makes conn the race's winner, if there's none yet and the race isn't over, returning whether it did (and
+    // then notifies keep_racing()).
+    bool claim(net::tcp_socket& conn) noexcept
+    {
+        {
+            const std::scoped_lock lock{mu};
+            if (over || winner.has_value()) return false;
+            winner.emplace(std::move(conn));
+        }
+
+        changed();
+        return true;
+    }
+
+    // fail records that the index'th attempt (spawned) failed with err, and notifies keep_racing().
+    void fail(std::size_t index, std::error_code err) noexcept
+    {
+        {
+            const std::scoped_lock lock{mu};
+            ++failed;
+            latest_failed = std::max(latest_failed, index + 1);
+            last_err      = err;
+        }
+
+        changed();
+    }
+
+    // failed_at_once records that an attempt keep_racing() started failed at once, with err.
+    void failed_at_once(std::error_code err) noexcept
+    {
+        const std::scoped_lock lock{mu};
+        last_err = err;
+    }
+
+    // view is what keep_racing() sees of the race.
+    struct view
+    {
+        // the winner, which keep_racing() then has (and the race is over).
+        std::optional<net::tcp_socket> winner;
+        // how many of the attempts spawned are still going, and whether the latest has failed.
+        std::size_t in_flight     = 0;
+        bool        latest_failed = false;
+        // the error of the last attempt to fail, if any has.
+        std::error_code last_err;
+    };
+
+    // look is the race as it is, of spawned attempts, next being the index of the next to start: so
+    // latest_failed is about the attempt before.
+    view look(std::size_t spawned, std::size_t next) noexcept
+    {
+        const std::scoped_lock lock{mu};
+
+        view now;
+        if (winner.has_value())
+        {
+            now.winner = std::exchange(winner, std::nullopt);
+            over       = true;
+        }
+        now.in_flight     = spawned - failed;
+        now.latest_failed = latest_failed == next;
+        now.last_err      = last_err;
+        return now;
+    }
+
+    // end ends the race (racing() returning, or its frame destroyed): a winner not taken is closed, as are any later
+    // ones (by their attempts), and the attempts still going are stopped. It holds none of the scheduler's locks (as
+    // stopping must not).
+    void end() noexcept
+    {
+        std::optional<net::tcp_socket> unclaimed;
+        {
+            const std::scoped_lock lock{mu};
+            over      = true;
+            unclaimed = std::exchange(winner, std::nullopt);
+        }
+
+        stop.request_stop();
+    }
+
+    net::io::scheduler* const scheduler;
+
+    // stop stops the attempts: requested by end(), and when connect's stop is.
+    net::util::linked_stop_source stop;
+
+    // changes is bumped (and notified) when an attempt ends: what keep_racing() waits on.
+    std::atomic<std::uint64_t> changes{0};
+
+    std::mutex mu;
+
+    // guarded by mu:
+    // the first attempt to connect, until keep_racing() takes it.
+    std::optional<net::tcp_socket> winner;
+    // whether keep_racing() has taken the winner, or racing() has returned, so a later connection is closed.
+    bool over = false;
+    // how many of the spawned attempts failed; one more than the index of the latest of them to (0: none has).
+    std::size_t failed        = 0;
+    std::size_t latest_failed = 0;
+    // the error of the last attempt to fail (spawned, or not: racing()'s before the race, keep_racing()'s at once).
+    std::error_code last_err;
+
+    // changed tells keep_racing() that something changed.
+    void changed() noexcept
+    {
+        changes.fetch_add(1, std::memory_order::release);
+        scheduler->notify_all(changes);
+    }
+};
+
+// racing_attempt waits for the index'th attempt, conn, to connect, by deadline, and tells the race.
+net::coro::task<> racing_attempt(std::shared_ptr<race>      state,
+                                 std::size_t                index,
+                                 net::tcp_socket            conn,
+                                 net::io::clock::time_point deadline)
+{
+    auto err = co_await wait_connected(state->scheduler, conn.native_handle(), deadline, state->stop.get_token());
+    if (!err && state->claim(conn)) co_return;
+
+    // it lost (another attempt connected first, or the race is over), or failed.
+    conn.close(false);
+    if (err) state->fail(index, err);
+}
+
+// ended is why connecting has to end now, if it does: stop was requested, or the deadline has passed.
+std::error_code ended(const std::stop_token& stop, net::io::clock::time_point deadline) noexcept
+{
+    if (stop.stop_requested()) return std::make_error_code(std::errc::operation_canceled);
+    if (net::io::clock::now() >= deadline) return std::make_error_code(std::errc::timed_out);
+    return {};
+}
+
+// keep_racing goes on with racing()'s race, once its first attempt has outlasted the delay (and is the race's): it
+// starts the rest of addresses, from next, and returns the first to connect.
+net::coro::task<std::expected<net::tcp_socket, std::error_code>>
+keep_racing(net::io::scheduler*                             scheduler,
+            const std::vector<net::detail::socket_address>& addresses,
+            std::size_t                                     next,
+            net::io::clock::time_point                      deadline,
+            const net::tcp_socket::connect_options&         options,
+            const std::shared_ptr<race>&                    state)
+{
+    std::size_t spawned    = 1;                     // attempts handed to tasks
+    auto        next_start = net::io::clock::now(); // the next is due at once
+
+    while (true)
+    {
+        // read before looking at the race, so a change after is noticed by the wait.
+        const auto seen = state->changes.load(std::memory_order::acquire);
+
+        auto now = state->look(spawned, next);
+        if (now.winner.has_value()) co_return std::move(*now.winner);
+
+        if (auto err = ended(options.stop, deadline); err) co_return std::unexpected(err);
+        if (next == addresses.size() && now.in_flight == 0) co_return std::unexpected(now.last_err);
+
+        const auto time = net::io::clock::now();
+        const bool due  = now.in_flight == 0 || now.latest_failed || time >= next_start;
+        if (next < addresses.size() && due)
+        {
+            const auto index   = next++;
+            auto       attempt = start(scheduler, addresses[index], options);
+            if (!attempt.has_value())
+            {
+                // the next starts at once.
+                state->failed_at_once(attempt.error());
+                next_start = time;
+                continue;
+            }
+            if (attempt->connected) co_return std::move(attempt->conn);
+
+            // NOTE: refused (and so destroyed, closing the socket) only if the scheduler is stopping.
+            if (!scheduler->spawn(racing_attempt(state, index, std::move(attempt->conn), deadline)))
+                co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+            ++spawned;
+            next_start = after(time, options.attempt_delay, deadline);
+            continue;
+        }
+
+        // wait for an attempt to end, until the next is due (or the end).
+        const auto until = next < addresses.size() ? std::min(next_start, deadline) : deadline;
+
+        auto err = co_await scheduler->wait_on(state->changes, seen, until, options.stop);
+        if (err == std::errc::operation_canceled) co_return std::unexpected(err);
+
+        // otherwise (an attempt ended, or the time came): the loop's start tells which.
+    }
+}
+
+// racing connects to the first of addresses (interleaved by family) to accept, by deadline, starting an attempt every
+// attempt_delay, or at once when the latest fails (RFC 8305 section 5): see connect_options::attempt_delay.
+//
+// An attempt waits here (inline) until the next is due: the first to connect often does, and then nothing is racing.
+// One that outlasts it is handed to a task of its own (racing_attempt()), with the race's shared state (race), and from
+// then on every attempt that doesn't finish at once is; this waits on the race's word, until the next attempt is due.
+net::coro::task<std::expected<net::tcp_socket, std::error_code>>
+racing(net::io::scheduler*                      scheduler,
+       std::vector<net::detail::socket_address> addresses,
+       net::io::clock::time_point               deadline,
+       net::tcp_socket::connect_options         options)
+{
+    interleave(addresses);
+
+    // made once an attempt outlasts the delay, and ended (its attempts stopped) however this ends.
+    std::shared_ptr<race> state;
+
+    const net::util::defer end_race{[&state] noexcept
+                                    {
+                                        if (state) state->end();
+                                    }};
+
+    std::error_code last_err;
+    std::size_t     next = 0; // the next address to try
+
+    // one at a time until an attempt outlasts the delay: then it goes on, in a task, alongside the next.
+    while (!state)
+    {
+        if (auto err = ended(options.stop, deadline); err) co_return std::unexpected(err);
+        if (next == addresses.size()) co_return std::unexpected(last_err);
+
+        const auto now     = net::io::clock::now();
+        const auto index   = next++;
+        auto       attempt = start(scheduler, addresses[index], options);
+        if (!attempt.has_value())
+        {
+            last_err = attempt.error();
+            continue;
+        }
+        if (attempt->connected) co_return std::move(attempt->conn);
+
+        // the last waits until the end.
+        auto&      conn  = attempt->conn;
+        const auto until = next == addresses.size() ? deadline : after(now, options.attempt_delay, deadline);
+
+        auto err = co_await wait_connected(scheduler, conn.native_handle(), until, options.stop);
+        if (!err) co_return std::move(conn);
+
+        if (err != std::errc::timed_out || next == addresses.size() || net::io::clock::now() >= deadline)
+        {
+            // it failed (or the time's up), and the next starts at once.
+            conn.close(false);
+            if (err == std::errc::operation_canceled) co_return std::unexpected(err);
+            last_err = err;
+            continue;
+        }
+
+        state           = std::make_shared<race>(scheduler, options.stop);
+        state->last_err = last_err;
+
+        // NOTE: refused (and so destroyed, closing the socket) only if the scheduler is stopping.
+        if (!scheduler->spawn(racing_attempt(state, index, std::move(conn), deadline)))
+            co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+    }
+
+    co_return co_await keep_racing(scheduler, addresses, next, deadline, options, state);
+}
+
+// connect_to connects to the first of addresses (those of options.proto's family) that accepts, by deadline: racing
+// them (see racing()), unless options.attempt_delay is 0 or there's only one, then one at a time.
+net::coro::task<std::expected<net::tcp_socket, std::error_code>>
+connect_to(net::io::scheduler*                      scheduler,
+           std::vector<net::detail::socket_address> addresses,
+           net::io::clock::time_point               deadline,
+           net::tcp_socket::connect_options         options)
+{
+    const auto given = addresses.size();
+    std::erase_if(addresses, [&](const auto& addr) { return !of_protocol(addr, options.proto); });
+    if (addresses.empty())
+    {
+        return net::coro::ready_task<std::expected<net::tcp_socket, std::error_code>>(std::unexpected(
+            std::make_error_code(given == 0 ? std::errc::invalid_argument : std::errc::address_family_not_supported)));
+    }
+
+    if (options.attempt_delay <= std::chrono::milliseconds::zero() || addresses.size() == 1)
+        return one_at_a_time(scheduler, std::move(addresses), deadline, std::move(options));
+
+    return racing(scheduler, std::move(addresses), deadline, std::move(options));
 }
 
 }

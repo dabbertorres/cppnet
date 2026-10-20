@@ -358,10 +358,11 @@ coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connecti
                                                   host,
                                                   port,
                                                   {
-                                                      .timeout   = std::max(remaining, std::chrono::milliseconds{1}),
-                                                      .keepalive = config.tcp_keepalive,
-                                                      .stop      = stop,
-                                                      .resolver  = config.resolver,
+                                                      .timeout       = std::max(remaining, std::chrono::milliseconds{1}),
+                                                      .attempt_delay = config.attempt_delay,
+                                                      .keepalive     = config.tcp_keepalive,
+                                                      .stop          = stop,
+                                                      .resolver      = config.resolver,
                                                   });
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 

@@ -35,6 +35,11 @@ struct client_options
     // addresses), and for one to be free when at a limit.
     std::chrono::milliseconds connect_timeout = std::chrono::seconds{10};
 
+    // How long an attempt to connect to one of a host's addresses has before the next starts alongside it (Happy
+    // Eyeballs, RFC 8305's Connection Attempt Delay): see tcp_socket::connect_options::attempt_delay. 0 tries them one
+    // at a time.
+    std::chrono::milliseconds attempt_delay = std::chrono::milliseconds{250};
+
     // What resolves hosts' names: null is dns::default_resolver(). It must outlive the client (and its copies, and the
     // responses whose bodies are being read).
     dns::resolver* resolver = nullptr;

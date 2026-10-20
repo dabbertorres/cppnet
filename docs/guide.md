@@ -170,14 +170,20 @@ auto conn = co_await listener->accept();          // std::expected<tcp_socket, s
 // any) is stopped. The port is a number.
 auto sock = co_await net::tcp_socket::connect(&scheduler, "example.com", "80");
 
-// or connects to addresses, in order, without resolving anything.
+// or connects to addresses, without resolving anything.
 const std::array<net::ip_addr, 2> addresses{net::ipv6_addr::loopback(), net::ipv4_addr::loopback()};
 auto local = co_await net::tcp_socket::connect(&scheduler, addresses, 7777);
 ```
 
-`connect` tries a host's addresses in order, until one accepts. Each attempt gets a share of the timeout, as Go's
-dialer gives it: what's left over the addresses left, but at least 2 seconds (never past the end), so an address that
-doesn't answer leaves time for the rest. A name is resolved first, with `connect_options::resolver` (by default
+`connect` races a host's addresses, as RFC 8305 (Happy Eyeballs) has it: in their order (the resolver's, sorted by RFC
+6724), but interleaved by family, the first address's first (e.g. IPv6, IPv4, IPv6, ...), it starts an attempt every
+`connect_options::attempt_delay` (250 ms), or at once when the latest attempt fails, and the attempts go on together,
+each until the timeout's end; the first to connect wins, and the rest are stopped and closed. So an address that doesn't
+answer (a broken IPv6 route, say) costs the delay, rather than the timeout. Usually the first attempt connects within
+the delay, and then nothing else happens (no task, no allocation). An `attempt_delay` of 0 tries the addresses one at a
+time, in their order, each with a share of the timeout, as Go's dialer gives it: what's left over the addresses left,
+but at least 2 seconds (never past the end), so an address that doesn't answer leaves time for the rest. When all fail,
+the error is the last attempt's to fail. A name is resolved first, with `connect_options::resolver` (by default
 `dns::default_resolver()`, see DNS), within the same timeout, and stop token; an IP address (e.g. `"127.0.0.1"` or
 `"::1"`, or `"fe80::1%en0"` with its zone) isn't, so it's connected to without a thread. A port that isn't a number
 (e.g. `"http"`) fails with `std::errc::invalid_argument`. `connect_options::proto` limits it to IPv4's or IPv6's
@@ -318,7 +324,8 @@ a scheme nor a host. An empty query or fragment is none (`/path?` builds as `/pa
 `http::client` (`http/client.hpp`) sends HTTP/1.1 and HTTP/2 requests, to `http://` and `https://` URLs, reusing
 connections within `client_options`' limits (per host, altogether, idle time), with timeouts for connecting
 (`connect_timeout`, which resolving the host counts towards, with `client_options::resolver`, by default
-`dns::default_resolver()`), the TLS handshake, the response's head, and stalled reads and writes.
+`dns::default_resolver()`; a host's addresses are raced as `connect` races them, `client_options::attempt_delay` apart),
+the TLS handshake, the response's head, and stalled reads and writes.
 
 ```cpp
 net::http::client client{&scheduler};
