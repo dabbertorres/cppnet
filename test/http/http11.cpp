@@ -315,13 +315,13 @@ TEST_CASE("requests are encoded in origin-form, with a Host header", "[http][1.1
 
     // nothing in the url can end the request line, and start a header.
     req.uri.path += "\r\nX-Injected: yes";
-    req.uri.query["q"] = {"x&y=z"};
+    req.uri.query = "q=x&y=z\r\n";
 
     net::io::string_writer<char> out;
     auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
     REQUIRE(res.has_value());
 
-    CHECK(out.build() == "GET /a%20b%0D%0AX-Injected:%20yes?q=x%26y%3Dz HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
+    CHECK(out.build() == "GET /a%20b%0D%0AX-Injected:%20yes?q=x&y=z%0D%0A HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
 }
 
 namespace

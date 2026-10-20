@@ -3,12 +3,13 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
-#include <functional>
+#include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
-#include <vector>
 
 namespace
 {
@@ -71,7 +72,8 @@ constexpr bool is_path_char(char c) noexcept
 {
     return is_unreserved(c) || is_sub_delim(c) || c == ':' || c == '@' || c == '/';
 }
-constexpr bool is_fragment_char(char c) noexcept { return is_path_char(c) || c == '?'; }
+constexpr bool is_query_char(char c) noexcept { return is_path_char(c) || c == '?'; }
+constexpr bool is_fragment_char(char c) noexcept { return is_query_char(c); }
 
 // The WHATWG URL standard's forbidden domain code points (in ASCII): a host containing these, once decoded, could be
 // mistaken for another part of a URL, or end a header line.
@@ -82,53 +84,50 @@ constexpr bool is_forbidden_host_char(char c) noexcept
 }
 
 template<typename Allowed>
-void percent_encode(std::string& out, std::string_view str, Allowed allowed)
+void percent_encode(std::string& out, char c, Allowed allowed)
 {
     static constexpr auto hex = "0123456789ABCDEF"sv;
 
-    for (char c : str)
+    if (allowed(c))
     {
-        if (allowed(c))
-        {
-            out += c;
-            continue;
-        }
-
-        auto byte = static_cast<unsigned char>(c);
-        out += '%';
-        out += hex[byte >> 4];
-        out += hex[byte & 0x0F];
+        out += c;
+        return;
     }
+
+    auto byte = static_cast<unsigned char>(c);
+    out += '%';
+    out += hex[byte >> 4];
+    out += hex[byte & 0x0F];
 }
 
-void append_query(std::string& out, const url::query_values& query)
+template<typename Allowed>
+void percent_encode(std::string& out, std::string_view str, Allowed allowed)
 {
-    // sorted, so the output doesn't depend on the map's order.
-    std::vector<const url::query_values::value_type*> params;
-    params.reserve(query.size());
-    for (const auto& param : query) params.push_back(&param);
-    std::ranges::sort(params, {}, [](const auto* param) -> const std::string& { return param->first; });
+    for (char c : str) percent_encode(out, c, allowed);
+}
 
-    char separator = '?';
-    for (const auto* param : params)
+// append_encoded appends str to out as it is, but for what can't appear in it unencoded: a character that isn't
+// allowed, or a '%' that doesn't start an encoding, is percent-encoded. Encodings are kept as written (e.g. "%2f").
+template<typename Allowed>
+void append_encoded(std::string& out, std::string_view str, Allowed allowed)
+{
+    for (std::size_t i = 0; i < str.size(); ++i)
     {
-        const auto& [key, values] = *param;
-
-        if (values.empty())
+        if (str[i] == '%' && str.size() - i > 2 && is_hex_digit(str[i + 1]) && is_hex_digit(str[i + 2]))
         {
-            out += std::exchange(separator, '&');
-            percent_encode(out, key, is_unreserved);
+            out += str[i];
+            out += str[i + 1];
+            out += str[i + 2];
+            i += 2;
         }
-
-        for (const auto& value : values)
+        else
         {
-            out += std::exchange(separator, '&');
-            percent_encode(out, key, is_unreserved);
-            out += '=';
-            percent_encode(out, value, is_unreserved);
+            percent_encode(out, str[i], allowed);
         }
     }
 }
+
+bool has_authority(const url& u) noexcept { return !u.host.empty() || !u.userinfo.empty() || !u.port.empty(); }
 
 std::optional<url_parse_failure> parse_port(std::string_view port, std::size_t offset, url& out)
 {
@@ -195,9 +194,24 @@ std::optional<url_parse_failure> parse_authority(std::string_view authority, std
     return parse_port(authority.substr(colon + 1), offset + colon + 1, out);
 }
 
-url::parse_result parse_url(std::string_view input)
+// reference is a URI reference split into its parts, with whether it has the parts that may be empty.
+struct reference
 {
-    url         out;
+    url  parts;
+    bool authority = false;
+    bool query     = false;
+};
+
+enum class reading : std::uint8_t
+{
+    url,    // as url::parse() reads it: without a scheme or "//", and not starting with '/', it starts with its host.
+    strict, // as RFC 3986's URI-reference.
+};
+
+std::expected<reference, url_parse_failure> split(std::string_view input, reading how)
+{
+    reference   ref;
+    url&        out = ref.parts;
     std::size_t pos = 0;
 
     // scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"
@@ -210,13 +224,13 @@ url::parse_result parse_url(std::string_view input)
 
     auto rest = input.substr(pos);
 
-    const bool has_authority = rest.starts_with("//"sv);
+    ref.authority = rest.starts_with("//"sv);
     const bool starts_with_host =
-        !has_authority && out.scheme.empty() && !rest.empty() && !"/?#"sv.contains(rest.front());
+        how == reading::url && !ref.authority && out.scheme.empty() && !rest.empty() && !"/?#"sv.contains(rest.front());
 
-    if (has_authority || starts_with_host)
+    if (ref.authority || starts_with_host)
     {
-        auto authority_start = has_authority ? pos + 2 : pos;
+        auto authority_start = ref.authority ? pos + 2 : pos;
         auto authority_end   = input.find_first_of("/?#"sv, authority_start);
         if (authority_end == std::string_view::npos) authority_end = input.size();
 
@@ -224,25 +238,155 @@ url::parse_result parse_url(std::string_view input)
                 parse_authority(input.substr(authority_start, authority_end - authority_start), authority_start, out))
             return std::unexpected(*err);
 
-        pos = authority_end;
+        ref.authority = true;
+        pos           = authority_end;
     }
 
     auto path_end = input.find_first_of("?#"sv, pos);
     if (path_end == std::string_view::npos) path_end = input.size();
-    out.path = url::decode(input.substr(pos, path_end - pos));
-    pos      = path_end;
+    const auto path       = input.substr(pos, path_end - pos);
+    const auto path_start = pos;
+    pos                   = path_end;
+
+    // a relative path's first segment can't have a ':', which would be read as a scheme (RFC 3986, section 4.2).
+    if (how == reading::strict && out.scheme.empty() && !ref.authority && path.substr(0, path.find('/')).contains(':'))
+        return std::unexpected(url_parse_failure{.failed_at = url_parse_state::path, .index = path_start});
+
+    append_encoded(out.path, path, is_path_char);
 
     if (pos < input.size() && input[pos] == '?')
     {
         auto query_end = input.find('#', pos);
         if (query_end == std::string_view::npos) query_end = input.size();
-        out.query = url::parse_query(input.substr(pos + 1, query_end - pos - 1));
+        append_encoded(out.query, input.substr(pos + 1, query_end - pos - 1), is_query_char);
+        ref.query = true;
         pos       = query_end;
     }
 
-    if (pos < input.size() && input[pos] == '#') out.fragment = url::decode(input.substr(pos + 1));
+    if (pos < input.size() && input[pos] == '#') append_encoded(out.fragment, input.substr(pos + 1), is_fragment_char);
 
-    return {std::move(out)};
+    return ref;
+}
+
+// remove_dot_segments removes the "." and ".." segments of a path, as RFC 3986 section 5.2.4 does.
+std::string remove_dot_segments(std::string_view in)
+{
+    std::string out;
+    out.reserve(in.size());
+
+    // pop removes the output's last segment, and the '/' before it.
+    const auto pop = [&]
+    {
+        const auto slash = out.rfind('/');
+        out.resize(slash == std::string::npos ? 0 : slash);
+    };
+
+    while (!in.empty())
+    {
+        if (in.starts_with("../"sv))
+        {
+            in.remove_prefix(3);
+        }
+        else if (in.starts_with("./"sv) || in.starts_with("/./"sv))
+        {
+            in.remove_prefix(2);
+        }
+        else if (in == "/."sv)
+        {
+            in = "/"sv;
+        }
+        else if (in.starts_with("/../"sv))
+        {
+            in.remove_prefix(3);
+            pop();
+        }
+        else if (in == "/.."sv)
+        {
+            in = "/"sv;
+            pop();
+        }
+        else if (in == "."sv || in == ".."sv)
+        {
+            in = {};
+        }
+        else
+        {
+            // the first segment, with the '/' before it.
+            const auto end = std::min(in.find('/', 1), in.size());
+            out.append(in.substr(0, end));
+            in.remove_prefix(end);
+        }
+    }
+
+    return out;
+}
+
+// merge merges a relative path with the base's (RFC 3986, section 5.2.3).
+std::string merge(const url& base, std::string_view path)
+{
+    if (has_authority(base) && base.path.empty()) return "/" + std::string{path};
+
+    const auto slash = base.path.rfind('/');
+    if (slash == std::string::npos) return std::string{path};
+    return base.path.substr(0, slash + 1) + std::string{path};
+}
+
+std::expected<url, std::error_code> resolve_reference(const url& base, std::string_view text)
+{
+    const auto invalid = std::make_error_code(std::errc::invalid_argument);
+
+    // RFC 3986 needs an absolute base (section 5.1), but one with an authority suffices (e.g. url::parse("host/a")),
+    // as the client sends requests to it.
+    if (base.scheme.empty() && !has_authority(base)) return std::unexpected(invalid);
+
+    auto split_ref = split(text, reading::strict);
+    if (!split_ref.has_value()) return std::unexpected(invalid);
+    auto& [ref, ref_authority, ref_query] = *split_ref;
+
+    // section 5.2.2, with "strict" parsing (a reference with the base's scheme is still absolute).
+    url target;
+    if (!ref.scheme.empty())
+    {
+        target      = std::move(ref);
+        target.path = remove_dot_segments(target.path);
+        return target;
+    }
+
+    target.scheme = base.scheme;
+
+    if (ref_authority)
+    {
+        // as for the base, the url must have a scheme or an authority: it can't hold an empty authority without a
+        // scheme (it would build as a relative reference).
+        if (target.scheme.empty() && !has_authority(ref)) return std::unexpected(invalid);
+
+        target.userinfo = std::move(ref.userinfo);
+        target.host     = std::move(ref.host);
+        target.port     = std::move(ref.port);
+        target.path     = remove_dot_segments(ref.path);
+        target.query    = std::move(ref.query);
+    }
+    else
+    {
+        target.userinfo = base.userinfo;
+        target.host     = base.host;
+        target.port     = base.port;
+
+        if (ref.path.empty())
+        {
+            target.path = base.path;
+            if (ref_query) target.query = std::move(ref.query);
+            else target.query = base.query;
+        }
+        else
+        {
+            target.path  = remove_dot_segments(ref.path.starts_with('/') ? ref.path : merge(base, ref.path));
+            target.query = std::move(ref.query);
+        }
+    }
+
+    target.fragment = std::move(ref.fragment);
+    return target;
 }
 
 }
@@ -324,6 +468,19 @@ url::query_values url::parse_query(std::string_view query)
     return values;
 }
 
+std::expected<url, std::error_code> url::resolve(const url& base, std::string_view reference) noexcept
+{
+    try
+    {
+        return resolve_reference(base, reference);
+    }
+    catch (...)
+    {
+        // only allocation can fail.
+        return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    }
+}
+
 url::parse_result url::parse(const char* s) noexcept { return parse(std::string_view(s)); }
 
 url::parse_result url::parse(const std::string& s) noexcept { return parse(std::string_view{s}); }
@@ -332,7 +489,9 @@ url::parse_result url::parse(std::string_view s) noexcept
 {
     try
     {
-        return parse_url(s);
+        auto ref = split(s, reading::url);
+        if (!ref.has_value()) return std::unexpected(ref.error());
+        return std::move(ref->parts);
     }
     catch (...)
     {
@@ -352,7 +511,7 @@ std::string url::build() const noexcept
     }
 
     // NOTE: "//" is also needed when the path starts with "//", which would otherwise be taken for the authority.
-    if (!host.empty() || !userinfo.empty() || !port.empty() || path.starts_with("//"))
+    if (has_authority(*this) || path.starts_with("//"))
     {
         out += "//";
 
@@ -388,13 +547,18 @@ std::string url::build() const noexcept
         if (!path.empty() && !path.starts_with('/')) out += '/';
     }
 
-    percent_encode(out, path, is_path_char);
-    append_query(out, query);
+    append_encoded(out, path, is_path_char);
+
+    if (!query.empty())
+    {
+        out += '?';
+        append_encoded(out, query, is_query_char);
+    }
 
     if (!fragment.empty())
     {
         out += '#';
-        percent_encode(out, fragment, is_fragment_char);
+        append_encoded(out, fragment, is_fragment_char);
     }
 
     return out;
@@ -404,9 +568,16 @@ std::string url::origin_form() const
 {
     std::string out;
 
+    out.reserve(path.size() + query.size() + 2);
+
     if (!path.starts_with('/')) out += '/';
-    percent_encode(out, path, is_path_char);
-    append_query(out, query);
+    append_encoded(out, path, is_path_char);
+
+    if (!query.empty())
+    {
+        out += '?';
+        append_encoded(out, query, is_query_char);
+    }
 
     return out;
 }

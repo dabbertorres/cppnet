@@ -33,7 +33,9 @@
 #include "http/http.hpp"
 #include "http/http11.hpp"
 #include "http/request.hpp"
+#include "http/request_target.hpp"
 #include "http/response.hpp"
+#include "http/server.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -154,6 +156,48 @@ TEST_CASE("get() sends a GET, over HTTP/1.1", "[http][client]")
     auto port = local_port(listener);
     CHECK(sched.run_to_completion(get(&sched, "http://127.0.0.1:" + port + "/path?q=1")) == "hello");
     CHECK(request_head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+}
+
+TEST_CASE("the client sends a URL's path and query as given", "[http][client]")
+{
+    const bool http2 = GENERATE(false, true);
+    CAPTURE(http2);
+
+    // as a signed URL's: encodings (of '/' too, in either case) and '+' kept, and the parameters in their order.
+    constexpr auto target = "/files/a%2Fb%2fc/x+y?Signature=ab+c/d%3D&Expires=1&a=%2F%2f&Key-Pair-Id=K"sv;
+
+    std::string   received;
+    std::uint32_t version = 0;
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    net::http::server  server{&sched,
+                              net::listener::make(&sched, "127.0.0.1", "0").value(),
+                              [&](net::http::server_request& req, net::http::response_writer&) -> task<>
+                              {
+                                 received = req.target.path + "?" + req.target.query;
+                                 version  = req.version.major;
+                                 co_return;
+                              }};
+    REQUIRE(sched.spawn(server.serve()));
+
+    auto get = [](net::io::scheduler* sched, std::string url, bool http2) -> task<std::string>
+    {
+        net::http::client_options options;
+        options.http2_prior_knowledge = http2;
+        net::http::client client{sched, options};
+
+        auto resp = co_await client.get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        co_return body.has_value() ? std::format("{}", static_cast<int>(resp->status_code))
+                                   : "error: " + body.error().message();
+    };
+
+    const auto url = std::format("http://127.0.0.1:{}{}", server.local_port(), target);
+    CHECK(sched.run_to_completion(get(&sched, url, http2)) == "200");
+    CHECK(received == target);
+    CHECK(version == (http2 ? 2U : 1U));
 }
 
 #ifndef NET_HAS_TLS

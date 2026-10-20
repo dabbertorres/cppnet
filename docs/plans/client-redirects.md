@@ -1,7 +1,7 @@
 # Plan: following redirects in the HTTP client
 
 Status: decided (2026-10-19): the questions at the end, as recommended, except that redirects aren't followed by
-default (question 2: `max_redirects` is 0 unless set). Neither stage has started.
+default (question 2: `max_redirects` is 0 unless set). Stage 1 is done; stage 2 hasn't started.
 
 ## Goal
 
@@ -110,6 +110,29 @@ knowledge). `url::resolve()` on RFC 3986's examples; `url::parse()` keeping enco
 
 1. **URLs as given.** `url` keeps the path and query encoded (`query` a string), `origin_form()` re-encodes nothing,
    `url::resolve()`. The URL tests, the client's (which build URLs), the guide's URL section, `fuzz_url`.
+
+   Done as above. Where the plan was silent:
+   - "What must be encoded" is what RFC 3986 doesn't allow unencoded in that part (path: pchar and `/`; query and
+     fragment: those and `?`), plus a `%` that doesn't start an encoding (`%zz` becomes `%25zz`, rather than kept as
+     WHATWG keeps it), so a parsed `url` is always a valid reference, and its `origin_form()` a target cppnet's server
+     accepts. So `|`, `[`, `]`, `{`, `"`, `^` and the like are encoded too, in the query as well (equivalent to any
+     server that decodes it).
+   - `build()` and `origin_form()` encode the same way, rather than nothing: idempotent, so they change nothing
+     `parse()` made, and a part set by hand (e.g. with a space, or a CRLF) still can't end a request line.
+   - The fragment is kept as written too, as the path and query are (so all that follows the authority is one form).
+     The user info and host stay decoded (the host is what's looked up and sent as `Host`, checked for forbidden
+     characters once decoded).
+   - An empty query is none, as before: `/path?` parses with an empty query and builds as `/path` (no Go
+     `ForceQuery`; the tests and `fuzz_url`'s round trip implied it). The same for the fragment.
+   - `url::resolve(base, reference)` returns `std::expected<url, std::error_code>` (`invalid_argument`, or
+     `not_enough_memory`), rather than `parse()`'s `url_parse_failure`: its caller (stage 2) reports an error code,
+     not a position. It reads the reference strictly (a relative path whose first segment has a `:` is invalid, as
+     Go's "first path segment in URL cannot contain colon"), but encodes what must be as `parse()` does, rather than
+     rejecting it (as browsers, and Go's paths). It's RFC 3986's "strict" parser (`http:g` is `http:g`). Dot segments
+     are only literal `.` and `..` (`%2E%2e` is kept, as written). An empty reference keeps the base's path as it is
+     (dot segments too: RFC 3986, unlike Go). The base needs a scheme or an authority (RFC 3986 wants a scheme, but
+     `parse("example.com/a")` has only a host, and the client sends such URLs as http), and so does the result: `//`
+     (an empty authority) against a base without a scheme fails, as `url` can't hold an empty authority without one.
 2. **Following redirects.** As above, with `client_request::get_body`, `client_options::max_redirects` (and the
    per-request override), `client_errc` (`http/client.hpp`, or its own header), the response's URL, and the guide's
    client section.

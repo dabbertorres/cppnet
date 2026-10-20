@@ -182,14 +182,14 @@ TEST_CASE("the router matches decoded segments", "[http][router]")
     CHECK(route("/x%2Fy") == "HTTP/1.1 404");
 }
 
-TEST_CASE("url::origin_form encodes the path and query", "[url][origin_form]")
+TEST_CASE("url::origin_form is a valid target, as given", "[url][origin_form]")
 {
     net::url u;
-    u.path       = "/a b/c:d@e/%";
-    u.query["k"] = {"v 1", "2"};
-    u.query["z"] = {};
+    u.path  = "/a b/c:d@e/%/%2F";
+    u.query = "k=v 1&k=2+3&z";
 
-    CHECK(u.origin_form() == "/a%20b/c:d@e/%25?k=v%201&k=2&z");
+    CHECK(u.origin_form() == "/a%20b/c:d@e/%25/%2F?k=v%201&k=2+3&z");
+    CHECK(net::http::parse_request_target(request_method::GET, u.origin_form()).has_value());
 
     CHECK(net::url{}.origin_form() == "/");
 }

@@ -283,6 +283,34 @@ one. A connected socket only reads its peer's datagrams, and an ICMP refusal of 
 `io::errc::end_of_stream` with `read()`, which ends nothing here. Deadlines, timeouts and stop tokens apply as they do to
 TCP's sockets.
 
+## URLs
+
+`net::url` (`url.hpp`) holds a URL's parts: `url::parse()` returns `std::expected<url, url_parse_failure>` (which part
+failed, and where). The scheme and port, and the user info and host (an IPv6 one without its brackets), are plain
+text; the path, query (without its `?`) and fragment (without its `#`) are kept as they were written, percent-encodings
+and all: `%2F` stays `%2F` (rather than becoming a `/`, another path), `%2f` stays `%2f`, and a query's parameters stay
+in their order, with their `+`s. So the HTTP client sends a URL as it was given (its request line is
+`origin_form()`, the path and query as they are), as a signed URL (e.g. a CDN's, or an object store's), whose
+signature covers them as written, needs. Only what can't appear unencoded (a space, a control or non-ASCII byte, a `%`
+that doesn't start an encoding, or another character RFC 3986 doesn't allow there) is encoded, by `parse()` and again
+by `build()` and `origin_form()`, so nothing set in a part can end a request line. `url::parse_query(u.query)` decodes
+the query's values (as a form: `+` is a space). Setting a part, encode what's meant as data rather than a delimiter,
+with `url::encode()`:
+
+```cpp
+auto u = net::url::parse("https://example.com/files/a%2Fb?sig=ab+c").value(); // u.path == "/files/a%2Fb"
+auto values = net::url::parse_query(u.query);                                 // values["sig"] == {"ab c"}
+u.query = "q=" + net::url::encode("a&b c");                                   // "q=a%26b%20c"
+auto next = net::url::resolve(u, "../other?x=1");                             // https://example.com/other?x=1
+```
+
+`parse()` reads a URL with neither a scheme nor `//`, not starting with `/`, as starting with its host
+(`example.com/path`), for `client::get("example.com")`. `url::resolve(base, reference)` reads a reference as RFC 3986
+does (`next/page` is a relative path), and resolves it against `base` (section 5.2: e.g. a `Location`), removing `.`
+and `..` segments (not their encodings), and keeping the rest as written; it returns `std::expected<url,
+std::error_code>`, failing with `std::errc::invalid_argument` for a reference that isn't valid, or a base with neither
+a scheme nor a host. An empty query or fragment is none (`/path?` builds as `/path`).
+
 ## HTTP client
 
 `http::client` (`http/client.hpp`) sends HTTP/1.1 and HTTP/2 requests, to `http://` and `https://` URLs, reusing
