@@ -1,11 +1,13 @@
 # Plan: following redirects in the HTTP client
 
-Status: proposed (2026-10-19). The questions at the end are open.
+Status: decided (2026-10-19): the questions at the end, as recommended, except that redirects aren't followed by
+default (question 2: `max_redirects` is 0 unless set). Neither stage has started.
 
 ## Goal
 
-`http::client` follows redirects (301, 302, 303, 307 and 308) as Go's client and browsers do, so a side project
-calling an API or downloading a file gets the resource rather than a 3xx it has to handle itself; without sending
+`http::client` can follow redirects (301, 302, 303, 307 and 308) as Go's client and browsers do, when asked to, so a
+side project calling an API or downloading a file gets the resource rather than a 3xx it has to handle itself; without
+sending
 credentials to a host they weren't meant for, and without changing the URLs it's sent to (many redirects go to signed
 CDN or object-store URLs, whose signatures cover the path and query as they're written).
 
@@ -58,7 +60,7 @@ changes; reqwest, OkHttp and browsers follow by default (10, 20, 20).
 the `?`), and `url::parse_query(u.query)` (which exists) gives the values; `origin_form()` is then the path and query
 joined, nothing re-encoded. Code building a URL from parts encodes them (`url::encode()`, which exists). Go's `url.URL`
 keeps a decoded `Path` with a `RawPath` hint and a raw `RawQuery`; keeping both forms is how Go gets bugs where they
-disagree, so this keeps one (Open question 1).
+disagree, so this keeps one (Decided question 1).
 
 `url::resolve(base, reference)` resolves a reference string against a URL (RFC 3986 5.2, with 5.2.4's dot-segment
 removal), reading the reference strictly (`next/page` is a path; no host-first shortcut), and fails with
@@ -72,25 +74,26 @@ builds agree.
 
 1. Send the request; if the response isn't 301, 302, 303, 307 or 308, has no `Location`, or the request's limit is 0,
    return it.
-2. If this would be one more than the limit, fail with `http::client_errc::too_many_redirects` (Open question 4).
+2. If this would be one more than the limit, fail with `http::client_errc::too_many_redirects` (Decided question 4).
 3. Resolve `Location` against the request's URL (a bad one fails with `client_errc::bad_redirect`, as Go fails); a
    scheme other than `http`/`https` fails with `std::errc::protocol_not_supported`, as a request to it would. The
    fragment is kept when `Location` has none.
 4. The next request: 301/302 (a method other than GET or HEAD) and 303 (other than HEAD) become GET without a body,
    dropping the body's fields (RFC 9110 15.4: `Content-Length`, `Content-Type`, `Content-Encoding`,
    `Content-Language`, `Content-Location`, `Transfer-Encoding`); 307/308 keep the method and need the body again:
-   `client_request::get_body` (Open question 5); without one, the 307/308 is returned as it is. Credentials are kept or
-   dropped (Open question 6). A `Host` the caller set is dropped when the host changes.
+   `client_request::get_body` (Decided question 5); without one, the 307/308 is returned as it is. Credentials are kept
+   or dropped (Decided question 6). A `Host` the caller set is dropped when the host changes.
 5. Discard the previous response: its body read to its end if what's left is at most 2 KiB (as Go), so its HTTP/1.x
    connection is reused; otherwise it's closed (HTTP/2: the stream reset). Then loop.
 
 The stop token covers every hop (it's the request's); each hop has the client's timeouts. The response returned carries
-its URL (Open question 8).
+its URL (Decided question 8).
 
 ### Configuration
 
-`client_options::max_redirects` (10 by default; 0 doesn't follow), and `client_request::max_redirects`
-(`std::optional<std::size_t>`) to override it for one request (Open questions 2 and 3).
+`client_options::max_redirects` (0 by default: redirects aren't followed unless asked for; Go's 10 is a sensible
+value), and `client_request::max_redirects`
+(`std::optional<std::size_t>`) to override it for one request (Decided questions 2 and 3).
 
 ## Testing
 
@@ -111,7 +114,7 @@ knowledge). `url::resolve()` on RFC 3986's examples; `url::parse()` keeping enco
    per-request override), `client_errc` (`http/client.hpp`, or its own header), the response's URL, and the guide's
    client section.
 
-## Open questions
+## Decided questions
 
 1. **How `url` keeps the path and query.** (a) Encoded, as given (`query` a string; `parse_query()` for values), as
    above; (b) Go's: decoded fields plus raw ones (`raw_path` when the encoding isn't the default, `raw_query`); (c)
@@ -119,7 +122,8 @@ knowledge). `url::resolve()` on RFC 3986's examples; `url::parse()` keeping enco
    fixed; `get()` with a signed URL still broken). **Recommended: (a)**: one form, so nothing can disagree, and it fixes
    `get()` too; it changes `url`'s API (`query` from a map to a string), whose only users are the client and tests.
 2. **Follow by default?** (a) Yes, up to 10 (Go, reqwest, browsers); (b) no, only when asked (curl's `-L`, hyper has
-   none). **Recommended: (a)**: what callers of an HTTP client expect, and the credential rule (6) makes it safe.
+   none). Recommended: (a). **Decided: (b)**: `max_redirects` (the client's and the request's) defaults to 0, so a
+   caller asks for redirects to be followed, and how many.
 3. **How it's configured.** (a) `client_options::max_redirects` plus a per-request override, as above; (b) only the
    client's option (as Go's per-client `CheckRedirect`); (c) a callback per redirect (Go's `CheckRedirect`: sees the
    next request and the ones before, may stop, or return the 3xx). **Recommended: (a)**: a number covers the uses seen
