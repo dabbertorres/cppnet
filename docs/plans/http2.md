@@ -4,9 +4,9 @@ Status: stages 1 to 4 implemented (2026-10-17): HPACK (`http/hpack.hpp`, with it
 and session, without I/O (`http/http2.hpp`, `http/http2_session.hpp`, `test/http/http2.cpp`, `fuzz_http2`); the
 server (`coro/notifier.hpp` and `bench_notifier`, `http/http2_server.hpp`, `test/http/http2_server.cpp`); and the
 client (`http/http2_connection.hpp`, the machinery both sides share, `http/http2_client.hpp`, the pool's HTTP/2
-connections, `test/http/http2_client.cpp`). Stage 5 proposed (2026-10-20): interim responses (Early Hints) checked
+connections, `test/http/http2_client.cpp`). Stage 5 decided (2026-10-20): interim responses (Early Hints) checked
 end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's priorities, in ten pull requests (see "Stage
-5"); its questions (at the end) are open.
+5"); its questions (at the end) all as recommended.
 
 ## Goal
 
@@ -442,7 +442,7 @@ idle stream would be a connection error for the peer.
 
 ## Stage 5
 
-Proposed (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
+Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
 them; an API for trailers; the HPACK encoder's dynamic table; and RFC 9218's priorities. Go's behaviour is from its
 sources as of October 2026 (Go 1.27 moved HTTP/2 into the standard library, `src/net/http/internal/http2`; HPACK is
 still x/net's, vendored as `src/vendor/golang.org/x/net/http2/hpack`); nghttp2's, Rust's h2 and hyper's, h2o's and
@@ -503,20 +503,21 @@ an HTTP/1.1 client that takes a 1xx for the final response would misread the res
 **Proposed.**
 
 - Server, HTTP/1.1: `send()` of a 1xx flushes the connection's writer once the head's in it (so it's a coroutine then;
-  interim responses are rare), and does nothing for an HTTP/1.0 request (returning the discarding writer: Open question
-  1). The flush is the handler's own write (no other task writes while the handler runs; the watch's read is held, and
-  doesn't flush), so it races with nothing.
+  interim responses are rare), and does nothing for an HTTP/1.0 request (returning the discarding writer: Decided
+  question 1). The flush is the handler's own write (no other task writes while the handler runs; the watch's read is
+  held, and doesn't flush), so it races with nothing.
 - Server, both versions: `send(status::SWITCHING_PROTOCOLS)` throws `std::system_error` with
-  `std::errc::not_supported` (as for a head that can't be sent), until something can switch protocols (Open question 2).
-- Server, both versions: 100 Continue sent by itself (Open question 3): for a request with `Expect: 100-continue` (not
-  HTTP/1.0, whose expectation is ignored) whose body is to come, when the handler first reads the body, if nothing (no
-  1xx, no final response) has been sent yet, as Go does; over HTTP/1.1 written and flushed before the read, over
+  `std::errc::not_supported` (as for a head that can't be sent), until something can switch protocols (Decided question
+  2).
+- Server, both versions: 100 Continue sent by itself (Decided question 3): for a request with `Expect: 100-continue`
+  (not HTTP/1.0, whose expectation is ignored) whose body is to come, when the handler first reads the body, if nothing
+  (no 1xx, no final response) has been sent yet, as Go does; over HTTP/1.1 written and flushed before the read, over
   HTTP/2 a HEADERS frame. A handler that answers without reading (e.g. 413 for a body too large) sends no 100, and its
   connection closes after the response if the body's left unread (as now). An expectation other than `100-continue`
   is answered 417 (RFC 9110 says MAY; Go does) before the handler runs. The body readers learn of it through the
   callback they already take at their end (`io::end_callback`), generalized to a "first read" hook on the request's body
   (`http11::call_at_body_end()`'s sibling), so a request without the expectation pays nothing.
-- Client: a callback on the request, called for each 1xx before the final response (Open question 4):
+- Client: a callback on the request, called for each 1xx before the final response (Decided question 4):
 
   ```cpp
   struct client_request
@@ -608,7 +609,7 @@ gRPC's status (`grpc-status`, `grpc-message`) is sent that way, and gRPC clients
   set-cookie, trailer, transfer-encoding, te); received ones are kept unfiltered (within 16 KiB).
 - curl passes received trailers to its header callback (`CURLH_TRAILER`) and sends `TE: trailers` only if asked.
 
-**Proposed API** (Open questions 5 to 12).
+**Proposed API** (Decided questions 5 to 12).
 
 ```cpp
 namespace net::http
@@ -750,11 +751,11 @@ low-entropy secrets shouldn't be indexed.
 - `dynamic_table`'s storage: one buffer per table, made once (up to twice the table's size), entries' text appended
   into it and moved to its front when it reaches the end (amortized: at most the table's size moved per table's worth
   appended), with a ring of fixed-size descriptors (offset, name and value lengths, a hash of the name and of the value:
-  at most size/32 of them). No allocation per entry, for the decoder too. (Open question 16.)
+  at most size/32 of them). No allocation per entry, for the decoder too. (Decided question 16.)
 - The encoder keeps a `dynamic_table` of its own, in step with the peer's decoder, and searches it by going through its
   descriptors (at most 128 for 4096 bytes; the hashes first), as the static table is gone through now: a static exact
   match, then a dynamic exact match, then a static name, then a dynamic name, as Go's.
-- What's indexed (Open questions 13 and 14), decided in `hpack.cpp` from the (lowercase) name:
+- What's indexed (Decided questions 13 and 14), decided in `hpack.cpp` from the (lowercase) name:
   - never indexed, as now: `sensitive()`'s names, and whatever the field says (`field::never_indexed`, which re-encodes
     what arrived so, e.g. through a proxy);
   - literals without indexing (as nghttp2's), as they change from message to message, so an entry for them would
@@ -763,7 +764,7 @@ low-entropy secrets shouldn't be indexed.
   - everything else is indexed (literal with incremental indexing, then an index while it stays): e.g. `:authority`,
     `user-agent`, `accept`, `content-type`, `server`, `cache-control`, `date` (a new entry a second), `grpc-status`.
 - Size: the encoder uses the smaller of the peer's SETTINGS_HEADER_TABLE_SIZE and its own cap (4096, as Go, nghttp2 and
-  h2 do: Open question 15; `session_config::encoder_table_size`, internal), tracks the smallest size since the last
+  h2 do: Decided question 15; `session_config::encoder_table_size`, internal), tracks the smallest size since the last
   block, and starts the next one with that, then the final, size update (only if either differs from the size the peer
   knows). `encoder::set_max_table_size()` takes every change (growing too), as the session applies each SETTINGS entry.
 - The encoder gets a mode, `hpack::indexing::none` (as now) or `automatic` (the above): the first part builds the table
@@ -874,21 +875,21 @@ struct server_config
     // http2_priorities is whether an HTTP/2 connection sends responses by their priority (RFC 9218): as clients ask
     // (the Priority field, and PRIORITY_UPDATE frames) and handlers say (a Priority field in the response). Off, every
     // response shares the connection alike (Go's DisableClientPriority).
-    bool http2_priorities = true; // (Open question 18)
+    bool http2_priorities = true; // (Decided question 18)
 };
 
 }
 ```
 
 A handler sets its response's priority with the field (`rw.headers().set("Priority", to_string({.urgency = 7}))`,
-e.g. for a bulk download), which is also sent to the client; a client caller sets a request's the same way (Open
+e.g. for a bulk download), which is also sent to the client; a client caller sets a request's the same way (Decided
 question 24). Middleware sees it as any field.
 
 **Inside.**
 
 - `http/structured_fields.hpp` (internal, as `hpack.hpp`): RFC 9651's parsing of a Dictionary, to the end of the
   value: every item type (Integer, Decimal, String, Token, Byte Sequence, Boolean, Date, Display String), inner lists
-  and parameters, so that a value with unknown members still parses and one that's malformed doesn't (Open question
+  and parameters, so that a value with unknown members still parses and one that's malformed doesn't (Decided question
   17); members reported to a callback as views, nothing allocated. `parse_priority()` takes the last `u` and `i` (as a
   Dictionary does: a later key replaces an earlier one), an Integer from 0 to 7 and a Boolean (a bare `i` is true).
 - The session (`http2.hpp`, `http2_session.hpp`): `frame_type::priority_update`, `setting_id::no_rfc7540_priorities` and
@@ -899,21 +900,21 @@ question 24). Middleware sees it as any field.
   frame's up to 16 KiB) and, for an open stream, reports `session_events::on_priority_update(stream, priority)`; for a
   stream not yet open, keeps the latest (as a stream id and a `priority`, at most MAX_CONCURRENT_STREAMS of them with
   the open streams, past which it's PROTOCOL_ERROR) and reports it just after the stream's head, so it overrides the
-  request's field; for a closed one, or a value that doesn't parse, ignores it, as a glitch (Open question 22). A
+  request's field; for a closed one, or a value that doesn't parse, ignores it, as a glitch (Decided question 22). A
   client's session takes PRIORITY_UPDATE as PROTOCOL_ERROR. (A PRIORITY_UPDATE carries a complete set:
   `parse_priority()` over the default, not over what the stream had.)
 - The server's connection: each stream's priority, from the request's `priority` lines (`parse_priority()` over the
-  default; Open question 19 for what the default is), then PRIORITY_UPDATEs (over the default), then the response's
-  `priority` when its head is sent (over the stream's, as RFC 9218's merging: Open question 23). Off (`http2_priorities
-  = false`), every stream is u=3 and incremental.
+  default; Decided question 19 for what the default is), then PRIORITY_UPDATEs (over the default), then the response's
+  `priority` when its head is sent (over the stream's, as RFC 9218's merging: Decided question 23). Off
+  (`http2_priorities = false`), every stream is u=3 and incremental.
 - The scheduler (`http/http2_scheduler.hpp`, internal, without I/O, so it's tested alone): eight urgencies, each with
   its non-incremental streams in stream-id order and its incremental ones in a ring; `next()` takes the most urgent
   level with a ready stream, alternating within it between the two kinds (Go's), the incremental ring moving on a frame
-  at a time, the non-incremental stream staying first until it has nothing to send (Open question 20); a stream is
+  at a time, the non-incremental stream staying first until it has nothing to send (Decided question 20); a stream is
   ready while it has data waiting and window to send it; `update(stream, priority)` moves it (to the end of its new
   ring).
 - Writing (`http2_connection_base`; the server's only: the client's request bodies go as now, as Go's): uncontended, as
-  now (Open question 21): a write submits DATA to the session at once while less than `max_ahead` (64 KiB) of DATA is
+  now (Decided question 21): a write submits DATA to the session at once while less than `max_ahead` (64 KiB) of DATA is
   waiting for the writer and no stream is waiting in the scheduler, so a connection with one response at a time (e.g.
   `bench_request`'s) pays nothing. Otherwise the stream joins the scheduler with the span it's writing (the handler's
   buffer, valid while its write is awaited) and waits; the writer, each time it has written, takes the session's output
@@ -962,12 +963,12 @@ throughput isn't changed (by frame count and order).
    (with a minimal test client), h2spec, curl, h2load.
 4. **The client.** The pool's shared connections, ALPN, stream limits (and the second connection), retries, PING
    checks. Loopback tests, and public servers (needs the network).
-5. **Proposed (2026-10-20), in ten pull requests, in this order** (see "Stage 5"; each mergeable and tested alone):
+5. **Decided (2026-10-20), in ten pull requests, in this order** (see "Stage 5"; each mergeable and tested alone):
    1. **Interim responses, the server.** HTTP/1.1 flushes a 1xx at once; none to HTTP/1.0; `send(101)` refused; 100
       Continue sent by itself (and 417); `status::EARLY_HINTS`; tests over both versions; the guide. First: small, a
       fix (Early Hints don't work over HTTP/1.1 now), and independent of the rest.
    2. **Interim responses, the client.** `client_request::on_informational`, over both versions, and HTTP/2's bound on
-      interim heads. Split from 1 as it's an API of its own (Open question 4), tested against 1's server.
+      interim heads. Split from 1 as it's an API of its own (Decided question 4), tested against 1's server.
    3. **Trailers in the codecs.** `chunked_reader` keeping a trailer section, `chunked_writer::finish(trailers)`,
       `trailer_allowed()`, and `fuzz_http11`'s transcript. Split out as it's the part without I/O, tested on strings,
       which both sides' parts build on.
@@ -980,7 +981,7 @@ throughput isn't changed (by frame count and order).
       encoder's table, search, eviction and size updates, and `hpack::indexing`, with HTTP/2's sessions on `none`, so
       nothing changes on the wire; `fuzz_hpack`'s new properties (with `automatic`). Split from 7 so the mechanics are
       proved on their own, by the fuzzer, before anything depends on them.
-   7. **HPACK's indexing, on.** The policy (Open questions 13 and 14), the encoder's cap (`encoder_table_size`), the
+   7. **HPACK's indexing, on.** The policy (Decided questions 13 and 14), the encoder's cap (`encoder_table_size`), the
       sessions indexing; `bench_request`'s bytes per request; curl and h2load by hand. A wire change, so its own pull
       request, to measure and to revert alone.
    8. **Structured Fields and `http::priority`.** RFC 9651's Dictionary parsing, `parse_priority()`, `to_string()`,
@@ -1001,7 +1002,9 @@ throughput isn't changed (by frame count and order).
    sending a body); reprioritizing a request from the client (PRIORITY_UPDATE, needing a handle on a request in flight);
    scheduling the client's request bodies; and TCP_NOTSENT_LOWAT, to keep what's past the scheduler small.
 
-## Open questions (stage 5)
+## Decided questions (stage 5)
+
+All decided as recommended (2026-10-20); the options are kept for the reasoning.
 
 1. **Interim responses to HTTP/1.x clients.** (a) Sent to HTTP/1.1 clients (flushed at once), never to HTTP/1.0 ones
    (dropped, as RFC 9110 requires); (b) Go's: to both; (c) h2o's: none to HTTP/1.x by default, an option to send them.
