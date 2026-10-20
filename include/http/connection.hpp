@@ -1,13 +1,16 @@
 #pragma once
 
+#include <memory>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "tls/certificate.hpp"
 #include "tls/version.hpp"
 
 #ifdef NET_HAS_TLS
@@ -96,6 +99,30 @@ inline tls::version tls_version([[maybe_unused]] const connection& conn) noexcep
     if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls->version();
 #endif
     return tls::version::none;
+}
+
+// peer_certificates is the chain of certificates the peer sent, if it's a TLS connection and the peer sent one (e.g. a
+// client asked for its certificate): null otherwise.
+inline std::shared_ptr<const std::vector<tls::certificate>> peer_certificates([[maybe_unused]] const connection& conn)
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn))
+    {
+        if (auto certs = tls->peer_certificates(); !certs->empty()) return certs;
+    }
+#endif
+    return nullptr;
+}
+
+// tls_failure is whether err is a TLS connection's failure: an alert (either side's), or the peer breaking the
+// protocol, which says why the connection ended, rather than only that it did (e.g. the peer closing or resetting it).
+inline bool tls_failure([[maybe_unused]] std::error_code err) noexcept
+{
+#ifdef NET_HAS_TLS
+    return err.category() == tls::category() && err != io::status_condition::closed;
+#else
+    return false;
+#endif
 }
 
 // shutdown ends the outgoing side of the connection (over TLS, after close_notify), while reads still work.

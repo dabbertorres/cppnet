@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -27,8 +28,11 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "ip_addr.hpp"
+#include "ipv4_addr.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+#include "tls/certificate.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
@@ -38,6 +42,7 @@ namespace tls = net::tls;
 using namespace std::chrono_literals;
 using namespace std::string_view_literals;
 using net::coro::task;
+using test::client_auth_server;
 using test::pki;
 using test::server_with;
 using test::trusting_client;
@@ -1235,6 +1240,367 @@ TEST_CASE("a write canceled by the stream's stop token fails the writes after it
     CAPTURE(first.err.message(), later.err.message());
     CHECK(first.err == std::errc::operation_canceled);
     CHECK(later.err == std::errc::operation_canceled);
+}
+
+TEST_CASE("a server asks for clients' certificates as client_auth says, and verifies those sent", "[tls][client_auth]")
+{
+    // which certificate the client has (see test_pki).
+    enum class has : std::uint8_t
+    {
+        none,
+        good,
+        expired,
+        server_only,
+        impostor, // issued by a CA with the client CA's name, so it's sent
+        unnamed,  // issued by a CA the server doesn't name, so it isn't
+    };
+
+    // how the handshake ends.
+    enum class outcome : std::uint8_t
+    {
+        with_certificate,    // the server has the client's certificate
+        without_certificate, // the server has none
+        none_sent,           // the server requires one, and the client sent none
+        rejected,            // the client's certificate failed verification
+    };
+
+    struct test_case
+    {
+        std::string_view name;
+        tls::client_auth auth;
+        has              cert;
+        outcome          expected;
+        std::string_view reason = {}; // Botan's, why it was rejected
+    };
+
+    constexpr auto expired   = "Certificate has expired"sv;
+    constexpr auto usage     = "Certificate does not allow the requested usage"sv;
+    constexpr auto not_found = "Certificate issuer not found"sv;
+
+    using enum tls::client_auth;
+    const auto tc = GENERATE_REF(
+        test_case{.name     = "none, without one",
+                  .auth     = none,
+                  .cert     = has::none,
+                  .expected = outcome::without_certificate},
+        test_case{.name     = "none, with one (never asked for)",
+                  .auth     = none,
+                  .cert     = has::good,
+                  .expected = outcome::without_certificate},
+        test_case{.name     = "optional, without one",
+                  .auth     = optional,
+                  .cert     = has::none,
+                  .expected = outcome::without_certificate},
+        test_case{.name     = "optional, with one",
+                  .auth     = optional,
+                  .cert     = has::good,
+                  .expected = outcome::with_certificate},
+        test_case{.name     = "optional, with an expired one",
+                  .auth     = optional,
+                  .cert     = has::expired,
+                  .expected = outcome::rejected,
+                  .reason   = expired},
+        test_case{.name     = "optional, with one for servers",
+                  .auth     = optional,
+                  .cert     = has::server_only,
+                  .expected = outcome::rejected,
+                  .reason   = usage},
+        test_case{.name     = "optional, with an impostor's",
+                  .auth     = optional,
+                  .cert     = has::impostor,
+                  .expected = outcome::rejected,
+                  .reason   = not_found},
+        test_case{.name     = "optional, with one the server doesn't name",
+                  .auth     = optional,
+                  .cert     = has::unnamed,
+                  .expected = outcome::without_certificate},
+        test_case{.name = "required, without one", .auth = required, .cert = has::none, .expected = outcome::none_sent},
+        test_case{.name     = "required, with one",
+                  .auth     = required,
+                  .cert     = has::good,
+                  .expected = outcome::with_certificate},
+        test_case{.name     = "required, with an expired one",
+                  .auth     = required,
+                  .cert     = has::expired,
+                  .expected = outcome::rejected,
+                  .reason   = expired},
+        test_case{.name     = "required, with one for servers",
+                  .auth     = required,
+                  .cert     = has::server_only,
+                  .expected = outcome::rejected,
+                  .reason   = usage},
+        test_case{.name     = "required, with an impostor's",
+                  .auth     = required,
+                  .cert     = has::impostor,
+                  .expected = outcome::rejected,
+                  .reason   = not_found},
+        test_case{.name     = "required, with one the server doesn't name",
+                  .auth     = required,
+                  .cert     = has::unnamed,
+                  .expected = outcome::none_sent});
+    const auto version = GENERATE(tls::version::tls13, tls::version::tls12);
+    CAPTURE(tc.name, version == tls::version::tls13 ? "TLS 1.3" : "TLS 1.2");
+
+    const auto& p     = pki();
+    const auto  files = [&p](has cert) -> std::pair<std::filesystem::path, std::filesystem::path>
+    {
+        switch (cert)
+        {
+        case has::none: return {};
+        case has::good: return {p.client_chain, p.client_key};
+        case has::expired: return {p.expired_client_chain, p.expired_client_key};
+        case has::server_only: return {p.server_only_client_chain, p.server_only_client_key};
+        case has::impostor: return {p.impostor_client_chain, p.impostor_client_key};
+        case has::unnamed: return {p.unnamed_client_chain, p.unnamed_client_key};
+        }
+        return {};
+    };
+    const auto [chain, key] = files(tc.cert);
+
+    server_outcome     server{.sched = nullptr, .err = {}};
+    net::io::scheduler sched{make_pool()};
+    server.sched = &sched;
+
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // the server says how many certificates the client sent, and the first's subject, then closes.
+    const auto say_certificates = [](tls::stream& s) -> task<>
+    {
+        const auto  certs = s.peer_certificates();
+        std::string said  = std::to_string(certs->size());
+        if (!certs->empty()) said += " " + certs->front().subject;
+
+        co_await net::io::write_all(s, std::as_bytes(std::span{said}));
+        co_await s.close();
+    };
+    REQUIRE(sched.spawn(serve_once(&listener, client_auth_server(tc.auth, version), say_certificates, &server)));
+
+    struct result
+    {
+        std::error_code connect_err;
+        std::string     said;
+        std::error_code read_err;
+    };
+
+    // the client's result, once the server's handshake has ended too.
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx,
+                           server_outcome*     server) -> task<result>
+    {
+        result out;
+        auto   s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (s.has_value()) std::tie(out.said, out.read_err) = co_await read_to_end(*s);
+        else out.connect_err = s.error();
+
+        co_await server->wait();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(
+        client(&sched, listener.local_port(), test::client_with(chain, key, tls::version::tls13), &server));
+    CAPTURE(out.connect_err.message(), out.said, out.read_err.message(), server.err.message());
+    REQUIRE(server.done.load() == 1);
+
+    switch (tc.expected)
+    {
+    case outcome::with_certificate:
+    case outcome::without_certificate:
+    {
+        CHECK_FALSE(server.err);
+        CHECK_FALSE(out.connect_err);
+        CHECK(out.said == (tc.expected == outcome::with_certificate ? "1 " + p.client_subject : "0"));
+        CHECK(out.read_err == net::io::errc::end_of_stream);
+        break;
+    }
+    case outcome::none_sent:
+    case outcome::rejected:
+    {
+        const auto alert = test::refusal(tc.expected == outcome::rejected, version);
+        CHECK(server.err == alert);
+        CHECK_FALSE(tls::from_peer(server.err));
+        if (tc.expected == outcome::rejected)
+        {
+            CHECK(server.err.category() == tls::verification_category());
+            CHECK(server.err.message().contains(tc.reason));
+        }
+
+        // the client's handshake is done, in TLS 1.3, before the server has looked at its certificate: so it's its
+        // first read that fails. In TLS 1.2, the server's Finished comes after.
+        const auto client_err = version == tls::version::tls13 ? out.read_err : out.connect_err;
+        if (version == tls::version::tls13) CHECK_FALSE(out.connect_err);
+        CHECK(out.said.empty());
+        CHECK(client_err == alert);
+        CHECK(tls::from_peer(client_err));
+        break;
+    }
+    }
+}
+
+TEST_CASE("a peer's certificates are read from what it sent", "[tls][client_auth]")
+{
+    using certificates = std::shared_ptr<const std::vector<tls::certificate>>;
+
+    // what the server saw of the client's certificates (asked for twice), and how its handshake ended.
+    certificates       first;
+    certificates       second;
+    server_outcome     server{.sched = nullptr, .err = {}};
+    net::io::scheduler sched{make_pool()};
+    server.sched = &sched;
+
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    const auto keep = [](certificates* first, certificates* second)
+    {
+        return [first, second](tls::stream& s) -> task<>
+        {
+            *first  = s.peer_certificates();
+            *second = s.peer_certificates();
+            co_await s.close();
+        };
+    };
+    REQUIRE(sched.spawn(
+        serve_once(&listener, client_auth_server(tls::client_auth::required), keep(&first, &second), &server)));
+
+    // the server's certificates, as the client saw them, once the server's handshake has ended too.
+    const auto client = [](net::io::scheduler* sched, std::uint16_t port, server_outcome* server) -> task<certificates>
+    {
+        auto s = co_await connect_to(sched, port, test::client_with(pki().client_chain, pki().client_key), "localhost");
+        if (!s.has_value()) co_return nullptr;
+
+        auto certs = s->peer_certificates();
+        (void)co_await read_to_end(*s);
+        co_await server->wait();
+        co_return certs;
+    };
+
+    const auto servers = sched.run_to_completion(client(&sched, listener.local_port(), &server));
+    CAPTURE(server.err.message());
+
+    const auto& p = pki();
+
+    // the client's, as the server saw it: made once, then shared.
+    REQUIRE(first != nullptr);
+    CHECK(first == second);
+    REQUIRE(first->size() == 1);
+
+    const auto& alice = first->front();
+    CHECK(alice.der == p.client_der);
+    CHECK(alice.sha256 == p.client_sha256);
+    CHECK(alice.subject == p.client_subject);
+    CHECK(alice.issuer == "CN=cppnet test client CA");
+    CHECK(alice.serial_number == p.client_serial);
+    CHECK(alice.not_before == p.client_not_before);
+    CHECK(alice.not_after == p.client_not_after);
+    CHECK(alice.dns_names == std::vector<std::string>{"a.alice.example", "b.alice.example"});
+    CHECK(alice.email_addresses == std::vector<std::string>{"alice@example.com"});
+    CHECK(alice.uris == std::vector<std::string>{"spiffe://example.com/alice"});
+    CHECK(alice.ip_addresses
+          == std::vector<net::ip_addr>{
+              net::ipv4_addr{192, 0, 2, 1},
+              net::ip_addr::parse("2001:db8::1").value()
+    });
+
+    // the server's, as the client saw it.
+    REQUIRE(servers != nullptr);
+    REQUIRE(servers->size() == 1);
+
+    const auto& localhost = servers->front();
+    CHECK(localhost.subject == "CN=localhost");
+    CHECK(localhost.issuer == "CN=cppnet test CA");
+    CHECK(localhost.dns_names == std::vector<std::string>{"localhost"});
+    CHECK(localhost.ip_addresses
+          == std::vector<net::ip_addr>{
+              net::ipv4_addr{127, 0, 0, 1}
+    });
+    CHECK(localhost.email_addresses.empty());
+    CHECK(localhost.uris.empty());
+    CHECK(localhost.not_before < std::chrono::system_clock::now());
+    CHECK(localhost.not_after > std::chrono::system_clock::now());
+    CHECK_FALSE(localhost.der.empty());
+}
+
+TEST_CASE("server contexts refuse client authentication without client CAs, or client CAs without it",
+          "[tls][client_auth]")
+{
+    struct test_case
+    {
+        std::string_view                     name;
+        tls::client_auth                     auth = tls::client_auth::required;
+        std::optional<std::filesystem::path> client_ca{};
+        std::error_code                      err{};
+    };
+
+    const auto& p       = pki();
+    const auto  invalid = std::make_error_code(std::errc::invalid_argument);
+    const auto  tc      = GENERATE_REF(
+        test_case{.name = "none", .auth = tls::client_auth::none},
+        test_case{.name = "optional", .auth = tls::client_auth::optional, .client_ca = p.client_ca},
+        test_case{.name = "required", .client_ca = p.client_ca},
+        test_case{.name = "optional without client CAs", .auth = tls::client_auth::optional, .err = invalid},
+        test_case{.name = "required without client CAs", .err = invalid},
+        test_case{.name      = "none with client CAs",
+                  .auth      = tls::client_auth::none,
+                  .client_ca = p.client_ca,
+                  .err       = invalid},
+        test_case{.name      = "not a mode",
+                  .auth      = static_cast<tls::client_auth>(3),
+                  .client_ca = p.client_ca,
+                  .err       = invalid},
+        test_case{.name      = "client CAs that aren't there",
+                  .client_ca = p.dir / "missing.pem",
+                  .err       = std::make_error_code(std::errc::no_such_file_or_directory)},
+        test_case{.name = "client CAs that aren't certificates", .client_ca = p.client_key, .err = invalid});
+    CAPTURE(tc.name);
+
+    auto ctx = tls::server_context::make({.certificate_chain = p.localhost_chain,
+                                          .private_key       = p.localhost_key,
+                                          .client_auth       = tc.auth,
+                                          .client_ca_file    = tc.client_ca});
+    CHECK(ctx.has_value() == !tc.err);
+    if (!ctx.has_value()) CHECK(ctx.error() == tc.err);
+}
+
+TEST_CASE("client contexts refuse a certificate without its key, or a key without its certificate, or another's",
+          "[tls][client_auth]")
+{
+    struct test_case
+    {
+        std::string_view                     name;
+        std::optional<std::filesystem::path> chain{};
+        std::optional<std::filesystem::path> key{};
+        std::error_code                      err{};
+    };
+
+    const auto& p       = pki();
+    const auto  invalid = std::make_error_code(std::errc::invalid_argument);
+    const auto  missing = std::make_error_code(std::errc::no_such_file_or_directory);
+    const auto  tc      = GENERATE_REF(
+        test_case{.name = "neither"},
+        test_case{.name = "both", .chain = p.client_chain, .key = p.client_key},
+        test_case{.name = "a certificate without its key", .chain = p.client_chain, .err = invalid},
+        test_case{.name = "a key without its certificate", .key = p.client_key, .err = invalid},
+        test_case{.name  = "another certificate's key",
+                  .chain = p.client_chain,
+                  .key   = p.expired_client_key,
+                  .err   = invalid},
+        test_case{.name  = "a certificate that isn't there",
+                  .chain = p.dir / "missing.pem",
+                  .key   = p.client_key,
+                  .err   = missing},
+        test_case{.name  = "a key that isn't there",
+                  .chain = p.client_chain,
+                  .key   = p.dir / "missing.key",
+                  .err   = missing},
+        test_case{.name = "a key that isn't a key", .chain = p.client_chain, .key = p.client_ca, .err = invalid});
+    CAPTURE(tc.name);
+
+    auto ctx =
+        tls::client_context::make({.trusted_ca_file = p.ca, .certificate_chain = tc.chain, .private_key = tc.key});
+    CHECK(ctx.has_value() == !tc.err);
+    if (!ctx.has_value()) CHECK(ctx.error() == tc.err);
 }
 
 TEST_CASE("the system's trust store verifies a public server", "[tls][.network]")

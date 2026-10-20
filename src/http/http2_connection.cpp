@@ -311,8 +311,9 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
     std::vector<std::byte> pending(already_read.begin(), already_read.end());
     std::vector<std::byte> buffer(read_size);
 
-    auto& reader   = as_reader(conn);
-    bool  read_end = false; // the peer's closed its side (or reading failed)
+    auto&           reader   = as_reader(conn);
+    bool            read_end = false; // the peer's closed its side (or reading failed)
+    std::error_code read_err;
     while (receive(pending))
     {
         auto res = co_await reader.read(buffer);
@@ -322,6 +323,7 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
             // what was read before the end is still received.
             if (!pending.empty()) (void)receive(pending);
             read_end = true;
+            read_err = res.err;
             break;
         }
     }
@@ -332,7 +334,12 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
     // streams GOAWAY says may have been processed until it is.
     {
         std::scoped_lock lock{mu};
-        end();
+
+        // a TLS alert says why the connection ended (e.g. a server refusing the client's certificate: in TLS 1.3, after
+        // the client's handshake is done, so with its first read), which the streams fail with. Otherwise they were
+        // cut off.
+        if (tls_failure(read_err)) end(read_err);
+        else end();
     }
     stop_pending();
 
@@ -497,6 +504,25 @@ coro::task<> http2_connection_base::write_loop()
             if (res.err)
             {
                 logger.debug("HTTP/2 connection's write failed: {}", res.err.message());
+
+                // the connection was closed (e.g. reset): the reader finds that too, at once, and why, if the peer said
+                // (e.g. a TLS alert it sent before closing, which a write after it doesn't see), so it's left to end
+                // it. Otherwise (e.g. a write that timed out), it's ended here.
+                if (res.err == io::status_condition::closed)
+                {
+                    // NOTE: end() notifies it.
+                    while (true)
+                    {
+                        const auto ended = writer_wakeup.value();
+                        {
+                            std::scoped_lock lock{mu};
+                            if (is_ending) break;
+                        }
+                        (void)co_await writer_wakeup.wait(ended);
+                    }
+                    break;
+                }
+
                 {
                     std::scoped_lock lock{mu};
                     end();
@@ -607,14 +633,14 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
     return next;
 }
 
-void http2_connection_base::end()
+void http2_connection_base::end(std::error_code why)
 {
     if (is_ending) return;
     is_ending = true;
 
     for (auto& [_, s] : active)
     {
-        fail_stream(*s, std::make_error_code(std::errc::connection_aborted));
+        fail_stream(*s, why);
         s->changed.notify();
     }
     drained.notify();

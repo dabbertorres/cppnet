@@ -43,6 +43,7 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "tls/certificate.hpp"
 
 namespace net::http::detail
 {
@@ -116,6 +117,7 @@ namespace
             : http2_connection_base{scheduler, conn, http2::role::server, options.session, logger}
             , options{options}
             , handler{handler}
+            , peer_certs{peer_certificates(conn)}
         {}
 
         coro::task<> serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort);
@@ -170,6 +172,9 @@ namespace
         const http2_options&   options;
         const request_handler& handler;
         std::stop_token        abort_token; // the server's abort(), for each request (set by serve(), before streams)
+
+        // the client's certificates, for each request (made once, if it sent any).
+        std::shared_ptr<const std::vector<tls::certificate>> peer_certs;
 
         // Guarded by mu.
         std::unordered_map<http2::stream_id, std::unique_ptr<http2_stream>> streams;
@@ -460,9 +465,10 @@ namespace
         }
         if (!req.target.host.empty()) req.host.assign(req.target.host);
 
-        req.version     = {.major = 2, .minor = 0};
-        req.tls_version = tls_version(conn);
-        req.body        = std::make_unique<stream_reader>(stream.get());
+        req.version           = {.major = 2, .minor = 0};
+        req.tls_version       = tls_version(conn);
+        req.peer_certificates = peer_certs;
+        req.body              = std::make_unique<stream_reader>(stream.get());
 
         // its handler's token: stopped when the stream fails (see fail_stream()), or by abort (at once, after
         // receiving, if it came first); and the server's abort token, for middleware to tell the two apart.

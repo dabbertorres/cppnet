@@ -3,6 +3,8 @@
 // NOTE: before Botan's headers, some of which use <algorithm> without including it (see ports/botan).
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -11,6 +13,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <ratio>
+#include <set>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -19,14 +24,19 @@
 #include <utility>
 #include <vector>
 
+#include <botan/asn1_obj.h>
+#include <botan/ber_dec.h>
 #include <botan/certstor.h>
 #include <botan/certstor_system.h>
 #include <botan/credentials_manager.h>
 #include <botan/data_src.h>
 #include <botan/exceptn.h>
+#include <botan/hash.h>
+#include <botan/ipv6_address.h>
 #include <botan/pk_keys.h>
 #include <botan/pkcs8.h>
 #include <botan/pkix_enums.h>
+#include <botan/pkix_types.h>
 #include <botan/rng.h>
 #include <botan/system_rng.h>
 #include <botan/tls_alert.h>
@@ -49,10 +59,15 @@
 
 #include "coro/notifier.hpp"
 #include "coro/task.hpp"
+#include "encoding/hex.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "ip_addr.hpp"
+#include "ipv4_addr.hpp"
+#include "ipv6_addr.hpp"
 #include "tcp.hpp"
+#include "tls/certificate.hpp"
 #include "util/defer.hpp"
 
 namespace
@@ -205,6 +220,8 @@ constexpr std::array groups{
 // offers the latest allowed, and a server agrees on the latest the client offers that it allows, or fails the handshake
 // with protocol_version. DTLS isn't used.)
 //
+// It asks for clients' certificates, and requires one, as client_auth says (a server's).
+//
 // It offers only the key exchange groups above (those of them the Botan it's built against has), and so only ECDHE in
 // TLS 1.2, not finite field DHE. Botan's default ciphers are already only AEADs (AES-GCM and ChaCha20-Poly1305), and
 // its signatures only ECDSA and RSA, with SHA-256 to SHA-512.
@@ -214,15 +231,28 @@ public:
     policy(bool                            require_ems,
            net::tls::version               min,
            net::tls::version               max,
+           net::tls::client_auth           auth   = net::tls::client_auth::none,
            net::tls::detail::policy_limits limits = {}) noexcept
         : require_ems{require_ems}
         , min{min}
         , max{max}
+        , auth{auth}
         , limits{std::move(limits)}
     {}
 
     [[nodiscard]] bool require_cert_revocation_info() const override { return false; }
     [[nodiscard]] bool require_extended_master_secret() const override { return require_ems; }
+
+    // NOTE: a server with client CAs (see credentials) asks anyway: these say so explicitly, and whether to require a
+    //       certificate (failing a handshake without one with certificate_required, or TLS 1.2's handshake_failure).
+    [[nodiscard]] bool request_client_certificate_authentication() const override
+    {
+        return auth != net::tls::client_auth::none;
+    }
+    [[nodiscard]] bool require_client_certificate_authentication() const override
+    {
+        return auth == net::tls::client_auth::required;
+    }
 
     [[nodiscard]] bool allow_tls12() const override { return allows(net::tls::version::tls12); }
     [[nodiscard]] bool allow_tls13() const override { return allows(net::tls::version::tls13); }
@@ -257,6 +287,7 @@ private:
     bool                            require_ems;
     net::tls::version               min;
     net::tls::version               max;
+    net::tls::client_auth           auth;
     net::tls::detail::policy_limits limits;
 };
 
@@ -268,60 +299,285 @@ bool valid_versions(net::tls::version min, net::tls::version max) noexcept
     return known(min) && known(max) && min <= max;
 }
 
-// client_credentials gives a client the certificate authorities it trusts.
-class client_credentials final : public Botan::Credentials_Manager
+// credentials gives one side of connections (a client's, or a server's) the certificate authorities it trusts for the
+// peer's certificates, and its own certificate chain and key, if it has them. Botan names the side by the type it asks
+// for: "tls-client" for a client's (verifying servers' certificates, and the certificate to send a server that asks for
+// one), "tls-server" for a server's (verifying clients' certificates, if it asks for them, and its own certificate).
+class credentials final : public Botan::Credentials_Manager
 {
 public:
-    explicit client_credentials(std::unique_ptr<Botan::Certificate_Store> store) noexcept
-        : store{std::move(store)}
-    {}
-
-    std::vector<Botan::Certificate_Store*> trusted_certificate_authorities(const std::string& type,
-                                                                           const std::string& /*context*/) override
-    {
-        if (type == "tls-client") return {store.get()};
-        return {};
-    }
-
-private:
-    std::unique_ptr<Botan::Certificate_Store> store;
-};
-
-// server_credentials gives a server its certificate chain and key.
-class server_credentials final : public Botan::Credentials_Manager
-{
-public:
-    server_credentials(std::vector<Botan::X509_Certificate> chain, std::shared_ptr<Botan::Private_Key> key) noexcept
-        : chain{std::move(chain)}
+    // side is "tls-client" or "tls-server"; trusted the certificate authorities it trusts (for a server, those for its
+    // clients' certificates: null if it doesn't ask for them, so it doesn't); chain and key its own, if any.
+    credentials(std::string                               side,
+                std::unique_ptr<Botan::Certificate_Store> trusted,
+                std::vector<Botan::X509_Certificate>      chain = {},
+                std::shared_ptr<Botan::Private_Key>       key   = nullptr) noexcept
+        : side{std::move(side)}
+        , trusted{std::move(trusted)}
+        , chain{std::move(chain)}
         , key{std::move(key)}
     {}
 
+    // NOTE: a server asks for clients' certificates when this gives any CAs (naming them in its CertificateRequest).
+    std::vector<Botan::Certificate_Store*> trusted_certificate_authorities(const std::string& type,
+                                                                           const std::string& /*context*/) override
+    {
+        if (type == side && trusted) return {trusted.get()};
+        return {};
+    }
+
     std::vector<Botan::X509_Certificate> find_cert_chain(const std::vector<std::string>& cert_key_types,
                                                          const std::vector<Botan::AlgorithmIdentifier>& /*schemes*/,
-                                                         const std::vector<Botan::X509_DN>& /*acceptable_CAs*/,
-                                                         const std::string& type,
+                                                         const std::vector<Botan::X509_DN>& acceptable_CAs,
+                                                         const std::string&                 type,
                                                          const std::string& /*context*/) override
     {
-        if (type != "tls-server") return {};
+        if (type != side || chain.empty()) return {};
 
-        // the client must accept the key's kind (e.g. ECDSA, RSA).
+        // the peer must accept the key's kind (e.g. ECDSA, RSA).
         if (!cert_key_types.empty() && std::ranges::find(cert_key_types, key->algo_name()) == cert_key_types.end())
             return {};
+
+        // a client's certificate must be issued by one of the CAs the server names, if it names any (as Go's
+        // SupportsCertificate checks): a server would refuse another, where it may accept none. (A server's isn't
+        // held to the CAs a client names, as Go's isn't: it has only the one.)
+        const auto named = [&acceptable_CAs](const Botan::X509_Certificate& cert)
+        { return std::ranges::contains(acceptable_CAs, cert.issuer_dn()); };
+        if (side == "tls-client" && !acceptable_CAs.empty() && !std::ranges::any_of(chain, named)) return {};
 
         return chain;
     }
 
     std::shared_ptr<Botan::Private_Key> private_key_for(const Botan::X509_Certificate& cert,
-                                                        const std::string& /*type*/,
+                                                        const std::string&             type,
                                                         const std::string& /*context*/) override
     {
-        return cert == chain.front() ? key : nullptr;
+        return type == side && !chain.empty() && cert == chain.front() ? key : nullptr;
     }
 
 private:
+    std::string                               side;
+    std::unique_ptr<Botan::Certificate_Store> trusted;
+    std::vector<Botan::X509_Certificate>      chain;
+    std::shared_ptr<Botan::Private_Key>       key;
+};
+
+// identity is a certificate chain and its leaf's private key: a side's own.
+struct identity
+{
     std::vector<Botan::X509_Certificate> chain;
     std::shared_ptr<Botan::Private_Key>  key;
 };
+
+// load_identity reads a certificate chain and its private key, failing with the error opening either, or
+// invalid_argument if they aren't what they should be (e.g. the key isn't PKCS #8), or the key isn't the certificate's.
+std::expected<identity, std::error_code> load_identity(const std::filesystem::path& chain_path,
+                                                       const std::filesystem::path& key_path)
+{
+    auto chain = load_certificates(chain_path);
+    if (!chain.has_value()) return std::unexpected(chain.error());
+
+    auto key_source = open_file(key_path);
+    if (!key_source.has_value()) return std::unexpected(key_source.error());
+
+    try
+    {
+        std::shared_ptr<Botan::Private_Key> key = Botan::PKCS8::load_key(**key_source);
+        if (!key) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+        // the certificate must be the key's: otherwise every handshake would fail, saying only that it had.
+        // NOTE: both encoded by Botan, so a key encoded differently in the certificate (e.g. a compressed point)
+        //       still matches.
+        if (chain->front().subject_public_key()->subject_public_key() != key->subject_public_key())
+            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+        return identity{.chain = std::move(*chain), .key = std::move(key)};
+    }
+    catch (const std::exception&)
+    {
+        // e.g. the key isn't PKCS #8.
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    }
+}
+
+// load_store reads the certificate authorities in a PEM file into a store, failing as load_certificates does.
+std::expected<std::unique_ptr<Botan::Certificate_Store>, std::error_code> load_store(const std::filesystem::path& path)
+{
+    auto certs = load_certificates(path);
+    if (!certs.has_value()) return std::unexpected(certs.error());
+
+    auto store = std::make_unique<Botan::Certificate_Store_In_Memory>();
+    for (const auto& cert : *certs) store->add_certificate(cert);
+    return store;
+}
+
+// rfc4514_name is RFC 4514's name for an attribute type (section 3), by its OID: empty if it has none.
+std::string_view rfc4514_name(std::string_view oid) noexcept
+{
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 9> names{
+        {
+         {"2.5.4.3", "CN"},
+         {"2.5.4.7", "L"},
+         {"2.5.4.8", "ST"},
+         {"2.5.4.10", "O"},
+         {"2.5.4.11", "OU"},
+         {"2.5.4.6", "C"},
+         {"2.5.4.9", "STREET"},
+         {"0.9.2342.19200300.100.1.25", "DC"},
+         {"0.9.2342.19200300.100.1.1", "UID"},
+         }
+    };
+
+    const auto* found = std::ranges::find(names, oid, &std::pair<std::string_view, std::string_view>::first);
+    return found != names.end() ? found->second : std::string_view{};
+}
+
+// append_escaped appends an attribute's value as RFC 4514 escapes it (section 2.4): its special characters, and a
+// space or '#' first or a space last, with a backslash; and (as it allows) control characters as hex pairs, so a name
+// can't break a line of a log.
+void append_escaped(std::string& out, std::string_view value)
+{
+    for (std::size_t i = 0; i < value.size(); ++i)
+    {
+        const char c    = value[i];
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte < 0x20 || byte == 0x7F)
+        {
+            const auto pair = net::encoding::hex::encode(static_cast<std::byte>(byte));
+            out += '\\';
+            out.append(pair.data(), pair.size());
+            continue;
+        }
+
+        const bool special = std::string_view{"\"+,;<>\\"}.contains(c) || (i == 0 && (c == ' ' || c == '#'))
+                          || (i + 1 == value.size() && c == ' ');
+        if (special) out += '\\';
+        out += c;
+    }
+}
+
+// format_name writes a distinguished name (its DER: a sequence of relative distinguished names, each a set of
+// attributes) as RFC 4514 does: the last RDN first, separated by commas, and each RDN's attributes separated by '+'.
+// NOTE: from the DER, rather than Botan's X509_DN, whose attributes don't keep which RDN they're in.
+std::string format_name(std::span<const std::uint8_t> der)
+{
+    std::vector<std::string> rdns;
+
+    Botan::BER_Decoder decoder{der};
+    Botan::BER_Decoder sequence = decoder.start_sequence();
+    while (sequence.more_items())
+    {
+        Botan::BER_Decoder set = sequence.start_set();
+        std::string        rdn;
+        while (set.more_items())
+        {
+            Botan::OID                oid;
+            std::vector<std::uint8_t> value;
+            set.start_sequence().decode(oid).raw_bytes(value).end_cons();
+
+            if (!rdn.empty()) rdn += '+';
+
+            const auto type = oid.to_string();
+            if (const auto name = rfc4514_name(type); !name.empty())
+            {
+                // NOTE: Botan only reads certificates whose names' values are strings.
+                Botan::ASN1_String str;
+                Botan::BER_Decoder{value}.decode(str).verify_end();
+
+                rdn += name;
+                rdn += '=';
+                append_escaped(rdn, str.value());
+            }
+            else
+            {
+                rdn += type;
+                rdn += "=#";
+                rdn += net::encoding::hex::encode(std::as_bytes(std::span{value}));
+            }
+        }
+        rdns.push_back(std::move(rdn));
+    }
+
+    std::string out;
+    for (const auto& rdn : rdns | std::views::reverse)
+    {
+        if (!out.empty()) out += ',';
+        out += rdn;
+    }
+    return out;
+}
+
+// to_time_point is when an X.509 time is, as the system clock's time: its earliest or latest if it can't hold it.
+// NOTE: not Botan's to_std_timepoint(), which fails for times before 1970, or that a time_t can't hold.
+std::chrono::system_clock::time_point to_time_point(const Botan::X509_Time& t)
+{
+    using clock = std::chrono::system_clock;
+    using std::chrono::seconds;
+
+    // NOTE: "YYYY/MM/DD hh:mm:ss UTC".
+    const auto text  = t.readable_string();
+    const auto field = [&text](std::size_t at, std::size_t length)
+    {
+        int value = 0;
+        for (const char c : std::string_view{text}.substr(at, length)) value = (value * 10) + (c - '0');
+        return value;
+    };
+
+    const std::chrono::sys_days    day{std::chrono::year{field(0, 4)} / field(5, 2) / field(8, 2)};
+    const std::chrono::sys_seconds when =
+        day + std::chrono::hours{field(11, 2)} + std::chrono::minutes{field(14, 2)} + seconds{field(17, 2)};
+
+    constexpr auto earliest = std::chrono::ceil<seconds>(clock::time_point::min());
+    constexpr auto latest   = std::chrono::floor<seconds>(clock::time_point::max());
+    if (when < earliest) return clock::time_point::min();
+    if (when > latest) return clock::time_point::max();
+    return std::chrono::time_point_cast<clock::duration>(when);
+}
+
+// make_certificate is cert, as data.
+net::tls::certificate make_certificate(const Botan::X509_Certificate& cert)
+{
+    net::tls::certificate out;
+
+    const auto der = cert.BER_encode();
+    out.der.resize(der.size());
+    std::ranges::copy(std::as_bytes(std::span{der}), out.der.begin());
+
+    out.subject = format_name(cert.raw_subject_dn());
+    out.issuer  = format_name(cert.raw_issuer_dn());
+
+    const auto& serial = cert.serial_number();
+    out.serial_number  = serial.empty() ? "00" : net::encoding::hex::encode(std::as_bytes(std::span{serial}));
+
+    out.not_before = to_time_point(cert.not_before());
+    out.not_after  = to_time_point(cert.not_after());
+
+    const auto& names = cert.subject_alt_name();
+    out.dns_names.assign(names.dns().begin(), names.dns().end());
+    out.email_addresses.assign(names.email().begin(), names.email().end());
+    out.uris.assign(names.uris().begin(), names.uris().end());
+    for (const auto v4 : names.ipv4_address()) out.ip_addresses.emplace_back(net::ipv4_addr{v4});
+    for (const auto& v6 : names.ipv6_address())
+    {
+        std::array<std::uint8_t, 16> bytes{};
+        std::ranges::copy(v6.address(), bytes.begin());
+        out.ip_addresses.emplace_back(net::ipv6_addr{bytes});
+    }
+
+    const auto hash = Botan::HashFunction::create_or_throw("SHA-256");
+    hash->update(der);
+    const auto digest = hash->final_stdvec();
+    std::ranges::copy(std::as_bytes(std::span{digest}).first(out.sha256.size()), out.sha256.begin());
+
+    return out;
+}
+
+// no_certificates is an empty chain of certificates, shared without allocating (it's owned by nothing).
+std::shared_ptr<const std::vector<net::tls::certificate>> no_certificates() noexcept
+{
+    static const std::vector<net::tls::certificate> none;
+    return {std::shared_ptr<void>{}, &none};
+}
 
 }
 
@@ -701,6 +957,17 @@ struct connection
                 if (channel->is_handshake_complete())
                 {
                     alpn = channel->application_protocol();
+
+                    // NOTE: copies of Botan's certificates share their data, so this is a vector of pointers.
+                    try
+                    {
+                        peer_chain = channel->peer_cert_chain();
+                    }
+                    catch (const std::exception&)
+                    {
+                        failure = make_error_code(errc::protocol_error);
+                        co_return failure;
+                    }
                     co_return std::error_code{};
                 }
                 if (peer_closed) co_return make_error_code(io::errc::end_of_stream);
@@ -748,6 +1015,10 @@ struct connection
     std::error_code                               failure;                // a fatal alert, or a broken protocol
     std::optional<Botan::Certificate_Status_Code> verification_failure;   // why the peer's certificate was rejected
     std::string                                   alpn;
+
+    // the chain the peer sent (set once the handshake is complete), and as peer_certificates() gives it, once it has.
+    std::vector<Botan::X509_Certificate>            peer_chain;
+    std::shared_ptr<const std::vector<certificate>> peer_certs;
 
     // the version the handshake agreed on. NOTE: set by the handshake, before the stream is made, and never after (the
     //       policy refuses renegotiation), so it's read without mu.
@@ -848,17 +1119,26 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
     if (!valid_versions(options.min_version, options.max_version))
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
+    // a certificate needs its key, and a key its certificate.
+    if (options.certificate_chain.has_value() != options.private_key.has_value())
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    identity own;
+    if (options.certificate_chain.has_value())
+    {
+        auto loaded = load_identity(*options.certificate_chain, *options.private_key);
+        if (!loaded.has_value()) return std::unexpected(loaded.error());
+        own = std::move(*loaded);
+    }
+
     try
     {
         std::unique_ptr<Botan::Certificate_Store> store;
         if (options.trusted_ca_file)
         {
-            auto certs = load_certificates(*options.trusted_ca_file);
-            if (!certs.has_value()) return std::unexpected(certs.error());
-
-            auto in_memory = std::make_unique<Botan::Certificate_Store_In_Memory>();
-            for (const auto& cert : *certs) in_memory->add_certificate(cert);
-            store = std::move(in_memory);
+            auto loaded = load_store(*options.trusted_ca_file);
+            if (!loaded.has_value()) return std::unexpected(loaded.error());
+            store = std::move(*loaded);
         }
         else
         {
@@ -867,12 +1147,14 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
 
         auto rng   = std::make_shared<Botan::System_RNG>();
         auto state = std::make_shared<detail::client_state>(detail::client_state{
-            .rng               = rng,
-            .credentials       = std::make_shared<client_credentials>(std::move(store)),
+            .rng = rng,
+            .credentials =
+                std::make_shared<credentials>("tls-client", std::move(store), std::move(own.chain), std::move(own.key)),
             .sessions          = std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng),
             .policy            = std::make_shared<policy>(options.require_extended_master_secret,
                                                           options.min_version,
                                                           options.max_version,
+                                                          client_auth::none,
                                                           limits),
             .skip_verification = options.insecure_skip_verification,
             .alpn              = options.alpn,
@@ -896,31 +1178,37 @@ std::expected<server_context, std::error_code> server_context::make(const server
     if (!valid_versions(options.min_version, options.max_version))
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
+    // client certificates are verified against client_ca_file's CAs, never the system's: so it's needed to ask for
+    // them, and refused without asking (as it wouldn't be used).
+    const bool asks = options.client_auth != client_auth::none;
+    if (options.client_auth > client_auth::required || asks != options.client_ca_file.has_value())
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    auto own = load_identity(options.certificate_chain, options.private_key);
+    if (!own.has_value()) return std::unexpected(own.error());
+
+    std::unique_ptr<Botan::Certificate_Store> client_cas;
+    if (asks)
+    {
+        auto loaded = load_store(*options.client_ca_file);
+        if (!loaded.has_value()) return std::unexpected(loaded.error());
+        client_cas = std::move(*loaded);
+    }
+
     try
     {
-        auto chain = load_certificates(options.certificate_chain);
-        if (!chain.has_value()) return std::unexpected(chain.error());
-
-        auto key_source = open_file(options.private_key);
-        if (!key_source.has_value()) return std::unexpected(key_source.error());
-
-        std::shared_ptr<Botan::Private_Key> key = Botan::PKCS8::load_key(**key_source);
-        if (!key) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-
-        // the certificate must be the key's: otherwise every handshake would fail, saying only that it had.
-        // NOTE: both encoded by Botan, so a key encoded differently in the certificate (e.g. a compressed point)
-        //       still matches.
-        if (chain->front().subject_public_key()->subject_public_key() != key->subject_public_key())
-            return std::unexpected(std::make_error_code(std::errc::invalid_argument));
-
         auto rng   = std::make_shared<Botan::System_RNG>();
         auto state = std::make_shared<detail::server_state>(detail::server_state{
             .rng         = rng,
-            .credentials = std::make_shared<server_credentials>(std::move(*chain), std::move(key)),
+            .credentials = std::make_shared<credentials>("tls-server",
+                                                         std::move(client_cas),
+                                                         std::move(own->chain),
+                                                         std::move(own->key)),
             .sessions    = std::make_shared<Botan::TLS::Session_Manager_Noop>(),
             .policy      = std::make_shared<policy>(options.require_extended_master_secret,
                                                     options.min_version,
-                                                    options.max_version),
+                                                    options.max_version,
+                                                    options.client_auth),
             .alpn        = options.alpn,
         });
 
@@ -928,7 +1216,6 @@ std::expected<server_context, std::error_code> server_context::make(const server
     }
     catch (const std::exception&)
     {
-        // e.g. the key isn't PKCS #8.
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
 }
@@ -1083,6 +1370,20 @@ coro::task<> stream::close()
 std::string_view stream::alpn() const noexcept { return conn->alpn; }
 
 version stream::version() const noexcept { return conn->negotiated; }
+
+std::shared_ptr<const std::vector<certificate>> stream::peer_certificates() const
+{
+    std::scoped_lock lock{conn->mu};
+    if (conn->peer_certs) return conn->peer_certs;
+    if (conn->peer_chain.empty()) return no_certificates();
+
+    auto made = std::make_shared<std::vector<certificate>>();
+    made->reserve(conn->peer_chain.size());
+    for (const auto& cert : conn->peer_chain) made->push_back(make_certificate(cert));
+
+    conn->peer_certs = std::move(made);
+    return conn->peer_certs;
+}
 
 void stream::release_close_reply() noexcept
 {

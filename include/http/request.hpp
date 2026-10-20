@@ -12,6 +12,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
@@ -21,6 +22,7 @@
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
 #include "io/writer.hpp"
+#include "tls/certificate.hpp"
 #include "tls/version.hpp"
 #include "url.hpp"
 #include "util/small_vector.hpp"
@@ -146,6 +148,13 @@ struct server_request
     // Secure cookies.
     tls::version tls_version = tls::version::none;
 
+    // The chain of certificates the client sent, leaf first, verified, if the request came over TLS from a server that
+    // asks for clients' certificates (tls::server_options::client_auth), and the client sent one; null otherwise
+    // (always, in builds without TLS). E.g. a handler (or middleware) authorizes the client by its leaf's subject, or a
+    // SPIFFE ID among its uris, answering 403 for one it doesn't know. Shared by the connection's requests (and
+    // HTTP/2's streams), so it's made once per connection, and a copy outlives the request.
+    std::shared_ptr<const std::vector<tls::certificate>> peer_certificates{};
+
     // stop is stopped once the request is no longer wanted: over HTTP/2, when the client resets its stream, the stream
     // times out, or its connection ends; over HTTP/1.1, when its connection ends; and for either, when the server is
     // aborted (abort(), its destructor, or the scheduler's request_stop(); not close(), which lets requests finish).
@@ -200,8 +209,8 @@ struct server_request
     void add_path_value(std::string_view name, std::string_view encoded);
 
     // clear empties the request, to decode another into it, keeping its memory (and body, which decoding replaces), and
-    // tls_version, stop and aborted, as the next request comes over the same connection (whose server sets stop for
-    // each request).
+    // tls_version, peer_certificates, stop and aborted, as the next request comes over the same connection (whose
+    // server sets stop for each request).
     void clear() noexcept
     {
         method  = request_method::NONE;

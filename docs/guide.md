@@ -420,8 +420,11 @@ auto resp = co_await client.send(std::move(out));   // operation_canceled, once 
 
 For `https://`, the server's certificate is verified against the system's trusted certificate authorities, or those
 in `client_options::tls` (e.g. `options.tls.trusted_ca_file = "ca.pem"`, for a private CA). A failed verification
-compares equal to `tls::alert::bad_certificate`, and says why in its message. Without TLS (`NET_TLS` off), `https://`
-fails with `std::errc::protocol_not_supported`.
+compares equal to `tls::alert::bad_certificate`, and says why in its message. For a server that asks for a client
+certificate (mutual TLS), give `client_options::tls` one, with its key (`options.tls.certificate_chain = "client.pem";
+options.tls.private_key = "client.key";`): one identity per client. A server that refuses it (or wanted one) fails the
+request with its alert, e.g. `tls::alert::certificate_required` or `bad_certificate`. Without TLS (`NET_TLS` off),
+`https://` fails with `std::errc::protocol_not_supported`.
 
 ## HTTP server
 
@@ -616,6 +619,22 @@ scheduler.spawn(server.serve());
   `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off). `example/http-server` serves HTTPS with
   `--cert` and `--key`.
 
+  For mutual TLS, the context asks clients for their certificates (`client_auth`: `optional` or `required`), verifying
+  them against `client_ca_file`'s certificate authorities; a handler sees the chain a client sent in
+  `req.peer_certificates` (leaf first; null if it sent none, in cleartext, and in builds without TLS), and authorizes
+  from it:
+
+  ```cpp
+  auto ctx = net::tls::server_context::make({.certificate_chain = "chain.pem",
+                                             .private_key       = "key.pem",
+                                             .client_auth       = net::tls::client_auth::required,
+                                             .client_ca_file    = "clients-ca.pem"});
+
+  // in a handler:
+  const auto& certs = req.peer_certificates;
+  if (!certs || !std::ranges::contains(certs->front().uris, "spiffe://example.com/billing")) { /* 403 */ }
+  ```
+
 ## TLS
 
 The HTTP client uses TLS for `https://` URLs by itself. To use it directly, TLS (`tls/tls.hpp`, built unless `NET_TLS`
@@ -636,6 +655,22 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   "Certificate does not match provided name").
 - A server makes a `server_context` from its certificate chain and key, and calls `stream::accept()` (as
   `http::server` does).
+- **Client certificates (mutual TLS):** `server_options::client_auth` says whether a server asks for clients'
+  certificates (`none`, the default; `optional`, verifying one that's sent; `required`), and `client_ca_file` (needed
+  unless `none`, and refused with it) which certificate authorities they must chain to (never the system's); the server
+  names them, and a client sends its certificate (`client_options::certificate_chain` and `private_key`, both or
+  neither) only if one of its chain's issuers is among them, and the server takes its kind of key. A certificate that
+  doesn't verify (an unknown issuer, expired, or without clientAuth in its extended key usage) fails the handshake: the
+  server's error is in `verification_category()`, the client's the peer's `bad_certificate`. A client that sends none,
+  where one's required, gets `certificate_required` (TLS 1.3) or `handshake_failure` (TLS 1.2). In TLS 1.3, the
+  client's handshake is done before the server has looked at its certificate, so it's the client's first read (e.g. of
+  the response) that fails, not `connect()`.
+- `stream::peer_certificates()` is the chain the peer sent, leaf first (a client's, if it sent one; a server's), as
+  `tls::certificate`s (`tls/certificate.hpp`, which builds without TLS too): plain data, made when first asked for,
+  then shared (`std::shared_ptr<const std::vector<tls::certificate>>`): the DER, `subject` and `issuer` (as RFC 4514
+  writes them, e.g. `CN=alice,O=Example`), `serial_number` (hex), `not_before` and `not_after`, the subject
+  alternative names (`dns_names`, `email_addresses`, `uris`, `ip_addresses`), and `sha256` (the DER's, e.g. for
+  pinning).
 - Both contexts allow TLS 1.2 and 1.3 by default. `min_version` and `max_version` (in `client_options` and
   `server_options`, as Go's `MinVersion` and `MaxVersion`; e.g. `.min_version = net::tls::version::tls13`) narrow that,
   and `make()` fails with `std::errc::invalid_argument` if the minimum is after the maximum. The client offers the
@@ -684,7 +719,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
 | `tls/tls.hpp`                          | TLS                                                       |
-| `tls/version.hpp`                      | `tls::version` (included by `tls/tls.hpp` and `http/request.hpp`; without TLS too) |
+| `tls/version.hpp`, `tls/certificate.hpp` | `tls::version` and `tls::certificate` (included by `tls/tls.hpp` and `http/request.hpp`; without TLS too) |
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |
 

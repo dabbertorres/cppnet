@@ -88,7 +88,9 @@ struct client_options
 
 #ifdef NET_HAS_TLS
     // For https:// URLs: which certificate authorities to trust (the system's, by default), or not to verify servers'
-    // certificates, for testing. Its ALPN protocols are ignored: the client offers h2 (if http2 is on) and http/1.1.
+    // certificates, for testing; and a certificate (and its key) for servers that ask for one (mutual TLS), the
+    // client's for every host (the connections' keys don't change). Its ALPN protocols are ignored: the client offers
+    // h2 (if http2 is on) and http/1.1.
     tls::client_options tls{};
 
     // How long a TLS handshake may take, once connected (separately from connect_timeout, so an error says which

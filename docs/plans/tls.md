@@ -5,7 +5,11 @@ Status: stages 1 to 3 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/
 (`server_config::tls`, `test/tls/server.cpp`). Stage 4 decided (2026-10-20): client certificates, session tickets
 for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) all as recommended. Its first part, a
 trimmed Botan, is done (2026-10-20): `ports/botan/portfile.cmake`, the policy in `src/tls/tls.cpp`, and
-`test/tls/stream.cpp`'s handshakes per group, cipher suite and kind of certificate (see "Learned in stage 4").
+`test/tls/stream.cpp`'s handshakes per group, cipher suite and kind of certificate (see "Learned in stage 4"). Its
+second part, client certificates (mutual TLS), is done (2026-10-20): `tls::client_auth`, `server_options::client_ca_file`,
+the client's `certificate_chain` and `private_key`, `tls::certificate` (`include/tls/certificate.hpp`),
+`stream::peer_certificates()` and `server_request::peer_certificates`; tests in `test/tls/stream.cpp` and
+`test/tls/server.cpp`.
 
 ## Goal
 
@@ -587,6 +591,59 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   libstdc++ builds are the check of the list on other CPUs, compilers and trust stores; `configure.py` was run by hand
   for macOS and Linux on x86-64 and arm64 (with `--disable-cc-tests`), loading the same modules but the CPUs'.
 
+### Client certificates (part 2)
+
+- **As proposed:** the API (`tls::client_auth`'s three modes, `server_options::client_auth` and `client_ca_file`,
+  `client_options::certificate_chain` and `private_key`, `tls::certificate`, `stream::peer_certificates()`,
+  `server_request::peer_certificates`), one `credentials` manager for both sides (a side's type, `"tls-client"` or
+  `"tls-server"`, naming both the CAs it trusts for the peer and its own chain; a server's CAs are null unless it asks,
+  so nothing is requested otherwise), the policy's `request_`/`require_client_certificate_authentication()` from
+  `client_auth`, and `make()`'s errors. `tls::certificate` is in `include/tls/certificate.hpp`, which needs only
+  `ip_addr.hpp`, so `http/request.hpp` includes it in every build. No Botan module was added: the DER, names and SANs
+  are `x509`'s (`BER_Decoder`, `AlternativeName`), SHA-256 is `sha2_32`'s (looked up by name, as `HashFunction`), and
+  hex is cppnet's own (`encoding/hex.hpp`, so upper case). The tests' certificates (`DER_Encoder`,
+  `X509_CA::make_cert()`) are `x509`'s too.
+- **Choosing the client's certificate** (`find_cert_chain()`, Go's `SupportsCertificate`) holds only a client's to the
+  CAs the server names (any of its chain's issuers among them, by `X509_DN`'s comparison), not a server's to a client's
+  `certificate_authorities` extension (rare), as Go's server doesn't either (it has one certificate). So a client whose
+  certificate is from a CA the server doesn't name sends none: with `optional` it's served unauthenticated, with
+  `required` it gets `certificate_required`. The tests' "untrusted" client certificate is therefore an impostor's: from
+  a CA with the client CA's name but another key, which the client sends and the server can't verify ("Certificate
+  issuer not found"); one from a CA with another name is the test that nothing is sent.
+- **The peer's chain** is kept (`channel->peer_cert_chain()`, copies sharing Botan's data) when the handshake is
+  complete; `peer_certificates()` makes the `tls::certificate`s the first time (under the stream's mutex) and keeps
+  them. It never returns null: no chain is an empty vector, a function-local static shared through an aliasing
+  `shared_ptr` without an owner, so asking costs no allocation. The HTTP server sets `server_request::peer_certificates`
+  from it when it isn't empty, and null otherwise (`detail::peer_certificates(conn)`, in `http/connection.hpp`): the
+  plan's "only if the server's context asks" is that, as a client only sends a certificate when asked, so no check of
+  the context is needed, and a server that doesn't ask makes nothing. HTTP/2 makes it once per connection (in the
+  connection's constructor), each stream's request sharing it.
+- **`subject` and `issuer`** are formatted from the name's DER (`raw_subject_dn()`), as Botan's `X509_DN` flattens
+  multi-valued RDNs: RDNs last first, joined by `,`, a multi-valued RDN's attributes by `+` (in their DER order); RFC
+  4514's names for its nine types, other types as their OID with the value's DER in hex (`2.5.4.5=#13023432`, as RFC
+  4514 2.4 says, and Go does); values escaped as 2.4 says, plus control characters as `\XX` (which it allows, so a name
+  can't break a log line). The tests' client certificate has each case (made from DER, as Botan's `X509_DN` can't make
+  a multi-valued RDN). `serial_number` is the number's bytes in hex (Botan keeps it as a `BigInt`'s, without leading
+  zero bytes; "00" for 0). `not_before` and `not_after` are read from the time's fields (Botan's `to_std_timepoint()`
+  fails for times before 1970, or that `time_t` can't hold), and clamped to the clock's range (libstdc++'s
+  `system_clock` ends in 2262, before RFC 5280's 9999-12-31).
+- **Where a refusal surfaces**, as the plan said: over TLS 1.2, `connect()` fails (the server's Finished comes after
+  its look at the certificate); over TLS 1.3, `connect()` succeeds and the first read fails with the server's alert
+  (`test/tls/stream.cpp` checks both, for each mode and kind of certificate). Over HTTP/1.1 the request is written,
+  then reading its response fails with the alert (a reset after it comes behind the alert, which is read first). Over
+  HTTP/2, the connection's end failed every stream with `connection_aborted`, which also counted as a dropped
+  connection, so the request was sent again on a new one (and failed the same way). Now a connection whose read fails
+  with a TLS alert (`detail::tls_failure()`: TLS's category, but not `stream_truncated`) fails its streams with the
+  alert (`end(why)`), and they aren't retried. And a write that fails because the connection was closed (a reset, or a
+  broken pipe: `status_condition::closed`) no longer ends it itself: the reader finds the end at once, and the alert
+  before it, if the peer sent one; otherwise the HTTP/2 client could write (e.g. its HEADERS after its preface) into
+  the server's reset, ending the streams with `connection_aborted` before the reader had read the alert. Other write
+  failures (e.g. a timeout) still end the connection at once.
+- **Session resumption (part 3)** isn't touched: the server's session manager is still `Session_Manager_Noop`, so every
+  handshake is full, and the chain is the one just verified. On a resumption, Botan's `peer_cert_chain()` is the
+  session's, so `peer_certificates()` will be the chain verified when the session began; and a TLS 1.3 server sends no
+  CertificateRequest in a resumed (PSK) handshake. Part 3 decides which sessions may resume (Decided question 10).
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`
@@ -604,7 +661,7 @@ handshake in the field. The network tests (public servers) exercise interoperabi
       key exchange groups, Go's set), so cppnet behaves the same over a whole Botan (e.g. a project's own vcpkg's).
       First, as it's independent, and halves the dependency's build for every CI run after it (once its cache is
       made again).
-   2. **Client certificates (mutual TLS).** `server_options::client_auth` and `client_ca_file`; a certificate and key
+   2. **Client certificates (mutual TLS). Done (2026-10-20).** `server_options::client_auth` and `client_ca_file`; a certificate and key
       in `client_options` (so `http::client`'s too); `tls::certificate` (Botan-free), `stream::peer_certificates()`
       and `server_request::peer_certificates`; one credentials manager for both sides; client certificates in the
       tests' PKI.

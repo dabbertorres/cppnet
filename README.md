@@ -2,7 +2,7 @@
 
 A C++23 networking library, built on its own coroutine runtime: TCP and UDP sockets, DNS lookups, URLs, an HTTP/1.1
 and HTTP/2 client, an HTTP/1.1 and HTTP/2 server (with a router, and middleware for Prometheus metrics and OpenTelemetry
-tracing), and TLS (with Botan), for HTTPS in both.
+tracing), and TLS (with Botan), for HTTPS in both, client certificates (mutual TLS) included.
 
 ```cpp
 namespace http = net::http;

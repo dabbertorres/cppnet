@@ -44,6 +44,7 @@
 #include "io/writer.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
+#include "tls/certificate.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
@@ -80,6 +81,16 @@ task<void> tls_version(const http::server_request& req, http::response_writer& r
 {
     const auto msg  = version_name(req.tls_version);
     auto*      body = co_await resp.send(http::status::OK, msg.size());
+    co_await net::io::write_all(*body, msg);
+}
+
+// peer_certificates answers with how many certificates the client sent, and the first's subject: "none" if it sent
+// none.
+task<void> peer_certificates(const http::server_request& req, http::response_writer& resp)
+{
+    const auto& certs = req.peer_certificates;
+    const auto  msg   = certs ? std::to_string(certs->size()) + " " + certs->front().subject : std::string{"none"};
+    auto*       body  = co_await resp.send(http::status::OK, msg.size());
     co_await net::io::write_all(*body, msg);
 }
 
@@ -155,6 +166,7 @@ struct https_server
         http::router r;
         r.GET("/", hello);
         r.GET("/tls-version", tls_version);
+        r.GET("/peer-certificates", peer_certificates);
         return r;
     }
 
@@ -369,6 +381,121 @@ TEST_CASE("a handler sees the TLS version its connection agreed on", "[tls][http
     const std::string url = (use_tls ? "https://localhost:" : "http://localhost:") + server.port() + "/tls-version";
     const auto        out = sched.run_to_completion(test(&client, url));
     CHECK(out == std::format("HTTP/{} {}", tc.http2 ? 2 : 1, version_name(tc.version)));
+}
+
+TEST_CASE("a handler sees the certificate its client sent", "[tls][http][server][client_auth]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        // none: cleartext.
+        tls::version     version     = tls::version::tls13;
+        bool             http2       = false;
+        tls::client_auth auth        = tls::client_auth::required;
+        bool             client_cert = true;
+        bool             sees        = true;
+    };
+
+    const auto tc = GENERATE(
+        test_case{.name = "TLS 1.3, HTTP/1.1"},
+        test_case{.name = "TLS 1.3, HTTP/2", .http2 = true},
+        test_case{.name = "TLS 1.2, HTTP/1.1", .version = tls::version::tls12},
+        test_case{.name = "TLS 1.2, HTTP/2", .version = tls::version::tls12, .http2 = true},
+        test_case{.name        = "optional, without one",
+                  .auth        = tls::client_auth::optional,
+                  .client_cert = false,
+                  .sees        = false},
+        test_case{.name        = "optional, without one, HTTP/2",
+                  .http2       = true,
+                  .auth        = tls::client_auth::optional,
+                  .client_cert = false,
+                  .sees        = false},
+        test_case{.name = "not asked for", .auth = tls::client_auth::none, .sees = false},
+        test_case{.name = "not asked for, HTTP/2", .http2 = true, .auth = tls::client_auth::none, .sees = false},
+        test_case{.name = "cleartext", .version = tls::version::none, .sees = false},
+        test_case{.name = "cleartext, HTTP/2", .version = tls::version::none, .http2 = true, .sees = false});
+    CAPTURE(tc.name);
+
+    const bool use_tls = tc.version != tls::version::none;
+
+    net::io::scheduler  sched{make_pool()};
+    http::server_config cfg{.header_read_timeout = 5s};
+    if (use_tls) cfg.tls = test::client_auth_server(tc.auth);
+    https_server server{&sched, cfg};
+
+    // the client allows only the version (the server both).
+    auto options = trusting_options();
+    if (use_tls)
+    {
+        options.tls.min_version = tc.version;
+        options.tls.max_version = tc.version;
+    }
+    if (tc.client_cert)
+    {
+        options.tls.certificate_chain = pki().client_chain;
+        options.tls.private_key       = pki().client_key;
+    }
+    options.http2                 = tc.http2;
+    options.http2_prior_knowledge = tc.http2 && !use_tls;
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::string>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        co_return std::format("HTTP/{} {}", resp->version.major, *body);
+    };
+
+    const std::string url =
+        (use_tls ? "https://localhost:" : "http://localhost:") + server.port() + "/peer-certificates";
+    const auto out = sched.run_to_completion(test(&client, url));
+    CHECK(out == std::format("HTTP/{} {}", tc.http2 ? 2 : 1, tc.sees ? "1 " + pki().client_subject : "none"));
+}
+
+TEST_CASE("requests to a server that requires a client certificate fail without one that verifies",
+          "[tls][http][server][client][client_auth]")
+{
+    // over TLS 1.3, the client's handshake is done before the server looks at its certificate, so the request fails
+    // reading its response (HTTP/1.1), or the connection's first read (HTTP/2); over TLS 1.2, connecting does.
+    const auto version     = GENERATE(tls::version::tls13, tls::version::tls12);
+    const bool http2       = GENERATE(false, true);
+    const bool client_cert = GENERATE(false, true); // an expired one
+    CAPTURE(version_name(version), http2, client_cert);
+
+    net::io::scheduler sched{make_pool()};
+    https_server       server{
+        &sched,
+        {.header_read_timeout = 5s, .tls = test::client_auth_server(tls::client_auth::required)}
+    };
+
+    auto options            = trusting_options(version);
+    options.tls.min_version = version;
+    options.http2           = http2;
+    if (client_cert)
+    {
+        options.tls.certificate_chain = pki().expired_client_chain;
+        options.tls.private_key       = pki().expired_client_key;
+    }
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::error_code>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return resp.error();
+
+        auto body = co_await net::io::read_all(*resp->body);
+        co_return body.has_value() ? std::error_code{} : body.error();
+    };
+
+    const auto err = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CAPTURE(err.message());
+
+    const auto alert = test::refusal(client_cert, version);
+    CHECK(err == alert);
+    CHECK(tls::from_peer(err));
 }
 
 TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 shares the connection being made",

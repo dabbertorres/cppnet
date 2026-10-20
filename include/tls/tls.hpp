@@ -18,6 +18,7 @@
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "tls/certificate.hpp"
 #include "tls/version.hpp"
 
 // TLS (with Botan, which stays private: see docs/plans/tls.md). Only built if NET_HAS_TLS is defined.
@@ -47,6 +48,13 @@ struct client_options
     // default. The handshake offers the latest; a server that allows none of them fails it with protocol_version.
     version min_version = version::tls12;
     version max_version = version::tls13;
+
+    // PEM files: a certificate (followed by any intermediate certificates) and its private key, for a server that asks
+    // for one (mutual TLS: see server_options::client_auth). Both, or neither. It's sent only if the server would
+    // accept it: its kind of key among those the server asks for, and (if the server names the certificate authorities
+    // it trusts, as cppnet's does) issued by one of them; otherwise the client sends none, as one without does.
+    std::optional<std::filesystem::path> certificate_chain{};
+    std::optional<std::filesystem::path> private_key{};
 };
 
 class stream;
@@ -81,13 +89,15 @@ namespace detail
 
 }
 
-// client_context holds what a client's connections share: the trusted certificate authorities (loaded once), a cache of
-// sessions (to resume them), and the policy. It's cheap to copy, as copies share it.
+// client_context holds what a client's connections share: the trusted certificate authorities (loaded once), its
+// certificate and key (if any), a cache of sessions (to resume them), and the policy. It's cheap to copy, as copies
+// share it.
 class client_context
 {
 public:
-    // make loads the trusted certificate authorities, failing if trusted_ca_file can't be read, or (with
-    // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none).
+    // make loads the trusted certificate authorities, and the certificate and key, failing if a file can't be read, or
+    // (with std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none), or
+    // if there's a certificate without a key or a key without a certificate, or the key isn't the certificate's.
     static std::expected<client_context, std::error_code> make(const client_options& options = {});
 
 private:
@@ -98,6 +108,18 @@ private:
     explicit client_context(std::shared_ptr<detail::client_state> state) noexcept;
 
     std::shared_ptr<detail::client_state> state;
+};
+
+// client_auth is whether a server asks for clients' certificates (mutual TLS), and whether it requires one: as Go's
+// ClientAuth, but only its modes that verify what's sent.
+enum class client_auth : std::uint8_t
+{
+    // not asked for (Go's NoClientCert).
+    none,
+    // asked for, and one that's sent must verify (VerifyClientCertIfGiven); a client may send none.
+    optional,
+    // one that verifies is required (RequireAndVerifyClientCert).
+    required,
 };
 
 // server_options configures a server_context.
@@ -118,15 +140,31 @@ struct server_options
     // offers none of them fails the handshake with protocol_version.
     version min_version = version::tls12;
     version max_version = version::tls13;
+
+    // Whether to ask clients for their certificates (mutual TLS): see client_auth. A certificate a client sends must
+    // chain to one of client_ca_file's certificate authorities (whose names the server sends, so the client knows which
+    // of its certificates to send), and be for a client (its extended key usage, if any, including clientAuth); one
+    // that doesn't fails the handshake with bad_certificate (with optional too). A client that sends none, where one's
+    // required, fails it with certificate_required (TLS 1.3) or handshake_failure (TLS 1.2). In TLS 1.3, the client's
+    // handshake is done before the server has looked at its certificate: so the client's connect() succeeds, and its
+    // first read fails with the server's alert (in TLS 1.2, its connect() does). The stream's peer_certificates() are
+    // the client's chain, and an HTTP server's handlers see them in server_request::peer_certificates.
+    tls::client_auth client_auth = tls::client_auth::none;
+
+    // PEM: the certificate authorities clients' certificates must chain to. Needed unless client_auth is none (and
+    // refused then): never the system's (as Go's, without ClientCAs), as client certificates are a private CA's, and
+    // trusting every public CA for them would let anyone with a web server's certificate in.
+    std::optional<std::filesystem::path> client_ca_file{};
 };
 
-// server_context holds what a server's connections share: its certificate and key, and the policy. It's cheap to copy,
-// as copies share it.
+// server_context holds what a server's connections share: its certificate and key, the certificate authorities it
+// trusts for clients' certificates (if it asks for them), and the policy. It's cheap to copy, as copies share it.
 class server_context
 {
 public:
-    // make loads the certificate chain and private key, failing if either can't be read, or (with
-    // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none).
+    // make loads the certificate chain and private key (and client_ca_file), failing if one can't be read, or (with
+    // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none), or the
+    // key isn't the certificate's, or there's client_auth without client_ca_file, or client_ca_file without it.
     static std::expected<server_context, std::error_code> make(const server_options& options);
 
 private:
@@ -212,6 +250,13 @@ public:
 
     // version is the protocol version the handshake agreed on.
     [[nodiscard]] tls::version version() const noexcept;
+
+    // peer_certificates is the chain of certificates the peer sent, leaf first: a client's is its server's, and a
+    // server's its client's, if it asked for one and the client sent one (see server_options::client_auth); empty if
+    // none. Each was verified (unless the client's context skips verification), and is what the peer sent, which may
+    // not be the chain verification built (e.g. with the trusted root). Made the first time it's asked for, then
+    // shared, so copies are cheap, and outlive the stream.
+    [[nodiscard]] std::shared_ptr<const std::vector<certificate>> peer_certificates() const;
 
     // release_close_reply answers the peer's close_notify as the stream does by default (undoing accept_options'
     // hold_close_reply): if it was read already, with the next write (or shutdown()), and otherwise as it's read.

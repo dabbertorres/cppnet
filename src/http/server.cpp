@@ -806,6 +806,9 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
     req.tls_version = detail::tls_version(conn);
 
+    // NOTE: made only if the client sent a certificate, which it does only to a server that asks for one.
+    req.peer_certificates = detail::peer_certificates(conn);
+
     // the server's, for the connection's requests (which reuse req).
     req.aborted = aborting.get_token();
 

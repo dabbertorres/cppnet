@@ -261,9 +261,10 @@ protected:
     // maybe_end ends the connection if it's done (holding the lock): called after receiving.
     virtual void maybe_end() {}
 
-    // end ends the connection (holding the lock): its streams fail, the writer finishes (shutting the connection down),
-    // and the reader stops receiving (lingering: see run()).
-    void               end();
+    // end ends the connection (holding the lock): its streams fail (with why: std::errc::connection_aborted, unless
+    // something says more, e.g. a TLS alert the peer sent), the writer finishes (shutting the connection down), and
+    // the reader stops receiving (lingering: see run()).
+    void               end(std::error_code why = std::make_error_code(std::errc::connection_aborted));
     [[nodiscard]] bool ending() const noexcept { return is_ending; }
 
     void wake_timer();
