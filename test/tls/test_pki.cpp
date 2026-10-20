@@ -3,24 +3,31 @@
 // NOTE: before Botan's headers, some of which use <algorithm> without including it (see ports/botan).
 #include <algorithm>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <botan/asn1_obj.h>
 #include <botan/ec_group.h>
 #include <botan/ecdsa.h>
+#include <botan/pk_keys.h>
 #include <botan/pkcs10.h>
 #include <botan/pkcs8.h>
+#include <botan/rsa.h>
 #include <botan/system_rng.h>
 #include <botan/x509_ca.h>
 #include <botan/x509cert.h>
 #include <botan/x509self.h>
 #include <catch2/catch_test_macros.hpp>
+
+#include "tls/tls.hpp"
 
 using namespace std::chrono_literals;
 
@@ -49,9 +56,16 @@ const test_pki& pki()
         out.dir = std::filesystem::temp_directory_path() / ("cppnet-tls-" + std::to_string(std::random_device{}()));
         std::filesystem::create_directories(out.dir);
 
-        const auto make_ca = [&](const std::string& name)
+        // NOTE: RSA's keys are slow to make (more so in a debug build), so only two are.
+        const auto make_key = [&](bool rsa) -> std::unique_ptr<Botan::Private_Key>
         {
-            auto                     key = std::make_unique<Botan::ECDSA_PrivateKey>(rng, group);
+            if (rsa) return std::make_unique<Botan::RSA_PrivateKey>(rng, 2048);
+            return std::make_unique<Botan::ECDSA_PrivateKey>(rng, group);
+        };
+
+        const auto make_ca = [&](const std::string& name, bool rsa = false)
+        {
+            auto                     key = make_key(rsa);
             Botan::X509_Cert_Options opts;
             opts.common_name = name;
             opts.CA_key();
@@ -59,20 +73,22 @@ const test_pki& pki()
             return std::pair{cert, std::move(key)};
         };
 
-        // issue writes a certificate for dns (and ip, if any), from ca, and its key.
+        // issue writes a certificate for dns (and ip, if any), from ca, and its key (an RSA key if rsa, or else
+        // ECDSA's).
         const auto issue = [&](const auto&                  ca,
                                const std::string&           dns,
                                const std::string&           ip,
                                const std::filesystem::path& chain,
-                               const std::filesystem::path& key_path)
+                               const std::filesystem::path& key_path,
+                               bool                         rsa = false)
         {
-            const Botan::ECDSA_PrivateKey key{rng, group};
-            Botan::X509_Cert_Options      opts;
+            const auto               key = make_key(rsa);
+            Botan::X509_Cert_Options opts;
             opts.common_name = dns;
             opts.dns         = dns;
             opts.ip          = ip;
 
-            const auto           request = Botan::X509::create_cert_req(opts, key, "SHA-256", rng);
+            const auto           request = Botan::X509::create_cert_req(opts, *key, "SHA-256", rng);
             const Botan::X509_CA authority{ca.first, *ca.second, "SHA-256", rng};
 
             const auto now = std::chrono::system_clock::now();
@@ -80,23 +96,27 @@ const test_pki& pki()
                 authority.sign_request(request, rng, Botan::X509_Time{now - 1h}, Botan::X509_Time{now + 24h});
 
             write_file(chain, cert.PEM_encode());
-            write_file(key_path, Botan::PKCS8::PEM_encode(key));
+            write_file(key_path, Botan::PKCS8::PEM_encode(*key));
         };
 
-        const auto trusted   = make_ca("cppnet test CA");
-        const auto untrusted = make_ca("cppnet untrusted CA");
+        const auto trusted     = make_ca("cppnet test CA");
+        const auto trusted_rsa = make_ca("cppnet test RSA CA", true);
+        const auto untrusted   = make_ca("cppnet untrusted CA");
 
         out.ca = out.dir / "ca.pem";
-        write_file(out.ca, trusted.first.PEM_encode());
+        write_file(out.ca, trusted.first.PEM_encode() + trusted_rsa.first.PEM_encode());
 
-        out.localhost_chain  = out.dir / "localhost.pem";
-        out.localhost_key    = out.dir / "localhost.key";
-        out.other_name_chain = out.dir / "other.pem";
-        out.other_name_key   = out.dir / "other.key";
-        out.untrusted_chain  = out.dir / "untrusted.pem";
-        out.untrusted_key    = out.dir / "untrusted.key";
+        out.localhost_chain     = out.dir / "localhost.pem";
+        out.localhost_key       = out.dir / "localhost.key";
+        out.rsa_localhost_chain = out.dir / "rsa-localhost.pem";
+        out.rsa_localhost_key   = out.dir / "rsa-localhost.key";
+        out.other_name_chain    = out.dir / "other.pem";
+        out.other_name_key      = out.dir / "other.key";
+        out.untrusted_chain     = out.dir / "untrusted.pem";
+        out.untrusted_key       = out.dir / "untrusted.key";
 
         issue(trusted, "localhost", "127.0.0.1", out.localhost_chain, out.localhost_key);
+        issue(trusted_rsa, "localhost", "127.0.0.1", out.rsa_localhost_chain, out.rsa_localhost_key, true);
         issue(trusted, "other.example", "", out.other_name_chain, out.other_name_key);
         issue(untrusted, "localhost", "127.0.0.1", out.untrusted_chain, out.untrusted_key);
         return out;

@@ -45,6 +45,69 @@ vcpkg_list(SET configure_arguments
 )
 vcpkg_list(SET pkgconfig_requires)
 
+# cppnet: only the modules cppnet uses (with their dependencies, which configure.py adds), rather than all of Botan:
+# about half its sources. See docs/plans/tls.md ("Trimming Botan"). cppnet's TLS policy offers only these (whichever
+# Botan it's built against), so a missing one fails its tests (test/tls/stream.cpp's handshakes per group, cipher suite
+# and kind of certificate) rather than a handshake in the field. Botan looks some algorithms up by name when they run
+# (e.g. a signature's padding or hash), which configure.py can't see, so those are named here too.
+vcpkg_list(SET cppnet_modules
+    # TLS 1.2 and 1.3, and 1.3's hybrid post-quantum key exchange (X25519MLKEM768, and Botan's P-256 and P-384 hybrids).
+    tls12
+    tls13
+    tls13_pqc
+    # The key exchange groups: Go's (X25519, P-256, P-384, P-521, and ML-KEM for the hybrids). Botan's TLS needs its
+    # finite field Diffie-Hellman (dh) too, which it adds, but cppnet's policy doesn't offer it.
+    x25519
+    ecdh
+    ml_kem
+    pcurves_secp256r1
+    pcurves_secp384r1
+    pcurves_secp521r1
+    # Certificates: X.509 (path validation; and X509_CA and PKCS #10, which the tests make theirs with), PEM, and ECDSA
+    # and RSA keys and signatures (ECDSA's nonces as RFC 6979 hedges them; RSA's PKCS #1 v1.5 and PSS signatures, and
+    # PKCS #1 v1.5 encryption, which TLS 1.2 needs).
+    x509
+    pem
+    ecdsa
+    rfc6979
+    rsa
+    emsa_pkcs1
+    emsa_pssr
+    eme_pkcs1
+    # The system's trust store: the keychain on Apple's platforms (skipped elsewhere), or a bundle of certificates (e.g.
+    # Linux's, which configure.py finds).
+    certstor_system
+    certstor_system_macos
+    certstor_flatfile
+    # The ciphers (TLS's AEADs: AES-GCM and ChaCha20-Poly1305), hashes and key derivation.
+    aes
+    gcm
+    chacha20poly1305
+    sha2_32
+    sha2_64
+    hmac
+    hkdf
+    prf_tls
+    # The RNG: the operating system's.
+    system_rng
+    # The CPUs' versions of the above (AES-NI, CLMUL, SHA extensions, AVX2, AVX-512, ARMv8's, ...): configure.py skips
+    # those for other CPUs.
+    aes_*
+    ghash_*
+    ctr_*
+    chacha_*
+    poly1305_*
+    sha1_*
+    sha2_32_*
+    sha2_64_*
+    keccak_perm_*
+)
+list(JOIN cppnet_modules "," cppnet_modules)
+vcpkg_list(APPEND configure_arguments --minimized-build "--enable-modules=${cppnet_modules}")
+
+# cppnet: chacha_* also names ChaCha's RNG, which isn't a CPU's version (and isn't used).
+vcpkg_list(SET cppnet_disabled_modules chacha_rng)
+
 if("amalgamation" IN_LIST FEATURES)
     vcpkg_list(APPEND configure_arguments --amalgamation)
 endif()
@@ -88,10 +151,13 @@ if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
 
     vcpkg_list(APPEND configure_arguments "--extra-cxxflags=${VCPKG_DETECTED_CMAKE_CXX_FLAGS}")
 
+    # cppnet: only the library, not Botan's command-line tool.
+    list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
+    vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
     if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
-        vcpkg_list(APPEND configure_arguments --enable-shared-library --disable-static-library)
+        vcpkg_list(APPEND configure_arguments --build-targets=shared)
     else()
-        vcpkg_list(APPEND configure_arguments --disable-shared-library --enable-static-library)
+        vcpkg_list(APPEND configure_arguments --build-targets=static)
     endif()
 
     if(VCPKG_CRT_LINKAGE STREQUAL "dynamic")
@@ -127,7 +193,6 @@ if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
         OPTIONS_DEBUG
             "ZLIB_LIBS=${ZLIB_LIBS_DEBUG}"
     )
-    vcpkg_copy_tools(TOOL_NAMES botan-cli AUTO_CLEAN)
     vcpkg_copy_pdbs()
 else()
     if(VCPKG_TARGET_IS_ANDROID)
@@ -148,23 +213,25 @@ else()
         #   store reads /etc/ssl/cert.pem (Apple's bundle of the system's roots) instead, which configure.py finds.
         # - on Apple Silicon, the ARMv8 SM3 code (which TLS doesn't use), as GCC writes SM3's instructions (e.g.
         #   "sm3tt1a v30.4s, v29.4s, v31.4s[0]") in a form Apple's assembler rejects.
+        #   (No longer loaded anyway, as the build is minimized; still disabled, should it ever be.)
         if(VCPKG_TARGET_IS_OSX)
-            set(cppnet_disabled_modules certstor_system_macos)
+            vcpkg_list(APPEND cppnet_disabled_modules certstor_system_macos)
             if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
-                list(APPEND cppnet_disabled_modules sm3_armv8)
+                vcpkg_list(APPEND cppnet_disabled_modules sm3_armv8)
             endif()
-
-            list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
-            vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
         endif()
     elseif(VCPKG_DETECTED_CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         vcpkg_list(APPEND configure_arguments --cc=clang)
     endif()
 
+    list(JOIN cppnet_disabled_modules "," cppnet_disabled_modules)
+    vcpkg_list(APPEND configure_arguments "--disable-modules=${cppnet_disabled_modules}")
+
+    # cppnet: only the library, not Botan's command-line tool (which cppnet doesn't use).
     if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
-        vcpkg_list(APPEND configure_arguments --build-targets=shared,cli)
+        vcpkg_list(APPEND configure_arguments --build-targets=shared)
     else()
-        vcpkg_list(APPEND configure_arguments --build-targets=static,cli)
+        vcpkg_list(APPEND configure_arguments --build-targets=static)
     endif()
 
     # botan's install.py doesn't handle DESTDIR on windows host,
@@ -190,9 +257,6 @@ else()
             "ZLIB_LIBS_RELEASE=${ZLIB_LIBS_RELEASE}"
             "ZLIB_LIBS_DEBUG=${ZLIB_LIBS_DEBUG}"
     )
-    if(NOT VCPKG_TARGET_IS_EMSCRIPTEN)
-        vcpkg_copy_tools(TOOL_NAMES botan AUTO_CLEAN)
-    endif()
 endif()
 
 vcpkg_cmake_config_fixup()

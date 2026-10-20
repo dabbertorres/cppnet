@@ -3,7 +3,9 @@
 Status: stages 1 to 3 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`;
 `https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`); and HTTPS in `http::server`
 (`server_config::tls`, `test/tls/server.cpp`). Stage 4 decided (2026-10-20): client certificates, session tickets
-for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) all as recommended.
+for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) all as recommended. Its first part, a
+trimmed Botan, is done (2026-10-20): `ports/botan/portfile.cmake`, the policy in `src/tls/tls.cpp`, and
+`test/tls/stream.cpp`'s handshakes per group, cipher suite and kind of certificate (see "Learned in stage 4").
 
 ## Goal
 
@@ -536,6 +538,55 @@ on every CI toolchain; and one handshake per group the policy lists, between cpp
 offer limited to that group (an internal policy hook), so a group whose module is missing fails a test rather than a
 handshake in the field. The network tests (public servers) exercise interoperability as now.
 
+## Learned in stage 4
+
+### A trimmed Botan (part 1)
+
+- **The module list** is in `ports/botan/portfile.cmake` (`cppnet_modules`, a comment per group), as planned, with
+  three more than the plan named. `rfc6979`: Botan's ECDSA derives its nonces as RFC 6979 does (hedged with the RNG) only
+  when that module is built, and otherwise takes them from the RNG alone, so without it a server's ECDSA signatures
+  would depend on the RNG more than a whole Botan's do. `ctr_*`: GCM runs AES in CTR mode, whose AVX2 and SIMD versions
+  are CPU-specific modules like the others. And `certstor_flatfile` everywhere (on Apple's platforms with Clang too,
+  where the keychain is used instead), as GCC on macOS needs it; `certstor_system_macos` is named everywhere too, and
+  `configure.py` skips it on other systems (as it skips other CPUs' modules), so the list has no conditions. `chacha_*`
+  also names ChaCha's RNG, which isn't a CPU's version: it's disabled (`--disable-modules`, which wins over
+  `--enable-modules`, as the GCC-on-macOS exclusions already relied on).
+- **What comes along** (with dependencies, as `configure.py` resolves them): `tls` requires `dh`, so finite field
+  Diffie-Hellman is still built, though the policy no longer offers it; `x509` requires `sha1` (key identifiers, OCSP);
+  `rfc6979` brings `hmac_drbg`; `ml_kem` brings SHA-3 and SHAKE. 257 sources are built (x86-64 macOS, Clang).
+- **Left out, as not used** (each loaded by a whole build): `thread_utils`, so Botan's RSA private key operations run
+  on the calling thread rather than splitting across Botan's own thread pool (only a server with an RSA key does them;
+  cppnet's tasks shouldn't block anyway); `locking_allocator`, so Botan's secure memory is zeroed when freed but not
+  `mlock()`ed (as Go's and OpenSSL's defaults); `auto_rng`, `entropy` and the CPUs' RNGs, as cppnet gives Botan
+  `System_RNG`; `http_util`, so no online OCSP checks (cppnet never asked for them); `pbes2`, so an encrypted PKCS #8
+  key can't be read (it couldn't before either: `server_options` takes no passphrase); and Ed25519/Ed448, which Botan's
+  default policy doesn't allow for certificates anyway.
+- **The policy** (`src/tls/tls.cpp`) offers the groups decided (X25519, P-256, the three ML-KEM hybrids, P-384, P-521,
+  in Botan's order), of those the Botan it's built against has (`Group_Params::is_available()`), and only ECDH as TLS
+  1.2's key exchange (no DHE suites). Unchanged: Botan's ciphers (already only AES-GCM and ChaCha20-Poly1305), its
+  signature methods and hashes, and its client's offer of a key share for X25519 only (the hybrids listed, so a server
+  that prefers one asks for it with a HelloRetryRequest). Against servers that speak only DHE (e.g. `dh2048.badssl.com`)
+  handshakes now fail, as Go's do.
+- **The tests** narrow what the client offers through an internal hook, `tls::detail::make_client_context(options,
+  policy_limits)` (groups and cipher suites by IANA code point; each narrows the policy's, so one the policy doesn't
+  offer leaves nothing, and fails too, as checked by hand with X448, brainpool, FFDHE and TLS_AES_128_CCM_SHA256).
+  `test/tls/stream.cpp` has a handshake per group over TLS 1.3 (the seven) and 1.2 (the four that aren't hybrids), per
+  cipher suite (TLS 1.3's three, and TLS 1.2's three for each of ECDSA and RSA), and with an RSA certificate over TLS 1.3;
+  `test/tls/test_pki.hpp` gained an RSA CA (trusted, in `ca.pem` beside the ECDSA one) and an RSA certificate for
+  localhost (2048 bits; made in well under a second, even in a debug build). A network test has `cloudflare.com` and
+  `www.google.com` agree on X25519MLKEM768 alone, against other implementations than Botan's. By hand (not kept, as
+  public servers change): 12 public servers and badssl.com's variants (RSA 2048 and 4096, ECDSA P-256 and P-384,
+  SHA-256 chains, TLS 1.2 only) handshake; those that fail fail as a whole Botan would (expired certificates, a chain
+  whose SHA-1 intermediate isn't sent) or are DHE-only; every group was agreed on by some server (P-256 with ML-KEM by Amazon's; P-384
+  with ML-KEM-1024 by none, so only the local test covers it).
+- **Measured** (this machine, Homebrew Clang 23, x86-64, the port's own builds as vcpkg ran them): Botan's debug build
+  1m46s and release build 2m11s, 4.4 minutes for the whole install (with its download, patches and configures), where
+  the plan measured 3m45s and 4m25s with GCC 14 for the whole library and the tool; the libraries are 8.8 MB (release)
+  and 183 MB (debug), from 17 MB and 317 MB as Clang built them whole. No `tools/botan` is installed.
+- vcpkg's ABI hash covers the portfile, so every cache (CI's too) builds Botan again once. CI's GCC, Linux, arm64 and
+  libstdc++ builds are the check of the list on other CPUs, compilers and trust stores; `configure.py` was run by hand
+  for macOS and Linux on x86-64 and arm64 (with `--disable-cc-tests`), loading the same modules but the CPUs'.
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`
@@ -548,7 +599,7 @@ handshake in the field. The network tests (public servers) exercise interoperabi
 3. **TLS in `http::server`**: `server_config`'s options, the handshake in `serve_connection`, and tests (the client from
    stage 2 talking to it).
 4. **Decided (2026-10-20), in three pull requests, in this order** (see "Stage 4"):
-   1. **A trimmed Botan.** The overlay port configures `--minimized-build` with the modules cppnet uses (Decided
+   1. **A trimmed Botan. Done (2026-10-20).** The overlay port configures `--minimized-build` with the modules cppnet uses (Decided
       questions 11 and 12), and stops building Botan's command-line tool; the policy offers only what's built (the
       key exchange groups, Go's set), so cppnet behaves the same over a whole Botan (e.g. a project's own vcpkg's).
       First, as it's independent, and halves the dependency's build for every CI run after it (once its cache is

@@ -50,6 +50,7 @@ struct client_options
 };
 
 class stream;
+class client_context;
 
 namespace detail
 {
@@ -57,6 +58,21 @@ namespace detail
     struct client_state;
     struct server_state;
     struct connection;
+
+    // policy_limits narrows what a client offers, for tests: e.g. one key exchange group, so that a handshake per group
+    // shows it's built (as Botan's build may leave a module out, which only a handshake that uses it finds). Each is by
+    // its code point in IANA's TLS registries, and limits the policy's to those it lists (empty: no limit).
+    struct policy_limits
+    {
+        // TLS Supported Groups (e.g. 29 for X25519, 0x11EC for X25519MLKEM768).
+        std::vector<std::uint16_t> groups{};
+        // TLS Cipher Suites (e.g. 0x1301 for TLS_AES_128_GCM_SHA256).
+        std::vector<std::uint16_t> cipher_suites{};
+    };
+
+    // make_client_context is client_context::make(), with what the client offers narrowed to limits.
+    std::expected<client_context, std::error_code> make_client_context(const client_options& options,
+                                                                       const policy_limits&  limits);
 
     // idle_clean is whether s holds nothing that a read hasn't taken: no data decrypted and unread, nor part of a
     // record; and neither the peer's close_notify nor a failure. For a pool of idle connections (whose sockets it
@@ -76,6 +92,8 @@ public:
 
 private:
     friend class stream;
+    friend std::expected<client_context, std::error_code>
+    detail::make_client_context(const client_options& options, const detail::policy_limits& limits);
 
     explicit client_context(std::shared_ptr<detail::client_state> state) noexcept;
 

@@ -30,8 +30,10 @@
 #include <botan/rng.h>
 #include <botan/system_rng.h>
 #include <botan/tls_alert.h>
+#include <botan/tls_algos.h>
 #include <botan/tls_callbacks.h>
 #include <botan/tls_channel.h>
+#include <botan/tls_ciphersuite.h>
 #include <botan/tls_client.h>
 #include <botan/tls_exceptn.h>
 #include <botan/tls_policy.h>
@@ -177,6 +179,21 @@ load_certificates(const std::filesystem::path& path)
     return certs;
 }
 
+// groups are the key exchange groups the policy offers: Go's (X25519, P-256, P-384 and P-521), and the hybrid
+// post-quantum ones Botan has (X25519MLKEM768, which Go and browsers offer, and P-256's and P-384's with ML-KEM), in
+// Botan's order of preference. Botan's default policy also offers X448 and the brainpool curves, which cppnet's Botan
+// isn't built with (see ports/botan), and finite field Diffie-Hellman, which Go doesn't offer either: so they're left
+// out whichever Botan cppnet's built against.
+constexpr std::array groups{
+    Botan::TLS::Group_Params_Code::X25519,
+    Botan::TLS::Group_Params_Code::SECP256R1,
+    Botan::TLS::Group_Params_Code::HYBRID_X25519_ML_KEM_768,
+    Botan::TLS::Group_Params_Code::HYBRID_SECP256R1_ML_KEM_768,
+    Botan::TLS::Group_Params_Code::HYBRID_SECP384R1_ML_KEM_1024,
+    Botan::TLS::Group_Params_Code::SECP384R1,
+    Botan::TLS::Group_Params_Code::SECP521R1,
+};
+
 // policy is Botan's default TLS policy, except that it doesn't require revocation information (OCSP or CRLs) for the
 // peer's certificates: many servers have none to give (e.g. Let's Encrypt's, which stopped OCSP in 2025), and neither
 // browsers, Go, nor OpenSSL require it by default.
@@ -187,13 +204,21 @@ load_certificates(const std::filesystem::path& path)
 // It allows the TLS versions from min to max. (Botan's TLS channels follow allow_tls12() and allow_tls13(): a client
 // offers the latest allowed, and a server agrees on the latest the client offers that it allows, or fails the handshake
 // with protocol_version. DTLS isn't used.)
+//
+// It offers only the key exchange groups above (those of them the Botan it's built against has), and so only ECDHE in
+// TLS 1.2, not finite field DHE. Botan's default ciphers are already only AEADs (AES-GCM and ChaCha20-Poly1305), and
+// its signatures only ECDSA and RSA, with SHA-256 to SHA-512.
 class policy final : public Botan::TLS::Policy
 {
 public:
-    policy(bool require_ems, net::tls::version min, net::tls::version max) noexcept
+    policy(bool                            require_ems,
+           net::tls::version               min,
+           net::tls::version               max,
+           net::tls::detail::policy_limits limits = {}) noexcept
         : require_ems{require_ems}
         , min{min}
         , max{max}
+        , limits{std::move(limits)}
     {}
 
     [[nodiscard]] bool require_cert_revocation_info() const override { return false; }
@@ -202,12 +227,37 @@ public:
     [[nodiscard]] bool allow_tls12() const override { return allows(net::tls::version::tls12); }
     [[nodiscard]] bool allow_tls13() const override { return allows(net::tls::version::tls13); }
 
+    [[nodiscard]] std::vector<Botan::TLS::Group_Params> key_exchange_groups() const override
+    {
+        std::vector<Botan::TLS::Group_Params> out;
+        for (const Botan::TLS::Group_Params group : groups)
+        {
+            if (group.is_available() && within(limits.groups, group.wire_code())) out.push_back(group);
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::vector<std::string> allowed_key_exchange_methods() const override { return {"ECDH"}; }
+
+    [[nodiscard]] bool acceptable_ciphersuite(const Botan::TLS::Ciphersuite& suite) const override
+    {
+        return Botan::TLS::Policy::acceptable_ciphersuite(suite)
+            && within(limits.cipher_suites, suite.ciphersuite_code());
+    }
+
 private:
     [[nodiscard]] bool allows(net::tls::version v) const noexcept { return min <= v && v <= max; }
 
-    bool              require_ems;
-    net::tls::version min;
-    net::tls::version max;
+    // within is whether code is among limit's, if it has any.
+    [[nodiscard]] static bool within(const std::vector<std::uint16_t>& limit, std::uint16_t code) noexcept
+    {
+        return limit.empty() || std::ranges::contains(limit, code);
+    }
+
+    bool                            require_ems;
+    net::tls::version               min;
+    net::tls::version               max;
+    net::tls::detail::policy_limits limits;
 };
 
 // valid_versions is whether min to max are versions there are, in order.
@@ -789,6 +839,12 @@ client_context::client_context(std::shared_ptr<detail::client_state> state) noex
 
 std::expected<client_context, std::error_code> client_context::make(const client_options& options)
 {
+    return detail::make_client_context(options, {});
+}
+
+std::expected<client_context, std::error_code> detail::make_client_context(const client_options& options,
+                                                                           const policy_limits&  limits)
+{
     if (!valid_versions(options.min_version, options.max_version))
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
@@ -816,7 +872,8 @@ std::expected<client_context, std::error_code> client_context::make(const client
             .sessions          = std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng),
             .policy            = std::make_shared<policy>(options.require_extended_master_secret,
                                                           options.min_version,
-                                                          options.max_version),
+                                                          options.max_version,
+                                                          limits),
             .skip_verification = options.insecure_skip_verification,
             .alpn              = options.alpn,
         });

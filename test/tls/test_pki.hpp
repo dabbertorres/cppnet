@@ -16,12 +16,16 @@ struct test_pki
 {
     std::filesystem::path dir;
 
-    // the CA the tests trust.
+    // the CAs the tests trust: one with an ECDSA key, and one with an RSA key.
     std::filesystem::path ca;
 
-    // a certificate (and key) for localhost and 127.0.0.1, from the CA.
+    // a certificate (and key) for localhost and 127.0.0.1, from the ECDSA CA: its key is ECDSA's, on P-256.
     std::filesystem::path localhost_chain;
     std::filesystem::path localhost_key;
+
+    // the same, with an RSA key (2048 bits), from the RSA CA.
+    std::filesystem::path rsa_localhost_chain;
+    std::filesystem::path rsa_localhost_key;
 
     // one for another name, from the CA.
     std::filesystem::path other_name_chain;

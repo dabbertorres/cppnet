@@ -45,8 +45,8 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug       # the tests
 ```
 
-The first configure builds the dependencies, which takes a while (Botan, for TLS, is most of it: several minutes);
-vcpkg caches them afterwards. To build without TLS (and Botan), add `-DNET_TLS=OFF`.
+The first configure builds the dependencies, which takes a while (Botan, for TLS, is most of it: a few minutes, for
+the parts of it cppnet uses); vcpkg caches them afterwards. To build without TLS (and Botan), add `-DNET_TLS=OFF`.
 
 The `-clang` and `-gcc` presets use the `clang` or `gcc` first on your `PATH`: on macOS, that's Apple's Clang, unless
 Homebrew's LLVM (`brew install llvm`) is first, as CI uses. The presets (in `CMakePresets.json`) write to `build/`,
@@ -84,7 +84,8 @@ target_link_libraries(app PRIVATE net::net)
 ```
 
 cppnet's tests and examples aren't built then. If your project has its own `vcpkg.json`, add cppnet's dependencies to
-it (see cppnet's `vcpkg.json`, and its overlay port for Botan in `ports/`).
+it (see cppnet's `vcpkg.json`, and its overlay port for Botan in `ports/`, which builds only the parts of Botan cppnet
+uses; vcpkg's own port, all of Botan, works too).
 
 ## License
 

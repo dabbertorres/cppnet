@@ -631,6 +631,104 @@ TEST_CASE("contexts refuse no TLS version as a minimum or maximum", "[tls][versi
     CHECK(server.error() == std::errc::invalid_argument);
 }
 
+TEST_CASE("handshakes work with every key exchange group and cipher suite offered and either kind of certificate",
+          "[tls][policy]")
+{
+    // The client offers one group (or cipher suite) of the policy's, so the handshake uses it: one that Botan's build
+    // left out fails here, rather than a handshake in the field (see ports/botan). A group or suite the policy doesn't
+    // offer fails too, as narrowing the policy to it leaves nothing.
+    struct test_case
+    {
+        std::string_view           name{};
+        tls::version               version = tls::version::tls13;
+        std::vector<std::uint16_t> groups{};
+        std::vector<std::uint16_t> cipher_suites{};
+        bool                       rsa = false;
+    };
+
+    const auto tc = GENERATE(
+        // TLS 1.3's groups (IANA's TLS Supported Groups).
+        test_case{.name = "X25519", .groups = {29}},
+        test_case{.name = "P-256", .groups = {23}},
+        test_case{.name = "P-384", .groups = {24}},
+        test_case{.name = "P-521", .groups = {25}},
+        test_case{.name = "X25519MLKEM768", .groups = {0x11EC}},
+        test_case{.name = "SecP256r1MLKEM768", .groups = {0x11EB}},
+        test_case{.name = "SecP384r1MLKEM1024", .groups = {0x11ED}},
+        // TLS 1.2's (ECDHE: the hybrids are TLS 1.3's only).
+        test_case{.name = "X25519 (TLS 1.2)", .version = tls::version::tls12, .groups = {29}},
+        test_case{.name = "P-256 (TLS 1.2)", .version = tls::version::tls12, .groups = {23}},
+        test_case{.name = "P-384 (TLS 1.2)", .version = tls::version::tls12, .groups = {24}},
+        test_case{.name = "P-521 (TLS 1.2)", .version = tls::version::tls12, .groups = {25}},
+        // TLS 1.3's cipher suites (IANA's TLS Cipher Suites).
+        test_case{.name = "TLS_AES_128_GCM_SHA256", .cipher_suites = {0x1301}},
+        test_case{.name = "TLS_AES_256_GCM_SHA384", .cipher_suites = {0x1302}},
+        test_case{.name = "TLS_CHACHA20_POLY1305_SHA256", .cipher_suites = {0x1303}},
+        // TLS 1.2's, with the ECDSA certificate.
+        test_case{.name          = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xC02B}},
+        test_case{.name          = "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xC02C}},
+        test_case{.name          = "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xCCA9}},
+        // an RSA certificate (from an RSA CA): TLS 1.3's signatures are RSA-PSS; and TLS 1.2's suites for it.
+        test_case{.name = "RSA certificate", .rsa = true},
+        test_case{.name          = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xC02F},
+                  .rsa           = true},
+        test_case{.name          = "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xC030},
+                  .rsa           = true},
+        test_case{.name          = "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                  .version       = tls::version::tls12,
+                  .cipher_suites = {0xCCA8},
+                  .rsa           = true});
+    CAPTURE(tc.name);
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    const auto server_ctx = tc.rsa ? server_with(pki().rsa_localhost_chain, pki().rsa_localhost_key)
+                                   : server_with(pki().localhost_chain, pki().localhost_key);
+    REQUIRE(sched.spawn(serve_once(&listener, server_ctx, echo)));
+
+    auto client_ctx = tls::detail::make_client_context(
+        {.trusted_ca_file = pki().ca, .min_version = tc.version, .max_version = tc.version},
+        {.groups = tc.groups, .cipher_suites = tc.cipher_suites});
+    REQUIRE(client_ctx.has_value());
+
+    // the client says hello, which the server echoes, and the version agreed on.
+    const auto client = [](net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx) -> task<std::string>
+    {
+        auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value()) co_return "handshake: " + s.error().message();
+
+        if (auto res = co_await net::io::write_all(*s, "hello"sv); res.err) co_return "write: " + res.err.message();
+
+        std::string               echoed;
+        std::array<std::byte, 16> buf{};
+        while (echoed.size() < 5)
+        {
+            auto res = co_await s->read(buf);
+            echoed += as_string(std::span{buf}.first(res.count));
+            if (res.err) co_return "read: " + res.err.message();
+        }
+
+        echoed += s->version() == tls::version::tls12 ? " over TLS 1.2" : " over TLS 1.3";
+        co_await s->close();
+        co_return echoed;
+    };
+
+    const auto expected = tc.version == tls::version::tls12 ? "hello over TLS 1.2"sv : "hello over TLS 1.3"sv;
+    CHECK(sched.run_to_completion(client(&sched, listener.local_port(), *client_ctx)) == expected);
+}
+
 TEST_CASE("a client needs the server's name to verify its certificate", "[tls][verification]")
 {
     net::io::scheduler sched{make_pool()};
@@ -1168,4 +1266,31 @@ TEST_CASE("the system's trust store verifies a public server", "[tls][.network]"
     const std::string_view expected =
         require_ems && host == "badssl.com" ? "handshake: handshake_failure (sent to the peer)" : "ok";
     CHECK(sched.run_to_completion(client(&sched, host, require_ems)) == expected);
+}
+
+TEST_CASE("public servers agree on the hybrid post-quantum key exchange", "[tls][policy][.network]")
+{
+    // X25519MLKEM768 against other implementations than Botan's (Cloudflare's and Google's offer it by default): the
+    // client offers only it, so the handshake uses it.
+    const std::string host = GENERATE("cloudflare.com", "www.google.com");
+    CAPTURE(host);
+
+    net::io::scheduler sched{make_pool()};
+
+    const auto client = [](net::io::scheduler* sched, std::string host) -> task<std::string>
+    {
+        auto ctx = tls::detail::make_client_context({.min_version = tls::version::tls13}, {.groups = {0x11EC}});
+        if (!ctx.has_value()) co_return "context: " + ctx.error().message();
+
+        auto conn = co_await net::tcp_socket::connect(sched, host, "443");
+        if (!conn.has_value()) co_return "connect: " + conn.error().message();
+
+        auto s = co_await tls::stream::connect(std::move(*conn), *ctx, host, net::io::clock::now() + 10s);
+        if (!s.has_value()) co_return "handshake: " + s.error().message();
+
+        co_await s->close();
+        co_return "ok";
+    };
+
+    CHECK(sched.run_to_completion(client(&sched, host)) == "ok");
 }
