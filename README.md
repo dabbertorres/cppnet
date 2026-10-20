@@ -42,7 +42,7 @@ git clone --recurse-submodules https://github.com/dabbertorres/cppnet.git   # or
 cd cppnet
 cmake --preset dev-clang              # or dev-gcc
 cmake --build build --config Debug
-ctest --test-dir build -C Debug       # the tests (some need the network)
+ctest --test-dir build -C Debug       # the tests
 ```
 
 The first configure builds the dependencies, which takes a while (Botan, for TLS, is most of it: several minutes);
@@ -60,7 +60,10 @@ with Ninja Multi-Config, so binaries land in per-configuration directories: e.g.
 | `lib-clang`, `lib-gcc`, `lib` | only the library                                                             |
 
 `./build/test/Debug/tests "[http]"` runs the tests tagged `[http]` (Catch2's filters), and `ctest -LE fuzz` skips the
-fuzz targets' short runs.
+fuzz targets' short runs. The tests that need the network (and public hosts, e.g. for DNS lookups and TLS handshakes)
+are hidden: they run only when asked for, as `./build/test/Debug/tests "[network]"` does, or with ctest if configured
+with `-DNET_NETWORK_TESTS=ON` (as CI is; `ctest -L network` runs only them). A filter naming another of their tags runs
+them too: `"[dns]~[network]"` leaves them out.
 
 ## Using it in your project
 

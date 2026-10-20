@@ -77,7 +77,7 @@ TEST_CASE("connecting to a port nothing listens on is refused", "[tcp][connect]"
     CHECK(sched.run_to_completion(connect_error(&sched, "127.0.0.1", port, 5s)) == std::errc::connection_refused);
 }
 
-TEST_CASE("connecting to an unknown host fails to resolve", "[tcp][connect][network]")
+TEST_CASE("connecting to an unknown host fails to resolve", "[tcp][connect][.network]")
 {
     net::io::scheduler sched{make_pool()};
 

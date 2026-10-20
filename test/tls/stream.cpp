@@ -1139,7 +1139,7 @@ TEST_CASE("a write canceled by the stream's stop token fails the writes after it
     CHECK(later.err == std::errc::operation_canceled);
 }
 
-TEST_CASE("the system's trust store verifies a public server", "[tls][network]")
+TEST_CASE("the system's trust store verifies a public server", "[tls][.network]")
 {
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be
     //       required. badssl.com speaks TLS 1.2 without the Extended Master Secret extension, which mustn't be either,

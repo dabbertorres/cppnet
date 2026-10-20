@@ -113,13 +113,14 @@ jobs:
         key: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-${{ github.sha }}
         restore-keys: ccache-${{ matrix.os }}-${{ steps.cache.outputs.compiler }}${{ matrix.variant != 'default' && format('-{0}', matrix.variant) || '' }}-
 
-    # The variants only build what they check: the tests (no examples, benchmarks or fuzz targets).
+    # The variants only build what they check: the tests (no examples, benchmarks or fuzz targets). Every job runs the
+    # tests that need the network too (NET_NETWORK_TESTS: off by default).
     - name: Configure CMake
       run: |
         set -- -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug \
           -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-          -DBUILD_TESTING=ON
+          -DBUILD_TESTING=ON -DNET_NETWORK_TESTS=ON
         case "${{ matrix.variant }}" in
           default) set -- "$@" -DBUILD_EXAMPLE=ON ;;
           *)       set -- "$@" -DBUILD_EXAMPLE=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_FUZZING=OFF ;;

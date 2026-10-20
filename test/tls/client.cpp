@@ -295,7 +295,7 @@ TEST_CASE("a request canceled during its TLS handshake fails, and counts its con
     CHECK(client.stats() == net::http::connection_stats{});
 }
 
-TEST_CASE("https requests to a public server", "[tls][http][client][network]")
+TEST_CASE("https requests to a public server", "[tls][http][client][.network]")
 {
     net::io::scheduler sched{make_pool()};
     net::http::client  client{&sched};

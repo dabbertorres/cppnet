@@ -25,3 +25,8 @@ endif()
 
 include(Catch)
 catch_discover_tests(tests)
+
+# Catch2 lists hidden tests only for a spec that names them: the network's (see NET_NETWORK_TESTS).
+if(NET_NETWORK_TESTS)
+  catch_discover_tests(tests TEST_SPEC "[network]" PROPERTIES LABELS network)
+endif()

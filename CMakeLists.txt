@@ -68,6 +68,11 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   return()
 endif()
 
+# The tests that need the network (and public hosts) are hidden from Catch2 (tagged [.network]), so
+# they run only when asked for (e.g. `tests "[network]"`): ON registers them with ctest too,
+# labelled network.
+option(NET_NETWORK_TESTS "Run the tests that need the network with ctest" OFF)
+
 if(BUILD_TESTING)
   include(CTest)
   add_subdirectory("test/")

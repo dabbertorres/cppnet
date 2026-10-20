@@ -796,7 +796,7 @@ TEST_CASE("the system's resolver, and the default one, find localhost", "[dns][r
     }
 }
 
-TEST_CASE("the system's resolver finds a public name", "[dns][resolver][network]")
+TEST_CASE("the system's resolver finds a public name", "[dns][resolver][.network]")
 {
     const net::dns::resolver resolver{{.use = net::dns::resolver::backend::system}};
     net::io::scheduler       sched{make_pool()};
@@ -806,7 +806,7 @@ TEST_CASE("the system's resolver finds a public name", "[dns][resolver][network]
     CHECK_FALSE(results->empty());
 }
 
-TEST_CASE("the system's resolver reports names that don't exist", "[dns][resolver][network]")
+TEST_CASE("the system's resolver reports names that don't exist", "[dns][resolver][.network]")
 {
     const net::dns::resolver resolver{{.use = net::dns::resolver::backend::system}};
     net::io::scheduler       sched{make_pool()};
