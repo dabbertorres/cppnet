@@ -3,7 +3,8 @@
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
 throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 6 are
-done (2026-10-19); "Where things stand" describes the code before them.
+done (2026-10-19); "Where things stand" describes the code before them. Stage 7 (Happy Eyeballs) was decided
+(2026-10-19): RFC 8305, its racing and its resolution delay, on both back ends, on by default (Decided question 10).
 
 ## Goal
 
@@ -408,10 +409,26 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
      cache reads such a file as empty, as stage 5 has it).
    The CI image's choice wasn't checked: no test depends on it (`localhost` is resolved by both back ends, and the
    default resolver's choice may be either).
-7. **Later.** Happy Eyeballs (RFC 8305) in `connect`: attempts staggered by 250 ms (`call_at`, or a `sleep_until` with
-   the token), losers stopped through a `util::linked_stop_source` linked to `options.stop`; with the native back end,
-   connecting on the first family's answer (RFC 8305's resolution delay). A cache, only if ever needed. A transport
-   hook (Go's `Resolver.Dial`) when DNS over TLS or HTTPS is wanted.
+7. **Happy Eyeballs (RFC 8305)**, decided 2026-10-19 (below), in two parts, each its own pull request:
+   1. **Racing the attempts** (RFC 8305 sections 4 and 5), in `connect_to()`, so both `connect`s get it: the
+      addresses sorted (RFC 6724, as the resolver gives them) and interleaved by family, the first address's family
+      first (RFC 8305's First Address Family Count of 1); an attempt started every `connect_options::attempt_delay`
+      (250 ms, RFC 8305's default; Go's is 300 ms), or at once when the latest fails; the first to connect wins, the
+      rest are stopped (a `util::linked_stop_source` from `options.stop`, the delay a `call_at` or a stoppable
+      `sleep_until`), their sockets closed. Attempts run to the overall deadline (no shares while racing).
+      `attempt_delay` 0 keeps today's behaviour: one at a time, each with its share (`attempt_deadline()`).
+      `client_options::attempt_delay` passes it through. The error, when all fail, is the last attempt's (or
+      `timed_out`).
+   2. **The resolution delay** (RFC 8305 section 3): `connect` starts on the first family's answer: at once for AAAA,
+      or for A after 50 ms (the Resolution Delay) without AAAA; addresses arriving later join the attempts not yet
+      made, sorted in (section 4). The resolver reports each family as it arrives, to `connect` (the public
+      `resolve()` still returns both together); shared lookups (stage 3) publish what's in so far to the callers
+      waiting. The native back end already asks both families at once; the system back end makes two
+      `getaddrinfo()` calls in parallel (`AF_INET6` and `AF_INET`, two `run_blocking` threads), and the results are
+      sorted with `sort_by_rfc6724()`, as getaddrinfo's own sort no longer sees both. A lookup of one family
+      (`protocol::ipv4`/`ipv6`) is unchanged.
+   Still later: a cache, only if ever needed; a transport hook (Go's `Resolver.Dial`) when DNS over TLS or HTTPS is
+   wanted.
 
 ## Decided questions
 
@@ -462,6 +479,15 @@ All decided as recommended (2026-10-19); the options are kept for the reasoning.
    only `connect()`, the tests' fake server using raw syscalls in a helper; (c) leave `udp_socket` alone, the resolver
    using its own descriptors. **Recommended: (a)**: the README promises UDP sockets, and the fake server is a real user
    of `bind()`.
+
+10. **Happy Eyeballs (stage 7).** Go races two families (RFC 6555's way: each family's addresses one at a time, the
+    second family 300 ms later), waiting for both DNS answers first. Its proposal to adopt RFC 8305 (golang/go#23841)
+    was accepted in 2018 "only if the result is simple enough", and is unimplemented for want of a contributor, not for
+    a reason against it. The cost of following RFC 8305 here is complexity: the resolver reporting each family as it
+    arrives, shared lookups publishing partial results, and `connect` merging late addresses; its benefit is that a
+    server dropping AAAA queries (or a dead address of either family) no longer costs seconds. **Decided:** RFC 8305's
+    racing (interleaved, staggered by `attempt_delay`, 250 ms, on by default; 0 is today's one at a time) and its
+    resolution delay, on both back ends (the system's as two `getaddrinfo()` calls, one per family).
 
 ## Out of scope
 
