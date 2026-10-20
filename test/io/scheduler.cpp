@@ -213,6 +213,47 @@ TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up",
     CHECK(idle_err == std::errc::operation_canceled);
 }
 
+TEST_CASE("a deadline set on a read that's waiting, from another thread, wakes the loop up", "[io][scheduler]")
+{
+    // NOTE: before the scheduler, as the reads use them.
+    std::error_code   err;
+    std::atomic<bool> finished = false;
+
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
+    // The read waits without a deadline, so the loop waits without a timeout, until the deadline set here wakes it.
+    // Woken, it looks for the earliest deadline again, which must be the new one by then: one that's woken first and
+    // finds the old one (none) waits for it, so the read waits for ever. The window is small (it was hit under load, or
+    // ThreadSanitizer), so it's tried many times.
+    for (int i = 0; i < 200; ++i)
+    {
+        CAPTURE(i);
+
+        finished = false;
+        reader.set_read_deadline(std::nullopt);
+        REQUIRE(sched.spawn(read_until_failure(&reader, &err, &finished)));
+
+        // give the read time to start waiting (if it hasn't, its wait begins with the deadline).
+        std::this_thread::sleep_for(1ms);
+        reader.set_read_deadline(net::io::clock::now());
+
+        const auto give_up_at = std::chrono::steady_clock::now() + 2s;
+        while (!finished.load() && std::chrono::steady_clock::now() < give_up_at) std::this_thread::sleep_for(100us);
+
+        const bool timed_out = finished.load();
+        if (!timed_out)
+        {
+            // the data ends the wait, and the read after it times out.
+            REQUIRE(::send(writer.native_handle(), "x", 1, 0) == 1);
+            REQUIRE(eventually([&] { return finished.load(); }));
+        }
+
+        REQUIRE(timed_out);
+        CHECK(err == std::errc::timed_out);
+    }
+}
+
 TEST_CASE("shutdown from one of the scheduler's tasks throws, rather than waiting for itself", "[io][scheduler]")
 {
     scheduler sched{make_pool()};

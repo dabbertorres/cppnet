@@ -391,13 +391,11 @@ void scheduler::retime(shard& sh, waiter& state) noexcept
         state.timer.reset();
     }
 
-    if (state.deadline)
-    {
-        state.timer = sh.timers.add(*state.deadline, &state);
-        note_deadline(*state.deadline);
-    }
+    if (state.deadline) state.timer = sh.timers.add(*state.deadline, &state);
 
+    // NOTE: the new deadline is published before run() is told of it (see note_deadline()).
     sh.update_earliest();
+    if (state.deadline) note_deadline(*state.deadline);
 }
 
 bool scheduler::handle_operation::begin(scheduler&                       sched,

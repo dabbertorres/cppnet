@@ -797,7 +797,9 @@ private:
     // next_deadline is the earliest deadline of any wait (as clock::rep): the most run() may wait for.
     [[nodiscard]] clock::rep next_deadline() const noexcept;
 
-    // note_deadline interrupts run() if it's waiting for a later deadline than this new one.
+    // note_deadline interrupts run() if it's waiting for a later deadline than this new one. Must be called once
+    // next_deadline() finds it (e.g. after update_earliest()): run(), woken (or about to wait), looks again, and would
+    // otherwise find the old one, and wait for that.
     void note_deadline(clock::time_point deadline) noexcept;
 
     void resume(const completions& done) noexcept;
