@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 
 #include <arpa/inet.h>
@@ -1135,46 +1136,55 @@ TEST_CASE("a socket's write canceled by its stop token reports what it wrote", "
     auto [reader, writer] = make_socket_pair(&sched);
     writer.set_stop_token(source.get_token());
 
-    // more than the socket's buffers hold, read slowly: the write makes some progress, and then it's stopped.
-    std::atomic<std::size_t> read = 0;
-    std::thread              slow_reader{[&, fd = reader.native_handle()]
-                                         {
-                                std::vector<char> buf(std::size_t{16} * 1'024);
-                                while (true)
-                                {
-                                    // slowly until the write's stopped, then to the end.
-                                    if (!source.stop_requested()) std::this_thread::sleep_for(5ms);
+    constexpr std::size_t chunk = std::size_t{16} * 1'024;
 
-                                    // NOTE: the socket's non-blocking, so this may find nothing yet.
-                                    auto got = ::recv(fd, buf.data(), buf.size(), 0);
-                                    if (got > 0) read += static_cast<std::size_t>(got);
-                                    else if (got == 0) break;
-                                    else std::this_thread::sleep_for(1ms);
-                                }
-                                         }};
+    // more than the socket's buffers hold, and than they then take while a little more than they held at first is read
+    // (below), so the write still waits when it's stopped.
+    std::vector<std::byte> lots(more_than_buffered(writer, reader) + chunk);
 
-    const auto write_lots = [](net::socket* writer) -> task<net::io::result>
+    const auto write_lots = [](net::socket* writer, std::span<const std::byte> lots) -> task<net::io::result>
+    { co_return co_await writer->write(lots); };
+
+    // nothing reads yet, so it writes what the buffers hold, and then waits: resumed here, it waits once this returns.
+    auto writing = write_lots(&writer, lots);
+    writing.get_handle().resume();
+    REQUIRE_FALSE(writing.is_ready());
+
+    // all it's written so far is in the reader's buffer.
+    int first = 0;
+    REQUIRE(::ioctl(reader.native_handle(), FIONREAD, &first) == 0);
+    REQUIRE(first > 0);
+
+    std::size_t       read = 0;
+    std::vector<char> buf(chunk);
+    const auto        read_some_now = [&, fd = reader.native_handle()]
     {
-        std::vector<std::byte> lots(std::size_t{64} * 1'024 * 1'024);
-        co_return co_await writer->write(lots);
+        // NOTE: the socket's non-blocking, so this may find nothing yet.
+        auto got = ::recv(fd, buf.data(), buf.size(), 0);
+        if (got > 0) read += static_cast<std::size_t>(got);
+        return got;
     };
 
-    std::thread stopper{[&]
-                        {
-                            std::this_thread::sleep_for(100ms);
-                            source.request_stop();
-                        }};
+    // more than that can only have come from the write as it waited: it's made progress while waiting.
+    REQUIRE(eventually(
+        [&]
+        {
+            read_some_now();
+            return std::cmp_greater(read, first);
+        }));
 
-    auto res = sched.run_to_completion(write_lots(&writer));
-    stopper.join();
+    // stopped while it still waits.
+    source.request_stop();
+    REQUIRE(eventually([&] { return writing.get_promise().finished(); }));
+    auto res = std::move(writing).result();
 
-    // the reader then reads what was written, to the end.
+    // then what was written is read, to the end.
     writer.shutdown_write();
-    slow_reader.join();
+    REQUIRE(eventually([&] { return read_some_now() == 0; }));
 
     CHECK(res.err == std::errc::operation_canceled);
-    CHECK(res.count > 0);
-    CHECK(res.count == read.load());
+    CHECK(std::cmp_greater(res.count, first));
+    CHECK(res.count == read);
 }
 
 TEST_CASE("run_blocking given a stop token", "[io][scheduler][run_blocking][stop]")

@@ -14,6 +14,9 @@
   { include: ["<mach/task.h>", "private", "<mach/mach.h>", "public"] },
   { include: ["<mach/task_info.h>", "private", "<mach/mach.h>", "public"] },
 
+  # macOS defines FIONREAD in <sys/filio.h>, which <sys/ioctl.h> includes (Linux has no <sys/filio.h>).
+  { include: ["<sys/filio.h>", "private", "<sys/ioctl.h>", "public"] },
+
   # proc_pidinfo's types come with it.
   { include: ["<sys/proc_info.h>", "private", "<libproc.h>", "public"] },
 
