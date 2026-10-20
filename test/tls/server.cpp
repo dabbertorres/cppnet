@@ -10,6 +10,7 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -496,6 +497,92 @@ TEST_CASE("requests to a server that requires a client certificate fail without 
     const auto alert = test::refusal(client_cert, version);
     CHECK(err == alert);
     CHECK(tls::from_peer(err));
+}
+
+TEST_CASE("an HTTPS server resumes its clients' sessions", "[tls][http][server][client][resumption]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        bool             http2       = false;
+        tls::version     version     = tls::version::tls13;
+        bool             client_cert = false;
+    };
+
+    const auto tc = GENERATE(test_case{.name = "HTTP/1.1"},
+                             test_case{.name = "HTTP/2", .http2 = true},
+                             test_case{.name = "HTTP/1.1, a client certificate", .client_cert = true},
+                             test_case{.name = "HTTP/2, a client certificate", .http2 = true, .client_cert = true},
+                             test_case{.name = "TLS 1.2", .version = tls::version::tls12},
+                             test_case{.name = "TLS 1.2, HTTP/2", .http2 = true, .version = tls::version::tls12});
+    CAPTURE(tc.name);
+
+    // whether each of the server's handshakes resumed a session. NOTE: before the scheduler, as its tasks use it.
+    std::mutex        mu;
+    std::vector<bool> handshakes;
+
+    net::io::scheduler sched{make_pool()};
+
+    tls::server_options options{.certificate_chain = pki().localhost_chain, .private_key = pki().localhost_key};
+    if (tc.client_cert)
+    {
+        options.client_auth    = tls::client_auth::required;
+        options.client_ca_file = pki().client_ca;
+    }
+    tls::detail::server_hooks hooks{.handshake_done = [&mu, &handshakes](bool resumed)
+                                    {
+                                        std::scoped_lock lock{mu};
+                                        handshakes.push_back(resumed);
+                                    }};
+    auto                      ctx = tls::detail::make_server_context(options, std::move(hooks));
+    REQUIRE(ctx.has_value());
+    https_server server{
+        &sched,
+        {.header_read_timeout = 5s, .tls = std::move(*ctx)}
+    };
+
+    // NOTE: no idle connections, so each request makes its own.
+    auto client_options         = trusting_options(tc.version);
+    client_options.http2        = tc.http2;
+    client_options.idle_timeout = 0ms;
+    if (tc.client_cert)
+    {
+        client_options.tls.certificate_chain = pki().client_chain;
+        client_options.tls.private_key       = pki().client_key;
+    }
+    http::client client{&sched, client_options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> out;
+        for (int i = 0; i < 3; ++i)
+        {
+            auto resp = co_await client->get(url);
+            if (!resp.has_value())
+            {
+                out.push_back("error: " + resp.error().message());
+                continue;
+            }
+
+            auto body = co_await net::io::read_all(*resp->body);
+            out.push_back(std::format("HTTP/{} {}",
+                                      resp->version.major,
+                                      body.has_value() ? *body : "error: " + body.error().message()));
+        }
+        co_return out;
+    };
+
+    const auto out =
+        sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/peer-certificates"));
+
+    // a resumed session's handler sees the client's certificate too: the session's.
+    const auto expected =
+        std::format("HTTP/{} {}", tc.http2 ? 2 : 1, tc.client_cert ? "1 " + pki().client_subject : "none");
+    CHECK(out == std::vector<std::string>(3, expected));
+
+    std::scoped_lock lock{mu};
+    if (tc.version == tls::version::tls13) CHECK(handshakes == std::vector{false, true, true});
+    else CHECK(handshakes == std::vector{false, false, false});
 }
 
 TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 shares the connection being made",

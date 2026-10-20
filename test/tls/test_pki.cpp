@@ -205,6 +205,8 @@ const test_pki& pki()
 
         out.client_ca = out.dir / "client-ca.pem";
         write_file(out.client_ca, client_ca.first.PEM_encode());
+        out.client_ca_and_unnamed = out.dir / "client-ca-and-unnamed.pem";
+        write_file(out.client_ca_and_unnamed, client_ca.first.PEM_encode() + unnamed.first.PEM_encode());
 
         constexpr auto utf8      = Botan::ASN1_Type::Utf8String;
         constexpr auto printable = Botan::ASN1_Type::PrintableString;

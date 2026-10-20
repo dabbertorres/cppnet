@@ -1,8 +1,12 @@
 #pragma once
 
+#include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -59,6 +63,8 @@ struct client_options
 
 class stream;
 class client_context;
+class server_context;
+struct server_options;
 
 namespace detail
 {
@@ -81,6 +87,21 @@ namespace detail
     // make_client_context is client_context::make(), with what the client offers narrowed to limits.
     std::expected<client_context, std::error_code> make_client_context(const client_options& options,
                                                                        const policy_limits&  limits);
+
+    // server_hooks are hooks into a server context, for tests.
+    struct server_hooks
+    {
+        // what time it is, instead of the system clock: for tickets' ages, their keys' rotation, and verifying clients'
+        // certificates.
+        std::function<std::chrono::system_clock::time_point()> clock{};
+
+        // called (on the thread running the handshake) as each handshake is done, with whether it resumed a session.
+        std::function<void(bool resumed)> handshake_done{};
+    };
+
+    // make_server_context is server_context::make(), with hooks.
+    std::expected<server_context, std::error_code> make_server_context(const server_options& options,
+                                                                       server_hooks          hooks);
 
     // idle_clean is whether s holds nothing that a read hasn't taken: no data decrypted and unread, nor part of a
     // record; and neither the peer's close_notify nor a failure. For a pool of idle connections (whose sockets it
@@ -122,6 +143,10 @@ enum class client_auth : std::uint8_t
     required,
 };
 
+// session_ticket_key is a key session tickets are encrypted with (see server_options::session_ticket_keys): 32 random
+// bytes.
+using session_ticket_key = std::array<std::byte, 32>;
+
 // server_options configures a server_context.
 struct server_options
 {
@@ -155,20 +180,57 @@ struct server_options
     // refused then): never the system's (as Go's, without ClientCAs), as client certificates are a private CA's, and
     // trusting every public CA for them would let anyone with a web server's certificate in.
     std::optional<std::filesystem::path> client_ca_file{};
+
+    // Session resumption, with tickets (as Go's, on by default): once a TLS 1.3 handshake is done, the server sends the
+    // client a ticket (its session, encrypted with the server's key), with which the client's next connection resumes
+    // the session, skipping the certificates (sending, signing for and verifying them, both ways) though still
+    // exchanging keys, so a key that leaks later doesn't decrypt connections recorded before. Every connection, a
+    // resumed one too, gets a ticket. TLS 1.2 sessions aren't resumed (their resumption skips the key exchange, so a
+    // leaked key would decrypt them). stream::resumed() says whether a handshake resumed.
+    //
+    // Tickets are bound to the client authentication (client_auth, and client_ca_file's certificate authorities): a
+    // ticket made where clients were verified differently isn't resumed (the handshake is a full one instead), even
+    // with the same keys; nor is one whose client certificate has expired since, or that has none where one's now
+    // required.
+    bool session_tickets = true;
+
+    // How long after it's made a ticket may be resumed with: at most 7 days (TLS 1.3's limit). Random keys are replaced
+    // this often (see session_ticket_keys).
+    std::chrono::seconds session_ticket_lifetime = std::chrono::hours{24};
+
+    // The keys tickets are encrypted with (e.g. shared by a fleet of servers, so a client resumes with any of them):
+    // the first makes tickets, and each is tried on them (so a new key can go first, the old one kept after it until
+    // its tickets have expired). Keep them secret: with one, a server could be impersonated to clients resuming its
+    // sessions (though connections recorded stay secret, as TLS 1.3's key exchange protects them). Empty (the default):
+    // a random key, made with the context, and replaced (when tickets are next made or resumed) once it's
+    // session_ticket_lifetime old, the previous one kept for as long again, so its tickets can still be resumed.
+    // Refused without session_tickets.
+    std::vector<session_ticket_key> session_ticket_keys{};
 };
 
 // server_context holds what a server's connections share: its certificate and key, the certificate authorities it
-// trusts for clients' certificates (if it asks for them), and the policy. It's cheap to copy, as copies share it.
+// trusts for clients' certificates (if it asks for them), the keys of its session tickets, and the policy. It's cheap
+// to copy, as copies share it.
 class server_context
 {
 public:
     // make loads the certificate chain and private key (and client_ca_file), failing if one can't be read, or (with
     // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none), or the
-    // key isn't the certificate's, or there's client_auth without client_ca_file, or client_ca_file without it.
+    // key isn't the certificate's, or there's client_auth without client_ca_file, or client_ca_file without it, or
+    // session_ticket_lifetime isn't more than 0 and at most 7 days, or there are session_ticket_keys without
+    // session_tickets.
     static std::expected<server_context, std::error_code> make(const server_options& options);
+
+    // set_session_ticket_keys replaces the keys tickets are encrypted with (as server_options::session_ticket_keys),
+    // from any thread, while connections go on: the first makes tickets from then, and only these are tried on them.
+    // Random keys are no longer replaced. Empty stops tickets being made or resumed. Without session_tickets, it does
+    // nothing. The keys given are zeroed once they've been used.
+    void set_session_ticket_keys(std::vector<session_ticket_key> keys);
 
 private:
     friend class stream;
+    friend std::expected<server_context, std::error_code> detail::make_server_context(const server_options& options,
+                                                                                      detail::server_hooks  hooks);
 
     explicit server_context(std::shared_ptr<detail::server_state> state) noexcept;
 
@@ -250,6 +312,10 @@ public:
 
     // version is the protocol version the handshake agreed on.
     [[nodiscard]] tls::version version() const noexcept;
+
+    // resumed is whether the handshake resumed an earlier session (see server_options::session_tickets), as Go's
+    // DidResume. A resumption sends no certificates: peer_certificates() are those the session began with.
+    [[nodiscard]] bool resumed() const noexcept;
 
     // peer_certificates is the chain of certificates the peer sent, leaf first: a client's is its server's, and a
     // server's its client's, if it asked for one and the client sent one (see server_options::client_auth); empty if

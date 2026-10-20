@@ -43,6 +43,10 @@ struct test_pki
     // "cppnet test client CA", with an ECDSA key, as all the clients' certificates have.
     std::filesystem::path client_ca;
 
+    // the client CA and another (the unnamed client CA, below): a server that trusts these verifies the client
+    // certificates client_ca's does, but its session tickets are bound to other CAs (see tls::server_options).
+    std::filesystem::path client_ca_and_unnamed;
+
     // a client's certificate (and key) from the client CA, for clientAuth: its subject has what RFC 4514 writes
     // specially (client_subject is how), its serial number is client_serial, and it has a subject alternative name of
     // each kind (two DNS names, given out of order).

@@ -10,6 +10,7 @@
 #include <exception>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include <botan/asn1_obj.h>
 #include <botan/ber_dec.h>
 #include <botan/certstor.h>
@@ -33,11 +36,15 @@
 #include <botan/exceptn.h>
 #include <botan/hash.h>
 #include <botan/ipv6_address.h>
+#include <botan/mac.h>
+#include <botan/mem_ops.h>
 #include <botan/pk_keys.h>
 #include <botan/pkcs8.h>
 #include <botan/pkix_enums.h>
 #include <botan/pkix_types.h>
 #include <botan/rng.h>
+#include <botan/strong_type.h>
+#include <botan/symkey.h>
 #include <botan/system_rng.h>
 #include <botan/tls_alert.h>
 #include <botan/tls_algos.h>
@@ -50,6 +57,7 @@
 #include <botan/tls_server.h>
 #include <botan/tls_server_info.h>
 #include <botan/tls_session.h>
+#include <botan/tls_session_id.h>
 #include <botan/tls_session_manager.h>
 #include <botan/tls_session_manager_memory.h>
 #include <botan/tls_session_manager_noop.h>
@@ -66,6 +74,7 @@
 #include "ip_addr.hpp"
 #include "ipv4_addr.hpp"
 #include "ipv6_addr.hpp"
+#include "sockaddr.hpp"
 #include "tcp.hpp"
 #include "tls/certificate.hpp"
 #include "util/defer.hpp"
@@ -222,6 +231,8 @@ constexpr std::array groups{
 //
 // It asks for clients' certificates, and requires one, as client_auth says (a server's).
 //
+// Its sessions' tickets are good for ticket_lifetime (a server's: Botan's default, a day, for a client's).
+//
 // It offers only the key exchange groups above (those of them the Botan it's built against has), and so only ECDHE in
 // TLS 1.2, not finite field DHE. Botan's default ciphers are already only AEADs (AES-GCM and ChaCha20-Poly1305), and
 // its signatures only ECDSA and RSA, with SHA-256 to SHA-512.
@@ -231,13 +242,15 @@ public:
     policy(bool                            require_ems,
            net::tls::version               min,
            net::tls::version               max,
-           net::tls::client_auth           auth   = net::tls::client_auth::none,
-           net::tls::detail::policy_limits limits = {}) noexcept
+           net::tls::client_auth           auth            = net::tls::client_auth::none,
+           net::tls::detail::policy_limits limits          = {},
+           std::chrono::seconds            ticket_lifetime = std::chrono::days{1}) noexcept
         : require_ems{require_ems}
         , min{min}
         , max{max}
         , auth{auth}
         , limits{std::move(limits)}
+        , ticket_lifetime{ticket_lifetime}
     {}
 
     [[nodiscard]] bool require_cert_revocation_info() const override { return false; }
@@ -269,6 +282,8 @@ public:
 
     [[nodiscard]] std::vector<std::string> allowed_key_exchange_methods() const override { return {"ECDH"}; }
 
+    [[nodiscard]] std::chrono::seconds session_ticket_lifetime() const override { return ticket_lifetime; }
+
     [[nodiscard]] bool acceptable_ciphersuite(const Botan::TLS::Ciphersuite& suite) const override
     {
         return Botan::TLS::Policy::acceptable_ciphersuite(suite)
@@ -289,6 +304,7 @@ private:
     net::tls::version               max;
     net::tls::client_auth           auth;
     net::tls::detail::policy_limits limits;
+    std::chrono::seconds            ticket_lifetime;
 };
 
 // valid_versions is whether min to max are versions there are, in order.
@@ -400,15 +416,20 @@ std::expected<identity, std::error_code> load_identity(const std::filesystem::pa
     }
 }
 
+// store_of is a store of certificate authorities.
+std::unique_ptr<Botan::Certificate_Store> store_of(const std::vector<Botan::X509_Certificate>& certs)
+{
+    auto store = std::make_unique<Botan::Certificate_Store_In_Memory>();
+    for (const auto& cert : certs) store->add_certificate(cert);
+    return store;
+}
+
 // load_store reads the certificate authorities in a PEM file into a store, failing as load_certificates does.
 std::expected<std::unique_ptr<Botan::Certificate_Store>, std::error_code> load_store(const std::filesystem::path& path)
 {
     auto certs = load_certificates(path);
     if (!certs.has_value()) return std::unexpected(certs.error());
-
-    auto store = std::make_unique<Botan::Certificate_Store_In_Memory>();
-    for (const auto& cert : *certs) store->add_certificate(cert);
-    return store;
+    return store_of(*certs);
 }
 
 // rfc4514_name is RFC 4514's name for an attribute type (section 3), by its OID: empty if it has none.
@@ -579,10 +600,315 @@ std::shared_ptr<const std::vector<net::tls::certificate>> no_certificates() noex
     return {std::shared_ptr<void>{}, &none};
 }
 
+// clock_function is what time it is (see detail::server_hooks): the system clock's, if it's empty.
+using clock_function = std::function<std::chrono::system_clock::time_point()>;
+
+std::chrono::system_clock::time_point now(const clock_function& clock)
+{
+    return clock ? clock() : std::chrono::system_clock::now();
+}
+
+// ticket_binding is what a server's tickets' keys are derived with besides the keys themselves (see ticket_manager): a
+// label, its client authentication mode, and (if it asks for clients' certificates) a hash of its client CAs'
+// certificates, in their file's order.
+std::vector<std::uint8_t> ticket_binding(net::tls::client_auth auth, const std::vector<Botan::X509_Certificate>& cas)
+{
+    constexpr std::string_view label = "cppnet TLS session ticket key";
+
+    std::vector<std::uint8_t> out(label.begin(), label.end());
+    out.push_back(static_cast<std::uint8_t>(auth));
+
+    if (!cas.empty())
+    {
+        // NOTE: each DER encoding says where it ends, so their concatenation is unambiguous.
+        const auto hash = Botan::HashFunction::create_or_throw("SHA-256");
+        for (const auto& ca : cas) hash->update(ca.BER_encode());
+        const auto digest = hash->final_stdvec();
+        out.insert(out.end(), digest.begin(), digest.end());
+    }
+    return out;
+}
+
+// client_sessions is a client's cache of sessions, to resume them: Botan's in-memory cache (of 1000, the oldest dropped
+// first), but storing TLS 1.3's tickets as tickets. NOTE: Botan's TLS 1.3 client stores a ticket as an opaque handle,
+//       which Botan 3.12's in-memory cache can't remove (its remove() finds a ticket only among handles stored as
+//       tickets, or an opaque one only if it's as short as a session ID, 32 bytes, which tickets usually aren't). So a
+//       ticket was never used up (as the policy's reuse_session_tickets(), false, means it to be), and the client
+//       offered any of those it had been given (that hadn't expired).
+class client_sessions final : public Botan::TLS::Session_Manager
+{
+public:
+    explicit client_sessions(const std::shared_ptr<Botan::RandomNumberGenerator>& rng)
+        : Botan::TLS::Session_Manager{rng}
+        , cache{rng}
+    {}
+
+    void store(const Botan::TLS::Session& session, const Botan::TLS::Session_Handle& handle) override
+    {
+        if (handle.is_opaque_handle())
+            cache.store(session, Botan::TLS::Session_Handle{Botan::TLS::Session_Ticket{handle.opaque_handle().get()}});
+        else cache.store(session, handle);
+    }
+
+    std::vector<Botan::TLS::Session_with_Handle> find(const Botan::TLS::Server_Information& info,
+                                                      Botan::TLS::Callbacks&                callbacks,
+                                                      const Botan::TLS::Policy&             policy) override
+    {
+        return cache.find(info, callbacks, policy);
+    }
+
+    std::optional<Botan::TLS::Session> retrieve(const Botan::TLS::Session_Handle& handle,
+                                                Botan::TLS::Callbacks&            callbacks,
+                                                const Botan::TLS::Policy&         policy) override
+    {
+        return cache.retrieve(handle, callbacks, policy);
+    }
+
+    std::size_t remove(const Botan::TLS::Session_Handle& handle) override { return cache.remove(handle); }
+    std::size_t remove_all() override { return cache.remove_all(); }
+
+protected:
+    // NOTE: unused, as find() and retrieve() are the cache's.
+    std::optional<Botan::TLS::Session> retrieve_one(const Botan::TLS::Session_Handle& /*handle*/) override
+    {
+        return std::nullopt;
+    }
+    std::vector<Botan::TLS::Session_with_Handle> find_some(const Botan::TLS::Server_Information& /*info*/,
+                                                           std::size_t /*max_sessions_hint*/) override
+    {
+        return {};
+    }
+
+private:
+    Botan::TLS::Session_Manager_In_Memory cache;
+};
+
+// peer_port is the port a socket's connected to: 0 if it can't say.
+std::uint16_t peer_port(const net::tcp_socket& socket) noexcept
+{
+    net::detail::socket_address addr;
+    addr.size = sizeof(addr.storage);
+    if (::getpeername(socket.native_handle(), addr.get(), &addr.size) != 0) return 0;
+
+    const auto peer = net::detail::from_sockaddr(addr);
+    return peer.has_value() ? peer->port : 0;
+}
+
 }
 
 namespace net::tls::detail
 {
+
+// ticket_manager is a server's session manager: it makes TLS 1.3 session tickets (the session, encrypted with a key of
+// its own: Botan's Session::encrypt()), and resumes sessions from them, storing nothing. TLS 1.2 sessions aren't
+// resumed (see server_options::session_tickets).
+//
+// Its keys are the given ones, or a random one, replaced once it's a lifetime old (lazily, as tickets are made or
+// resumed, as Go's are, so there's no timer), the previous one kept until it's two lifetimes old: as no key makes
+// tickets once it's a lifetime old, every ticket can be resumed for its lifetime, and no longer. Each is derived from
+// the key it's given (or the random one) and the context's ticket_binding(), with HMAC-SHA-256, so a ticket made by a
+// context that verifies clients' certificates differently (another mode, or other CAs) doesn't decrypt.
+// NOTE: a member of server_state, which the header declares, so it mustn't be internal.
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+class ticket_manager final : public Botan::TLS::Session_Manager
+{
+public:
+    ticket_manager(const std::shared_ptr<Botan::RandomNumberGenerator>& rng,
+                   clock_function                                       clock,
+                   std::chrono::seconds                                 lifetime,
+                   net::tls::client_auth                                auth,
+                   std::vector<std::uint8_t>                            binding,
+                   std::vector<net::tls::session_ticket_key>            given)
+        : Botan::TLS::Session_Manager{rng}
+        , clock{std::move(clock)}
+        , lifetime{lifetime}
+        , auth{auth}
+        , binding{std::move(binding)}
+    {
+        if (given.empty())
+        {
+            auto made = std::make_shared<key_set>();
+            made->keys.push_back(random_key(now(this->clock)));
+            made->rotating = true;
+            keys           = std::move(made);
+        }
+        else
+        {
+            set_keys(std::move(given));
+        }
+    }
+
+    // set_keys replaces the keys with those given (zeroing them once the keys are derived from them), stopping the
+    // rotation.
+    void set_keys(std::vector<net::tls::session_ticket_key> given)
+    {
+        util::defer scrub{[&given] noexcept
+                          { Botan::secure_scrub_memory(given.data(), given.size() * sizeof(given.front())); }};
+
+        auto made = std::make_shared<key_set>();
+        for (const auto& key : given) made->keys.push_back(derive(key));
+
+        std::scoped_lock lock{mu};
+        keys = std::move(made);
+    }
+
+    // NOTE: only TLS 1.3 sessions get tickets, and none get session IDs (the handle a stateful server keeps).
+    std::optional<Botan::TLS::Session_Handle> establish(const Botan::TLS::Session& session,
+                                                        const std::optional<Botan::TLS::Session_ID>& /*id*/,
+                                                        bool /*tls12_no_ticket*/) override
+    {
+        if (!session.version().is_tls_13_or_later()) return std::nullopt;
+
+        try
+        {
+            const auto current = current_keys();
+            if (current->keys.empty()) return std::nullopt;
+
+            return Botan::TLS::Session_Handle{
+                Botan::TLS::Session_Ticket{session.encrypt(current->keys.front().key, *m_rng)}};
+        }
+        catch (const std::exception&)
+        {
+            // no ticket, rather than failing the handshake.
+            return std::nullopt;
+        }
+    }
+
+    // NOTE: only clients store sessions.
+    void store(const Botan::TLS::Session& /*session*/, const Botan::TLS::Session_Handle& /*handle*/) override {}
+
+    std::size_t remove(const Botan::TLS::Session_Handle& /*handle*/) override { return 0; }
+    std::size_t remove_all() override { return 0; }
+
+    // NOTE: only TLS 1.2's server asks (TLS 1.3's sends tickets if establish() gives one): false, so it doesn't say
+    //       it'll send one (and then send an empty one).
+    bool emits_session_tickets() override { return false; }
+
+protected:
+    // NOTE: Botan's retrieve() then checks the ticket's age (against the policy's session_ticket_lifetime(), by the
+    //       callbacks' clock), and its server name and cipher suite's hash.
+    std::optional<Botan::TLS::Session> retrieve_one(const Botan::TLS::Session_Handle& handle) override
+    {
+        const auto ticket = handle.ticket();
+        if (!ticket.has_value()) return std::nullopt;
+
+        const auto current = current_keys();
+
+        std::optional<Botan::TLS::Session> session;
+        for (const auto& key : current->keys)
+        {
+            session = decrypt(ticket->get(), key.key);
+            if (session.has_value()) break;
+        }
+
+        // RFC 8446 4.2.11: a ticket that can't be decrypted is ignored (a full handshake).
+        if (!session.has_value() || !session->version().is_tls_13_or_later()) return std::nullopt;
+
+        // as Go's server, nothing that wouldn't be accepted now: no client certificate where one's required, or one
+        // that has expired since.
+        const auto& certs = session->peer_certs();
+        if (certs.empty())
+        {
+            if (auth == net::tls::client_auth::required) return std::nullopt;
+        }
+        else if (now(clock) > to_time_point(certs.front().not_after()))
+        {
+            return std::nullopt;
+        }
+
+        return session;
+    }
+
+    // NOTE: only clients look for sessions.
+    std::vector<Botan::TLS::Session_with_Handle> find_some(const Botan::TLS::Server_Information& /*info*/,
+                                                           std::size_t /*max_sessions_hint*/) override
+    {
+        return {};
+    }
+
+private:
+    struct key
+    {
+        Botan::SymmetricKey                   key;
+        std::chrono::system_clock::time_point made;
+    };
+
+    // key_set is the keys, the first making tickets; rotating if they're random ones, replaced in time.
+    struct key_set
+    {
+        std::vector<key> keys;
+        bool             rotating = false;
+    };
+
+    // decrypt is the session in ticket, if key made it. NOTE: one that didn't fails at once, on the key name the ticket
+    //       carries (derived from the key).
+    static std::optional<Botan::TLS::Session> decrypt(std::span<const std::uint8_t> ticket,
+                                                      const Botan::SymmetricKey&    key)
+    {
+        try
+        {
+            return Botan::TLS::Session::decrypt(ticket, key);
+        }
+        catch (const std::exception&)
+        {
+            return std::nullopt;
+        }
+    }
+
+    // derive is the key tickets are encrypted with, from a key that's given (or random), made at made.
+    [[nodiscard]] key derive(std::span<const std::byte> given, std::chrono::system_clock::time_point made = {}) const
+    {
+        const auto hmac = Botan::MessageAuthenticationCode::create_or_throw("HMAC(SHA-256)");
+        hmac->set_key(reinterpret_cast<const std::uint8_t*>(given.data()), given.size());
+        hmac->update(binding);
+        return key{.key = Botan::SymmetricKey{hmac->final()}, .made = made};
+    }
+
+    [[nodiscard]] key random_key(std::chrono::system_clock::time_point made) const
+    {
+        const auto random = m_rng->random_vec(sizeof(net::tls::session_ticket_key));
+        return derive(std::as_bytes(std::span{random}), made);
+    }
+
+    // current_keys is the keys to use now: if they're random, the first replaced once it's a lifetime old, and the
+    // previous dropped once it's two.
+    std::shared_ptr<const key_set> current_keys()
+    {
+        std::scoped_lock lock{mu};
+        if (!keys->rotating) return keys;
+
+        const auto at       = now(clock);
+        const auto newest   = keys->keys.front().made;
+        const bool rotate   = at - newest >= lifetime;
+        const bool previous = keys->keys.size() > 1;
+        const bool drop     = previous && at - keys->keys[1].made >= 2 * lifetime;
+        if (!rotate && !drop) return keys;
+
+        auto next      = std::make_shared<key_set>();
+        next->rotating = true;
+        if (rotate)
+        {
+            next->keys.push_back(random_key(at));
+            if (at - newest < 2 * lifetime) next->keys.push_back(keys->keys.front());
+        }
+        else
+        {
+            next->keys.push_back(keys->keys.front());
+        }
+
+        keys = std::move(next);
+        return keys;
+    }
+
+    clock_function            clock;
+    std::chrono::seconds      lifetime;
+    net::tls::client_auth     auth;
+    std::vector<std::uint8_t> binding;
+
+    // NOTE: replaced as a whole (under mu), so a handshake uses the keys it took without holding mu.
+    std::mutex                     mu;
+    std::shared_ptr<const key_set> keys;
+};
 
 struct client_state
 {
@@ -599,8 +925,10 @@ struct server_state
     std::shared_ptr<Botan::RandomNumberGenerator> rng;
     std::shared_ptr<Botan::Credentials_Manager>   credentials;
     std::shared_ptr<Botan::TLS::Session_Manager>  sessions;
+    std::shared_ptr<ticket_manager>               tickets; // sessions, if they're resumed: null otherwise
     std::shared_ptr<const Botan::TLS::Policy>     policy;
     std::vector<std::string>                      alpn;
+    std::shared_ptr<const server_hooks>           hooks; // null without any
 };
 
 // callbacks are Botan's calls back into a connection. They're only made while the connection's mutex is held (from
@@ -610,11 +938,21 @@ struct server_state
 class callbacks final : public Botan::TLS::Callbacks
 {
 public:
-    callbacks(connection* conn, bool skip_verification, std::vector<std::string> server_alpn) noexcept
+    callbacks(connection*                         conn,
+              bool                                skip_verification,
+              std::vector<std::string>            server_alpn,
+              std::shared_ptr<const server_hooks> hooks = nullptr) noexcept
         : conn{conn}
         , skip_verification{skip_verification}
         , server_alpn{std::move(server_alpn)}
+        , hooks{std::move(hooks)}
     {}
+
+    // NOTE: for a ticket's age, and verifying certificates.
+    std::chrono::system_clock::time_point tls_current_timestamp() override
+    {
+        return hooks ? now(hooks->clock) : Botan::TLS::Callbacks::tls_current_timestamp();
+    }
 
     void tls_emit_data(std::span<const std::uint8_t> data) override;
     void tls_record_received(std::uint64_t seq_no, std::span<const std::uint8_t> data) override;
@@ -671,9 +1009,10 @@ public:
     }
 
 private:
-    connection*              conn;
-    bool                     skip_verification;
-    std::vector<std::string> server_alpn;
+    connection*                         conn;
+    bool                                skip_verification;
+    std::vector<std::string>            server_alpn;
+    std::shared_ptr<const server_hooks> hooks;
 };
 
 struct connection
@@ -1020,9 +1359,10 @@ struct connection
     std::vector<Botan::X509_Certificate>            peer_chain;
     std::shared_ptr<const std::vector<certificate>> peer_certs;
 
-    // the version the handshake agreed on. NOTE: set by the handshake, before the stream is made, and never after (the
-    //       policy refuses renegotiation), so it's read without mu.
+    // the version the handshake agreed on, and whether it resumed a session. NOTE: set by the handshake, before the
+    //       stream is made, and never after (the policy refuses renegotiation), so they're read without mu.
     version negotiated = version::tls13;
+    bool    resumed    = false;
 
     // the record the channel has been fed part of: the part of its header (header_have bytes of it) or how much of its
     // fragment is still to come.
@@ -1074,6 +1414,9 @@ void callbacks::tls_alert(Botan::TLS::Alert alert)
 void callbacks::tls_session_established(const Botan::TLS::Session_Summary& session)
 {
     conn->negotiated = session.version() == Botan::TLS::Protocol_Version::TLS_V13 ? version::tls13 : version::tls12;
+    conn->resumed    = session.was_resumption();
+
+    if (hooks && hooks->handshake_done) hooks->handshake_done(conn->resumed);
 }
 
 // NOTE: TLS 1.3's channel answers the peer's close_notify only if this returns true; TLS 1.2's always does (as RFC 5246
@@ -1150,7 +1493,7 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
             .rng = rng,
             .credentials =
                 std::make_shared<credentials>("tls-client", std::move(store), std::move(own.chain), std::move(own.key)),
-            .sessions          = std::make_shared<Botan::TLS::Session_Manager_In_Memory>(rng),
+            .sessions          = std::make_shared<client_sessions>(rng),
             .policy            = std::make_shared<policy>(options.require_extended_master_secret,
                                                           options.min_version,
                                                           options.max_version,
@@ -1175,7 +1518,19 @@ server_context::server_context(std::shared_ptr<detail::server_state> state) noex
 
 std::expected<server_context, std::error_code> server_context::make(const server_options& options)
 {
+    return detail::make_server_context(options, {});
+}
+
+std::expected<server_context, std::error_code> detail::make_server_context(const server_options& options,
+                                                                           server_hooks          hooks)
+{
     if (!valid_versions(options.min_version, options.max_version))
+        return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    // TLS 1.3's tickets last 7 days at most (RFC 8446 4.6.1); and keys are only used with tickets.
+    constexpr std::chrono::seconds longest = std::chrono::days{7};
+    if (options.session_ticket_lifetime <= std::chrono::seconds{0} || options.session_ticket_lifetime > longest
+        || (!options.session_tickets && !options.session_ticket_keys.empty()))
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     // client certificates are verified against client_ca_file's CAs, never the system's: so it's needed to ask for
@@ -1187,29 +1542,51 @@ std::expected<server_context, std::error_code> server_context::make(const server
     auto own = load_identity(options.certificate_chain, options.private_key);
     if (!own.has_value()) return std::unexpected(own.error());
 
-    std::unique_ptr<Botan::Certificate_Store> client_cas;
+    std::vector<Botan::X509_Certificate> client_cas;
     if (asks)
     {
-        auto loaded = load_store(*options.client_ca_file);
+        auto loaded = load_certificates(*options.client_ca_file);
         if (!loaded.has_value()) return std::unexpected(loaded.error());
         client_cas = std::move(*loaded);
     }
 
     try
     {
-        auto rng   = std::make_shared<Botan::System_RNG>();
+        auto rng = std::make_shared<Botan::System_RNG>();
+
+        std::shared_ptr<const server_hooks> shared_hooks;
+        if (hooks.clock || hooks.handshake_done) shared_hooks = std::make_shared<const server_hooks>(std::move(hooks));
+
+        std::shared_ptr<ticket_manager> tickets;
+        if (options.session_tickets)
+        {
+            tickets = std::make_shared<ticket_manager>(rng,
+                                                       shared_hooks ? shared_hooks->clock : clock_function{},
+                                                       options.session_ticket_lifetime,
+                                                       options.client_auth,
+                                                       ticket_binding(options.client_auth, client_cas),
+                                                       options.session_ticket_keys);
+        }
+
+        std::shared_ptr<Botan::TLS::Session_Manager> sessions = tickets;
+        if (!sessions) sessions = std::make_shared<Botan::TLS::Session_Manager_Noop>();
+
         auto state = std::make_shared<detail::server_state>(detail::server_state{
             .rng         = rng,
             .credentials = std::make_shared<credentials>("tls-server",
-                                                         std::move(client_cas),
+                                                         asks ? store_of(client_cas) : nullptr,
                                                          std::move(own->chain),
                                                          std::move(own->key)),
-            .sessions    = std::make_shared<Botan::TLS::Session_Manager_Noop>(),
+            .sessions    = std::move(sessions),
+            .tickets     = std::move(tickets),
             .policy      = std::make_shared<policy>(options.require_extended_master_secret,
                                                     options.min_version,
                                                     options.max_version,
-                                                    options.client_auth),
+                                                    options.client_auth,
+                                                    policy_limits{},
+                                                    options.session_ticket_lifetime),
             .alpn        = options.alpn,
+            .hooks       = std::move(shared_hooks),
         });
 
         return server_context{std::move(state)};
@@ -1218,6 +1595,12 @@ std::expected<server_context, std::error_code> server_context::make(const server
     {
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
     }
+}
+
+void server_context::set_session_ticket_keys(std::vector<session_ticket_key> keys)
+{
+    if (state->tickets) state->tickets->set_keys(std::move(keys));
+    else Botan::secure_scrub_memory(keys.data(), keys.size() * sizeof(session_ticket_key));
 }
 
 stream::stream(std::unique_ptr<detail::connection> conn) noexcept
@@ -1247,7 +1630,9 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
                                                           ctx.state->credentials,
                                                           ctx.state->policy,
                                                           ctx.state->rng,
-                                                          Botan::TLS::Server_Information{host},
+                                                          // NOTE: its sessions are kept by host and port, so a
+                                                          //       ticket is only offered where it came from.
+                                                          Botan::TLS::Server_Information{host, peer_port(c->socket)},
                                                           ctx.state->policy->latest_supported_version(false),
                                                           ctx.state->alpn);
     }
@@ -1269,7 +1654,7 @@ stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadli
     try
     {
         auto protocols = options.alpn.has_value() ? std::move(*options.alpn) : ctx.state->alpn;
-        c->cb          = std::make_shared<detail::callbacks>(c.get(), false, std::move(protocols));
+        c->cb          = std::make_shared<detail::callbacks>(c.get(), false, std::move(protocols), ctx.state->hooks);
 
         std::scoped_lock lock{c->mu};
         c->channel = std::make_unique<Botan::TLS::Server>(c->cb,
@@ -1370,6 +1755,8 @@ coro::task<> stream::close()
 std::string_view stream::alpn() const noexcept { return conn->alpn; }
 
 version stream::version() const noexcept { return conn->negotiated; }
+
+bool stream::resumed() const noexcept { return conn->resumed; }
 
 std::shared_ptr<const std::vector<certificate>> stream::peer_certificates() const
 {

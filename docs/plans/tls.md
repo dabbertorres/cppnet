@@ -9,7 +9,10 @@ trimmed Botan, is done (2026-10-20): `ports/botan/portfile.cmake`, the policy in
 second part, client certificates (mutual TLS), is done (2026-10-20): `tls::client_auth`, `server_options::client_ca_file`,
 the client's `certificate_chain` and `private_key`, `tls::certificate` (`include/tls/certificate.hpp`),
 `stream::peer_certificates()` and `server_request::peer_certificates`; tests in `test/tls/stream.cpp` and
-`test/tls/server.cpp`.
+`test/tls/server.cpp`. Its third part, session resumption for the server, is done (2026-10-20), and with it stage 4:
+`server_options::session_tickets`, `session_ticket_lifetime` and `session_ticket_keys`,
+`server_context::set_session_ticket_keys()`, `stream::resumed()`, the client's sessions kept by host and port; tests in
+`test/tls/resumption.cpp` and `test/tls/server.cpp`, and `bench_tls` (`bench/tls/handshake.cpp`).
 
 ## Goal
 
@@ -644,6 +647,85 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   session's, so `peer_certificates()` will be the chain verified when the session began; and a TLS 1.3 server sends no
   CertificateRequest in a resumed (PSK) handshake. Part 3 decides which sessions may resume (Decided question 10).
 
+### Session resumption (part 3)
+
+- **As proposed:** the API (`tls::session_ticket_key`, `server_options::session_tickets`, `session_ticket_lifetime` and
+  `session_ticket_keys`, `server_context::set_session_ticket_keys()`, `stream::resumed()`), `make()`'s errors, and
+  `ticket_manager`, cppnet's `Botan::TLS::Session_Manager` (in `src/tls/tls.cpp`): `establish()` gives a TLS 1.3
+  session a ticket, `Session::encrypt()` with the first key; `retrieve_one()` decrypts with each in turn (Botan checks a
+  ticket's key name before decrypting); nothing is stored, and TLS 1.2 sessions get neither tickets nor session IDs. The
+  policy's `session_ticket_lifetime()` is the server's option (the client's keeps Botan's day). The client's sessions are
+  kept by `Server_Information{host, port}`, the port the socket's peer's (`getpeername()`; 0 if it can't say). No Botan
+  module was added: HMAC, SHA-256, SHA-512-256 and AES-256/GCM were built already.
+- **Decided where the plan was silent:**
+  - `emits_session_tickets()` is false, rather than whether there's a key: only Botan's TLS 1.2 server reads it, to say
+    in its ServerHello that it'll send a ticket (then sending an empty one, as `establish()` gives TLS 1.2 none); TLS
+    1.3's sends a ticket whenever `establish()` gives one. So TLS 1.2 clients aren't told of tickets at all.
+  - `session_ticket_keys` without `session_tickets` is refused (`invalid_argument`), as `client_ca_file` without
+    `client_auth` is (it wouldn't be used); `set_session_ticket_keys()` on a context without tickets does nothing (as
+    Go's `SessionTicketsDisabled` wins over its keys). The lifetime is checked with tickets off too. A key's size is
+    the type's (`std::array<std::byte, 32>`), so there's no size to refuse.
+  - The keys Botan's given are HMAC-SHA-256, keyed with the configured (or random) key, of a label ("cppnet TLS
+    session ticket key"), `client_auth`'s value, and (with client authentication) SHA-256 of the client CAs' DER in
+    their file's order: the same CAs in another order are another binding (one full handshake per client after a
+    restart with the file reordered). Botan then derives its key name and each ticket's AES-256/GCM key from that
+    (HMAC(SHA-512-256)).
+  - Key material: a given key is derived from as it's set, and the bytes given zeroed (`secure_scrub_memory()`, on the
+    vector `set_session_ticket_keys()` takes by value and the manager's copy of the options'; the options' own copy is
+    the caller's). Derived keys are `Botan::SymmetricKey`s, and a random key's bytes a `secure_vector`, zeroed when
+    freed. Nothing logs them.
+  - Rotation is lazy (as planned), in `current_keys()`, under the manager's mutex, called by `establish()` and
+    `retrieve_one()`; the keys are a `shared_ptr<const key_set>` replaced as a whole, so encrypting and decrypting
+    happen without the mutex. A key makes no tickets once it's a lifetime old, so dropping it two lifetimes after it
+    was made loses no ticket that could still be resumed, and can't be told apart from the tickets' own ages: the
+    rotation test checks that a ticket made with the previous key resumes, and that tickets end.
+  - Every connection gets a ticket, a resumed one too (Botan's TLS 1.3 server sends
+    `new_session_tickets_upon_handshake_success()`, one, after every handshake), whose session starts again then,
+    carrying the first handshake's peer certificates (the plan's "and a resumption for as long"): a client that comes
+    back within each lifetime keeps resuming, until its certificate expires (refused on resumption, below).
+  - `retrieve_one()` refuses a session whose client leaf's `not_after` has passed (by the server's clock), or that has
+    no client certificate where one's required. The second can't happen with the binding (a ticket from a context in
+    another mode doesn't decrypt): it's a second line, untested.
+  - The test clock is `tls::detail::server_hooks::clock`, given to `tls::detail::make_server_context(options, hooks)` (as
+    `make_client_context()` takes its `policy_limits`): it's the callbacks' `tls_current_timestamp()` (so Botan's ticket
+    ages and sessions' start times, and verifying clients' certificates) and the manager's (rotation, a client leaf's
+    expiry). `server_hooks::handshake_done` tells the HTTP tests whether each of the server's handshakes resumed, which
+    `http::server` doesn't say (the plan adds nothing to its API).
+- **A Botan bug, worked around:** Botan 3.12's TLS 1.3 client stores each ticket under an opaque handle, and
+  `Session_Manager_In_Memory::remove()` finds a ticket only among handles stored as tickets (or an opaque one as a
+  session ID, if it's at most 32 bytes, which tickets usually aren't: Botan's are over 100). So `find()`'s removal of
+  the tickets it hands out (the policy's `reuse_session_tickets()` being false) did nothing: tickets were never used up,
+  and a client offered whichever of all it had been given (that hadn't expired) came first in its map (keyed by random
+  IDs), against RFC 8446 C.4 and what this plan assumed. The tests found it (resumptions that succeeded or failed by
+  chance, as a ticket under a replaced key was offered again). `client_sessions` wraps Botan's cache (which is `final`)
+  and stores TLS 1.3's handles as tickets, so each ticket is offered once (`test/tls/resumption.cpp` checks it). Worth
+  reporting upstream.
+- **Untested:** Botan's server refuses a ticket for another SNI (`PSK::select_offered_psk()`), but cppnet's client keeps
+  tickets by host (and port), so never offers one elsewhere; the client's keying by port is tested instead.
+- **Tests:** `test/tls/resumption.cpp` (streams, TLS 1.3, no network): a second and third connection resume (both
+  sides' `resumed()`), and the client still sees the server's certificate; tickets off, or TLS 1.2 on either side,
+  never; tickets across contexts (random keys, the same keys, the first's key second, other keys: a full handshake, not
+  a failure); `set_session_ticket_keys()` (other keys, the old one second, none, keys again); lifetime and rotation
+  with the clock (three quarters of a lifetime on, a lifetime and a half with rotation, past a ticket's lifetime), with
+  random and given keys; client authentication (the same mode and CAs resume, with the session's certificate seen;
+  another mode, or other CAs, don't, verifying the certificate again; a client leaf expired since isn't resumed, and
+  fails verification: the server's error in `verification_category()`, the client's read the peer's
+  `bad_certificate`); a client's tickets by port (two servers with the same keys on two ports); each ticket offered
+  once; `make()`'s errors; `set_session_ticket_keys()` without tickets. `test/tls/server.cpp`: through `http::client`
+  (with `idle_timeout` 0, so each request connects), over HTTP/1.1 and HTTP/2, with and without a client certificate,
+  the server's handshakes after the first resume, and the handler sees the client's certificate each time; over TLS 1.2,
+  none do. `test_pki` gained `client_ca_and_unnamed` (the client CA and another).
+- **Measured** (`bench_tls`, Release, this machine; us per connection over loopback, one at a time, time / process CPU
+  time; see `bench/tls/handshake.cpp`): ECDSA P-256 server key, full 1577 / 1554 (1574 / 1551 without tickets), resumed
+  1200 / 1166; RSA 2048, full 3715 / 3650 (3576 / 3511), resumed 1237 / 1205; ECDSA with a client certificate, full
+  2460 / 2413 (2381 / 2341), resumed 1319 / 1296; a TCP connection alone 106 / 89 (under load, all up to half as much
+  again). So a ticket costs a full handshake little (within the runs' noise), and resuming saves about 0.4 ms (ECDSA),
+  1.1 ms (with a client certificate) and 2.5 ms (RSA). Half of what a resumption still costs is the key exchange's:
+  cppnet's server prefers X25519MLKEM768, which its client supports but sends no share for (only X25519's, part 1), so
+  every handshake between them, resumed too, takes a HelloRetryRequest round trip and an ML-KEM exchange; with the
+  client limited to X25519 (the tests' hook), a resumption took 633 / 617 us and a full ECDSA handshake 1260 / 1231.
+  Whether cppnet's client should send a hybrid share too (as Chrome and Go do) is a question for later.
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`
@@ -665,7 +747,7 @@ handshake in the field. The network tests (public servers) exercise interoperabi
       in `client_options` (so `http::client`'s too); `tls::certificate` (Botan-free), `stream::peer_certificates()`
       and `server_request::peer_certificates`; one credentials manager for both sides; client certificates in the
       tests' PKI.
-   3. **Session resumption for the server.** Session tickets, from a session manager of cppnet's (keys rotated, or
+   3. **Session resumption for the server. Done (2026-10-20).** Session tickets, from a session manager of cppnet's (keys rotated, or
       given; bound to the context's client authentication), `stream::resumed()`, the client's session cache keyed by
       port as well, and a benchmark of full and resumed handshakes. After client certificates, as which sessions may
       be resumed depends on them.

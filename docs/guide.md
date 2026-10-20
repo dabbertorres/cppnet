@@ -616,8 +616,9 @@ scheduler.spawn(server.serve());
   `body_read_timeout` and `write_timeout`), and `req.tls_version` tells a handler the TLS version its request's
   connection agreed on (`net::tls::version::tls12` or `tls13`; `none` in cleartext, and in builds without TLS, so
   `req.tls_version != net::tls::version::none` is whether it came over TLS). The server offers
-  `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off). `example/http-server` serves HTTPS with
-  `--cert` and `--key`.
+  `h2` and `http/1.1` with ALPN (or only `http/1.1` if `http2` is off). Clients' TLS 1.3 sessions are resumed with
+  tickets, as the context's options say (see TLS, below), and `http::client` resumes them. `example/http-server`
+  serves HTTPS with `--cert` and `--key`.
 
   For mutual TLS, the context asks clients for their certificates (`client_auth`: `optional` or `required`), verifying
   them against `client_ca_file`'s certificate authorities; a handler sees the chain a client sent in
@@ -671,6 +672,20 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   writes them, e.g. `CN=alice,O=Example`), `serial_number` (hex), `not_before` and `not_after`, the subject
   alternative names (`dns_names`, `email_addresses`, `uris`, `ip_addresses`), and `sha256` (the DER's, e.g. for
   pinning).
+- **Session resumption:** once a TLS 1.3 handshake is done, the server sends the client a session ticket (its session,
+  encrypted with the server's key), and the client's next connection to the same host and port resumes the session
+  with it: no certificates are sent, signed for or verified (either way), though keys are still exchanged, so a ticket
+  key that leaks doesn't decrypt connections recorded before. `stream::resumed()` says whether a handshake did, and a
+  resumed session's `peer_certificates()` are those its first handshake verified. A client context keeps up to 1000
+  sessions, and offers each ticket once. On the server, it's on unless `server_options::session_tickets` is off;
+  tickets are good for `session_ticket_lifetime` (24 hours by default, at most 7 days), and encrypted with a random
+  key made with the context and replaced each lifetime (the previous one kept as long again), or with
+  `session_ticket_keys` (e.g. shared by servers behind a load balancer, so a client resumes with any of them: the first
+  makes tickets, each is tried on them), which `server_context::set_session_ticket_keys()` replaces while the server
+  runs. A ticket is bound to the context's client authentication (`client_auth` and `client_ca_file`'s CAs): one made
+  where clients were verified differently isn't resumed (a full handshake is made instead), even with the same keys,
+  nor is one whose client certificate has expired since. TLS 1.2 sessions aren't resumed (their resumption skips the
+  key exchange).
 - Both contexts allow TLS 1.2 and 1.3 by default. `min_version` and `max_version` (in `client_options` and
   `server_options`, as Go's `MinVersion` and `MaxVersion`; e.g. `.min_version = net::tls::version::tls13`) narrow that,
   and `make()` fails with `std::errc::invalid_argument` if the minimum is after the maximum. The client offers the

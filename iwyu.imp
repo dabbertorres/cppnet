@@ -6,6 +6,7 @@
   { include: ["<_stdio.h>", "private", "<cstdio>", "public"] },
   { include: ["<_stdlib.h>", "private", "<cstdlib>", "public"] },
   { include: ["<_string.h>", "private", "<cstring>", "public"] },
+  { include: ["<_time.h>", "private", "<ctime>", "public"] },
 
   # Mach's API is used through its umbrella header.
   { include: ["<mach/kern_return.h>", "private", "<mach/mach.h>", "public"] },

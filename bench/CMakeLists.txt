@@ -21,6 +21,12 @@ target_link_libraries(bench_router PRIVATE net)
 add_benchmark(bench_request http/request.cpp)
 target_link_libraries(bench_request PRIVATE net)
 
+# with TLS: full and resumed handshakes (it makes its certificates with Botan).
+if(NET_TLS)
+  add_benchmark(bench_tls tls/handshake.cpp)
+  target_link_libraries(bench_tls PRIVATE net ${NET_BOTAN_TARGET})
+endif()
+
 # TechEmpower's plaintext and JSON tests: bench/web/run.sh runs it, and other servers, under wrk.
 add_benchmark(bench_web web/cppnet/main.cpp)
 target_link_libraries(bench_web PRIVATE net glaze::glaze)
