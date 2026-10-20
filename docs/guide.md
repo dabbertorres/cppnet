@@ -183,8 +183,13 @@ answer (a broken IPv6 route, say) costs the delay, rather than the timeout. Usua
 the delay, and then nothing else happens (no task, no allocation). An `attempt_delay` of 0 tries the addresses one at a
 time, in their order, each with a share of the timeout, as Go's dialer gives it: what's left over the addresses left,
 but at least 2 seconds (never past the end), so an address that doesn't answer leaves time for the rest. When all fail,
-the error is the last attempt's to fail. A name is resolved first, with `connect_options::resolver` (by default
-`dns::default_resolver()`, see DNS), within the same timeout, and stop token; an IP address (e.g. `"127.0.0.1"` or
+the error is the last attempt's to fail. A name is resolved with `connect_options::resolver` (by default
+`dns::default_resolver()`, see DNS), within the same timeout, and stop token. Resolving both families, `connect` starts
+on the first family's addresses rather than waiting for both (RFC 8305 section 3): IPv6's at once, IPv4's once they've
+waited 50 ms (the Resolution Delay) for IPv6's, or as soon as those come in; addresses that come in later are sorted
+into the attempts not yet made (going on alternating by family), and if every attempt has failed before then, it waits
+for them. With `attempt_delay` 0, or `proto` limiting it to one family, the name is resolved before connecting, as
+`resolve()` does. An IP address (e.g. `"127.0.0.1"` or
 `"::1"`, or `"fe80::1%en0"` with its zone) isn't, so it's connected to without a thread. A port that isn't a number
 (e.g. `"http"`) fails with `std::errc::invalid_argument`. `connect_options::proto` limits it to IPv4's or IPv6's
 addresses. It fails with the resolver's error, the last address's (e.g. `std::errc::connection_refused`), `timed_out`,
@@ -209,7 +214,11 @@ if (!addrs && addrs.error() == net::dns::condition::not_found) { /* no such name
 
 A `dns::resolver` (`dns/resolver.hpp`) looks names up with the system's resolver (`getaddrinfo()`, on the scheduler's
 threads for blocking calls) or its own (the native back end, below), choosing per name as Go does (`backend::automatic`,
-below); `dns::default_resolver()` is the one `connect` and the HTTP client use unless given another.
+below); `dns::default_resolver()` is the one `connect` and the HTTP client use unless given another. The system's looks
+up both families with a call for each (`AF_INET6` and `AF_INET`, in parallel, on two threads), so `connect` can start on
+the first to answer, and sorts their addresses together by RFC 6724, as one call would have. One family failing (no
+AAAA records, say, or no IPv6 on the host) isn't an error if the other has addresses; if both fail, the error is a
+temporary failure's if only one is one (e.g. `EAI_AGAIN`: the name may have addresses), and otherwise IPv4's.
 `resolve_options::proto` limits it to IPv4's or IPv6's addresses. An IP address is returned as it is, without a thread
 or a lookup, and a name that isn't valid (labels of letters, digits, `-` and `_`) fails with
 `std::errc::invalid_argument` without one. Concurrent calls for the same name (ignoring case) and families, on the same
@@ -241,7 +250,8 @@ and whether the hosts table or DNS comes first (nsswitch.conf's `hosts:` line, a
 resolv.conf without nameservers means 127.0.0.1 and ::1). A name is looked up in the hosts table, then, under each name
 the search list makes, both families' queries go out at once on one UDP socket (a new one per attempt, so a new random
 source port) with random IDs and EDNS(0) (offering 1232 bytes; asked again without it if a server answers FORMERR), and
-replies that don't match a query (ID, question) are ignored. A truncated answer is asked again over TCP, a server that
+replies that don't match a query (ID, question) are ignored (and `connect` is told of a family's addresses as soon as
+they're in). A truncated answer is asked again over TCP, a server that
 fails (SERVFAIL, REFUSED, no answer within the timeout, its port closed) is followed by the next, and CNAME chains are
 followed within the answer. The addresses are sorted by RFC 6724, as `getaddrinfo()` sorts them. Its errors are
 `dns::errc`'s: `name_not_found` (NXDOMAIN under every name tried) and `no_address` match `condition::not_found`,

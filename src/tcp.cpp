@@ -218,6 +218,95 @@ void interleave(std::vector<net::detail::socket_address>& addresses) noexcept
     }
 }
 
+// same is whether a and b are the same address (and port).
+bool same(const net::detail::socket_address& a, const net::detail::socket_address& b) noexcept
+{
+    return a.size == b.size && std::memcmp(a.get(), b.get(), a.size) == 0;
+}
+
+// sort_in puts found's addresses (in the resolver's order) that the attempts haven't tried yet (those before next)
+// after them, interleaved by family as interleave() does, but going on from the last tried (RFC 8305 section 4): the
+// other family's first.
+void sort_in(std::vector<net::detail::socket_address>& addresses,
+             std::size_t                               next,
+             const std::vector<net::ip_addr>&          found,
+             std::uint16_t                             port)
+{
+    std::vector<net::detail::socket_address> rest;
+    rest.reserve(found.size());
+    for (const auto& addr : found)
+    {
+        auto       converted = net::detail::to_sockaddr(addr, port);
+        const auto tried     = std::any_of(addresses.begin(),
+                                           addresses.begin() + static_cast<std::ptrdiff_t>(next),
+                                           [&](const auto& a) { return same(a, converted); });
+        if (!tried) rest.push_back(converted);
+    }
+
+    if (next > 0)
+    {
+        const auto other = addresses[next - 1].family() == AF_INET ? AF_INET6 : AF_INET;
+        const auto it    = std::ranges::find_if(rest, [&](const auto& a) { return a.family() == other; });
+        if (it != rest.end()) std::rotate(rest.begin(), it, std::next(it));
+    }
+    interleave(rest);
+
+    addresses.resize(next);
+    addresses.insert(addresses.end(), rest.begin(), rest.end());
+}
+
+// pending is the host's lookup while the attempts have started on some of its addresses but its other family's are
+// still to come (RFC 8305 section 3): what's found later is sorted into the attempts not yet made.
+struct pending
+{
+    net::dns::detail::resolution* resolution = nullptr; // null once the lookup is done
+    std::uint64_t                 merged     = 0;       // the version of what it had found that's been sorted in
+    std::uint64_t                 watched    = 0;       // the version its race's word last watched, if it does
+    std::uint16_t                 port       = 0;
+
+    // merge sorts in what the lookup has found since it last did (if anything), returning whether more may come.
+    bool merge(std::vector<net::detail::socket_address>& addresses, std::size_t next)
+    {
+        if (resolution == nullptr || resolution->news().load(std::memory_order::acquire) == merged)
+            return resolution != nullptr;
+
+        auto found = resolution->look();
+        merged     = found.version;
+        if (found.done) resolution = nullptr;
+        if (!found.addrs.empty()) sort_in(addresses, next, found.addrs, port);
+        return resolution != nullptr;
+    }
+
+    // waiting is whether the lookup may still find more.
+    [[nodiscard]] bool waiting() const noexcept { return resolution != nullptr; }
+
+    // wait waits until the lookup finds something new, by deadline, or stop.
+    [[nodiscard]] net::io::scheduler::stoppable_wait_operation
+    wait(net::io::scheduler* scheduler, net::io::clock::time_point deadline, std::stop_token stop) const noexcept
+    {
+        return scheduler->wait_on(resolution->news(), merged, deadline, std::move(stop));
+    }
+
+    // watch has the lookup bump word (and notify it) too when it next finds something, returning false if it has
+    // since it was last merged (then merge it first).
+    bool watch(std::shared_ptr<std::atomic<std::uint64_t>> word)
+    {
+        if (watched == merged) return true;
+        if (!resolution->watch(std::move(word), merged)) return false;
+        watched = merged;
+        return true;
+    }
+};
+
+// more_coming sorts in what more (if any) has found (see pending::merge()), returning whether more may come.
+bool more_coming(pending* more, std::vector<net::detail::socket_address>& addresses, std::size_t next)
+{
+    return more != nullptr && more->merge(addresses, next);
+}
+
+// none_left is whether there are no addresses left to try after next (of count), nor any to come (waiting).
+bool none_left(std::size_t next, std::size_t count, bool waiting) noexcept { return next == count && !waiting; }
+
 // after is delay after now, but no later than deadline (after now).
 net::io::clock::time_point
 after(net::io::clock::time_point now, std::chrono::milliseconds delay, net::io::clock::time_point deadline) noexcept
@@ -225,6 +314,16 @@ after(net::io::clock::time_point now, std::chrono::milliseconds delay, net::io::
     // NOTE: compared in milliseconds, so a long delay (e.g. milliseconds::max()) doesn't overflow.
     if (delay >= std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)) return deadline;
     return now + delay;
+}
+
+// inline_until is when an attempt waited for inline (started at now) gives way to the next: after the attempt delay,
+// unless it's the last (then the deadline).
+net::io::clock::time_point inline_until(net::io::clock::time_point now,
+                                        bool                       last,
+                                        std::chrono::milliseconds  delay,
+                                        net::io::clock::time_point deadline) noexcept
+{
+    return last ? deadline : after(now, delay, deadline);
 }
 
 // race is what a race of attempts to connect shares: racing() (and keep_racing(), which it hands the race to) and the
@@ -345,6 +444,13 @@ struct race
     }
 };
 
+// watch_more has more's lookup (if any, and if it may find more) bump the race's word too (see pending::watch()),
+// returning false if it has found something since it was last merged.
+bool watch_more(pending* more, const std::shared_ptr<race>& state)
+{
+    return more == nullptr || !more->waiting() || more->watch({state, &state->changes});
+}
+
 // racing_attempt waits for the index'th attempt, conn, to connect, by deadline, and tells the race.
 net::coro::task<> racing_attempt(std::shared_ptr<race>      state,
                                  std::size_t                index,
@@ -359,37 +465,43 @@ net::coro::task<> racing_attempt(std::shared_ptr<race>      state,
     if (err) state->fail(index, err);
 }
 
-// ended is why connecting has to end now, if it does: stop was requested, or the deadline has passed.
-std::error_code ended(const std::stop_token& stop, net::io::clock::time_point deadline) noexcept
+// ended is why connecting has to end now, if it does: stop was requested (or the scheduler is stopping), or the
+// deadline has passed.
+std::error_code
+ended(const net::io::scheduler* scheduler, const std::stop_token& stop, net::io::clock::time_point deadline) noexcept
 {
-    if (stop.stop_requested()) return std::make_error_code(std::errc::operation_canceled);
+    if (stop.stop_requested() || scheduler->stop_requested())
+        return std::make_error_code(std::errc::operation_canceled);
     if (net::io::clock::now() >= deadline) return std::make_error_code(std::errc::timed_out);
     return {};
 }
 
 // keep_racing goes on with racing()'s race, once its first attempt has outlasted the delay (and is the race's): it
-// starts the rest of addresses, from next, and returns the first to connect.
+// starts the rest of addresses, from next (and those more sorts in, as the host's lookup finds them), and returns the
+// first to connect.
 net::coro::task<std::expected<net::tcp_socket, std::error_code>>
-keep_racing(net::io::scheduler*                             scheduler,
-            const std::vector<net::detail::socket_address>& addresses,
-            std::size_t                                     next,
-            net::io::clock::time_point                      deadline,
-            const net::tcp_socket::connect_options&         options,
-            const std::shared_ptr<race>&                    state)
+keep_racing(net::io::scheduler*                       scheduler,
+            std::vector<net::detail::socket_address>& addresses,
+            std::size_t                               next,
+            net::io::clock::time_point                deadline,
+            const net::tcp_socket::connect_options&   options,
+            const std::shared_ptr<race>&              state,
+            pending*                                  more)
 {
     std::size_t spawned    = 1;                     // attempts handed to tasks
     auto        next_start = net::io::clock::now(); // the next is due at once
 
     while (true)
     {
-        // read before looking at the race, so a change after is noticed by the wait.
-        const auto seen = state->changes.load(std::memory_order::acquire);
+        // read before looking at the race (and the lookup), so a change after is noticed by the wait.
+        const auto seen    = state->changes.load(std::memory_order::acquire);
+        const bool waiting = more_coming(more, addresses, next);
 
         auto now = state->look(spawned, next);
         if (now.winner.has_value()) co_return std::move(*now.winner);
 
-        if (auto err = ended(options.stop, deadline); err) co_return std::unexpected(err);
-        if (next == addresses.size() && now.in_flight == 0) co_return std::unexpected(now.last_err);
+        if (auto err = ended(scheduler, options.stop, deadline); err) co_return std::unexpected(err);
+        if (next == addresses.size() && now.in_flight == 0 && !waiting) co_return std::unexpected(now.last_err);
 
         const auto time = net::io::clock::now();
         const bool due  = now.in_flight == 0 || now.latest_failed || time >= next_start;
@@ -414,18 +526,21 @@ keep_racing(net::io::scheduler*                             scheduler,
             continue;
         }
 
-        // wait for an attempt to end, until the next is due (or the end).
+        // wait for an attempt to end (or the lookup to find more, which bumps the race's word too), until the next is
+        // due (or the end).
+        if (!watch_more(more, state)) continue; // it has: sort it in
+
         const auto until = next < addresses.size() ? std::min(next_start, deadline) : deadline;
 
-        auto err = co_await scheduler->wait_on(state->changes, seen, until, options.stop);
-        if (err == std::errc::operation_canceled) co_return std::unexpected(err);
-
-        // otherwise (an attempt ended, or the time came): the loop's start tells which.
+        // an attempt ended, the time came, or stop: the loop's start tells which.
+        (void)co_await scheduler->wait_on(state->changes, seen, until, options.stop);
     }
 }
 
 // racing connects to the first of addresses (interleaved by family) to accept, by deadline, starting an attempt every
-// attempt_delay, or at once when the latest fails (RFC 8305 section 5): see connect_options::attempt_delay.
+// attempt_delay, or at once when the latest fails (RFC 8305 section 5): see connect_options::attempt_delay. If more
+// (not null) is waiting for the host's other family, its addresses are sorted into those not tried yet once they come
+// in, and the attempts wait for them (until the deadline) if all those so far have failed.
 //
 // An attempt waits here (inline) until the next is due: the first to connect often does, and then nothing is racing.
 // One that outlasts it is handed to a task of its own (racing_attempt()), with the race's shared state (race), and from
@@ -434,7 +549,8 @@ net::coro::task<std::expected<net::tcp_socket, std::error_code>>
 racing(net::io::scheduler*                      scheduler,
        std::vector<net::detail::socket_address> addresses,
        net::io::clock::time_point               deadline,
-       net::tcp_socket::connect_options         options)
+       net::tcp_socket::connect_options         options,
+       pending*                                 more = nullptr)
 {
     interleave(addresses);
 
@@ -452,8 +568,17 @@ racing(net::io::scheduler*                      scheduler,
     // one at a time until an attempt outlasts the delay: then it goes on, in a task, alongside the next.
     while (!state)
     {
-        if (auto err = ended(options.stop, deadline); err) co_return std::unexpected(err);
-        if (next == addresses.size()) co_return std::unexpected(last_err);
+        const bool waiting = more_coming(more, addresses, next);
+
+        if (auto err = ended(scheduler, options.stop, deadline); err) co_return std::unexpected(err);
+        if (none_left(next, addresses.size(), waiting)) co_return std::unexpected(last_err);
+        if (next == addresses.size())
+        {
+            // every attempt so far has failed: wait for the other family's addresses (until the deadline, or stop: the
+            // loop's start tells which).
+            (void)co_await more->wait(scheduler, deadline, options.stop);
+            continue;
+        }
 
         const auto now     = net::io::clock::now();
         const auto index   = next++;
@@ -465,14 +590,15 @@ racing(net::io::scheduler*                      scheduler,
         }
         if (attempt->connected) co_return std::move(attempt->conn);
 
-        // the last waits until the end.
+        // the last waits until the end (unless more may come).
         auto&      conn  = attempt->conn;
-        const auto until = next == addresses.size() ? deadline : after(now, options.attempt_delay, deadline);
+        const bool last  = none_left(next, addresses.size(), waiting);
+        const auto until = inline_until(now, last, options.attempt_delay, deadline);
 
         auto err = co_await wait_connected(scheduler, conn.native_handle(), until, options.stop);
         if (!err) co_return std::move(conn);
 
-        if (err != std::errc::timed_out || next == addresses.size() || net::io::clock::now() >= deadline)
+        if (err != std::errc::timed_out || last || net::io::clock::now() >= deadline)
         {
             // it failed (or the time's up), and the next starts at once.
             conn.close(false);
@@ -489,7 +615,7 @@ racing(net::io::scheduler*                      scheduler,
             co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
     }
 
-    co_return co_await keep_racing(scheduler, addresses, next, deadline, options, state);
+    co_return co_await keep_racing(scheduler, addresses, next, deadline, options, state, more);
 }
 
 // connect_to connects to the first of addresses (those of options.proto's family) that accepts, by deadline: racing
@@ -512,6 +638,50 @@ connect_to(net::io::scheduler*                      scheduler,
         return one_at_a_time(scheduler, std::move(addresses), deadline, std::move(options));
 
     return racing(scheduler, std::move(addresses), deadline, std::move(options));
+}
+
+// connect_resolving connects to a host's addresses as its lookup (res, of both families) finds them, by deadline
+// (RFC 8305 section 3): starting on IPv6's at once, or on IPv4's once they've had the resolution delay (unless IPv6's
+// come in by then), with what's found later sorted into the attempts not yet made (see racing()).
+net::coro::task<std::expected<net::tcp_socket, std::error_code>>
+connect_resolving(net::io::scheduler*              scheduler,
+                  net::dns::detail::resolution     res,
+                  std::uint16_t                    port,
+                  net::io::clock::time_point       deadline,
+                  net::tcp_socket::connect_options options)
+{
+    auto found = res.look();
+    while (!found.done)
+    {
+        if (auto err = ended(scheduler, options.stop, deadline); err) co_return std::unexpected(err);
+
+        auto until = deadline;
+        if (!found.addrs.empty())
+        {
+            if (found.family == net::protocol::ipv6) break;
+
+            // NOTE: no later than the deadline, which ends it first (at the loop's start).
+            until = after(found.at, options.resolution_delay, deadline);
+            if (net::io::clock::now() >= until) break;
+        }
+
+        // something new, or the delay's end (or the deadline's: the loop's start tells which).
+        auto err = co_await scheduler->wait_on(res.news(), found.version, until, options.stop);
+        if (err == std::errc::operation_canceled) co_return std::unexpected(err);
+
+        found = res.look();
+    }
+
+    if (found.addrs.empty()) co_return std::unexpected(found.err);
+
+    std::vector<net::detail::socket_address> addresses;
+    addresses.reserve(found.addrs.size());
+    for (const auto& addr : found.addrs) addresses.push_back(net::detail::to_sockaddr(addr, port));
+
+    if (found.done) co_return co_await connect_to(scheduler, std::move(addresses), deadline, std::move(options));
+
+    pending more{.resolution = &res, .merged = found.version, .port = port};
+    co_return co_await racing(scheduler, std::move(addresses), deadline, std::move(options), &more);
 }
 
 }
@@ -572,6 +742,15 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
     {
         // NOTE: an IP address is returned at once, without a thread.
         const auto& resolver = options.resolver != nullptr ? *options.resolver : dns::default_resolver();
+
+        // racing both families: started on the first's addresses (see connect_resolving()).
+        if (options.proto == protocol::not_care && options.attempt_delay > std::chrono::milliseconds::zero())
+        {
+            auto res = resolver.start_resolving(scheduler, std::move(host), options.proto);
+            if (!res.has_value()) co_return std::unexpected(res.error());
+
+            co_return co_await connect_resolving(scheduler, std::move(*res), *number, deadline, std::move(options));
+        }
 
         auto found = co_await resolver.resolve(scheduler,
                                                std::move(host),

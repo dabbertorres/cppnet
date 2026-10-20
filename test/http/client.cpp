@@ -1133,11 +1133,11 @@ TEST_CASE("a request canceled while its host is resolved fails at once", "[http]
     {
         std::stop_source source;
 
-        // stops once the lookup has started (or the scheduler has).
+        // stops once the lookup has started, a call for each family (or the scheduler has stopped).
         REQUIRE(sched->spawn(
             [](net::io::scheduler* sched, test::blocking_lookup* lookup, std::stop_source source) -> task<>
             {
-                while (lookup->started.load() == 0)
+                while (lookup->started.load() < 2)
                 {
                     if (co_await sched->sleep_until(net::io::clock::now() + 1ms)) co_return;
                 }
@@ -1156,7 +1156,7 @@ TEST_CASE("a request canceled while its host is resolved fails at once", "[http]
 
     CHECK(result == canceled());
     CHECK(elapsed < 5s);
-    CHECK(lookup.started.load() == 1);
+    CHECK(lookup.started.load() == 2);
     CHECK(client.stats() == net::http::connection_stats{});
 }
 
@@ -1188,7 +1188,7 @@ TEST_CASE("connect_timeout bounds resolving the host", "[http][client][timeout]"
     CHECK(result == "error: " + std::make_error_code(std::errc::timed_out).message());
     CHECK(elapsed >= 200ms);
     CHECK(elapsed < 5s);
-    CHECK(lookup.started.load() == 1);
+    CHECK(lookup.started.load() == 2); // a call for each family
     CHECK(client.stats() == net::http::connection_stats{});
 }
 

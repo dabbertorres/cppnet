@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -44,15 +45,22 @@ void sort_by_rfc6724(std::vector<ip_addr>& addrs, std::span<const std::optional<
 // (which sends nothing), and asking for its address.
 void sort_by_rfc6724(std::vector<ip_addr>& addrs);
 
+// found_function is told of a family's addresses (sorted by RFC 6724) as soon as a server has answered with them, while
+// the other family's question is still open.
+using found_function = std::function<void(protocol family, std::vector<ip_addr> addrs)>;
+
 // native_lookup looks host (lower-cased) up as conf says: in its hosts table, and with DNS queries to its
 // nameservers (starting with first_server's, of their count), as the resolver's native back end does. It's ended by
-// stop (failing with std::errc::operation_canceled), as by the scheduler stopping.
+// stop (failing with std::errc::operation_canceled), as by the scheduler stopping. Looking up both families, it tells
+// found (if set) of the first's addresses, if they come in before the other's answer (as they're then the lookup's,
+// whatever the other's are).
 [[nodiscard]] coro::task<std::expected<std::vector<ip_addr>, std::error_code>>
 native_lookup(io::scheduler*                scheduler,
               std::shared_ptr<const config> conf,
               std::string                   host,
               protocol                      proto,
               std::size_t                   first_server,
-              std::stop_token               stop);
+              std::stop_token               stop,
+              found_function                found = {});
 
 }

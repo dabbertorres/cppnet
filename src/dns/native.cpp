@@ -131,13 +131,16 @@ struct question
     std::error_code           err{};
 };
 
-// exchange is what a name's queries share.
+// exchange is what a name's queries share: and its questions, and what to tell of a family's addresses (if anything).
 struct exchange
 {
     net::io::scheduler* scheduler = nullptr;
     const dns::config*  conf      = nullptr;
     std::string_view    name{};
     std::stop_token     stop{};
+
+    std::span<question>                     questions{};
+    const net::dns::detail::found_function* found = nullptr;
 };
 
 bool canceled(const std::error_code& err) noexcept { return err == std::errc::operation_canceled; }
@@ -257,6 +260,20 @@ void answer(question& q, const dns::message& msg, std::string_view name)
     }
 }
 
+// take_answer takes a server's answer to q (see answer()), and if it ends q with addresses while another of the name's
+// questions is still open, tells ex.found of them (sorted): they're the lookup's (as this name has addresses, the
+// search list goes no further), whatever the other's answer is.
+void take_answer(question& q, const dns::message& msg, const exchange& ex)
+{
+    answer(q, msg, ex.name);
+
+    if (ex.found == nullptr || !*ex.found || !q.done || q.addrs.empty()) return;
+    if (std::ranges::all_of(ex.questions, [&q](const question& other) { return &other == &q || other.done; })) return;
+
+    net::dns::detail::sort_by_rfc6724(q.addrs);
+    (*ex.found)(q.qtype == dns::type::a ? net::protocol::ipv4 : net::protocol::ipv6, q.addrs);
+}
+
 // read_exact reads into data until it's full.
 net::coro::task<std::error_code> read_exact(net::io::reader& in, std::span<std::byte> data)
 {
@@ -331,7 +348,7 @@ net::coro::task<std::error_code> exchange_udp(net::udp_socket&           sock,
         }
         else
         {
-            answer(q, *msg, ex.name);
+            take_answer(q, *msg, ex);
         }
     }
 
@@ -390,7 +407,7 @@ exchange_tcp(const dns::nameserver& server, question& q, const exchange& ex, net
         }
 
         // NOTE: an answer truncated over TCP too is taken as it is.
-        answer(q, *msg, ex.name);
+        take_answer(q, *msg, ex);
         co_return std::error_code{};
     }
 }
@@ -508,12 +525,13 @@ net::coro::task<std::error_code> ask_servers(std::span<question> qs, const excha
 }
 
 // query_dns looks host up with DNS: each of its names (the search list's) in turn, until one has addresses.
-net::coro::task<lookup_result> query_dns(net::io::scheduler*    scheduler,
-                                         const dns::config&     conf,
-                                         std::string_view       host,
-                                         net::protocol          proto,
-                                         std::size_t            first,
-                                         const std::stop_token& stop)
+net::coro::task<lookup_result> query_dns(net::io::scheduler*                     scheduler,
+                                         const dns::config&                      conf,
+                                         std::string_view                        host,
+                                         net::protocol                           proto,
+                                         std::size_t                             first,
+                                         const std::stop_token&                  stop,
+                                         const net::dns::detail::found_function& found)
 {
     std::vector<dns::type> types;
     types.reserve(2);
@@ -529,7 +547,12 @@ net::coro::task<lookup_result> query_dns(net::io::scheduler*    scheduler,
         qs.reserve(types.size());
         for (const auto type : types) qs.push_back({.qtype = type});
 
-        const exchange ex{.scheduler = scheduler, .conf = &conf, .name = name, .stop = stop};
+        const exchange ex{.scheduler = scheduler,
+                          .conf      = &conf,
+                          .name      = name,
+                          .stop      = stop,
+                          .questions = qs,
+                          .found     = &found};
         if (auto err = co_await ask_servers(qs, ex, first); err) co_return std::unexpected(err);
 
         std::vector<net::ip_addr> addrs;
@@ -637,7 +660,8 @@ coro::task<std::expected<std::vector<ip_addr>, std::error_code>> native_lookup(i
                                                                                std::string                   host,
                                                                                protocol                      proto,
                                                                                std::size_t     first_server,
-                                                                               std::stop_token stop)
+                                                                               std::stop_token stop,
+                                                                               found_function  found)
 {
     // the hosts table first, unless nsswitch.conf puts DNS first.
     if (conf->order == lookup_order::files_dns || conf->order == lookup_order::files)
@@ -651,7 +675,7 @@ coro::task<std::expected<std::vector<ip_addr>, std::error_code>> native_lookup(i
         }
     }
 
-    auto result = co_await query_dns(scheduler, *conf, host, proto, first_server, stop);
+    auto result = co_await query_dns(scheduler, *conf, host, proto, first_server, stop, found);
 
     if (!result.has_value() && !canceled(result.error()) && conf->order == lookup_order::dns_files)
     {

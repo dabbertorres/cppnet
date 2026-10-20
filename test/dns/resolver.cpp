@@ -26,6 +26,7 @@
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "dns/blocking_lookup.hpp"
+#include "dns/native.hpp"
 #include "exception.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
@@ -43,6 +44,12 @@ using net::coro::task;
 using resolve_result = std::expected<std::vector<net::ip_addr>, std::error_code>;
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(2); }
+
+// test_ipv6 is an IPv6 address (the documentation's) that RFC 6724 sorts after 127.0.0.1 on any machine: if it has a
+// route to it, by its label (or precedence), and otherwise as it can't be reached.
+const net::ip_addr test_ipv6{
+    net::ipv6_addr{0x2001, 0xdb8, 0, 0, 0, 0, 0, 1}
+};
 
 // wait_started waits (in a task) until lookup has started n lookups, returning whether it has: not if the scheduler's
 // stopped, or they haven't within 10 seconds.
@@ -268,7 +275,7 @@ TEST_CASE("the resolver checks names before looking them up", "[dns][resolver][n
     if (tc.valid)
     {
         CHECK(result.has_value());
-        CHECK(looked_up.load() == 1);
+        CHECK(looked_up.load() == 2); // a call for each family
     }
     else
     {
@@ -365,11 +372,11 @@ TEST_CASE("a caller gives up on a lookup at its deadline, while the lookup goes 
     CHECK(out.result.error() == net::io::status_condition::timed_out);
     CHECK(out.elapsed >= 100ms);
     CHECK(out.elapsed < 5s);
-    CHECK(lookup.started.load() == 1);
+    CHECK(lookup.started.load() == 2); // a call for each family
     CHECK(out.finished_then == 0);
 
     // run_to_completion() waited for the lookup to finish.
-    CHECK(lookup.finished.load() == 1);
+    CHECK(lookup.finished.load() == 2);
 }
 
 TEST_CASE("a caller gives up on a lookup when stop is requested", "[dns][resolver][stop]")
@@ -385,11 +392,11 @@ TEST_CASE("a caller gives up on a lookup when stop is requested", "[dns][resolve
         {
             std::stop_source source;
 
-            // stops once the lookup has started.
+            // stops once the lookup has started (both families' calls).
             REQUIRE(sched->spawn(
                 [](net::io::scheduler* sched, test::blocking_lookup* lookup, std::stop_source source) -> task<>
                 {
-                    if (co_await wait_started(sched, lookup, 1)) source.request_stop();
+                    if (co_await wait_started(sched, lookup, 2)) source.request_stop();
                 }(sched, lookup, source)));
 
             const auto start = net::io::clock::now();
@@ -409,8 +416,8 @@ TEST_CASE("a caller gives up on a lookup when stop is requested", "[dns][resolve
         CHECK(out.result.error() == std::errc::operation_canceled);
         CHECK(out.elapsed < 5s);
         CHECK(out.finished_then == 0);
-        CHECK(lookup.started.load() == 1);
-        CHECK(lookup.finished.load() == 1);
+        CHECK(lookup.started.load() == 2);
+        CHECK(lookup.finished.load() == 2);
     }
 
     SECTION("before it's called")
@@ -440,7 +447,7 @@ TEST_CASE("stopping the scheduler ends the lookups' waits", "[dns][resolver][sto
         REQUIRE(sched->spawn(
             [](net::io::scheduler* sched, test::blocking_lookup* lookup) -> task<>
             {
-                if (co_await wait_started(sched, lookup, 1)) sched->request_stop();
+                if (co_await wait_started(sched, lookup, 2)) sched->request_stop();
             }(sched, lookup)));
 
         const auto start  = net::io::clock::now();
@@ -458,7 +465,7 @@ TEST_CASE("stopping the scheduler ends the lookups' waits", "[dns][resolver][sto
     CHECK(out.result.error() == std::errc::operation_canceled);
     CHECK(out.elapsed < 5s);
     CHECK(out.finished_then == 0);
-    CHECK(lookup.finished.load() == 1);
+    CHECK(lookup.finished.load() == 2);
 }
 
 TEST_CASE("a lookup whose callers have all left doesn't start", "[dns][resolver][stop]")
@@ -469,10 +476,16 @@ TEST_CASE("a lookup whose callers have all left doesn't start", "[dns][resolver]
     net::io::scheduler sched{make_pool(), {.blocking_threads = 1}};
     net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
 
-    const auto test = [](net::io::scheduler* sched, test::blocking_lookup* lookup) -> task<resolve_result>
+    // the first lookup's caller, which waits for it to finish.
+    std::vector<caller> first{caller{.host = "first.test"}};
+    caller_counts       counts;
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      first,
+                         caller_counts*         counts) -> task<resolve_result>
     {
-        REQUIRE(sched->spawn([](net::io::scheduler* sched, test::blocking_lookup* lookup) -> task<>
-                             { (void)co_await lookup->resolver.resolve(sched, "first.test"); }(sched, lookup)));
+        REQUIRE(start(sched, &lookup->resolver, first, counts));
         const auto started = co_await wait_started(sched, lookup, 1);
         REQUIRE(started);
 
@@ -480,18 +493,23 @@ TEST_CASE("a lookup whose callers have all left doesn't start", "[dns][resolver]
         auto result =
             co_await lookup->resolver.resolve(sched, "second.test", {.deadline = net::io::clock::now() + 50ms});
 
+        // NOTE: the first lookup's second call (its other family's) waits for the thread too, and is made once it's
+        //       released: its caller is waited for, so stopping the scheduler doesn't stop it first.
         lookup->release();
+        const auto returned = co_await wait_count(sched, &counts->returned, 1);
+        REQUIRE(returned);
         co_return result;
     };
 
-    const auto result = sched.run_to_completion(test(&sched, &lookup));
+    const auto result = sched.run_to_completion(test(&sched, &lookup, first, &counts));
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == std::errc::timed_out);
+    CHECK(first[0].result == lookup.answer);
 
-    // run_to_completion() waited for both lookups: only the first was called.
-    CHECK(lookup.started.load() == 1);
-    CHECK(lookup.finished.load() == 1);
+    // only the first's calls (a call for each family) were made.
+    CHECK(lookup.started.load() == 2);
+    CHECK(lookup.finished.load() == 2);
 }
 
 TEST_CASE("shutting the scheduler down waits for a lookup in flight", "[dns][resolver][shutdown]")
@@ -507,12 +525,12 @@ TEST_CASE("shutting the scheduler down waits for a lookup in flight", "[dns][res
         [](net::io::scheduler* sched, test::blocking_lookup* lookup, std::atomic<int>* left) -> task<>
         {
             auto result =
-                co_await lookup->resolver.resolve(sched, "slow.test", {.deadline = net::io::clock::now() + 10ms});
+                co_await lookup->resolver.resolve(sched, "slow.test", {.deadline = net::io::clock::now() + 100ms});
             left->store(result.has_value() ? 2 : 1);
             left->notify_all();
         }(&sched, &lookup, &left)));
 
-    REQUIRE(lookup.wait_started(1));
+    REQUIRE(lookup.wait_started(2)); // a call for each family
     left.wait(0);
     CHECK(left.load() == 1);
 
@@ -524,7 +542,7 @@ TEST_CASE("shutting the scheduler down waits for a lookup in flight", "[dns][res
                           }};
 
     sched.shutdown();
-    CHECK(lookup.finished.load() == 1);
+    CHECK(lookup.finished.load() == 2);
 }
 
 TEST_CASE("concurrent lookups of one name share one", "[dns][resolver][merge]")
@@ -534,10 +552,11 @@ TEST_CASE("concurrent lookups of one name share one", "[dns][resolver][merge]")
         resolve_result answer{std::unexpected(std::error_code{})};
     };
 
-    // an error is shared as addresses are.
+    // an error is shared as addresses are. (Addresses sorted by RFC 6724, as the lookup sorts them, whatever the
+    // machine's addresses are: see "a lookup of both families sorts their addresses together".)
     auto tc = GENERATE(
         test_case{
-            .answer = std::vector<net::ip_addr>{net::ipv6_addr::loopback(), net::ipv4_addr::loopback()}
+            .answer = std::vector<net::ip_addr>{net::ipv4_addr::loopback(), test_ipv6}
     },
         test_case{.answer = std::unexpected(net::make_gai_error_code(EAI_NONAME))});
 
@@ -571,7 +590,7 @@ TEST_CASE("concurrent lookups of one name share one", "[dns][resolver][merge]")
 
     sched.run_to_completion(test(&sched, &lookup, callers, &counts));
 
-    CHECK(lookup.started.load() == 1);
+    CHECK(lookup.started.load() == 2); // a call for each family
     for (const auto& c : callers)
     {
         CAPTURE(c.host);
@@ -592,7 +611,8 @@ TEST_CASE("lookups of different names or families don't share", "[dns][resolver]
 {
     test::blocking_lookup lookup;
 
-    // four lookups (the last caller shares the first's), as many as the threads for blocking calls.
+    // four lookups (the last caller shares the first's), of six calls (one for each family), as many as the threads
+    // for blocking calls.
     std::vector<caller> callers{
         caller{.host = "a.test"},
         caller{.host = "a.test", .proto = net::protocol::ipv4},
@@ -602,7 +622,7 @@ TEST_CASE("lookups of different names or families don't share", "[dns][resolver]
     };
     caller_counts counts;
 
-    net::io::scheduler sched{one_worker(), {.blocking_threads = 4}};
+    net::io::scheduler sched{one_worker(), {.blocking_threads = 6}};
     net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
 
     const auto test = [](net::io::scheduler*    sched,
@@ -614,7 +634,7 @@ TEST_CASE("lookups of different names or families don't share", "[dns][resolver]
 
         const auto called = co_await wait_count(sched, &counts->called, callers.size());
         REQUIRE(called);
-        const auto started = co_await wait_started(sched, lookup, 4);
+        const auto started = co_await wait_started(sched, lookup, 6);
         REQUIRE(started);
 
         lookup->release();
@@ -624,11 +644,11 @@ TEST_CASE("lookups of different names or families don't share", "[dns][resolver]
 
     sched.run_to_completion(test(&sched, &lookup, callers, &counts));
 
-    CHECK(lookup.started.load() == 4);
+    CHECK(lookup.started.load() == 6);
     for (const auto& c : callers)
     {
         CAPTURE(c.host, c.proto);
-        CHECK(c.result == lookup.answer);
+        CHECK(c.result == lookup.answer_for(c.proto));
     }
 }
 
@@ -675,7 +695,7 @@ TEST_CASE("a caller that leaves a shared lookup leaves the others waiting", "[dn
 
     const auto finished_then = sched.run_to_completion(test(&sched, &lookup, callers, &counts, &stop));
     CHECK(finished_then == 0);
-    CHECK(lookup.started.load() == 1);
+    CHECK(lookup.started.load() == 2); // a call for each family
 
     REQUIRE_FALSE(callers[1].result.has_value());
     CHECK(callers[1].result.error() == std::errc::timed_out);
@@ -737,9 +757,10 @@ TEST_CASE("a shared lookup whose callers have all left is stopped, and not share
 
     sched.run_to_completion(test(&sched, &lookup, callers, &later, &counts, &stop));
 
-    // run_to_completion() waited for every lookup: the one they left never started.
-    CHECK(lookup.started.load() == 2);
-    CHECK(lookup.finished.load() == 2);
+    // run_to_completion() waited for every lookup: the one they left never started. (The others made a call for each
+    // family.)
+    CHECK(lookup.started.load() == 4);
+    CHECK(lookup.finished.load() == 4);
 
     CHECK(callers[0].result == lookup.answer);
     for (std::size_t i = 1; i < callers.size(); ++i)
@@ -769,8 +790,364 @@ TEST_CASE("a lookup that has finished isn't shared", "[dns][resolver][merge]")
     };
 
     const auto started_then = sched.run_to_completion(test(&sched, &lookup));
-    CHECK(started_then == 1);
+    CHECK(started_then == 2); // a call for each family
+    CHECK(lookup.started.load() == 4);
+}
+
+namespace
+{
+
+// family_answers is a system back end whose calls answer at once, each family with its own result.
+struct family_answers
+{
+    resolve_result ipv6{std::unexpected(std::error_code{})};
+    resolve_result ipv4{std::unexpected(std::error_code{})};
+
+    std::atomic<int> ipv6_calls{0};
+    std::atomic<int> ipv4_calls{0};
+    std::atomic<int> other_calls{0};
+
+    net::dns::resolver resolver{
+        {
+         .use           = net::dns::resolver::backend::system,
+         .system_lookup = [this](const std::string& /*host*/, net::protocol proto) -> resolve_result
+            {
+                switch (proto)
+                {
+                case net::protocol::ipv6: ipv6_calls.fetch_add(1); return ipv6;
+                case net::protocol::ipv4: ipv4_calls.fetch_add(1); return ipv4;
+                case net::protocol::not_care: break;
+                }
+                other_calls.fetch_add(1);
+                return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+            }, }
+    };
+};
+
+// wait_news waits (in a task) until res has something new after version, returning what it has then: what it had, if
+// the scheduler's stopped, or nothing new came within 10 seconds.
+task<net::dns::detail::found>
+wait_news(net::io::scheduler* sched, const net::dns::detail::resolution* res, std::uint64_t version)
+{
+    const auto until = net::io::clock::now() + 10s;
+    while (res->news().load() == version)
+    {
+        if (auto err = co_await sched->wait_on(res->news(), version, until); err) break;
+    }
+    co_return res->look();
+}
+
+}
+
+TEST_CASE("a lookup of both families sorts their addresses together", "[dns][resolver][families]")
+{
+    struct test_case
+    {
+        std::vector<net::ip_addr> ipv6{};
+        std::vector<net::ip_addr> ipv4{};
+
+        // the order, if it's the same on any machine.
+        std::vector<net::ip_addr> exactly{};
+    };
+
+    // each family's calls answer in their own order; the result is RFC 6724's (which, for the first, is the same on
+    // any machine: see test_ipv6).
+    auto tc = GENERATE(
+        test_case{
+            .ipv6    = {test_ipv6},
+            .ipv4    = {net::ipv4_addr::loopback()},
+            .exactly = {net::ipv4_addr::loopback(), test_ipv6}
+    },
+        test_case{.ipv6 = {net::ipv6_addr::loopback()}, .ipv4 = {net::ipv4_addr::loopback()}},
+        test_case{
+            .ipv6 = {test_ipv6, net::ipv6_addr::loopback()},
+            .ipv4 = {net::ipv4_addr{192, 0, 2, 1}, net::ipv4_addr::loopback()},
+        });
+
+    family_answers answers;
+    answers.ipv6 = tc.ipv6;
+    answers.ipv4 = tc.ipv4;
+
+    net::io::scheduler sched{make_pool()};
+
+    auto result = sched.run_to_completion(answers.resolver.resolve(&sched, "both.test"));
+    REQUIRE(result.has_value());
+
+    auto expected = tc.ipv6;
+    expected.insert(expected.end(), tc.ipv4.begin(), tc.ipv4.end());
+    net::dns::detail::sort_by_rfc6724(expected);
+    CHECK(*result == expected);
+    if (!tc.exactly.empty()) CHECK(*result == tc.exactly);
+
+    // a call for each family, and nothing else.
+    CHECK(answers.ipv6_calls.load() == 1);
+    CHECK(answers.ipv4_calls.load() == 1);
+    CHECK(answers.other_calls.load() == 0);
+}
+
+TEST_CASE("a lookup of one family makes one call", "[dns][resolver][families]")
+{
+    family_answers answers;
+    answers.ipv6 = std::vector<net::ip_addr>{test_ipv6};
+    answers.ipv4 = std::vector<net::ip_addr>{net::ipv4_addr::loopback()};
+
+    const auto proto = GENERATE(net::protocol::ipv4, net::protocol::ipv6);
+    CAPTURE(proto);
+
+    net::io::scheduler sched{make_pool()};
+
+    auto result = sched.run_to_completion(answers.resolver.resolve(&sched, "one.test", {.proto = proto}));
+    CHECK(result == (proto == net::protocol::ipv4 ? answers.ipv4 : answers.ipv6));
+    CHECK(answers.ipv4_calls.load() == (proto == net::protocol::ipv4 ? 1 : 0));
+    CHECK(answers.ipv6_calls.load() == (proto == net::protocol::ipv6 ? 1 : 0));
+    CHECK(answers.other_calls.load() == 0);
+}
+
+TEST_CASE("a lookup of both families fails only if both do", "[dns][resolver][families][errors]")
+{
+    const auto error = [](int code) { return resolve_result{std::unexpected(net::make_gai_error_code(code))}; };
+
+    struct test_case
+    {
+        std::string    name{};
+        resolve_result ipv6{std::unexpected(std::error_code{})};
+        resolve_result ipv4{std::unexpected(std::error_code{})};
+        resolve_result expected{std::unexpected(std::error_code{})};
+    };
+
+    const std::vector<net::ip_addr> v6{test_ipv6};
+    const std::vector<net::ip_addr> v4{
+        net::ipv4_addr{192, 0, 2, 1}
+    };
+
+    auto tc = GENERATE_COPY(
+        // one failing (e.g. no AAAA records, or no IPv6 on the host) isn't an error.
+        test_case{.name = "no IPv6", .ipv6 = error(EAI_NONAME), .ipv4 = v4, .expected = v4},
+        test_case{.name = "IPv4 failed", .ipv6 = v6, .ipv4 = error(EAI_AGAIN), .expected = v6},
+        // both failing: a temporary failure, if only one is one...
+        test_case{.name     = "IPv6 timed out",
+                  .ipv6     = error(EAI_AGAIN),
+                  .ipv4     = error(EAI_NONAME),
+                  .expected = error(EAI_AGAIN)},
+        test_case{.name     = "IPv4 timed out",
+                  .ipv6     = error(EAI_NONAME),
+                  .ipv4     = error(EAI_AGAIN),
+                  .expected = error(EAI_AGAIN)},
+        // ... and otherwise IPv4's.
+        test_case{.name     = "neither found",
+                  .ipv6     = error(EAI_FAIL),
+                  .ipv4     = error(EAI_AGAIN),
+                  .expected = error(EAI_AGAIN)},
+        test_case{.name     = "other errors",
+                  .ipv6     = error(EAI_NONAME),
+                  .ipv4     = error(EAI_MEMORY),
+                  .expected = error(EAI_MEMORY)},
+        test_case{.name     = "other errors, the other way",
+                  .ipv6     = error(EAI_MEMORY),
+                  .ipv4     = error(EAI_NONAME),
+                  .expected = error(EAI_NONAME)});
+    CAPTURE(tc.name);
+
+    family_answers answers;
+    answers.ipv6 = tc.ipv6;
+    answers.ipv4 = tc.ipv4;
+
+    net::io::scheduler sched{make_pool()};
+
+    auto result = sched.run_to_completion(answers.resolver.resolve(&sched, "failing.test"));
+    CHECK(result == tc.expected);
+}
+
+TEST_CASE("a resolution is told of each family's addresses as they come in", "[dns][resolver][resolution]")
+{
+    test::blocking_lookup lookup;
+    lookup.answer = std::vector<net::ip_addr>{net::ipv4_addr::loopback(), test_ipv6};
+
+    const auto first = GENERATE(net::protocol::ipv4, net::protocol::ipv6);
+    const auto other = first == net::protocol::ipv4 ? net::protocol::ipv6 : net::protocol::ipv4;
+    CAPTURE(first);
+
+    // what the resolution had found: at the start, once the first family's in, and once the other's is.
+    struct seen
+    {
+        net::dns::detail::found    start;
+        net::dns::detail::found    first;
+        net::dns::detail::found    done;
+        net::io::clock::time_point released{};
+    };
+
+    net::io::scheduler sched{make_pool()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         net::protocol          first,
+                         net::protocol          other) -> task<seen>
+    {
+        auto res = lookup->resolver.start_resolving(sched, "both.test", net::protocol::not_care);
+        REQUIRE(res.has_value());
+
+        seen out{.start = res->look(), .first = {}, .done = {}, .released = {}};
+
+        out.released = net::io::clock::now();
+        lookup->release(first);
+        out.first = co_await wait_news(sched, &*res, out.start.version);
+
+        lookup->release(other);
+        out.done = co_await wait_news(sched, &*res, out.first.version);
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(&sched, &lookup, first, other));
+
+    CHECK_FALSE(out.start.done);
+    CHECK(out.start.addrs.empty());
+
+    CHECK_FALSE(out.first.done);
+    CHECK(out.first.family == first);
+    CHECK(out.first.addrs == lookup.answer_for(first));
+    CHECK(out.first.at >= out.released);
+    CHECK(out.first.version > out.start.version);
+
+    // all of them, sorted.
+    CHECK(out.done.done);
+    CHECK(out.done.addrs == *lookup.answer);
+    CHECK(out.done.version > out.first.version);
+}
+
+TEST_CASE("a resolution isn't told of a family that fails", "[dns][resolver][resolution]")
+{
+    test::blocking_lookup lookup;
+    lookup.answer = std::vector<net::ip_addr>{net::ipv4_addr::loopback()}; // no IPv6 addresses
+
+    net::io::scheduler sched{make_pool()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test =
+        [](net::io::scheduler*    sched,
+           test::blocking_lookup* lookup) -> task<std::pair<net::dns::detail::found, net::dns::detail::found>>
+    {
+        auto res = lookup->resolver.start_resolving(sched, "v4.test", net::protocol::not_care);
+        REQUIRE(res.has_value());
+
+        // IPv6's call fails: nothing to tell.
+        lookup->release(net::protocol::ipv6);
+        const auto until = net::io::clock::now() + 10s;
+        while (lookup->finished.load() < 1)
+        {
+            REQUIRE(net::io::clock::now() < until);
+            const auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms);
+            REQUIRE_FALSE(err);
+        }
+        auto after_ipv6 = res->look();
+
+        lookup->release(net::protocol::ipv4);
+        auto done = co_await wait_news(sched, &*res, 0);
+        co_return std::pair{std::move(after_ipv6), std::move(done)};
+    };
+
+    const auto [after_ipv6, done] = sched.run_to_completion(test(&sched, &lookup));
+
+    CHECK_FALSE(after_ipv6.done);
+    CHECK(after_ipv6.addrs.empty());
+    CHECK(after_ipv6.version == 0);
+
+    CHECK(done.done);
+    CHECK(done.addrs == *lookup.answer);
+    CHECK(done.version == 1);
+}
+
+TEST_CASE("a shared lookup tells what's in so far to the callers that join it", "[dns][resolver][resolution][merge]")
+{
+    test::blocking_lookup lookup;
+    lookup.answer = std::vector<net::ip_addr>{net::ipv4_addr::loopback(), test_ipv6};
+
+    std::vector<caller> callers{caller{.host = "shared.test"}};
+    caller_counts       counts;
+
+    // what a resolution joining it found, once IPv4's addresses were in; what one joining after found at once; and
+    // whether resolve()'s caller had returned by then.
+    struct seen
+    {
+        net::dns::detail::found joined;
+        net::dns::detail::found later;
+        std::uint64_t           returned_then = 0;
+        net::dns::detail::found done;
+    };
+
+    net::io::scheduler sched{one_worker()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    const auto test = [](net::io::scheduler*    sched,
+                         test::blocking_lookup* lookup,
+                         std::span<caller>      callers,
+                         caller_counts*         counts) -> task<seen>
+    {
+        // resolve()'s caller starts the lookup, then a resolution joins it.
+        REQUIRE(start(sched, &lookup->resolver, callers, counts));
+        const auto started = co_await wait_started(sched, lookup, 2);
+        REQUIRE(started);
+
+        auto res = lookup->resolver.start_resolving(sched, "SHARED.test", net::protocol::not_care);
+        REQUIRE(res.has_value());
+
+        seen out;
+        lookup->release(net::protocol::ipv4);
+        out.joined        = co_await wait_news(sched, &*res, 0);
+        out.returned_then = counts->returned.load();
+
+        auto later = lookup->resolver.start_resolving(sched, "shared.test", net::protocol::not_care);
+        REQUIRE(later.has_value());
+        out.later = later->look();
+
+        lookup->release(net::protocol::ipv6);
+        out.done = co_await wait_news(sched, &*res, out.joined.version);
+
+        const auto returned = co_await wait_count(sched, &counts->returned, callers.size());
+        REQUIRE(returned);
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(&sched, &lookup, callers, &counts));
+
+    // one lookup: a call for each family.
     CHECK(lookup.started.load() == 2);
+
+    CHECK_FALSE(out.joined.done);
+    CHECK(out.joined.family == net::protocol::ipv4);
+    CHECK(out.joined.addrs == std::vector<net::ip_addr>{net::ipv4_addr::loopback()});
+    CHECK(out.returned_then == 0);
+
+    // the same, when it came in.
+    CHECK_FALSE(out.later.done);
+    CHECK(out.later.addrs == out.joined.addrs);
+    CHECK(out.later.at == out.joined.at);
+    CHECK(out.later.version == out.joined.version);
+
+    CHECK(out.done.done);
+    CHECK(out.done.addrs == *lookup.answer);
+    CHECK(callers[0].result == lookup.answer);
+}
+
+TEST_CASE("a resolution of an IP address is done at once", "[dns][resolver][resolution][literal]")
+{
+    test::blocking_lookup lookup;
+
+    net::io::scheduler sched{make_pool()};
+    net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
+
+    auto res = lookup.resolver.start_resolving(&sched, "::1", net::protocol::not_care);
+    REQUIRE(res.has_value());
+
+    const auto found = res->look();
+    CHECK(found.done);
+    CHECK(found.addrs == std::vector<net::ip_addr>{net::ipv6_addr::loopback()});
+
+    CHECK(lookup.resolver.start_resolving(&sched, "::1", net::protocol::ipv4).error()
+          == std::errc::address_family_not_supported);
+    CHECK(lookup.resolver.start_resolving(&sched, "a..b", net::protocol::not_care).error()
+          == std::errc::invalid_argument);
+    CHECK(lookup.started.load() == 0);
 }
 
 TEST_CASE("the system's resolver, and the default one, find localhost", "[dns][resolver]")

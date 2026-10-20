@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -35,7 +37,8 @@ struct resolve_options
 namespace detail
 {
 
-    // lookup_function is a blocking lookup of a host's addresses, as the system back end's getaddrinfo() is.
+    // lookup_function is a blocking lookup of a host's addresses, as the system back end's getaddrinfo() is. A lookup
+    // of both families calls it once for each (protocol::ipv6 and protocol::ipv4), in parallel.
     using lookup_function =
         std::function<std::expected<std::vector<ip_addr>, std::error_code>(const std::string& host, protocol proto)>;
 
@@ -55,6 +58,61 @@ namespace detail
     };
 
     struct resolver_state;
+    struct lookup;
+
+    // found is what a lookup has found so far (see resolution::look()).
+    struct found
+    {
+        // once done, the lookup's addresses (as resolve() returns them), or err (none: why). Until then, the addresses
+        // of the first family to have any (family's), which came in at `at`; or none, if neither has yet.
+        bool                  done = false;
+        std::vector<ip_addr>  addrs{};
+        std::error_code       err{};
+        protocol              family = protocol::not_care;
+        io::clock::time_point at{};
+
+        // how many times the lookup had told its callers of something new: what resolution::news() holds until the
+        // next time.
+        std::uint64_t version = 0;
+    };
+
+    // resolution is a caller's share of a lookup, for tcp_socket::connect(), which starts connecting on the first
+    // family's addresses (RFC 8305 section 3) rather than waiting for both: the lookup tells it of each as it comes
+    // in (see resolver::start_resolving()). It leaves the lookup when it's destroyed (as resolve()'s callers do when
+    // they give up), unless the lookup is done. Not thread-safe (but the lookup it shares is).
+    class resolution
+    {
+    public:
+        // a resolution that's done: e.g. host was an IP address.
+        explicit resolution(std::vector<ip_addr> addrs) noexcept;
+        resolution(std::shared_ptr<resolver_state> resolver, std::shared_ptr<lookup> state) noexcept;
+
+        resolution(const resolution&)            = delete;
+        resolution& operator=(const resolution&) = delete;
+        resolution(resolution&& other) noexcept;
+        resolution& operator=(resolution&&) = delete;
+        ~resolution();
+
+        // look is what the lookup has found so far.
+        [[nodiscard]] found look() const;
+
+        // news is bumped (and notified, with the lookup's scheduler's notify_all()) each time the lookup has found
+        // something new, or is done: to wait for, with found::version as what it holds now.
+        [[nodiscard]] const std::atomic<std::uint64_t>& news() const noexcept;
+
+        // watch has word bumped and notified too (once) the next time news is, unless it no longer holds version: then
+        // it returns false, and there's something new to look at. (For a caller that waits on a word of its own, for
+        // other things too.) It throws if it can't allocate.
+        bool watch(std::shared_ptr<std::atomic<std::uint64_t>> word, std::uint64_t version);
+
+    private:
+        std::shared_ptr<resolver_state> resolver;
+        std::shared_ptr<lookup>         state; // null: done at once, with addrs
+        std::vector<ip_addr>            addrs;
+
+        // the word watch() was last given, which leaving takes back.
+        std::atomic<std::uint64_t>* watching = nullptr;
+    };
 
 }
 
@@ -89,7 +147,12 @@ public:
         // follows it. NET_DNS=system or NET_DNS=native in the environment (read when the resolver is made; other
         // values are ignored) makes it that one.
         automatic,
-        // the system's resolver, getaddrinfo().
+        // the system's resolver, getaddrinfo(): for both families, a call for each (AF_INET6 and AF_INET), in
+        // parallel, on threads of their own, their addresses then sorted by RFC 6724 together (as one call's would be).
+        // One family failing (e.g. a name without AAAA records, or AI_ADDRCONFIG on a host without IPv6) isn't an
+        // error if the other has addresses; if both fail, the error is a temporary failure's (as condition has it),
+        // if only one is one, and otherwise IPv4's (IPv6's failure being the likelier to be the host's own, with
+        // AI_ADDRCONFIG).
         system,
         // the resolver's own, as Go's: it reads the configuration (see config), looks names up in the hosts table, and
         // asks the nameservers itself, over UDP from a new socket (so a new random source port) each attempt, with
@@ -140,6 +203,15 @@ public:
     //       the task.
     coro::task<std::expected<std::vector<ip_addr>, std::error_code>>
     resolve(io::scheduler* scheduler, std::string host, resolve_options options = {}) const;
+
+    // Internal (for tcp_socket::connect()): start_resolving starts looking host up (with proto's families), or joins
+    // the lookup in flight, as resolve() does, but returns at once: the resolution tells of each family's addresses as
+    // they come in (the system back end looks each up on its own thread; the native tells of a family as soon as a
+    // server has answered with its addresses, if the other's question is still open), and of the lookup's result
+    // once it's done. An IP address is a resolution that's done. It fails as resolve() does without waiting
+    // (std::errc::invalid_argument, address_family_not_supported).
+    [[nodiscard]] std::expected<detail::resolution, std::error_code>
+    start_resolving(io::scheduler* scheduler, std::string host, protocol proto) const;
 
 private:
     std::shared_ptr<detail::resolver_state> state;

@@ -55,9 +55,15 @@ public:
         // together, each until the timeout's end, and the first to connect wins: the rest are stopped, their sockets
         // closed. So an address that doesn't answer (e.g. a broken IPv6 route) costs attempt_delay, not the timeout.
         //
-        // 0 tries the addresses one at a time, in their order, each with a share of what's left of the timeout (Go's
-        // rule: the time left over the addresses left, but at least 2 seconds, and never past the end), so one that
-        // doesn't answer leaves time for the rest.
+        // Connecting to a name (of both families) starts on the first family's addresses rather than waiting for
+        // both (RFC 8305 section 3): IPv6's at once, IPv4's once they've had the resolution delay (RFC 8305's
+        // recommended 50 ms) unless IPv6's come in by then; those that come in later are sorted into the
+        // attempts not yet made (going on alternating by family), and if every attempt has failed before then, it
+        // waits for them.
+        //
+        // 0 waits for both families' addresses, then tries them one at a time, in their order, each with a share of
+        // what's left of the timeout (Go's rule: the time left over the addresses left, but at least 2 seconds, and
+        // never past the end), so one that doesn't answer leaves time for the rest.
         std::chrono::milliseconds attempt_delay = std::chrono::milliseconds{250};
 
         bool keepalive = true;
@@ -70,6 +76,10 @@ public:
         // What resolves the host, if it's a name: null is dns::default_resolver(). It must outlive the connect.
         dns::resolver* resolver = nullptr;
 
+        // Internal (for tests): how long connecting to a name waits for its IPv6 addresses once its IPv4 addresses
+        // have come in (RFC 8305's Resolution Delay): see attempt_delay.
+        std::chrono::milliseconds resolution_delay = std::chrono::milliseconds{50};
+
         // Internal (for tests): replaces connect() for each attempt, if set. It's called on the connecting task's
         // thread, and mustn't throw.
         detail::connect_function system_connect{};
@@ -79,7 +89,8 @@ public:
     tcp_socket(io::scheduler* scheduler, io::handle fd);
 
     // connect resolves host (with options.resolver, see dns::resolver::resolve()), and connects to the first of its
-    // addresses that accepts (see connect() for addresses), on port, which must be a number (e.g. "80", not "http").
+    // addresses that accepts (see connect() for addresses, and connect_options::attempt_delay for starting before the
+    // lookup's done), on port, which must be a number (e.g. "80", not "http").
     // An IP address (e.g. "127.0.0.1" or "::1", or an IPv6 address with a zone, "fe80::1%en0") isn't resolved: it's
     // connected to without a blocking thread (see io::scheduler::run_blocking()). It fails with:
     // - std::errc::invalid_argument if port isn't a number from 0 to 65535, or host isn't a valid name.

@@ -53,11 +53,14 @@ struct fake_query
 };
 
 // fake_reply is a message the fake server sends back to a query, after a delay. (A reply's delay holds up the queries
-// that come after it, on UDP, which are read one at a time.)
+// that come after it, on UDP, which are read one at a time, unless it's apart.)
 struct fake_reply
 {
     net::dns::message         msg{};
     std::chrono::milliseconds delay{};
+
+    // whether it's sent apart (UDP only): by a task of its own, so its delay holds up nothing else.
+    bool apart = false;
 };
 
 // fake_handler is what the fake server sends back to a query: any number of replies, none to drop it. It's called on
@@ -269,8 +272,14 @@ private:
 
             auto replies =
                 st->take({.msg = std::move(*msg), .tcp = false, .port = got->port, .when = net::io::clock::now()});
-            for (const auto& reply : replies)
+            for (auto& reply : replies)
             {
+                if (reply.apart)
+                {
+                    if (!st->sched->spawn(send_apart(st, std::move(reply), got->addr, got->port))) co_return;
+                    continue;
+                }
+
                 if (reply.delay > std::chrono::milliseconds::zero())
                 {
                     auto err =
@@ -283,6 +292,21 @@ private:
                 (void)co_await st->udp->send_to(out, got->addr, got->port);
             }
         }
+    }
+
+    // send_apart sends reply over UDP to addr and port, after its delay.
+    static net::coro::task<>
+    send_apart(std::shared_ptr<state> st, fake_reply reply, net::ip_addr addr, std::uint16_t port)
+    {
+        if (reply.delay > std::chrono::milliseconds::zero())
+        {
+            auto err = co_await st->sched->sleep_until(net::io::clock::now() + reply.delay, st->stop.get_token());
+            if (err) co_return;
+        }
+
+        std::vector<std::byte> out;
+        if (net::dns::encode(reply.msg, out)) co_return;
+        (void)co_await st->udp->send_to(out, addr, port);
     }
 
     static net::coro::task<> serve_tcp(std::shared_ptr<state> st)

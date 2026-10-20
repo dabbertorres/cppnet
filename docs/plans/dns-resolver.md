@@ -5,7 +5,7 @@ sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's 
 throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 6 are
 done (2026-10-19); "Where things stand" describes the code before them. Stage 7 (Happy Eyeballs) was decided
 (2026-10-19): RFC 8305, its racing and its resolution delay, on both back ends, on by default (Decided question 10).
-Its first part (racing the attempts) is done (2026-10-19).
+Its first part (racing the attempts) is done (2026-10-19), and its second (the resolution delay) too (2026-10-20).
 
 ## Goal
 
@@ -449,6 +449,79 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
       `getaddrinfo()` calls in parallel (`AF_INET6` and `AF_INET`, two `run_blocking` threads), and the results are
       sorted with `sort_by_rfc6724()`, as getaddrinfo's own sort no longer sees both. A lookup of one family
       (`protocol::ipv4`/`ipv6`) is unchanged.
+      **Done** (2026-10-20) as above. The interface is `resolver::start_resolving(scheduler, host, proto)` (internal,
+      for `tcp_socket::connect`): it joins or starts the lookup as `resolve()` does, but returns at once a
+      `detail::resolution`, the caller's share of the lookup (left when it's destroyed, unless the lookup's done),
+      whose `look()` is what's found so far (`detail::found`: once done, the result; before, the first family's
+      addresses, their family and when they came in; and a version), `news()` the word bumped (and notified) each
+      time there's something new, and `watch(word, version)` a word of the caller's own to bump too, once, the next
+      time (unless the version has moved on: then it returns false). `resolve()` is unchanged, and waits on its own
+      word, `done`. Decided along the way, where the plan was silent:
+      - Only addresses are told of: a family that fails before the other's in changes nothing for `connect` (it has
+        nothing to try, and waits for the other anyway), so it's kept for the result, not told of. A lookup tells of
+        at most one family before it's done (the first to have addresses), so `found` holds one.
+      - A shared lookup keeps what it has found (the first family's addresses, and when) under the resolver's lock,
+        so a resolution that joins later sees it at once, and counts the resolution delay from when they came in, not
+        from when it joined. The lookup's `news` word is notified only once a resolution has joined it (`watched`),
+        so `resolve()`'s callers aren't woken by what they don't wait for; the first family's addresses are kept
+        where they are (the system back end's result for it), not copied.
+      - The system back end's two calls: IPv6's in the lookup's task, IPv4's in a task of its own (both on
+        `run_blocking`, with the lookup's token). `options::system_lookup` is called once per family (`ipv6`,
+        `ipv4`; a test's `blocking_lookup` answers each with its family's part of its answer, and releases each
+        family on its own). Each family's addresses are kept to that family (a test hook's too). A numeric host that
+        `literal()` leaves to `getaddrinfo()` (e.g. `127.1`) is read with `AF_UNSPEC` and `AI_NUMERICHOST` in each
+        family's call, as the single call read it, and the other family's address dropped, so the IPv6 call doesn't
+        ask DNS for it as a name. The two families' addresses are sorted together only when both have some (each
+        call's are sorted already).
+      - The system back end's error when both families fail: a temporary failure's (`condition::temporary_failure`,
+        e.g. `EAI_AGAIN`) if only one is one, as `getaddrinfo()` for both reports a query that timed out (the name may
+        well have addresses); otherwise IPv4's, as with `AI_ADDRCONFIG` IPv6's failure is the likelier to be the
+        host's own (no IPv6 address), saying nothing of the name. The native back end's rules are unchanged (the
+        last met, the name as given winning over the search domains').
+      - The native back end tells of a family's addresses as soon as an answer (over UDP or TCP) gives them, if
+        another of the name's questions is still open (they're then the lookup's: the search list goes no further),
+        sorted on their own (their sockets' syscalls again, when the result's sorted). Its queries are still sent A
+        first, then AAAA (both at once, unless `single-request`); RFC 8305 asks for AAAA first, which matters only
+        with `single-request`, and is left as it is.
+      - `connect` starts on the first family's answer only when resolving a name of both families with
+        `attempt_delay` above 0; a connect of one family, and `attempt_delay` 0, resolve both families (or the one)
+        before connecting, exactly as before (0 being today's behaviour: waiting for both, then one at a time with
+        shares; the resolution delay doesn't apply). An IP address is a resolution that's done at once.
+      - The resolution delay is RFC 8305's recommended 50 ms, not an option for applications (Go has none; RFC 8305
+        doesn't ask for one), but an internal one, `connect_options::resolution_delay`, for tests that need a long
+        one. IPv6's addresses start the attempts at once, and so does a lookup that's done before the delay's end
+        (e.g. IPv6 failing): then its result (both families sorted by RFC 6724) is tried as part 1 tries addresses
+        (`connect_to()`, so a single address takes the one-at-a-time path).
+      - Addresses that come in later are sorted into the attempts not yet made: the lookup's result (sorted), less
+        the addresses already tried, interleaved going on from the last tried (the other family first). They wait for
+        the attempt delay like any (they don't start an attempt early), unless every attempt so far has failed: then
+        `connect` waits for them (until the deadline), and starts on them at once. Waiting before any attempt has
+        outlasted the delay is a wait on the lookup's `news` word (no race made, so a host whose IPv6 address is
+        refused at once, e.g. localhost with a server on 127.0.0.1 only, costs what it did); once racing, the race's
+        word watches the lookup (`resolution::watch()`), so its one wait wakes for either.
+      - When the lookup ends with neither family's addresses (before an attempt), `connect` fails with its error; when
+        attempts have been made and the other family fails, with the last attempt's.
+      - A wait in `connect` that's canceled by the scheduler stopping (not `options.stop`) is told by the loop's start
+        too: `ended()` checks `scheduler::stop_requested()`.
+      - The tests: `test/dns/resolver.cpp` (both families sorted together, the error choice, one family's lookup a
+        single call, a resolution told of each family, not of a family that fails, and a shared lookup telling
+        joiners what's in), `test/dns/native.cpp` (the native back end telling of a family early, with
+        `fake_reply::apart`, a delayed reply that doesn't hold up the next query, so either family can be late), and
+        `test/tcp.cpp` (`[happy-eyeballs][resolution]`: IPv6 first starts at once, IPv4 first waits the delay, IPv6
+        within the delay starts then, late addresses sorted in, waiting for a family once every attempt's failed, a
+        family that came in as the other's attempts failed, one family failing, both failing, the deadline and a stop
+        during the delay, and `attempt_delay` 0 waiting for both). Those that need a family to be in before something
+        else happens join the connect's lookup with a resolution of their own, rather than sleeping.
+      - Costs. A system lookup of both families: a second task (its frame and `spawn()`'s allocations), a second
+        `run_blocking` call (a thread, and a hop to it and back), and when both families have addresses, the RFC
+        6724 sort over them (a UDP socket connected and asked its address per address: syscalls, no packets), which
+        `getaddrinfo()` did in its one call. Nothing for what's found early unless a resolution has joined (a
+        notification). A native lookup: a copy and a sort of the first family's addresses when they come in before
+        the other's answer. `connect` to a name: `resolve()`'s coroutine frame is gone (`start_resolving()` isn't a
+        coroutine), and `connect_resolving()`'s is there instead; a copy of what's found each time it looks (once or
+        twice); a host whose IPv4 addresses come in up to 50 ms before its IPv6 addresses waits for them (as RFC 8305
+        intends), and one whose IPv6 addresses are late by more starts without them. Racing while a family is still
+        to come adds an entry to the lookup's watchers.
    Still later: a cache, only if ever needed; a transport hook (Go's `Resolver.Dial`) when DNS over TLS or HTTPS is
    wanted.
 

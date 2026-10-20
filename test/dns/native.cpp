@@ -1184,6 +1184,109 @@ TEST_CASE("native lookups finish whichever way their callers leave", "[dns][nati
 // nameservers, as the system back end's [network] tests in resolver.cpp. (CI's back end is the system's on its Linux
 // and on macOS, but automatic picks the native one on e.g. Debian's and Ubuntu's servers.)
 
+TEST_CASE("a native lookup tells of a family's addresses as soon as they're in", "[dns][native][resolution]")
+{
+    // one family's answer is late (sent apart, so the other's isn't held up behind it).
+    constexpr auto late = 300ms;
+
+    const auto late_type = GENERATE(dns::type::a, dns::type::aaaa);
+    CAPTURE(late_type == dns::type::a ? "A" : "AAAA");
+
+    const auto handler = [late_type, late](const test::fake_query& q)
+    {
+        auto replies = test::answer_from(host_zone())(q);
+        if (q.msg.questions.front().type == late_type)
+        {
+            for (auto& r : replies)
+            {
+                r.delay = late;
+                r.apart = true;
+            }
+        }
+        return replies;
+    };
+
+    // what the resolution had found: once the first family's in, and once both are; and when.
+    struct seen
+    {
+        dns::detail::found         first;
+        net::io::clock::time_point first_when{};
+        dns::detail::found         done;
+        net::io::clock::time_point done_when{};
+    };
+
+    net::io::scheduler sched{make_pool()};
+    test::fake_server  server{&sched, handler};
+
+    const auto resolver = native(config_for({server.nameserver()}));
+
+    const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<seen>
+    {
+        auto res = resolver->start_resolving(sched, "host.test", net::protocol::not_care);
+        REQUIRE(res.has_value());
+
+        const auto wait = [](net::io::scheduler*            sched,
+                             const dns::detail::resolution* res,
+                             std::uint64_t                  version) -> task<dns::detail::found>
+        {
+            const auto until = net::io::clock::now() + 10s;
+            while (res->news().load() == version)
+            {
+                if (auto err = co_await sched->wait_on(res->news(), version, until); err) break;
+            }
+            co_return res->look();
+        };
+
+        seen out;
+        out.first      = co_await wait(sched, &*res, 0);
+        out.first_when = net::io::clock::now();
+        out.done       = co_await wait(sched, &*res, out.first.version);
+        out.done_when  = net::io::clock::now();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(&sched, &resolver));
+
+    const auto early = late_type == dns::type::a ? net::protocol::ipv6 : net::protocol::ipv4;
+    REQUIRE_FALSE(out.first.done);
+    CHECK(out.first.family == early);
+    CHECK(out.first.addrs
+          == std::vector<net::ip_addr>{early == net::protocol::ipv4 ? net::ip_addr{addr4} : net::ip_addr{addr6}});
+
+    CHECK(out.done.done);
+    CHECK(set_of(out.done.addrs) == set_of({addr4, addr6}));
+    CHECK(out.done_when - out.first.at >= late / 2);
+
+    // asked once each, at once.
+    CHECK(server.queries().size() == 2);
+}
+
+TEST_CASE("a native lookup of one family tells of nothing until it's done", "[dns][native][resolution]")
+{
+    net::io::scheduler sched{make_pool()};
+    test::fake_server  server{&sched, test::answer_from(host_zone())};
+
+    const auto resolver = native(config_for({server.nameserver()}));
+
+    const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<dns::detail::found>
+    {
+        auto res = resolver->start_resolving(sched, "host.test", net::protocol::ipv4);
+        REQUIRE(res.has_value());
+
+        const auto until = net::io::clock::now() + 10s;
+        while (res->news().load() == 0)
+        {
+            if (auto err = co_await sched->wait_on(res->news(), 0, until); err) break;
+        }
+        co_return res->look();
+    };
+
+    const auto found = sched.run_to_completion(test(&sched, &resolver));
+    CHECK(found.done);
+    CHECK(found.version == 1);
+    CHECK(found.addrs == std::vector<net::ip_addr>{addr4});
+}
+
 TEST_CASE("the native resolver finds a public name", "[dns][native][.network]")
 {
     struct test_case

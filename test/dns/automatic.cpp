@@ -303,7 +303,7 @@ TEST_CASE("automatic looks names up with the back end it chooses", "[dns][automa
     auto result = sched.run_to_completion(resolver.resolve(&sched, tc.host));
     REQUIRE(result.has_value());
     CHECK(*result == std::vector<net::ip_addr>{tc.expected});
-    CHECK(system_lookups.load() == (tc.expected == net::ip_addr{system_addr} ? 1 : 0));
+    CHECK(system_lookups.load() == (tc.expected == net::ip_addr{system_addr} ? 2 : 0)); // a call for each family
 }
 
 TEST_CASE("automatic's choice follows the configuration's changes, and lookups of one name with different back ends "
@@ -407,5 +407,5 @@ TEST_CASE("automatic's choice follows the configuration's changes, and lookups o
     auto second = sched.run_to_completion(test(&sched, &resolver, &files, &started, &released, &first));
     CHECK(second == resolve_result{std::vector<net::ip_addr>{hosts_addr}});
     CHECK(first.result == resolve_result{std::vector<net::ip_addr>{system_addr}});
-    CHECK(started.load() == 1);
+    CHECK(started.load() == 2); // a call for each family
 }
