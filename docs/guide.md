@@ -122,7 +122,7 @@ The objects that coroutines use must outlive them too:
 
 Failures are reported, not thrown: functions that can fail return `std::expected<T, std::error_code>`, and reads and
 writes return an `io::result{count, err}`. Errors are `std::error_code`s: the OS's (`std::system_category()`), or the
-library's own (`io::errc`, `tls::errc`, `dns::errc`, `gai_category()`'s, ...).
+library's own (`io::errc`, `tls::errc`, `dns::errc`, `gai_category()`'s, `http::client_errc`, ...).
 
 Compare an error against a condition, which matches every error that means the same, rather than a particular code:
 
@@ -139,6 +139,8 @@ if (res.err == net::io::errc::end_of_stream) { /* only the clean end of the stre
   request) `std::errc::operation_canceled`.
 - A name that doesn't resolve compares equal to `dns::condition::not_found` (and a failure that might pass to
   `dns::condition::temporary_failure`), whichever resolver reported it (see DNS).
+- The HTTP client's own errors are `http::client_errc`'s (`http/client.hpp`, in `http::client_category()`):
+  `too_many_redirects` and `bad_redirect` (see HTTP client).
 - `error.message()` says what happened, for logs.
 
 Exceptions are for programming errors (e.g. a second final response to a request, or an invalid metric name), and
@@ -359,6 +361,31 @@ body, whose connection dropped (without GOAWAY) before its response. The request
 `max_connections` as others do (one without streams is idle, and may be closed to make room for another host's), close
 once idle for `idle_timeout` (at once, if it's 0), and fail if their writes stall for `io_timeout`. Destroying the
 client lets the bodies being read finish.
+
+Redirects (301, 302, 303, 307 and 308, with a `Location`) are followed only when asked for: up to
+`client_options::max_redirects` of them (0 by default, so `send()` returns the redirect's response; Go's 10 is a
+sensible limit), or `client_request::max_redirects`, which overrides it for one request. Each is a request of its own
+(its connection, retries and timeouts; the request's stop token covers them all), to `Location` resolved against the
+request's URL (`url::resolve()`, keeping the fragment if `Location` has none), and the response's `url` says which URL
+it answers. One more than the limit fails with `http::client_errc::too_many_redirects`, a `Location` that isn't a valid
+reference with `client_errc::bad_redirect`, and one that isn't `http` or `https` with `std::errc::protocol_not_supported`.
+
+```cpp
+net::http::client client{&scheduler, {.max_redirects = 10}};
+
+auto resp = co_await client.get("http://example.com/download");   // after any redirects
+if (resp) std::println("{}", resp->url.build());                    // e.g. a CDN's signed URL
+```
+
+301 and 302 (for methods other than GET and HEAD) and 303 (other than HEAD) are followed with a GET, and none of them
+sends the body, nor the fields describing it (`Content-Length`, `Content-Type`, ...); 307 and 308 keep the method and
+the body, which they read again from `client_request::get_body` (a function returning a new reader of it, as Go's
+`GetBody`), which `set_body()` sets: a request with a body but no `get_body` gets the 307 or 308 back. The request's
+fields go on, but `Authorization`, `Proxy-Authorization` and `Cookie` only to the same scheme, host and port, or the
+same host from `http` to `https` on the default ports, and once dropped, to none of the later requests; a `Host` the
+request set only to the same host and port. No `Referer` is sent. A redirect's response is read to its end and
+discarded if what's left of its body is at most 2 KiB (so its HTTP/1.1 connection is reused), and closed otherwise (an
+HTTP/2 stream is reset).
 
 A request is canceled by its `stop` token (`client_request::stop`, or `get(url, stop)`): requesting stop ends it
 wherever it is (waiting for a connection or an HTTP/2 stream, resolving the host, connecting and the TLS handshake,

@@ -55,6 +55,11 @@ struct client_options
     // is done.
     std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
 
+    // How many redirects (301, 302, 303, 307 and 308, with a Location) a request follows, before failing with
+    // client_errc::too_many_redirects: 0 (the default) follows none, so send() returns the redirect's response; Go's 10
+    // is a sensible limit. A request may override it (client_request::max_redirects). See client::send().
+    std::size_t max_redirects = 0;
+
     // How long to wait for a response's head, once its request has been sent. 0 is no limit.
     std::chrono::milliseconds response_header_timeout = std::chrono::seconds{30};
 

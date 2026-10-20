@@ -22,6 +22,7 @@
 #include "io/limit_writer.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
+#include "url.hpp"
 
 namespace net::http
 {
@@ -210,6 +211,10 @@ struct client_response
     // std::errc::connection_aborted, if the connection ends first).
     std::unique_ptr<io::reader> body = nullptr;
 
+    // The URL of the request the response answers: the request's, or after redirects, the last one's (e.g. to resolve
+    // the body's relative links against).
+    net::url url{};
+
     client_response() noexcept = default;
 
     client_response(const client_response&)            = delete;
@@ -220,6 +225,7 @@ struct client_response
         , status_code{std::exchange(other.status_code, status::NONE)}
         , headers{std::exchange(other.headers, {})}
         , body{std::exchange(other.body, nullptr)}
+        , url{std::exchange(other.url, {})}
     {}
 
     client_response& operator=(client_response&& other) noexcept
@@ -230,6 +236,7 @@ struct client_response
             status_code = std::exchange(other.status_code, status::NONE);
             headers     = std::exchange(other.headers, {});
             body        = std::exchange(other.body, nullptr);
+            url         = std::exchange(other.url, {});
         }
 
         return *this;

@@ -1,7 +1,7 @@
 # Plan: following redirects in the HTTP client
 
-Status: decided (2026-10-19): the questions at the end, as recommended, except that redirects aren't followed by
-default (question 2: `max_redirects` is 0 unless set). Stage 1 is done; stage 2 hasn't started.
+Status: done (2026-10-19). Decided: the questions at the end, as recommended, except that redirects aren't followed by
+default (question 2: `max_redirects` is 0 unless set). Stages 1 and 2 are done.
 
 ## Goal
 
@@ -136,6 +136,42 @@ knowledge). `url::resolve()` on RFC 3986's examples; `url::parse()` keeping enco
 2. **Following redirects.** As above, with `client_request::get_body`, `client_options::max_redirects` (and the
    per-request override), `client_errc` (`http/client.hpp`, or its own header), the response's URL, and the guide's
    client section.
+
+   Done as above. Where the plan was silent:
+   - `client_errc` (and `client_category()`) is in `http/client.hpp`, not a header of its own: only the client reports
+     it, and whoever compares with it has the client's result, so has included `http/client.hpp` anyway
+     (`dns/error.hpp` is separate so the DNS codec doesn't pull in the scheduler, which doesn't apply here).
+   - 301, 302 and 303 never send the body, whatever the method (as Go's `includeBody = false`), so a GET with a body
+     doesn't need `get_body` for them; and they always drop the body's fields.
+   - The order: a response that isn't one of the five, has no `Location`, has a limit of 0, or is a 307/308 for a
+     request with a body and no `get_body`, is returned as it is (before the limit, as Go's `redirectBehavior` decides
+     before `CheckRedirect`); then the limit; then `Location` (`url::resolve()`'s `invalid_argument` is
+     `bad_redirect`, its other errors, e.g. `not_enough_memory`, are passed on); then the scheme; and only then is
+     `get_body` called (returning null, the 307/308 is returned). Nothing in the request changes until then. The
+     response that fails (over the limit, a bad `Location`) is closed, not read (as Go closes it).
+   - A `Host` the caller set is dropped when the host or the port changes (the plan said the host), compared as the
+     credentials are: the host ignoring case, a missing port as the scheme's default. Both are compared hop to hop
+     (each redirect against the request it follows); what's dropped is removed from the request, so it stays dropped.
+   - The credentials' rule is `http::detail::keeps_credentials(from, to)`, in `http/client.hpp` for its tests: the
+     upgrade (default ports) can't be reached on loopback.
+   - Discarding: a `Content-Length` over 2 KiB is closed without reading; otherwise up to 2 KiB and one byte more are
+     read (a `discard` coroutine, allocated only for a redirect), and the response is destroyed: its body's end seen
+     by then, an HTTP/1.x connection goes back to the pool (as `pooled_body` does for any body read to its end), and
+     an HTTP/2 stream ends without RST_STREAM; otherwise it's closed (reset). Those reads are limited by `io_timeout`
+     and the request's stop token, as any body's.
+   - `client_response::url` is set for every response: moved from the request (whose response it is, and which
+     nothing refers to once its head is in), so it costs no copy.
+   - `set_body()` keeps the content in a `std::shared_ptr<const std::string>`, read by `io::shared_string_reader`
+     (new, beside `owned_string_reader`); `get_body`'s lambda holds the pointer, which fits `std::function`'s small
+     buffer (libc++'s and libstdc++'s). That's one allocation more per `set_body()` (the shared string's control
+     block) than before.
+   - Cost without redirects: `send()` checks the status (`redirect()` returns at its first test) and moves the URL into
+     the response; its frame holds a few more words (the limit, the count, and the attempt's result, now outside the
+     retry loop), and `client_request` grows by `get_body` and `max_redirects`. Nothing more is allocated (but for
+     `set_body()`'s one), and no coroutine is added: the hops and the retries are loops in `send()`, and
+     `send_on()`, which picks HTTP/2 or HTTP/1.x, isn't a coroutine.
+   - The tests are `test/http/client_redirect.cpp` (`[http][client][redirect]`): servers scripted per target,
+     HTTP/1.1 and HTTP/2 (prior knowledge).
 
 ## Decided questions
 

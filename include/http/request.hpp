@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -92,6 +94,12 @@ struct client_request
     // it, so it can only be sent once.
     std::unique_ptr<io::reader> body = nullptr;
 
+    // get_body returns a new reader of the same body, from its start (Go's GetBody), for a redirect that sends it again
+    // (307 and 308: see client::send()): without it, or if it returns null, a request with a body isn't redirected by
+    // them (the 307 or 308 is returned). set_body() sets it. It's called on the task sending the request, so must be
+    // quick (as any of the scheduler's tasks); an exception it throws comes out of send().
+    std::function<std::unique_ptr<io::reader>()> get_body{};
+
     // stop cancels the request: requesting stop ends it wherever it is, failing with std::errc::operation_canceled,
     // whether it's waiting for a connection (or an HTTP/2 stream), connecting, sending the request, or waiting for the
     // response's head; and once send() has returned the response, reading its body fails the same way (unless it was
@@ -105,11 +113,20 @@ struct client_request
     // canceled with it: out.stop = req.stop.
     std::stop_token stop{};
 
-    // set_body sets the body to content, and the Content-Length to match.
+    // max_redirects is how many redirects to follow for this request, overriding client_options::max_redirects (which
+    // says what following them does) if it's set: e.g. 0 to get a redirect's response, from a client that follows
+    // them.
+    std::optional<std::size_t> max_redirects{};
+
+    // set_body sets the body to content, and the Content-Length to match; and get_body, to read it again (sharing
+    // content, rather than copying it), for redirects that send it again.
     void set_body(std::string content)
     {
         headers.set_content_length(content.size());
-        body = std::make_unique<io::owned_string_reader>(std::move(content));
+
+        auto shared = std::make_shared<const std::string>(std::move(content));
+        body        = std::make_unique<io::shared_string_reader>(shared);
+        get_body    = [shared = std::move(shared)] { return std::make_unique<io::shared_string_reader>(shared); };
     }
 };
 

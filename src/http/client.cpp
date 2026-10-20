@@ -1,10 +1,12 @@
 #include "http/client.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <compare>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -193,6 +195,140 @@ std::optional<std::size_t> known_length(const net::http::client_response& resp, 
     return resp.headers.get_content_length();
 }
 
+// the most of a redirect's response's body that's read (and discarded), so its connection may be reused: Go's.
+constexpr std::size_t max_discarded = std::size_t{2} * 1'024;
+
+bool is_redirect(net::http::status code) noexcept
+{
+    using enum net::http::status;
+    return code == MOVED_PERMANENTLY || code == FOUND || code == SEE_OTHER || code == TEMPORARY_REDIRECT
+        || code == PERMANENT_REDIRECT;
+}
+
+// scheme_of is the scheme a URL's requests are sent with: http, unless it's https (whatever its case).
+std::string_view scheme_of(const net::url& uri) noexcept
+{
+    return net::util::equal_ignore_case(std::string_view{uri.scheme}, "https"sv) ? "https"sv : "http"sv;
+}
+
+// port_of is the port a URL's requests are sent to: its own, or its scheme's default.
+std::string_view port_of(const net::url& uri) noexcept
+{
+    if (!uri.port.empty()) return uri.port;
+    return scheme_of(uri) == "https"sv ? "443"sv : "80"sv;
+}
+
+// same_server is whether two URLs' requests go to the same host and port.
+bool same_server(const net::url& from, const net::url& to) noexcept
+{
+    return net::util::equal_ignore_case(std::string_view{from.host}, std::string_view{to.host})
+        && port_of(from) == port_of(to);
+}
+
+// redirect turns request into the one that follows its response, if the response is a redirect to follow (see
+// client::send()), returning whether it did: followed counts the redirects followed so far, and limit is the most
+// that may be. A redirect that can't be followed fails, leaving request as it was.
+std::expected<bool, std::error_code> redirect(net::http::client_request&        request,
+                                              const net::http::client_response& resp,
+                                              std::size_t                       limit,
+                                              std::size_t&                      followed)
+{
+    using net::http::client_errc;
+    using net::http::request_method;
+    using net::http::status;
+
+    if (!is_redirect(resp.status_code) || limit == 0) return false;
+
+    const auto location = resp.headers.get("Location"sv);
+    if (!location.has_value()) return false;
+
+    // 307 and 308 send the body again, which needs get_body; 301, 302 and 303 never send it.
+    const bool keep_body =
+        resp.status_code == status::TEMPORARY_REDIRECT || resp.status_code == status::PERMANENT_REDIRECT;
+    const bool resend_body = keep_body && request.body != nullptr;
+    if (resend_body && !request.get_body) return false;
+
+    if (followed >= limit) return std::unexpected(make_error_code(client_errc::too_many_redirects));
+
+    auto next = net::url::resolve(request.uri, *location);
+    if (!next.has_value())
+    {
+        if (next.error() == std::errc::invalid_argument)
+            return std::unexpected(make_error_code(client_errc::bad_redirect));
+        return std::unexpected(next.error());
+    }
+
+    if (auto target = endpoint(*next); !target.has_value()) return std::unexpected(target.error());
+
+    // RFC 9110, section 10.2.2: a Location without a fragment keeps the request's.
+    if (next->fragment.empty()) next->fragment = request.uri.fragment;
+
+    std::unique_ptr<net::io::reader> body;
+    if (resend_body)
+    {
+        body = request.get_body();
+        if (body == nullptr) return false;
+    }
+
+    ++followed;
+
+    // never to another server, nor from https to http; and once dropped, they're gone for the later redirects too.
+    if (!net::http::detail::keeps_credentials(request.uri, *next))
+    {
+        request.headers.remove("Authorization"sv);
+        request.headers.remove("Proxy-Authorization"sv);
+        request.headers.remove("Cookie"sv);
+    }
+
+    // a Host the caller set is for the server it named.
+    if (!same_server(request.uri, *next)) request.headers.remove("Host"sv);
+
+    if (keep_body)
+    {
+        request.body = std::move(body);
+    }
+    else
+    {
+        // RFC 9110, section 15.4: as browsers do, a method other than GET or HEAD becomes GET; and the content goes,
+        // with the fields that describe it.
+        if (request.method != request_method::GET && request.method != request_method::HEAD)
+            request.method = request_method::GET;
+
+        request.body     = nullptr;
+        request.get_body = nullptr;
+        for (const auto field : {"Content-Length"sv,
+                                 "Content-Type"sv,
+                                 "Content-Encoding"sv,
+                                 "Content-Language"sv,
+                                 "Content-Location"sv,
+                                 "Transfer-Encoding"sv})
+            request.headers.remove(field);
+    }
+
+    request.uri = std::move(*next);
+    return true;
+}
+
+// discard is done with a redirect's response: its body is read to its end if what's left of it is at most
+// max_discarded, so its HTTP/1.x connection may be reused (and its HTTP/2 stream needn't be reset); otherwise it's
+// closed (or reset) at once, as its response is destroyed before its end.
+net::coro::task<> discard(net::http::client_response resp)
+{
+    if (resp.body == nullptr) co_return;
+
+    // NOTE: a response that has no body (e.g. to HEAD) has been done with already, whatever its Content-Length says.
+    if (const auto length = resp.headers.get_content_length(); length.has_value() && *length > max_discarded) co_return;
+
+    // up to a byte more than max_discarded: a body no longer than that has ended by then.
+    std::array<std::byte, 512> buf{};
+    for (std::size_t read = 0; read <= max_discarded;)
+    {
+        const auto res = co_await resp.body->read(std::span{buf}.first(std::min(buf.size(), max_discarded + 1 - read)));
+        if (res.err) co_return;
+        read += res.count;
+    }
+}
+
 // sent is what sending a request once made of it: its response (or why there's none), and whether to send it again.
 struct sent
 {
@@ -294,10 +430,89 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     co_return sent{.response = std::move(*resp)};
 }
 
+// send_on sends a request on what was leased for it: a stream of an HTTP/2 connection, or an HTTP/1.x connection.
+// NOTE: not a coroutine, so it adds no frame of its own.
+net::coro::task<sent> send_on(std::shared_ptr<net::http::detail::connection_pool> pool,
+                              net::http::detail::connection_pool::lease           leased,
+                              net::http::client_request&                          request,
+                              bool                                                first,
+                              bool                                                reusable_request)
+{
+    if (leased.http2 != nullptr) return send_http2(std::move(leased), request, first);
+    return send_http11(std::move(pool), std::move(leased), request, first, reusable_request);
+}
+
+// destination is where a request is sent: the scheme and port (see endpoint()), and whether its connection may be
+// reused after it.
+struct destination
+{
+    std::string scheme;
+    std::string port;
+    bool        reusable = false;
+};
+
+// destination_of checks that a request can be sent (before taking a connection, which one that can't would waste),
+// and says where it's sent.
+std::expected<destination, std::error_code> destination_of(const net::http::client_request& request)
+{
+    auto target = endpoint(request.uri);
+    if (!target.has_value()) return std::unexpected(target.error());
+
+    if (auto err = net::http::http11::check_request(request); err) return std::unexpected(err);
+
+    // a request that closes its connection can't be followed by another (over HTTP/1.x: HTTP/2 has no such thing).
+    return destination{.scheme   = std::move(target->first),
+                       .port     = std::move(target->second),
+                       .reusable = request.version.minor >= 1 && !has_close(request.headers)};
+}
+
+class client_category_impl final : public std::error_category
+{
+public:
+    [[nodiscard]] const char* name() const noexcept override { return "net::http::client"; }
+
+    [[nodiscard]] std::string message(int ev) const override
+    {
+        using net::http::client_errc;
+
+        switch (static_cast<client_errc>(ev))
+        {
+        case client_errc::too_many_redirects: return "too many redirects";
+        case client_errc::bad_redirect: return "a redirect's Location isn't a valid URI reference";
+        default: return "(unrecognized)";
+        }
+    }
+};
+
 }
 
 namespace net::http
 {
+
+const std::error_category& client_category() noexcept
+{
+    static const client_category_impl category;
+    return category;
+}
+
+std::error_code make_error_code(client_errc err) noexcept { return {static_cast<int>(err), client_category()}; }
+
+namespace detail
+{
+
+    bool keeps_credentials(const url& from, const url& to) noexcept
+    {
+        if (!util::equal_ignore_case(std::string_view{from.host}, std::string_view{to.host})) return false;
+
+        const auto from_scheme = scheme_of(from);
+        const auto to_scheme   = scheme_of(to);
+        if (from_scheme == to_scheme) return port_of(from) == port_of(to);
+
+        // an upgrade to https, on the default ports.
+        return from_scheme == "http"sv && to_scheme == "https"sv && port_of(from) == "80"sv && port_of(to) == "443"sv;
+    }
+
+}
 
 client::client(io::scheduler* scheduler, const client_options& options)
     : pool{std::make_shared<detail::connection_pool>(scheduler, options)}
@@ -308,40 +523,60 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
     // a request's version is the HTTP/1.x it's sent as: HTTP/2 is used when a connection agrees on it.
     if (request.version.major > 1) co_return std::unexpected(std::make_error_code(std::errc::not_supported));
 
-    auto target = endpoint(request.uri);
-    if (!target.has_value()) co_return std::unexpected(target.error());
-    const auto& [scheme, port] = *target;
-
-    // before taking a connection, which a request that can't be sent would waste.
-    if (auto err = http11::check_request(request); err) co_return std::unexpected(err);
-
-    // a request that closes its connection can't be followed by another (over HTTP/1.x: HTTP/2 has no such thing).
-    const bool reusable_request = request.version.minor >= 1 && !has_close(request.headers);
-
     // a canceled request fails with that, whatever its cancellation caused (e.g. a connection shut part way through a
     // TLS record), or happened meanwhile; and it isn't sent again.
     const auto canceled = [&request] { return request.stop.stop_requested(); };
     const auto cancel   = [] { return std::unexpected(std::make_error_code(std::errc::operation_canceled)); };
+    const auto fail     = [&](std::error_code err) { return canceled() ? cancel() : std::unexpected(err); };
 
-    // the HTTP/2 connection the last attempt was on: a retry is on another.
-    std::shared_ptr<detail::http2_client_connection> tried;
+    const std::size_t limit    = request.max_redirects.value_or(pool->options().max_redirects);
+    std::size_t       followed = 0;
 
-    for (int attempt = 0;; ++attempt)
+    // each redirect is a request of its own: its connection, retries and timeouts.
+    while (true)
     {
-        // a retry is because a reused connection had been closed, so the others may have been too.
-        auto leased = co_await pool->acquire(scheme, request.uri.host, port, attempt == 0, tried.get(), request.stop);
-        if (!leased.has_value()) co_return canceled() ? cancel() : std::unexpected(leased.error());
+        const auto dest = destination_of(request);
+        if (!dest.has_value()) co_return std::unexpected(dest.error());
 
-        // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the response's
-        // body is read. Either gives up what it took, if it was canceled (HTTP/2's stream reserved for it, too).
-        tried       = leased->http2;
-        auto result = leased->http2 != nullptr
-                        ? co_await send_http2(std::move(*leased), request, attempt == 0)
-                        : co_await send_http11(pool, std::move(*leased), request, attempt == 0, reusable_request);
+        // the HTTP/2 connection the last attempt was on: a retry is on another.
+        std::shared_ptr<detail::http2_client_connection> tried;
+        sent                                             result;
 
-        // NOTE: a response that arrived as stop was requested is dropped, with its connection (HTTP/1.x) or stream.
-        if (canceled()) co_return cancel();
-        if (!result.retry) co_return std::move(result.response);
+        for (int attempt = 0; attempt == 0 || result.retry; ++attempt)
+        {
+            // a retry is because a reused connection had been closed, so the others may have been too.
+            auto leased = co_await pool->acquire(dest->scheme,
+                                                 request.uri.host,
+                                                 dest->port,
+                                                 attempt == 0,
+                                                 tried.get(),
+                                                 request.stop);
+            if (!leased.has_value()) co_return fail(leased.error());
+
+            // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the
+            // response's body is read. Either gives up what it took, if it was canceled (HTTP/2's stream reserved for
+            // it, too).
+            tried  = leased->http2;
+            result = co_await send_on(pool, std::move(*leased), request, attempt == 0, dest->reusable);
+
+            // NOTE: a response that arrived as stop was requested is dropped, with its connection (HTTP/1.x) or
+            //       stream.
+            if (canceled()) co_return cancel();
+        }
+
+        if (!result.response.has_value()) co_return std::move(result.response);
+
+        auto followed_now = redirect(request, *result.response, limit, followed);
+        if (!followed_now.has_value()) co_return std::unexpected(followed_now.error());
+
+        if (!*followed_now)
+        {
+            // NOTE: moved, as the request is done with: nothing refers to it once its response's head is in.
+            result.response->url = std::move(request.uri);
+            co_return std::move(result.response);
+        }
+
+        co_await discard(std::move(*result.response));
     }
 }
 
