@@ -2,7 +2,8 @@
 
 Status: stages 1 to 3 implemented (2026-10-17): `include/tls/tls.hpp`, `src/tls/tls.cpp`, `test/tls/stream.cpp`;
 `https://` in `http::client` (`http/connection_pool.hpp`, `test/tls/client.cpp`); and HTTPS in `http::server`
-(`server_config::tls`, `test/tls/server.cpp`).
+(`server_config::tls`, `test/tls/server.cpp`). Stage 4 proposed (2026-10-20): client certificates, session tickets
+for the server, and a trimmed Botan (see "Stage 4"); its questions (at the end) are open.
 
 ## Goal
 
@@ -233,6 +234,308 @@ const std::error_category& category() noexcept;
 - `server_context::make()` fails (`invalid_argument`) if the key isn't the certificate's (comparing their public keys,
   as Botan encodes them), rather than every handshake failing.
 
+## Stage 4
+
+Three things, chosen for stage 4: client certificates, session resumption for the server, and a smaller Botan. What
+Botan does is from its 3.12 sources (`vcpkg/buildtrees/botan/src/`), and Go's from `crypto/tls` (its sources as of
+October 2026).
+
+### Client certificates (mutual TLS)
+
+**Where things stand.** Neither side can use them. Botan's server asks for a client certificate when the credentials
+manager's `trusted_certificate_authorities("tls-server", sni)` has any CAs, or the policy's
+`request_client_certificate_authentication()` is true: `server_credentials` doesn't override the first (Botan's default
+returns none) and the policy the second, so no CertificateRequest is ever sent. `client_credentials` gives only trusted
+CAs, so a client asked for one sends an empty Certificate. `callbacks::tls_verify_cert_chain()` already handles a
+client's chain (`Usage_Type::TLS_CLIENT_AUTH`, no host name), and nothing reads the peer's chain after the handshake.
+
+**How Botan does it.**
+
+- The server: a CertificateRequest goes out if the `"tls-server"` stores have subjects, or the policy requests one,
+  listing those subjects as the acceptable CAs (TLS 1.3's `certificate_authorities` extension; TLS 1.2's list). An empty
+  Certificate fails the handshake if `require_client_certificate_authentication()` (TLS 1.3 with `certificate_required`,
+  116; TLS 1.2 with `handshake_failure`), and is otherwise accepted. A certificate that is sent goes to
+  `tls_verify_cert_chain()` with the `"tls-server"` stores and `TLS_CLIENT_AUTH` (Botan's path validation then checks
+  the leaf's key usage, and that its extended key usage, if it has one, includes clientAuth); a failure is
+  `bad_certificate`, required or not (RFC 8446 4.4.2.4 lets a server go on unauthenticated instead; Botan doesn't,
+  unless the callback ignores the failure). CertificateVerify proves the client has the key.
+- The client: `find_cert_chain(key_types, cert_signature_schemes, acceptable_CAs, "tls-client", host)` and
+  `private_key_for(leaf, ...)`, as the server's credentials already do for `"tls-server"`; an empty chain sends an empty
+  Certificate.
+- After the handshake, `Channel::peer_cert_chain()` is the peer's chain, leaf first, also after a resumption (the
+  session carries it: `Session_Base::peer_certs()`). Botan doesn't check, on resuming, that the client's certificate is
+  still valid, or that one is still required.
+- In TLS 1.3, the client's handshake is complete once it has sent its Finished, before the server has looked at its
+  certificate: a rejection reaches the client as an alert on its first read, not from `connect()`. In TLS 1.2 the server
+  checks it before its own Finished, so `connect()` fails.
+
+**How Go does it.** `Config.ClientAuth` is one of `NoClientCert`, `RequestClientCert`, `RequireAnyClientCert` (neither
+verifies what's sent), `VerifyClientCertIfGiven` and `RequireAndVerifyClientCert`; `ClientCAs` are the roots it verifies
+against (nil means the system's, a known trap) and whose subjects it sends. A client has `Certificates` (sending the
+first that `CertificateRequestInfo.SupportsCertificate` accepts: a key the server can verify, issued by one of its
+acceptable CAs if it listed any; otherwise an empty Certificate) or a `GetClientCertificate` callback.
+`VerifyPeerCertificate` and `VerifyConnection` are hooks for checks of one's own (the only use of the unverifying
+modes). `ConnectionState` has `PeerCertificates` and `VerifiedChains`, and `net/http` gives handlers `Request.TLS`.
+
+**Proposed API.**
+
+```cpp
+namespace net::tls
+{
+
+// tls/certificate.hpp: needs neither Botan nor NET_HAS_TLS (as tls/version.hpp), so http/request.hpp can include it.
+// certificate is an X.509 certificate a peer sent, as data: its DER, and what's commonly checked, read from it.
+struct certificate
+{
+    std::vector<std::byte>                der{};
+    std::string                           subject{};       // RFC 4514, e.g. "CN=alice,O=Example"
+    std::string                           issuer{};
+    std::string                           serial_number{}; // hex
+    std::chrono::system_clock::time_point not_before{};
+    std::chrono::system_clock::time_point not_after{};
+    // the subject alternative name's entries (e.g. a SPIFFE ID among uris)
+    std::vector<std::string>              dns_names{};
+    std::vector<std::string>              email_addresses{};
+    std::vector<std::string>              uris{};
+    std::vector<ip_addr>                  ip_addresses{};
+    std::array<std::byte, 32>             sha256{};        // of der: e.g. for pinning
+};
+
+// client_auth is whether a server asks for clients' certificates (Go's ClientAuth, without its unverifying modes).
+enum class client_auth : std::uint8_t
+{
+    none,     // not asked for (NoClientCert)
+    optional, // asked for; one that's sent must verify (VerifyClientCertIfGiven)
+    required, // one that verifies is required (RequireAndVerifyClientCert)
+};
+
+struct server_options
+{
+    // ... as now, and:
+    client_auth                          client_auth = client_auth::none;
+    // PEM: the certificate authorities clients' certificates must chain to (and whose names the server sends). Needed
+    // unless client_auth is none (and refused then).
+    std::optional<std::filesystem::path> client_ca_file{};
+};
+
+struct client_options
+{
+    // ... as now, and:
+    // PEM files: a certificate (and intermediates) and its key, sent to a server that asks for one and would accept
+    // it (its kind of key, and issued by one of the CAs it names, if it names any). Both, or neither.
+    std::optional<std::filesystem::path> certificate_chain{};
+    std::optional<std::filesystem::path> private_key{};
+};
+
+class stream
+{
+    // ... as now, and:
+    // peer_certificates is the chain the peer sent (a server's, or a client's if it sent one), leaf first: empty if
+    // none. Made the first time it's asked for, then shared (so copies are cheap and outlive the stream).
+    [[nodiscard]] std::shared_ptr<const std::vector<certificate>> peer_certificates() const;
+};
+
+}
+```
+
+- `make()` fails with `invalid_argument` for `client_auth` other than `none` without `client_ca_file` (or `none` with
+  one), a client certificate without its key (or a key without one), and a client key that isn't the certificate's (the
+  check the server's already has); with the file's error for one that can't be read.
+- Errors are the existing ones: a server that requires a certificate and gets none fails with `sent_alert_base + 116`
+  (TLS 1.3) or `+ 40` (TLS 1.2), and its client with the peer's alert; one that doesn't verify, on the server with
+  `verification_category()`'s code (e.g. an unknown issuer, expired, or the wrong extended key usage), and on the client
+  with the peer's `bad_certificate`. All compare equal to `tls::alert` conditions as now.
+
+**Inside.** `client_credentials` and `server_credentials` become one `credentials` class: the store it trusts for the
+peer's certificates (for `"tls-client"`: the server's CAs, as now; for `"tls-server"`: the client CAs, returned only
+when `client_auth` isn't `none`, so nothing is requested otherwise), and its own chain and key, if any, for its own
+side. `find_cert_chain()` does what Go's `SupportsCertificate` does: the leaf's key type among those asked for, and if
+CAs are named, one of the chain's issuers among them. The policy overrides `request_client_certificate_authentication()`
+and `require_client_certificate_authentication()` from `client_auth`. The stream keeps Botan's chain (copies of
+`X509_Certificate` share their data) once the handshake is complete, and makes `tls::certificate`s from it the first
+time `peer_certificates()` is called (under the stream's mutex), so a connection that never asks pays nothing; `subject`
+and `issuer` are formatted by cppnet (Botan's `X509_DN::to_string()` isn't RFC 4514), and SAN entries come from Botan's
+sets (sorted, not in the certificate's order).
+
+**HTTP.** `server_request::peer_certificates` (a `std::shared_ptr<const std::vector<tls::certificate>>`, null without
+one) is set where `tls_version` is (once per HTTP/1.1 connection, kept by `clear()`; per HTTP/2 stream, a copy of the
+connection's), and only if the server's context asks for client certificates, so other servers don't make them. A
+handler (or middleware) authorizes from it, e.g. answering 403 for a subject it doesn't know. `http::client` gets client
+certificates through `client_options::tls`, as its trusted CAs; the pool's keys don't change (a client has one
+identity). In TLS 1.3, a rejected certificate fails the request when its response is read (HTTP/1.1) or the connection's
+first read (HTTP/2), with the peer's alert; it's a new connection, so it isn't retried.
+
+**Costs.** None without client authentication (one branch in the credentials manager). With it: the client's chain
+verified per full handshake (as a client verifies a server's), the CertificateRequest's CA names (as large as the client
+CA file's subjects), and `tls::certificate`s made per connection a handler might look at.
+
+**Tests** (`test/tls/stream.cpp`, `test/tls/server.cpp`, `test/tls/client.cpp`; no network). `test_pki` gets a client
+CA, and from it a client certificate (extended key usage clientAuth), one with only serverAuth, one expired, and one
+from an untrusted CA. For TLS 1.2 and 1.3: `none` sends no request (a client with a certificate sends nothing, and the
+server sees no peer certificates); `optional` without a certificate succeeds, with a good one the server sees it (DER,
+subject, SANs, fingerprint), with a bad one (untrusted, expired, wrong usage) fails (the server with the verification
+code, the client with the alert: from `connect()` in TLS 1.2, from the first read in 1.3); `required` without one fails
+with `certificate_required` (1.3) or `handshake_failure` (1.2); a client whose certificate's issuer isn't among the
+named CAs sends none; the client sees the server's chain; `make()`'s errors. Over HTTP: a handler sees the client's
+certificate over HTTP/1.1 and HTTP/2, and none in cleartext or without client authentication; `http::client` with a
+certificate; a rejected one failing `get()`.
+
+### Session resumption for the server
+
+**Where things stand.** The server's session manager is `Session_Manager_Noop`: no TLS 1.2 session IDs or tickets, no
+TLS 1.3 tickets, so every connection is a full handshake. The client's is `Session_Manager_In_Memory` (Botan's default
+size, 1000), so it already resumes with servers that issue tickets (and, per Botan's policy, uses each ticket once, as
+RFC 8446 C.4 recommends). It's keyed by `Server_Information{host}`, without the port: a ticket from one port is offered
+to another, where it's ignored (a full handshake) and used up.
+
+**How Botan does it.**
+
+- Session managers: `Session_Manager_In_Memory` (stateful: sessions in a map, a TLS 1.2 session ID or a TLS 1.3 ticket
+  that's only a handle), `Session_Manager_Stateless` (the session encrypted into the ticket, with a key from
+  `Credentials_Manager::session_ticket_key()`: a single key, so no rotation), `Session_Manager_Hybrid` (both), and
+  `Session_Manager_Noop`. The base class is public and meant to be derived from (`establish`, `retrieve_one`, `store`,
+  `remove`, `find_some`, `emits_session_tickets`). `Session::encrypt(key, rng)` and `Session::decrypt(ticket, key)` are
+  public: HMAC(SHA-512-256) of the key derives a 4-byte key name, checked first, and a per-ticket AES-256/GCM key from a
+  random seed. The ticket carries the whole session, the peer's certificates included.
+- `retrieve()` drops sessions older than `Policy::session_ticket_lifetime()` (one day by default; TLS 1.3's at most
+  seven). A TLS 1.3 server sends `new_session_tickets_upon_handshake_success()` tickets (one by default) once the
+  client's Finished is in, and resumes only on the same SNI and a cipher suite with the same hash; it only implements
+  `psk_dhe_ke`, so a resumption still does an ECDHE exchange (forward secrecy kept). A TLS 1.2 resumption is the
+  abbreviated handshake (one round trip less, no key exchange: the ticket key protects those sessions' secrets).
+- `Session_Summary::was_resumption()` (in `tls_session_established()`) says whether a handshake resumed.
+
+**How Go does it.** Tickets are on by default (`SessionTicketsDisabled`), for TLS 1.2 and 1.3, one per TLS 1.3
+connection, valid 7 days. Without keys of its own, a server's key is random and rotated every 24 hours, older keys kept
+for 7 days to decrypt (`ticketKeyRotation`, `ticketKeyLifetime`, done lazily as tickets are made);
+`SetSessionTicketKeys` sets keys (the first encrypts, all decrypt) and stops the rotation, so a fleet can share them.
+Resuming a TLS 1.3 ticket checks its age, the suite's hash, that a session without a client certificate isn't resumed
+where one is required, that the client's leaf hasn't expired, and (since CVE-2025-68121, Go 1.25.7, February 2026: a
+resumption that succeeded after `ClientCAs` or `RootCAs` had changed) that the session's verified chains still verify
+against the current configuration. A Go client resumes only with a `ClientSessionCache` (none by default).
+
+**Proposed API.**
+
+```cpp
+namespace net::tls
+{
+
+using session_ticket_key = std::array<std::byte, 32>;
+
+struct server_options
+{
+    // ... as above, and:
+    // Session resumption with tickets: on by default, for TLS 1.3 (Open question 8). A ticket is good for
+    // session_ticket_lifetime (at most 7 days, TLS 1.3's limit), and a resumption for as long.
+    bool                 session_tickets         = true;
+    std::chrono::seconds session_ticket_lifetime = std::chrono::hours{24};
+    // The keys that protect tickets (e.g. shared by a fleet of servers): the first makes them, all are tried on them.
+    // Empty: random keys, made when the context is, and rotated every session_ticket_lifetime.
+    std::vector<session_ticket_key> session_ticket_keys{};
+};
+
+class server_context
+{
+    // ... as now, and:
+    // set_session_ticket_keys replaces the keys (as session_ticket_keys), from any thread, while connections go on;
+    // automatic rotation stops. Empty turns tickets off.
+    void set_session_ticket_keys(std::vector<session_ticket_key> keys);
+};
+
+class stream
+{
+    // resumed is whether the handshake resumed an earlier session (Go's DidResume).
+    [[nodiscard]] bool resumed() const noexcept;
+};
+
+}
+```
+
+`make()` fails with `invalid_argument` for a lifetime of 0 or over 7 days.
+
+**Inside.** A session manager of cppnet's (`ticket_manager`, deriving from `Botan::TLS::Session_Manager`), in the
+server's state:
+
+- `establish(session, id, tls12_no_ticket)` returns a ticket, `session.encrypt(current key)`, for a TLS 1.3 session (and
+  none for TLS 1.2's, nor session IDs: Open question 8); `retrieve_one(handle)` decrypts with each key in turn (the key
+  name rejects the others before any decryption); `find_some()` is empty (it's a server's), and `store()`/`remove()` do
+  nothing. `emits_session_tickets()` is whether there's a key.
+- Keys: the given ones, or a random one made with the context, and, when it's a lifetime old, another made in its place
+  (lazily, under the manager's mutex, as Go does, so there's no timer), the previous one kept for a lifetime more: every
+  ticket within its lifetime can still be decrypted, and a key is gone two lifetimes after it began.
+- The key Botan uses is derived from the configured one and the context's client authentication: HMAC-SHA-256 over
+  `client_auth` and a hash of the client CAs' certificates. So a ticket made where client certificates were verified
+  against other CAs (another context sharing the keys, or a restart with a new CA file) doesn't decrypt, which is what
+  Go's re-verification guards against, without verifying the chain again on each resumption (Open question 10). Then
+  `retrieve_one()` refuses what Go refuses: a session whose client leaf has expired, or without a client certificate
+  where one is required.
+- The policy's `session_ticket_lifetime()` comes from the options; the client's policy keeps Botan's default.
+- `tls_session_established()` records `was_resumption()` for `resumed()`.
+- The client's sessions are keyed by host and port (`Server_Information{host, port}`, the port being the socket's
+  peer's), so a ticket is offered only where it came from.
+
+**HTTP.** Nothing in `http::server`'s API: `server_config::tls`'s context carries it. `http::client` already resumes
+(with its own context's cache); against cppnet's server it now will.
+
+**Costs.** Per full TLS 1.3 handshake, one ticket made (an AES-GCM encryption and a few HMACs, of a session of a few
+hundred bytes, more with a client's chain) and sent (in the flight after the handshake, which the reader writes as it
+writes other replies), to clients that resume and to those that never will (e.g. a one-shot curl). Per resumption:
+decrypting it, and no certificate sent, signed for, or verified (the server's signature, the client's chain
+verification, and with client certificates, the server's verification of theirs), though TLS 1.3 still does its key
+exchange and takes the same round trips. No memory per session (it's in the ticket). A benchmark (`bench_tls`: full and
+resumed handshakes over loopback, ECDSA P-256 and RSA 2048 server keys) measures it, for a note here.
+
+**Tests** (no network; a clock in the server's state, an internal hook defaulting to the system's, as the resolver's
+`facts` are, passed through `Callbacks::tls_current_timestamp()` and the rotation). TLS 1.3: a second connection with
+the same client context resumes (`resumed()` on both sides) and the handler sees the same client certificate; tickets
+off, never; a ticket from another context (another random key) is a full handshake; shared keys across two contexts
+resume; `set_session_ticket_keys()` with the old key second still resumes, without it doesn't; the clock past the
+lifetime, a full handshake; rotation (the clock a lifetime on: still resumes with an earlier ticket, two lifetimes on:
+doesn't); contexts with the same keys but other client CAs don't resume; a client leaf that has expired since isn't
+resumed (and then fails verification); a ticket for one SNI isn't resumed on another. TLS 1.2: no ticket, a full
+handshake each time. The client: a ticket from one port isn't offered to another.
+
+### Trimming Botan
+
+**Where things stand.** vcpkg's port (and so the overlay) builds all of Botan: 556 library sources here, plus Botan's
+command-line tool (45 more, installed by `vcpkg_copy_tools()`, unused by cppnet). On this machine (GCC 14, x86-64, 16
+threads) the port took about 3m45s for its debug build and 4m25s for its release build (the build logs' times); the
+release library is 19 MB, the debug one 470 MB. CI pays it whenever its cache key changes (the vcpkg commit, compiler
+version, `vcpkg.json` or `ports/`).
+
+**How Botan does it.** `configure.py --minimized-build` loads only what's always loaded (`utils`, ...) and what
+`--enable-modules=` names, with their dependencies; modules for particular CPUs (AES-NI, CLMUL, SHA extensions, AVX2,
+ARMv8's) are separate modules not loaded unless named, and names may use `*` (`aes_*`), where those for other CPUs are
+skipped (`Skipping (incompatible CPU)`). A minimized build has no RNG unless one is named (`system_rng`). Botan's own
+module policies (`src/build-data/policy/modern.txt`) are a reference, not a fit (they keep much more).
+
+**What cppnet uses.** TLS 1.2 and 1.3 (`tls12`, `tls13`), with the PQ hybrid groups (`tls13_pqc`, `ml_kem`:
+X25519MLKEM768, Go's default since 1.24, and what browsers offer); key exchange `x25519`, `ecdh` on P-256, P-384 and
+P-521 (`pcurves_secp256r1`, `_secp384r1`, `_secp521r1`); certificates `ecdsa` and `rsa` (`emsa_pkcs1`, `emsa_pssr`,
+`eme_pkcs1` for TLS 1.2); `aes`, `gcm`, `chacha20poly1305`; `sha2_32`, `sha2_64` (SHA-512-256 for tickets), `hmac`,
+`hkdf`, `prf_tls`; `x509` (path validation, and for the tests `X509_CA` and PKCS #10), `pem`, `certstor_system` (with
+`certstor_system_macos` on Apple's platforms with Clang, and `certstor_flatfile` on Linux, its bundle found by
+`configure.py`); `system_rng`; and the CPUs' versions: `aes_*`, `ghash_*`, `sha1_*`, `sha2_32_*`, `sha2_64_*`,
+`chacha_*`, `poly1305_*` (and `keccak_perm_*` for ML-KEM). Botan's default policy also offers X448, the brainpool curves
+and FFDHE (and DHE suites in TLS 1.2), which Go doesn't: the policy drops them (`key_exchange_groups()`,
+`allowed_key_exchange_methods()` returning only ECDH), so what's built is what's offered, whichever Botan cppnet is
+built against (a project with its own vcpkg manifest gets vcpkg's whole Botan, without the overlay). Botan's default
+ciphers are already only AEADs (no `tls_cbc`), and its signature hashes SHA-256 to 512.
+
+**Measured** (configured as above with `configure.py` from the port's sources; the library only, release, GCC 14 `-O3`,
+`make -j16`, on this machine): 251 sources instead of 556; 98 s instead of 206 s; 9.0 MB instead of 19.2 MB. Without the
+tool too, the port's two builds should take under half as long as now.
+
+**Changes.** `ports/botan/portfile.cmake`: `--minimized-build --enable-modules=...` (one list, with a comment per
+group), `--build-targets=static` (or `shared`), not `cli`, and no `vcpkg_copy_tools()`; GCC on macOS keeps disabling
+`certstor_system_macos` and `sm3_armv8` (the latter then not loaded anyway). (vcpkg's ABI hash covers the portfile, so
+caches build it again once.) `src/tls/tls.cpp`'s policy lists the groups and key exchanges. The README's build time
+note.
+
+**Tests.** The suite (which makes certificates with Botan, so covers the tests' needs: ECDSA P-256 keys, CAs, PKCS #8),
+on every CI toolchain; and one handshake per group the policy lists, between cppnet's client and server, the client's
+offer limited to that group (an internal policy hook), so a group whose module is missing fails a test rather than a
+handshake in the field. The network tests (public servers) exercise interoperability as now.
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`
@@ -244,5 +547,101 @@ const std::error_category& category() noexcept;
 2. **`https://` in `http::client`**, with the pool's keys, and tests against a TLS server in the tests.
 3. **TLS in `http::server`**: `server_config`'s options, the handshake in `serve_connection`, and tests (the client from
    stage 2 talking to it).
-4. **Later:** HTTP/2 over ALPN (`h2`); client certificates; OCSP; session tickets for the server; trimming Botan's
-   build (an overlay port with `--minimized-build`) if it's too slow.
+4. **Proposed (2026-10-20), in three pull requests, in this order** (see "Stage 4"):
+   1. **A trimmed Botan.** The overlay port configures `--minimized-build` with the modules cppnet uses (Open
+      questions 11 and 12), and stops building Botan's command-line tool; the policy offers only what's built (the
+      key exchange groups, Go's set), so cppnet behaves the same over a whole Botan (e.g. a project's own vcpkg's).
+      First, as it's independent, and halves the dependency's build for every CI run after it (once its cache is
+      made again).
+   2. **Client certificates (mutual TLS).** `server_options::client_auth` and `client_ca_file`; a certificate and key
+      in `client_options` (so `http::client`'s too); `tls::certificate` (Botan-free), `stream::peer_certificates()`
+      and `server_request::peer_certificates`; one credentials manager for both sides; client certificates in the
+      tests' PKI.
+   3. **Session resumption for the server.** Session tickets, from a session manager of cppnet's (keys rotated, or
+      given; bound to the context's client authentication), `stream::resumed()`, the client's session cache keyed by
+      port as well, and a benchmark of full and resumed handshakes. After client certificates, as which sessions may
+      be resumed depends on them.
+
+   HTTP/2 over ALPN (`h2`), listed here before, is done: the server's in the HTTP/2 plan's stage 3, the client's in its
+   stage 4. OCSP is dropped (see "Out of scope").
+
+## Open questions (stage 4)
+
+1. **Which client authentication modes.** (a) Go's five (with `request` and `require_any`, which don't verify what's
+   sent); (b) three that verify: `none`, `optional`, `required`; (c) two: `none` and `required`. **Recommended: (b)**:
+   an unverified certificate means something only to a check of one's own (Go's `VerifyPeerCertificate`), which cppnet
+   doesn't have; a handler could check a pinned fingerprint, but a mode named "require" that accepts anyone is the trap
+   Go's has. They can come with a verification hook, if something needs one.
+2. **Where client CAs come from.** (a) A PEM file, required unless `none` (and refused with `none`); (b) the same, but
+   the system's trust store without one (Go's nil `ClientCAs`); (c) a list of certificates in memory as well as the
+   file. **Recommended: (a)**: client certificates are almost always from a private CA, and trusting every public CA for
+   them lets anyone with a web certificate in; (c) can come when contexts take certificates from memory (as
+   `trusted_ca_file` would too).
+3. **How a handler sees the client's certificate.** (a) `server_request::peer_certificates`, a shared pointer to the
+   chain, beside `tls_version`; (b) a `tls::connection_state` (Go's `ConnectionState`: version, ALPN, resumed, server
+   name, peer certificates) as `server_request::tls`, replacing `tls_version`; (c) only `stream::peer_certificates()`,
+   for code below HTTP. **Recommended: (a)**: what handlers need, made only for servers that ask for certificates;
+   `tls_version` (just added) stays; (b) can gather them later if more is wanted.
+4. **What a certificate is, to cppnet's users.** (a) `tls::certificate`: its DER and the fields commonly checked
+   (subject, issuer, serial, validity, SANs, SHA-256 fingerprint), read with Botan at the handshake, Botan-free in the
+   header; (b) only the DER, parsed by the user's own X.509 library; (c) a class wrapping Botan's certificate (behind a
+   pointer, its accessors in `tls.cpp`), so anything Botan reads is reachable. **Recommended: (a)**: plain data, usable
+   in builds without TLS (as `tls::version`), and enough to authorize by name, SPIFFE ID or pin; the DER is there for
+   anything else.
+5. **The client's certificate.** (a) One chain and key in `client_options` (paths, as the server's), sent when the
+   server would accept it; (b) several, the first acceptable sent (Go's `Certificates`); (c) a callback choosing one per
+   request (Go's `GetClientCertificate`). **Recommended: (a)**: one identity per client covers the uses seen (an API
+   that requires mTLS); a client per identity covers the rest.
+6. **Where sessions live.** (a) Tickets, from cppnet's own session manager (rotating keys, keys that can be given, bound
+   to the client authentication); (b) Botan's `Session_Manager_Stateless` (one key from the credentials manager, no
+   rotation); (c) Botan's `Session_Manager_In_Memory` on the server (stateful, no keys: sessions in a bounded map, lost
+   on restart and not shared by a fleet). **Recommended: (a)**: Go's model; no memory per session; (b) has no rotation,
+   and (c) neither shares across processes nor bounds a key's exposure any better.
+7. **Resumption on by default?** (a) On (Go, nginx, Caddy); (b) off unless asked for. **Recommended: (a)**: it costs a
+   ticket per handshake and saves the certificate work on every resumption; `session_tickets = false` turns it off.
+8. **Which versions resume.** (a) TLS 1.3 and 1.2 (Go); (b) TLS 1.3 only. **Recommended: (b)**: a TLS 1.3 resumption
+   still does its key exchange (Botan only implements `psk_dhe_ke`), so a stolen ticket key doesn't decrypt recorded
+   sessions; a TLS 1.2 resumption doesn't, so it does. TLS 1.2 clients are few, and those keep full handshakes. (Go
+   differs here.)
+9. **Ticket keys and their lifetime.** (a) Random per context, rotated every `session_ticket_lifetime` (24 hours by
+   default) keeping the previous key, or given (`session_ticket_keys`, `set_session_ticket_keys()`, which stops the
+   rotation); (b) the same without given keys (no sharing across processes or restarts); (c) Go's numbers: tickets for 7
+   days, a new key daily, kept 7 days. **Recommended: (a)**: a fleet behind a load balancer needs shared keys, and a
+   day's lifetime (Botan's default, RFC 5246's suggestion for sessions) bounds a key's use to two days rather than Go's
+   eight, at the cost of a full handshake for clients away more than a day.
+10. **Resuming sessions with client certificates.** (a) Bind tickets to the client authentication (the key derived with
+    the mode and the client CAs), and refuse an expired leaf or a missing certificate where one is required; (b) Go's:
+    verify the session's chain again against the current client CAs on each resumption; (c) nothing beyond Botan's
+    checks (lifetime, SNI). **Recommended: (a)**: as safe as (b) against a changed configuration (a ticket from another
+    one doesn't decrypt), without the verification resuming saves; (c) would let a ticket outlive the client's
+    certificate, or cross to a context that trusts other CAs.
+11. **Trimming unconditionally or as an option.** (a) Always, in the overlay port (which only cppnet's manifest uses);
+    (b) behind a port feature (vcpkg's features add, so it would be a `full` feature undoing the trimming); (c) only
+    stop building the command-line tool. **Recommended: (a)**: cppnet's port exists for cppnet; a project wanting the
+    rest of Botan uses its own manifest, and vcpkg's port, which cppnet works with too (the policy offers the same
+    either way). (b) can be added if a cppnet user wants Botan for more.
+12. **What the trimmed build (and the policy) keeps.** (a) As above: Go's groups (X25519MLKEM768 and Botan's other two
+    hybrids, X25519, P-256, P-384, P-521), ECDSA and RSA certificates, AES-GCM and ChaCha20-Poly1305, and the CPUs'
+    versions; (b) everything Botan's default policy offers (adding X448, brainpool, FFDHE and TLS 1.2's DHE, and their
+    modules); (c) narrower: no PQ hybrids, no P-521. **Recommended: (a)**: what Go and browsers offer, so nothing a
+    server or client in practice needs is missing; the hybrids are what's coming (Chrome and Firefox send X25519MLKEM768
+    by default), and P-521 costs one module.
+13. **The client's session cache.** (a) As it is (on, Botan's in-memory cache of 1000 sessions per context), keyed by
+    port as well; (b) that and an option to turn it off (or size it); (c) off by default, as Go's. **Recommended: (a)**:
+    resumption is what a client wants, and nothing has asked for less; an option is easy to add when something does.
+
+## Out of scope (stage 4)
+
+- **OCSP.** Let's Encrypt ended its OCSP service on 2025-08-06 (it had stopped putting OCSP URLs in certificates in May
+  2025), leaving CRLs; Chrome hasn't checked OCSP for years (CRLSets), Firefox has moved to CRLite, and Go checks no
+  revocation at all. cppnet's policy already doesn't require revocation data. Botan still checks an OCSP response a
+  server staples (the client asks, as Botan's `support_cert_status_message()` does by default), which costs nothing;
+  stapling one from cppnet's server isn't planned.
+- **HTTP/2 over ALPN**: done (see Stages).
+- Go's verification hooks (`VerifyPeerCertificate`, `VerifyConnection`) and the unverifying client authentication modes
+  (Open question 1); post-handshake client authentication; raw public keys.
+- Choosing a certificate per SNI (Go's `GetCertificate`), and replacing a server's certificate while it runs (e.g. after
+  an ACME renewal): a context is fixed once made, so a server restarts with a new one. Worth a stage of its own if
+  certificates get shorter-lived (the CA/Browser Forum's 47-day limit is coming).
+- 0-RTT (early data): Botan doesn't implement it, and it's replayable.
+- Session IDs (stateful TLS 1.2 resumption), and storing tickets' sessions anywhere.
