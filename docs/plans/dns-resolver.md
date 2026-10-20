@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 4 are
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 5 are
 done (2026-10-19); "Where things stand" describes the code before them.
 
 ## Goal
@@ -341,6 +341,35 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
    (RFC 1035's compression example among them), not captured replies.
 5. **The native back end**, opt-in (`backend::native`): configuration and its parsers, queries over UDP and TCP, IDs,
    EDNS(0), retries, search, `hosts`, CNAMEs, RFC 6724 order. The fake nameserver.
+   **Done** as above, in two commits (the configuration, then the queries). `dns/config.hpp` (public, included by
+   `resolver.hpp`): `dns::config` (nameservers with ports, search, ndots, the timeout in milliseconds, attempts, the
+   options as booleans, `unknown_option` for stage 6, the hosts table, and `lookup_order`), `parse_resolv_conf(text,
+   hostname)` (Go's reading: at most 3 nameservers, the last search or domain line, numbers from their leading digits
+   and clamped; `usevc`/`tcp` as `use-vc`; `no-reload`, which the list above lacks, is unknown; without nameservers
+   127.0.0.1 and ::1, without a search line the host name's domain), `parse_hosts()`, and `parse_nsswitch_hosts()`
+   (sources with their actions, kept for stage 6) with `order_of()`. `options::conf` injects it; otherwise
+   `detail::config_cache` reads the files (paths internal, `options::files`, for tests) when first needed, and again
+   when one's inode, size or mtime changed, checked at most every 5 s. `dns/native.hpp` (internal): `name_list()`,
+   `random_id()`, `sort_by_rfc6724()` (`src/dns/addrselect.cpp`, Go's rules 1, 2, 5, 6, 8 and 9, its policy table;
+   sources from connected UDP sockets' `getsockname()`), and `native_lookup()`, which the lookup's task awaits with
+   its token, the configuration it started with, and the first server (`rotate`: a counter in the resolver's state).
+   The socket's read deadline is the attempt's only: a lookup is shared (stage 3), so no one caller's deadline is
+   its, and a caller's deadline reaches it as a stop, once the last caller has left. Decided along the way, following
+   Go where the plan was silent: servers that never answer (timeouts, ICMP refusals)
+   are `server_failure`, as `getaddrinfo()`'s `EAI_AGAIN` is a temporary failure; a name's error is the last one met,
+   but the name as given wins over the search domains' (Go's rule), so `name_not_found` only when every name was
+   NXDOMAIN; the hosts table's answers keep its order (Go sorts only DNS's), and a name the hosts table has with only
+   the other family's addresses goes on to DNS (`no_address` with `files` alone); a truncated answer's TCP retry gets
+   a timeout of its own (Go's shares its UDP exchange's, but Go asks each family on its own, where here A's TC waits
+   for AAAA's answer); with `single-request`, the second family is asked even if the first timed out; `.onion` names
+   aren't asked (RFC 7686, as Go), though a search domain makes another name of them; a CNAME chain longer than 8 links
+   is `bad_response` as a loop is, and moves on to the next server; the lame-referral check Go makes (needing the SOA
+   records the codec skips) isn't made. UDP replies are read into 1232 bytes (Go's buffer), and anything that doesn't
+   decode, or match an open query (ID, QR, opcode, one question of the name ignoring case, its type and class), is
+   read past; over TCP a mismatch is `bad_response`. The fake nameserver is `test/dns/fake_server.hpp` (a listener on
+   a port the OS chooses, and a UDP socket bound to the same port, tried again if it's taken; a handler per test, and
+   helpers to answer from a zone); `test/dns/native.cpp` has the back end's tests, and `test/dns/config.cpp` the
+   parsers' and the cache's (on files in a temporary directory).
 6. **`automatic`**: Go's rule, and `NET_DNS`. Until this lands, `automatic` is the system back end.
 7. **Later.** Happy Eyeballs (RFC 8305) in `connect`: attempts staggered by 250 ms (`call_at`, or a `sleep_until` with
    the token), losers stopped through a `util::linked_stop_source` linked to `options.stop`; with the native back end,

@@ -20,6 +20,8 @@
 #include <sys/socket.h>
 
 #include "coro/task.hpp"
+#include "dns/config.hpp"
+#include "dns/native.hpp"
 #include "exception.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
@@ -219,8 +221,18 @@ namespace detail
 
     struct resolver_state
     {
+        explicit resolver_state(resolver::options opts)
+            : use{opts.use}
+            , system_lookup{std::move(opts.system_lookup)}
+            , configs{std::move(opts.conf), std::move(opts.files)}
+        {}
+
         resolver::backend use = resolver::backend::automatic;
         lookup_function   system_lookup;
+
+        // the native back end's configuration, and the server its next lookup starts with, if it rotates them.
+        config_cache             configs;
+        std::atomic<std::size_t> next_server{0};
 
         // in_flight are the lookups not yet finished, which callers for the same key join (as Go's singleflight), each
         // keyed by its own fields. A lookup leaves it when it finishes, or when its last caller leaves (Go's
@@ -278,20 +290,36 @@ namespace
 
         try
         {
-            // NOTE: the system's back end, whatever resolver->use is, until there's another.
-            //       Not started at all if every caller has left by the time it has a thread.
-            auto ran = co_await state->scheduler->run_blocking(
-                [&]
-                {
-                    return resolver->system_lookup ? resolver->system_lookup(state->host, state->proto)
-                                                   : getaddrinfo_lookup(state->host, state->proto);
-                },
-                state->stop.get_token());
+            if (resolver->use == resolver::backend::native)
+            {
+                // NOTE: the configuration as it is when the lookup starts, kept until it ends.
+                auto       conf  = resolver->configs.get();
+                const auto first = conf->rotate ? resolver->next_server.fetch_add(1, std::memory_order::relaxed) : 0;
 
-            if (ran.has_value()) result = std::move(*ran);
-            else result = std::unexpected(ran.error());
+                result = co_await detail::native_lookup(state->scheduler,
+                                                        std::move(conf),
+                                                        state->host,
+                                                        state->proto,
+                                                        first,
+                                                        state->stop.get_token());
+            }
+            else
+            {
+                // NOTE: the system's back end, for automatic too, until stage 6 of docs/plans/dns-resolver.md.
+                //       Not started at all if every caller has left by the time it has a thread.
+                auto ran = co_await state->scheduler->run_blocking(
+                    [&]
+                    {
+                        return resolver->system_lookup ? resolver->system_lookup(state->host, state->proto)
+                                                       : getaddrinfo_lookup(state->host, state->proto);
+                    },
+                    state->stop.get_token());
+
+                if (ran.has_value()) result = std::move(*ran);
+                else result = std::unexpected(ran.error());
+            }
         }
-        catch (...) // NOLINT(bugprone-empty-catch): failing to allocate, the only way it can throw: result says so.
+        catch (...) // NOLINT(bugprone-empty-catch): failing to allocate (or to read the configuration): result says so.
         {}
 
         finish(*resolver, *state, std::move(result));
@@ -365,7 +393,7 @@ resolver::resolver()
 {}
 
 resolver::resolver(options opts)
-    : state{std::make_shared<detail::resolver_state>(opts.use, std::move(opts.system_lookup))}
+    : state{std::make_shared<detail::resolver_state>(std::move(opts))}
 {}
 
 coro::task<std::expected<std::vector<ip_addr>, std::error_code>>

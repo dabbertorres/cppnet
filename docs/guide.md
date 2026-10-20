@@ -212,6 +212,33 @@ another rather than share it: `getaddrinfo()` can't be interrupted, so it goes o
 and its result is dropped (a lookup whose callers gave up before it got a thread isn't started), and the scheduler's
 `shutdown()` waits for it. Errors are `getaddrinfo()`'s (in `gai_category()`): compare them with `dns::condition`.
 
+```cpp
+// the native back end, with its own configuration (without one, it reads /etc/resolv.conf, /etc/hosts and
+// /etc/nsswitch.conf, and again when they change, at most every 5 seconds).
+net::dns::config conf = net::dns::parse_resolv_conf("nameserver 192.0.2.53\noptions timeout:2 attempts:3\n");
+conf.hosts            = net::dns::parse_hosts("192.0.2.10 build.internal\n");
+
+const net::dns::resolver resolver{{.use = net::dns::resolver::backend::native, .conf = std::move(conf)}};
+auto addrs = co_await resolver.resolve(&scheduler, "example.com", {.stop = stop});
+```
+
+`backend::native` opts into the resolver's own back end, as Go's: no thread, but DNS queries it sends itself.
+`automatic` is still the system's, everywhere. It works from a `dns::config` (`dns/config.hpp`, which
+`dns/resolver.hpp` includes): the nameservers (addresses and ports), the search list and `ndots`, the timeout per
+attempt and the attempts, `rotate`, `single-request`, `single-request-reopen`, `use-vc`, `trust-ad`, the hosts table,
+and whether the hosts table or DNS comes first (nsswitch.conf's `hosts:` line, as far as `files` and `dns` go).
+`parse_resolv_conf()`, `parse_hosts()` and `parse_nsswitch_hosts()`/`order_of()` read the files' text as Go does (a
+resolv.conf without nameservers means 127.0.0.1 and ::1). A name is looked up in the hosts table, then, under each
+name the search list makes, both families' queries go out at once on one UDP socket (a new one per attempt, so a new
+random source port) with random IDs and EDNS(0) (offering 1232 bytes; asked again without it if a server answers
+FORMERR), and replies that don't match a query (ID, question) are ignored. A truncated answer is asked again over TCP,
+a server that fails (SERVFAIL, REFUSED, no answer within the timeout, its port closed) is followed by the next, and
+CNAME chains are followed within the answer. The addresses are sorted by RFC 6724, as `getaddrinfo()` sorts them.
+Its errors are `dns::errc`'s: `name_not_found` (NXDOMAIN under every name tried) and `no_address` match
+`condition::not_found`, `server_failure` (no server answered, or they failed) `condition::temporary_failure`, and
+`refused` and `bad_response` (e.g. a CNAME loop) neither. Deadlines, stop tokens, `request_stop()` and sharing a
+lookup work as for the system's, but a stopped lookup's queries end at once.
+
 ## UDP
 
 ```cpp
@@ -556,7 +583,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `io/io.hpp`                            | `io::result`, `io::errc`, `io::status_condition`          |
 | `listen.hpp`, `tcp.hpp`                | TCP sockets                                                 |
 | `udp.hpp`                              | UDP sockets                                               |
-| `dns/resolver.hpp`, `ip_addr.hpp`, `url.hpp` | names, addresses and URLs                           |
+| `dns/resolver.hpp` (and `dns/config.hpp`), `ip_addr.hpp`, `url.hpp` | names, addresses and URLs  |
 | `http/client.hpp`                      | the HTTP client                                           |
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
