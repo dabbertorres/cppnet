@@ -59,6 +59,24 @@ std::pair<net::socket, net::socket> make_socket_pair(scheduler* sched)
     };
 }
 
+// more_than_buffered is more than a pair of sockets' buffers hold (four times the writer's send buffer and the reader's
+// receive buffer together: Linux and macOS limit a Unix socket's data in flight by its sender's, Linux overshooting it
+// by a fraction), so a write of it has to wait for the reader. It's sized to the system's buffers rather than big
+// enough for any: Debug builds construct and destroy a std::vector a byte at a time, which for 64 MiB took 1.5 s of CPU
+// (and several under load).
+std::size_t more_than_buffered(const net::socket& writer, const net::socket& reader)
+{
+    int       send_buffer = 0;
+    socklen_t size        = sizeof(send_buffer);
+    REQUIRE(::getsockopt(writer.native_handle(), SOL_SOCKET, SO_SNDBUF, &send_buffer, &size) == 0);
+
+    int receive_buffer = 0;
+    size               = sizeof(receive_buffer);
+    REQUIRE(::getsockopt(reader.native_handle(), SOL_SOCKET, SO_RCVBUF, &receive_buffer, &size) == 0);
+
+    return std::size_t{4} * (static_cast<std::size_t>(send_buffer) + static_cast<std::size_t>(receive_buffer));
+}
+
 // eventually polls until check passes, or the test times out.
 template<typename F>
 bool eventually(F check)
@@ -660,15 +678,16 @@ TEST_CASE("socket write timeouts", "[io][socket][timeout]")
     writer.set_write_timeout(100ms);
 
     // nothing reads, so the socket's buffers fill, and the write has to wait.
-    auto write_lots = [](net::socket* writer) -> task<std::pair<std::size_t, std::error_code>>
+    std::vector<std::byte> lots(more_than_buffered(writer, reader));
+    auto write_lots = [](net::socket*               writer,
+                         std::span<const std::byte> lots) -> task<std::pair<std::size_t, std::error_code>>
     {
-        std::vector<std::byte> lots(static_cast<std::size_t>(64 * 1'024) * 1'024);
-        auto                   res = co_await writer->write(lots);
+        auto res = co_await writer->write(lots);
         co_return std::pair{res.count, res.err};
     };
 
     auto start        = net::io::clock::now();
-    auto [count, err] = sched.run_to_completion(write_lots(&writer));
+    auto [count, err] = sched.run_to_completion(write_lots(&writer, lots));
     auto elapsed      = net::io::clock::now() - start;
 
     CHECK(err == std::errc::timed_out);
