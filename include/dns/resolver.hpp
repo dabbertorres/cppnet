@@ -39,6 +39,21 @@ namespace detail
     using lookup_function =
         std::function<std::expected<std::vector<ip_addr>, std::error_code>(const std::string& host, protocol proto)>;
 
+    // system_facts are what resolver::backend::automatic reads of the machine besides the configuration files.
+    // (Internal: tests replace them.)
+    struct system_facts
+    {
+        // whether the OS is one whose configuration the native back end reads (Linux and the BSDs but OpenBSD). None:
+        // this one's.
+        std::optional<bool> native_os{};
+
+        // reads an environment variable (none: it isn't set). Empty: std::getenv().
+        std::function<std::optional<std::string>(const char* name)> getenv{};
+
+        // the machine's name, or empty if it can't be had. Empty: gethostname().
+        std::function<std::string()> host_name{};
+    };
+
     struct resolver_state;
 
 }
@@ -47,9 +62,9 @@ namespace detail
 // threads for blocking calls (see io::scheduler::run_blocking()), or its own (native), which sends DNS queries itself,
 // as Go's resolver does.
 //
-// Concurrent calls for the same name (ignoring case) and families, on the same scheduler, share one lookup (as Go's
-// singleflight merges them), each caller with its own deadline and stop. Nothing is cached: a call after a lookup has
-// finished starts another.
+// Concurrent calls for the same name (ignoring case) and families, on the same scheduler, with the same back end (as
+// automatic chooses it), share one lookup (as Go's singleflight merges them), each caller with its own deadline and
+// stop. Nothing is cached: a call after a lookup has finished starts another.
 //
 // A caller gives up at its deadline or when stop is requested (or the scheduler is stopped), at once, whatever the back
 // end is doing, and the others sharing its lookup go on waiting. Once they all have, the lookup is stopped, and a later
@@ -64,7 +79,15 @@ class resolver
 public:
     enum class backend : std::uint8_t
     {
-        // the best for the platform: for now, always the system's.
+        // chosen per name, as Go chooses (see docs/guide.md): the native on Linux and the BSDs (but OpenBSD), unless
+        // the configuration has something it doesn't do (an option resolv.conf has that it doesn't know; LOCALDOMAIN
+        // set, or RES_OPTIONS or HOSTALIASES not empty, in the environment; in nsswitch.conf's hosts line, a source
+        // besides files and dns, or an action besides the defaults), or the name is one that such a source answers
+        // (a .local name, with an mdns source; the machine's own name, or localhost, with myhostname: other names skip
+        // them); otherwise, and on other OSes (macOS's configuration isn't all in /etc), the system's. The
+        // configuration is the native back end's (conf, or the files', read again as they change), so the choice
+        // follows it. NET_DNS=system or NET_DNS=native in the environment (read when the resolver is made; other
+        // values are ignored) makes it that one.
         automatic,
         // the system's resolver, getaddrinfo().
         system,
@@ -90,6 +113,9 @@ public:
 
         // Internal (for tests): the files the native back end's configuration is read from, if conf isn't set.
         detail::config_files files{};
+
+        // Internal (for tests): what automatic reads of the machine, besides the configuration.
+        detail::system_facts facts{};
     };
 
     resolver();

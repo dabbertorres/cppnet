@@ -101,13 +101,6 @@ std::string read_file(const std::string& path)
     return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
 }
 
-std::string host_name()
-{
-    std::array<char, 256> name{};
-    if (::gethostname(name.data(), name.size() - 1) != 0) return {};
-    return name.data();
-}
-
 net::dns::detail::file_stamp stamp_of(const std::string& path) noexcept
 {
     struct stat st{};
@@ -305,10 +298,19 @@ namespace detail
 
     config read_config(const config_files& files)
     {
-        auto conf  = parse_resolv_conf(read_file(files.resolv_conf), host_name());
-        conf.hosts = parse_hosts(read_file(files.hosts));
-        conf.order = order_of(parse_nsswitch_hosts(read_file(files.nsswitch_conf)));
+        auto conf       = parse_resolv_conf(read_file(files.resolv_conf), host_name());
+        conf.hosts      = parse_hosts(read_file(files.hosts));
+        conf.nss_hosts  = parse_nsswitch_hosts(read_file(files.nsswitch_conf));
+        conf.order      = order_of(conf.nss_hosts);
+        conf.mdns_allow = stamp_of(files.mdns_allow).exists;
         return conf;
+    }
+
+    std::string host_name()
+    {
+        std::array<char, 256> name{};
+        if (::gethostname(name.data(), name.size() - 1) != 0) return {};
+        return name.data();
     }
 
     config_cache::config_cache(std::optional<config> given, config_files files)
@@ -336,9 +338,14 @@ namespace detail
         return current;
     }
 
-    std::array<file_stamp, 3> config_cache::stamps() const
+    std::array<file_stamp, 4> config_cache::stamps() const
     {
-        return {stamp_of(files.resolv_conf), stamp_of(files.hosts), stamp_of(files.nsswitch_conf)};
+        return {
+            stamp_of(files.resolv_conf),
+            stamp_of(files.hosts),
+            stamp_of(files.nsswitch_conf),
+            stamp_of(files.mdns_allow),
+        };
     }
 
 }

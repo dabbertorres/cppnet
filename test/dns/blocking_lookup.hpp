@@ -32,6 +32,7 @@ struct blocking_lookup
 
     net::dns::resolver resolver{
         {
+         .use = net::dns::resolver::backend::system,
          .system_lookup =
                 [this](const std::string& /*host*/, net::protocol /*proto*/)
             {

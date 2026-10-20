@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 
 #include "coro/task.hpp"
+#include "dns/automatic.hpp"
 #include "dns/config.hpp"
 #include "dns/native.hpp"
 #include "exception.hpp"
@@ -164,14 +165,17 @@ lookup_result getaddrinfo_lookup(const std::string& host, net::protocol proto) n
     }
 }
 
+using backend = net::dns::resolver::backend;
+
 // lookup_key is what makes two lookups the same, so concurrent callers share one: the scheduler (whose word the
-// callers wait on), the name (lower-cased: DNS names are case-insensitive) and the families. (The back end is the
-// resolver's, whose table it is.)
+// callers wait on), the name (lower-cased: DNS names are case-insensitive), the families, and the back end (which
+// automatic chooses per name, and again as the configuration changes).
 struct lookup_key
 {
     net::io::scheduler* scheduler = nullptr;
     std::string_view    host{};
     net::protocol       proto = net::protocol::not_care;
+    backend             use   = backend::system;
 
     bool operator==(const lookup_key&) const = default;
 };
@@ -182,22 +186,25 @@ struct lookup_key_hash
     {
         auto hash = net::util::detail::hash_combine(0, key.host);
         hash      = net::util::detail::hash_combine(hash, key.scheduler);
-        return net::util::detail::hash_combine(hash, key.proto);
+        hash      = net::util::detail::hash_combine(hash, key.proto);
+        return net::util::detail::hash_combine(hash, key.use);
     }
 };
 
 // lookup is a lookup in flight: what it looks up, its result once it has one, and its callers.
 struct lookup
 {
-    lookup(net::io::scheduler* scheduler, std::string host, net::protocol proto) noexcept
+    lookup(net::io::scheduler* scheduler, std::string host, net::protocol proto, backend use) noexcept
         : scheduler{scheduler}
         , host{std::move(host)}
         , proto{proto}
+        , use{use}
     {}
 
     net::io::scheduler* const scheduler;
     const std::string         host; // lower-cased
     const net::protocol       proto;
+    const backend             use; // system or native
 
     // done is 1 once result is set: the word callers wait on.
     std::atomic<std::uint64_t> done{0};
@@ -208,7 +215,10 @@ struct lookup
     std::size_t      waiters = 1;
     std::stop_source stop;
 
-    [[nodiscard]] lookup_key key() const noexcept { return {.scheduler = scheduler, .host = host, .proto = proto}; }
+    [[nodiscard]] lookup_key key() const noexcept
+    {
+        return {.scheduler = scheduler, .host = host, .proto = proto, .use = use};
+    }
 };
 
 }
@@ -222,12 +232,15 @@ namespace detail
     struct resolver_state
     {
         explicit resolver_state(resolver::options opts)
-            : use{opts.use}
+            : use{opts.use == backend::automatic ? fixed_choice(opts.facts).value_or(backend::automatic) : opts.use}
+            , facts{std::move(opts.facts)}
             , system_lookup{std::move(opts.system_lookup)}
             , configs{std::move(opts.conf), std::move(opts.files)}
         {}
 
+        // the back end: automatic only if it's chosen per name (see fixed_choice()).
         resolver::backend use = resolver::backend::automatic;
+        system_facts      facts;
         lookup_function   system_lookup;
 
         // the native back end's configuration, and the server its next lookup starts with, if it rotates them.
@@ -284,16 +297,17 @@ namespace
     }
 
     // run_lookup does a lookup's work, on its own (the callers wait for it, and may leave), and hands them its result.
-    coro::task<> run_lookup(std::shared_ptr<detail::resolver_state> resolver, std::shared_ptr<lookup> state)
+    // A native lookup works from conf.
+    coro::task<> run_lookup(std::shared_ptr<detail::resolver_state> resolver,
+                            std::shared_ptr<lookup>                 state,
+                            std::shared_ptr<const config>           conf)
     {
         lookup_result result{std::unexpected(std::make_error_code(std::errc::not_enough_memory))};
 
         try
         {
-            if (resolver->use == resolver::backend::native)
+            if (state->use == backend::native)
             {
-                // NOTE: the configuration as it is when the lookup starts, kept until it ends.
-                auto       conf  = resolver->configs.get();
                 const auto first = conf->rotate ? resolver->next_server.fetch_add(1, std::memory_order::relaxed) : 0;
 
                 result = co_await detail::native_lookup(state->scheduler,
@@ -305,8 +319,7 @@ namespace
             }
             else
             {
-                // NOTE: the system's back end, for automatic too, until stage 6 of docs/plans/dns-resolver.md.
-                //       Not started at all if every caller has left by the time it has a thread.
+                // NOTE: not started at all if every caller has left by the time it has a thread.
                 auto ran = co_await state->scheduler->run_blocking(
                     [&]
                     {
@@ -325,6 +338,34 @@ namespace
         finish(*resolver, *state, std::move(result));
     }
 
+    // choice is the back end a lookup uses, and the configuration a native one works from.
+    struct choice
+    {
+        backend                       use = backend::system;
+        std::shared_ptr<const config> conf{};
+    };
+
+    // choose_for is the back end to look host (lower-cased) up with: the resolver's, or for automatic, the one Go's
+    // rule chooses for it from the configuration as it is now (read again if it has changed).
+    std::expected<choice, std::error_code> choose_for(detail::resolver_state& resolver, std::string_view host) noexcept
+    {
+        try
+        {
+            choice c{.use = resolver.use};
+            if (c.use == backend::system) return c;
+
+            // NOTE: the configuration as it is when the lookup starts, kept until it ends.
+            c.conf = resolver.configs.get();
+            if (c.use == backend::automatic) c.use = detail::choose(*c.conf, host, resolver.facts);
+            if (c.use == backend::system) c.conf.reset();
+            return c;
+        }
+        catch (...) // failing to allocate (or to read the configuration)
+        {
+            return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+        }
+    }
+
     // look_up joins the lookup of host in flight, or starts one, and waits for its result, leaving if the deadline
     // passes or stop is requested first.
     coro::task<lookup_result> look_up(io::scheduler*                          scheduler,
@@ -336,12 +377,16 @@ namespace
         //       so the lookup holds the one string, its key viewing it.
         std::ranges::transform(host, host.begin(), [](char c) { return util::to_lower_ascii(c); });
 
+        auto chosen = choose_for(*resolver, host);
+        if (!chosen.has_value()) co_return std::unexpected(chosen.error());
+
         std::shared_ptr<lookup> state;
         bool                    started = false;
         {
             const std::scoped_lock lock{resolver->mu};
 
-            const auto it = resolver->in_flight.find({.scheduler = scheduler, .host = host, .proto = options.proto});
+            const auto it = resolver->in_flight.find(
+                {.scheduler = scheduler, .host = host, .proto = options.proto, .use = chosen->use});
             if (it != resolver->in_flight.end())
             {
                 state = it->second;
@@ -349,7 +394,7 @@ namespace
             }
             else
             {
-                state = std::make_shared<lookup>(scheduler, std::move(host), options.proto);
+                state = std::make_shared<lookup>(scheduler, std::move(host), options.proto, chosen->use);
                 resolver->in_flight.emplace(state->key(), state);
                 started = true;
             }
@@ -367,7 +412,7 @@ namespace
             auto refused = std::make_error_code(std::errc::operation_canceled);
             try
             {
-                if (scheduler->spawn(run_lookup(resolver, state))) refused.clear();
+                if (scheduler->spawn(run_lookup(resolver, state, std::move(chosen->conf)))) refused.clear();
             }
             catch (...)
             {

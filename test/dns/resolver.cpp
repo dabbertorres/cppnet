@@ -218,6 +218,7 @@ TEST_CASE("the resolver checks names before looking them up", "[dns][resolver][n
     std::atomic<int>         looked_up{0};
     const net::dns::resolver resolver{
         {
+         .use           = net::dns::resolver::backend::system,
          .system_lookup = [&looked_up](const std::string& /*host*/, net::protocol /*proto*/) -> resolve_result
             {
                 looked_up.fetch_add(1);
@@ -295,6 +296,7 @@ TEST_CASE("the resolver returns the lookup's result", "[dns][resolver]")
     net::protocol            asked_proto = net::protocol::not_care;
     const net::dns::resolver resolver{
         {
+         .use           = net::dns::resolver::backend::system,
          .system_lookup = [&](const std::string& host, net::protocol proto) -> resolve_result
             {
                 asked_host  = host;
@@ -325,6 +327,7 @@ TEST_CASE("a lookup that outlives its resolver still finishes", "[dns][resolver]
     {
         const net::dns::resolver resolver{
             {
+             .use           = net::dns::resolver::backend::system,
              .system_lookup = [](const std::string& /*host*/, net::protocol /*proto*/) -> resolve_result
                 { return std::vector<net::ip_addr>{net::ipv4_addr::loopback()}; },
              }
@@ -770,11 +773,17 @@ TEST_CASE("a lookup that has finished isn't shared", "[dns][resolver][merge]")
     CHECK(lookup.started.load() == 2);
 }
 
-TEST_CASE("the system's resolver finds localhost", "[dns][resolver]")
+TEST_CASE("the system's resolver, and the default one, find localhost", "[dns][resolver]")
 {
+    // the default resolver's back end is automatic's choice, which may be either.
+    const bool               use_default = GENERATE(false, true);
+    const net::dns::resolver system{{.use = net::dns::resolver::backend::system}};
+    const auto&              resolver = use_default ? net::dns::default_resolver() : system;
+    CAPTURE(use_default);
+
     net::io::scheduler sched{make_pool()};
 
-    auto results = sched.run_to_completion(net::dns::default_resolver().resolve(&sched, "localhost"));
+    auto results = sched.run_to_completion(resolver.resolve(&sched, "localhost"));
     REQUIRE(results.has_value());
     CHECK_FALSE(results->empty());
 
@@ -789,19 +798,21 @@ TEST_CASE("the system's resolver finds localhost", "[dns][resolver]")
 
 TEST_CASE("the system's resolver finds a public name", "[dns][resolver][network]")
 {
-    net::io::scheduler sched{make_pool()};
+    const net::dns::resolver resolver{{.use = net::dns::resolver::backend::system}};
+    net::io::scheduler       sched{make_pool()};
 
-    auto results = sched.run_to_completion(net::dns::default_resolver().resolve(&sched, "google.com"));
+    auto results = sched.run_to_completion(resolver.resolve(&sched, "google.com"));
     REQUIRE(results.has_value());
     CHECK_FALSE(results->empty());
 }
 
 TEST_CASE("the system's resolver reports names that don't exist", "[dns][resolver][network]")
 {
-    net::io::scheduler sched{make_pool()};
+    const net::dns::resolver resolver{{.use = net::dns::resolver::backend::system}};
+    net::io::scheduler       sched{make_pool()};
 
     // .invalid never resolves (RFC 6761).
-    auto results = sched.run_to_completion(net::dns::default_resolver().resolve(&sched, "nothing.invalid"));
+    auto results = sched.run_to_completion(resolver.resolve(&sched, "nothing.invalid"));
     REQUIRE_FALSE(results.has_value());
     CAPTURE(results.error().message());
     CHECK(results.error() == net::dns::condition::not_found);

@@ -60,6 +60,8 @@ TEST_CASE("an empty resolv.conf gives the defaults", "[dns][config][resolv.conf]
     CHECK_FALSE(conf.unknown_option);
     CHECK(conf.hosts.empty());
     CHECK(conf.order == dns::lookup_order::files_dns);
+    CHECK(conf.nss_hosts.empty());
+    CHECK_FALSE(conf.mdns_allow);
 }
 
 TEST_CASE("resolv.conf's nameservers are read, up to three", "[dns][config][resolv.conf]")
@@ -292,6 +294,7 @@ TEST_CASE("the configuration is read from its files, and again when they change"
         .resolv_conf    = (dir / "resolv.conf").string(),
         .hosts          = (dir / "hosts").string(),
         .nsswitch_conf  = (dir / "nsswitch.conf").string(),
+        .mdns_allow     = (dir / "mdns.allow").string(),
         .check_interval = 0s,
     };
 
@@ -304,6 +307,8 @@ TEST_CASE("the configuration is read from its files, and again when they change"
         CHECK(conf->nameservers == default_servers());
         CHECK(conf->hosts.empty());
         CHECK(conf->order == dns::lookup_order::files_dns);
+        CHECK(conf->nss_hosts.empty());
+        CHECK_FALSE(conf->mdns_allow);
     }
 
     SECTION("read, and read again")
@@ -323,6 +328,8 @@ TEST_CASE("the configuration is read from its files, and again when they change"
                   {"one.example", {addr("192.0.2.10")}}
         });
         CHECK(first->order == dns::lookup_order::dns_files);
+        CHECK(first->nss_hosts == std::vector<dns::nss_source>{{.name = "dns"}, {.name = "files"}});
+        CHECK_FALSE(first->mdns_allow);
 
         // unchanged: the same one.
         CHECK(cache.get() == first);
@@ -344,6 +351,17 @@ TEST_CASE("the configuration is read from its files, and again when they change"
               == dns::hosts_table{
                   {"one.example", {addr("192.0.2.10")}}
         });
+
+        // /etc/mdns.allow is only looked for, and its coming and going is a change.
+        write(files.mdns_allow, "");
+        const auto third = cache.get();
+        REQUIRE(third != nullptr);
+        CHECK(third->mdns_allow);
+
+        std::filesystem::remove(files.mdns_allow);
+        const auto fourth = cache.get();
+        REQUIRE(fourth != nullptr);
+        CHECK_FALSE(fourth->mdns_allow);
     }
 
     SECTION("not checked again until the interval has passed")

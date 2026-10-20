@@ -2,7 +2,7 @@
 
 Status: proposed (2026-10-15), revised (2026-10-19) for what has landed since: stop tokens on the scheduler's waits,
 sockets and `connect`, `run_blocking(func, stop)`, `call_at`, the HTTP client's pool, TLS, and `std::expected`
-throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 5 are
+throughout. The questions at the end (Decided questions) were decided as recommended (2026-10-19). Stages 1 to 6 are
 done (2026-10-19); "Where things stand" describes the code before them.
 
 ## Goal
@@ -214,7 +214,8 @@ on one thread.
 `automatic` follows Go (Decided question 6): native on Linux and the BSDs, unless the configuration has something the
 native resolver doesn't do (an unknown `resolv.conf` option, `LOCALDOMAIN`/`RES_OPTIONS`/`HOSTALIASES` set, an
 `nsswitch.conf` source other than `files` and `dns`, or one with non-default actions); system on macOS, for `.local`
-names, and for the machine's own name when `nsswitch.conf` has `myhostname`. `NET_DNS=system|native` (cppnet's
+names (when `nsswitch.conf` has an `mdns` source), and for the machine's own name when `nsswitch.conf` has
+`myhostname` (stage 6's note has the details). `NET_DNS=system|native` (cppnet's
 `GODEBUG=netdns`) and `resolver::options::use` force one. Note: Arch's default `nsswitch.conf` lists `mymachines` and
 `resolve` before `dns`, so `automatic` chooses the system there (CI's Linux container, unless its image differs); on
 Ubuntu's server images (`files dns`, `resolv.conf` pointing at systemd-resolved's stub) it chooses the native. (To
@@ -371,6 +372,42 @@ Each is mergeable alone, with its tests and docs (`docs/guide.md`, CLAUDE.md, RE
    helpers to answer from a zone); `test/dns/native.cpp` has the back end's tests, and `test/dns/config.cpp` the
    parsers' and the cache's (on files in a temporary directory).
 6. **`automatic`**: Go's rule, and `NET_DNS`. Until this lands, `automatic` is the system back end.
+   **Done** as above. `dns/automatic.hpp` (internal): `detail::fixed_choice(facts)`, what the environment and the OS
+   decide for every name (`NET_DNS`; the system's off Linux and the BSDs; `LOCALDOMAIN`, `RES_OPTIONS`,
+   `HOSTALIASES`), read once when a resolver is made (as Go reads them once; `default_resolver()`'s when first used),
+   so a resolver whose choice it fixes reads no configuration for it; and `detail::choose(conf, name, facts)`, Go's
+   `hostLookupOrder` on the native back end's configuration (the cached one, or `options::conf`, chosen from as the
+   files' would be), made per lookup, before joining one. `config` gained `nss_hosts` (the hosts line's sources and
+   actions) and `mdns_allow` (whether `/etc/mdns.allow` is there: `config_files::mdns_allow`, stamped as the other
+   files, so its coming or going is a change). `resolver::options::facts` (internal: the OS, `getenv`, the host name)
+   lets the tests choose without the machine's `/etc` and environment. The in-flight key holds the back end chosen
+   (system or native), and a native lookup works from the configuration its choice was made from. The tests whose
+   `system_lookup` hook stood for `automatic` choose `backend::system`. Decided along the way, following Go where the
+   plan was silent:
+   - `NET_DNS` other than exactly `system` or `native` (e.g. `go`, `Native`, empty) is ignored, as Go ignores netdns
+     values it doesn't know. It wins over the OS and the rest of the environment (as `netdns=go` does), and an
+     explicit `options::use` wins over it (as `Resolver.PreferGo` wins over `netdns=cgo`).
+   - `LOCALDOMAIN` counts when set, even empty; `RES_OPTIONS` and `HOSTALIASES` only when not empty (Go's reading).
+   - `.local` names go to the system's only when the hosts line has an `mdns*` source (without one, the C library
+     doesn't do mDNS either), as do all names when `/etc/mdns.allow` is there (Go doesn't read the file); other names
+     skip `mdns*` sources. `myhostname`: localhost names (`localhost`, `localhost.localdomain` and names under them),
+     `_gateway`, `_outbound` and the machine's own name (ignoring case; any name, if `gethostname()` fails) go to the
+     system's, other names skip it. Any other source besides `files` and `dns` makes it the system's. No hosts line
+     (or no nsswitch.conf) is the native's, and sources with neither `files` nor `dns` the system's (Go's fallback).
+   - An action is the defaults' (Go's `standardCriteria`) when each criterion is its status's default (`success`
+     returns, `notfound`, `unavail` and `tryagain` continue), ignoring case, not negated. Go also allows `return` on a
+     source's last criterion wherever the source is (its "debian_squeeze" case, `files [notfound=return]` last), so
+     `files [NOTFOUND=return] dns` would be Go's own though the C library never asks DNS for a name the hosts table
+     hasn't: here `return` is allowed only on the line's last source, where it comes to the same. An action that
+     can't be read (unclosed, a criterion without `=` or under 3 characters) makes it the system's wherever it is, as
+     Go then can't read nsswitch.conf; so does a source's second bracketed action (Go reads it as an unknown source).
+   - OpenBSD gets the system's always: Go reads its resolv.conf's `lookup` keyword instead of nsswitch.conf, which
+     the native back end doesn't (stage 5's parser counts `lookup` unknown, so most OpenBSD configurations would choose
+     the system's anyway).
+   - Not kept from Go: falling back to the system's when resolv.conf or nsswitch.conf is there but can't be read (the
+     cache reads such a file as empty, as stage 5 has it).
+   The CI image's choice wasn't checked: no test depends on it (`localhost` is resolved by both back ends, and the
+   default resolver's choice may be either).
 7. **Later.** Happy Eyeballs (RFC 8305) in `connect`: attempts staggered by 250 ms (`call_at`, or a `sleep_until` with
    the token), losers stopped through a `util::linked_stop_source` linked to `options.stop`; with the native back end,
    connecting on the first family's answer (RFC 8305's resolution delay). A cache, only if ever needed. A transport

@@ -199,10 +199,11 @@ auto addrs = co_await net::dns::default_resolver().resolve(
 if (!addrs && addrs.error() == net::dns::condition::not_found) { /* no such name, or no addresses */ }
 ```
 
-A `dns::resolver` (`dns/resolver.hpp`) looks names up with the system's resolver (`getaddrinfo()`), on the scheduler's
-threads for blocking calls; `dns::default_resolver()` is the one `connect` and the HTTP client use unless given
-another. `resolve_options::proto` limits it to IPv4's or IPv6's addresses. An IP address is returned as it is, without
-a thread or a lookup, and a name that isn't valid (labels of letters, digits, `-` and `_`) fails with
+A `dns::resolver` (`dns/resolver.hpp`) looks names up with the system's resolver (`getaddrinfo()`, on the scheduler's
+threads for blocking calls) or its own (the native back end, below), choosing per name as Go does (`backend::automatic`,
+below); `dns::default_resolver()` is the one `connect` and the HTTP client use unless given another.
+`resolve_options::proto` limits it to IPv4's or IPv6's addresses. An IP address is returned as it is, without a thread
+or a lookup, and a name that isn't valid (labels of letters, digits, `-` and `_`) fails with
 `std::errc::invalid_argument` without one. Concurrent calls for the same name (ignoring case) and families, on the same
 scheduler, share one lookup (as Go's `singleflight` merges them), so a burst of connections to a host resolves it once;
 nothing is cached, so a call after it has finished looks the name up again. A caller gives up at its deadline
@@ -210,7 +211,8 @@ nothing is cached, so a call after it has finished looks the name up again. A ca
 callers sharing its lookup go on waiting. Once they've all given up, the lookup is stopped, and a later call starts
 another rather than share it: `getaddrinfo()` can't be interrupted, so it goes on holding its thread until it returns,
 and its result is dropped (a lookup whose callers gave up before it got a thread isn't started), and the scheduler's
-`shutdown()` waits for it. Errors are `getaddrinfo()`'s (in `gai_category()`): compare them with `dns::condition`.
+`shutdown()` waits for it. The system's errors are `getaddrinfo()`'s (in `gai_category()`), the native's `dns::errc`'s
+(below): compare either with `dns::condition`.
 
 ```cpp
 // the native back end, with its own configuration (without one, it reads /etc/resolv.conf, /etc/hosts and
@@ -222,22 +224,44 @@ const net::dns::resolver resolver{{.use = net::dns::resolver::backend::native, .
 auto addrs = co_await resolver.resolve(&scheduler, "example.com", {.stop = stop});
 ```
 
-`backend::native` opts into the resolver's own back end, as Go's: no thread, but DNS queries it sends itself.
-`automatic` is still the system's, everywhere. It works from a `dns::config` (`dns/config.hpp`, which
-`dns/resolver.hpp` includes): the nameservers (addresses and ports), the search list and `ndots`, the timeout per
+`backend::native` chooses the resolver's own back end, as Go's: no thread, but DNS queries it sends itself; and
+`backend::system` chooses the system's, whatever `automatic` would. It works from a `dns::config` (`dns/config.hpp`,
+which `dns/resolver.hpp` includes): the nameservers (addresses and ports), the search list and `ndots`, the timeout per
 attempt and the attempts, `rotate`, `single-request`, `single-request-reopen`, `use-vc`, `trust-ad`, the hosts table,
 and whether the hosts table or DNS comes first (nsswitch.conf's `hosts:` line, as far as `files` and `dns` go).
 `parse_resolv_conf()`, `parse_hosts()` and `parse_nsswitch_hosts()`/`order_of()` read the files' text as Go does (a
-resolv.conf without nameservers means 127.0.0.1 and ::1). A name is looked up in the hosts table, then, under each
-name the search list makes, both families' queries go out at once on one UDP socket (a new one per attempt, so a new
-random source port) with random IDs and EDNS(0) (offering 1232 bytes; asked again without it if a server answers
-FORMERR), and replies that don't match a query (ID, question) are ignored. A truncated answer is asked again over TCP,
-a server that fails (SERVFAIL, REFUSED, no answer within the timeout, its port closed) is followed by the next, and
-CNAME chains are followed within the answer. The addresses are sorted by RFC 6724, as `getaddrinfo()` sorts them.
-Its errors are `dns::errc`'s: `name_not_found` (NXDOMAIN under every name tried) and `no_address` match
-`condition::not_found`, `server_failure` (no server answered, or they failed) `condition::temporary_failure`, and
-`refused` and `bad_response` (e.g. a CNAME loop) neither. Deadlines, stop tokens, `request_stop()` and sharing a
-lookup work as for the system's, but a stopped lookup's queries end at once.
+resolv.conf without nameservers means 127.0.0.1 and ::1). A name is looked up in the hosts table, then, under each name
+the search list makes, both families' queries go out at once on one UDP socket (a new one per attempt, so a new random
+source port) with random IDs and EDNS(0) (offering 1232 bytes; asked again without it if a server answers FORMERR), and
+replies that don't match a query (ID, question) are ignored. A truncated answer is asked again over TCP, a server that
+fails (SERVFAIL, REFUSED, no answer within the timeout, its port closed) is followed by the next, and CNAME chains are
+followed within the answer. The addresses are sorted by RFC 6724, as `getaddrinfo()` sorts them. Its errors are
+`dns::errc`'s: `name_not_found` (NXDOMAIN under every name tried) and `no_address` match `condition::not_found`,
+`server_failure` (no server answered, or they failed) `condition::temporary_failure`, and `refused` and `bad_response`
+(e.g. a CNAME loop) neither. Deadlines, stop tokens, `request_stop()` and sharing a lookup work as for the system's, but
+a stopped lookup's queries end at once.
+
+`backend::automatic` (the default) uses the native back end where it gives the answers the system's would, and the
+system's elsewhere, as Go's resolver chooses between its own and cgo's:
+
+- On macOS (whose configuration isn't all in `/etc`: per-interface resolvers for VPNs, mDNS), and on OpenBSD (which
+  orders the hosts table and DNS with resolv.conf's `lookup`, not nsswitch.conf), always the system's.
+- On Linux and the other BSDs, the native, unless the configuration has something it doesn't do: an option (or
+  keyword) in resolv.conf it doesn't know; `LOCALDOMAIN` set (even empty), or `RES_OPTIONS` or `HOSTALIASES` not empty,
+  in the environment; in nsswitch.conf's `hosts:` line, an action it can't read, `files` or `dns` with an action
+  besides the defaults (e.g. `[!UNAVAIL=return]`, or `[NOTFOUND=return]` before another source), or a source besides
+  `files`, `dns`, `myhostname` and `mdns*` (e.g. systemd's `resolve` or `mymachines`, as Arch's and Fedora's default
+  nsswitch.conf have). `myhostname` and `mdns*` sources only matter to the names they answer, which go to the system's:
+  `myhostname` to the machine's own name, `localhost` (and names under it), `_gateway` and `_outbound`; `mdns*` to
+  `.local` names (to every name, if `/etc/mdns.allow` is there). So a desktop's `files mdns4_minimal [NOTFOUND=return]
+  dns myhostname` (Debian's and Ubuntu's) is the native's for most names, and a server's `files dns` for all.
+- `NET_DNS=system` or `NET_DNS=native` in the environment (Go's `GODEBUG=netdns=cgo|go`) makes it that one, wherever;
+  other values are ignored. The environment is read when the resolver is made (for `default_resolver()`, when it's
+  first used).
+
+The configuration it chooses from is the native back end's: the one given in `options::conf`, or the files, read again
+as they change (at most every 5 seconds), so the choice follows them. Concurrent calls for the same name share a
+lookup only if they chose the same back end.
 
 ## UDP
 

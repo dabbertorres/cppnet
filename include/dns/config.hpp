@@ -43,6 +43,16 @@ enum class lookup_order : std::uint8_t
 // them.
 using hosts_table = std::map<std::string, std::vector<ip_addr>, std::less<>>;
 
+// nss_source is a source of nsswitch.conf's hosts line: its name, and the action that follows it (e.g.
+// "[NOTFOUND=return]", as written; empty if none).
+struct nss_source
+{
+    std::string name{};
+    std::string action{};
+
+    bool operator==(const nss_source&) const = default;
+};
+
 // config is what the native resolver works from.
 struct config
 {
@@ -70,6 +80,12 @@ struct config
     hosts_table  hosts{};
     lookup_order order = lookup_order::files_dns;
 
+    // For resolver::backend::automatic's choice (as order is what the native back end makes of them): nsswitch.conf's
+    // hosts line (none: it has none, or there's no nsswitch.conf), and whether /etc/mdns.allow is there (which may let
+    // an mdns source answer names besides .local ones).
+    std::vector<nss_source> nss_hosts{};
+    bool                    mdns_allow = false;
+
     bool operator==(const config&) const = default;
 };
 
@@ -91,16 +107,6 @@ inline constexpr std::size_t max_nameservers = 3;
 // address that isn't one (or has a zone), or without names, are skipped.
 [[nodiscard]] hosts_table parse_hosts(std::string_view text);
 
-// nss_source is a source of nsswitch.conf's hosts line: its name, and the action that follows it (e.g.
-// "[NOTFOUND=return]", as written; empty if none).
-struct nss_source
-{
-    std::string name{};
-    std::string action{};
-
-    bool operator==(const nss_source&) const = default;
-};
-
 // parse_nsswitch_hosts reads nsswitch.conf's text, returning its hosts line's sources (none if it has none). '#'
 // starts a comment.
 [[nodiscard]] std::vector<nss_source> parse_nsswitch_hosts(std::string_view text);
@@ -119,12 +125,16 @@ namespace detail
         std::string                         resolv_conf   = "/etc/resolv.conf";
         std::string                         hosts         = "/etc/hosts";
         std::string                         nsswitch_conf = "/etc/nsswitch.conf";
+        std::string                         mdns_allow    = "/etc/mdns.allow"; // only whether it's there
         std::chrono::steady_clock::duration check_interval{std::chrono::seconds{5}};
     };
 
     // read_config reads files into a config (a file that can't be read counts as empty, so resolv.conf's defaults
     // apply), with the machine's host name for resolv.conf's default search domain.
     [[nodiscard]] config read_config(const config_files& files);
+
+    // host_name is the machine's name (gethostname()'s), or empty if it can't be had.
+    [[nodiscard]] std::string host_name();
 
     // file_stamp is what tells whether a file changed: whether it's there, and its inode, size and modification time.
     struct file_stamp
@@ -149,14 +159,14 @@ namespace detail
         [[nodiscard]] std::shared_ptr<const config> get();
 
     private:
-        [[nodiscard]] std::array<file_stamp, 3> stamps() const;
+        [[nodiscard]] std::array<file_stamp, 4> stamps() const;
 
         std::mutex                            mu;
         std::shared_ptr<const config>         current;
         config_files                          files;
         bool                                  given = false;
         std::chrono::steady_clock::time_point next_check{};
-        std::array<file_stamp, 3>             read_stamps{};
+        std::array<file_stamp, 4>             read_stamps{};
     };
 
 }
