@@ -97,6 +97,15 @@ public:
     // There's no Referer. The URL's fragment is kept, unless Location has one. A redirect's response is read to its end
     // (and discarded) if what's left of its body is at most 2 KiB, so its HTTP/1.x connection may be reused; otherwise,
     // it's closed (over HTTP/2, its stream reset).
+    //
+    // A request with "Expect: 100-continue" and a body (not of length 0) sends its head alone over HTTP/1.1, then waits
+    // for the server's first response, up to client_options::expect_continue_timeout: a 100 (Continue), or none in
+    // time, sends the body; another interim response is passed on (see client_request::on_informational), and the wait
+    // goes on, to the same deadline. A final response first is returned, and the body's sent only if the connection's
+    // to be reused (its framing needs it), otherwise not, nor is the connection reused. A 417 (Expectation Failed) to
+    // such a request, whose body wasn't sent, has it sent again at once, once, without its Expect field (on another
+    // connection), its body read then (so no get_body is needed); a 417 once the body's been sent is returned.
+    // response_header_timeout starts once the body's sent. Over HTTP/2, the body's sent at once, for now.
     coro::task<std::expected<client_response, std::error_code>> send(client_request request);
 
     // get sends a GET request for url (e.g. "http://example.com/path"), as send() does, canceled by stop (see

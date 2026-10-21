@@ -29,6 +29,14 @@ std::error_code check_request(const client_request& req) noexcept;
 // POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
 task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept;
 
+// request_encode_head writes a request's head: what request_encode() writes before the body, failing as it does. For a
+// client that waits for 100 (Continue) before it sends the body (Expect: 100-continue), with request_encode_body().
+task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept;
+
+// request_encode_body writes the body of a request whose head request_encode_head() wrote (and, if it's chunked, the
+// last chunk, with make_trailers' fields): the rest of what request_encode() writes.
+task<request_encoder_result> request_encode_body(io::writer* writer, const client_request& req) noexcept;
+
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
 
 // max_fields is the most field lines a message's head may have (as hyper's default): headers are looked up by going
@@ -84,10 +92,16 @@ task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reade
                                               informational_ref on_informational = {}) noexcept;
 
 // response_decode decodes a response's head, as above, but the body borrows reader, which must outlive it.
+//
+// With stop_at_interim, it returns each interim response (but 101), without a body, once it's passed it to
+// on_informational, rather than going on to the next head: for a client waiting for 100 (Continue) before it sends a
+// request's body, which waits for each head with a deadline of its own. Each call's heads count against
+// max_header_bytes by themselves.
 task<response_decoder_result> response_decode(io::buffered_reader* reader,
                                               request_method       method,
                                               std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max(),
-                                              informational_ref on_informational = {}) noexcept;
+                                              informational_ref on_informational = {},
+                                              bool              stop_at_interim  = false) noexcept;
 
 // keep_body_trailers has the body of a response that response_decode() decoded (borrowing its reader) keep its trailer
 // section's fields in trailers (see chunked_reader::keep_trailers()): only a chunked body has any. trailers must

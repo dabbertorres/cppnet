@@ -996,6 +996,128 @@ TEST_CASE("a request's TE is listed in Connection", "[http][1.1][request_encode]
     }
 }
 
+TEST_CASE("a request's head and body encode apart as together", "[http][1.1][request_encode][expect]")
+{
+    using net::http::request_method;
+
+    // make makes the request again, as its body is read once.
+    struct test_case
+    {
+        std::string_view                           name;
+        std::function<net::http::client_request()> make;
+        std::string_view                           head;
+    };
+
+    const auto test = GENERATE(test_case{.name = "a Content-Length",
+                                         .make =
+                                             []
+                                         {
+                                             auto req = make_request(request_method::POST);
+                                             req.set_body("hello");
+                                             req.headers.set("Expect"sv, "100-continue"sv);
+                                             return req;
+                                         },
+                                         .head = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n"
+                                                 "Expect: 100-continue\r\n\r\n"},
+                               test_case{.name = "chunked, with trailers",
+                                         .make =
+                                             []
+                                         {
+                                             auto req          = make_request(request_method::PUT);
+                                             req.body          = body_of("hello");
+                                             req.make_trailers = [](net::http::trailer_fields& trailers)
+                                             { trailers.set("X-Digest"sv, "abc"sv); };
+                                             return req;
+                                         },
+                                         .head = "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: "
+                                                 "chunked\r\n\r\n"},
+                               test_case{.name = "no body",
+                                         .make = [] { return make_request(request_method::POST); },
+                                         .head = "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n"});
+    CAPTURE(test.name);
+
+    const auto whole = encode_request(test.make());
+
+    const auto                   req = test.make();
+    net::io::string_writer<char> out;
+
+    const auto head = test::sync_wait(net::http::http11::request_encode_head(&out, req));
+    REQUIRE(head.has_value());
+    CHECK(out.build() == test.head);
+
+    const auto body = test::sync_wait(net::http::http11::request_encode_body(&out, req));
+    REQUIRE(body.has_value());
+    CHECK(out.build() == whole);
+}
+
+TEST_CASE("a request's head alone fails as the whole request would", "[http][1.1][request_encode][expect]")
+{
+    auto req = make_request(net::http::request_method::POST);
+    req.headers.set_content_length(5);
+
+    net::io::string_writer<char> out;
+    const auto                   res = test::sync_wait(net::http::http11::request_encode_head(&out, req));
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == std::errc::invalid_argument);
+    CHECK(out.build().empty());
+}
+
+TEST_CASE("stop_at_interim returns each interim response, once it's passed on", "[http][1.1][response_decode][expect]")
+{
+    using net::http::status;
+
+    owning_buffered_reader reader{"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n"
+                                  "HTTP/1.1 100 Continue\r\n\r\n"
+                                  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"};
+
+    std::vector<status> seen;
+    const auto on_informational = [&seen](status code, const net::http::headers& /*fields*/) { seen.push_back(code); };
+
+    const auto decode = [&]
+    {
+        return test::sync_wait(net::http::http11::response_decode(&reader,
+                                                                  net::http::request_method::POST,
+                                                                  std::numeric_limits<std::size_t>::max(),
+                                                                  on_informational,
+                                                                  true));
+    };
+
+    const auto hints = decode();
+    REQUIRE(hints.has_value());
+    CHECK(hints->status_code == status::EARLY_HINTS);
+    CHECK(hints->headers.get("Link"sv) == "</a.css>");
+    CHECK(hints->body == nullptr);
+    CHECK(seen == std::vector{status::EARLY_HINTS});
+
+    const auto continued = decode();
+    REQUIRE(continued.has_value());
+    CHECK(continued->status_code == status::CONTINUE);
+    CHECK(continued->body == nullptr);
+    CHECK(seen == std::vector{status::EARLY_HINTS, status::CONTINUE});
+
+    // a final response, as without it.
+    const auto final_response = decode();
+    REQUIRE(final_response.has_value());
+    CHECK(final_response->status_code == status::OK);
+    REQUIRE(final_response->body != nullptr);
+    CHECK(read_body(*final_response->body) == "ok");
+    CHECK(seen.size() == 2);
+}
+
+TEST_CASE("stop_at_interim doesn't stop at 101, which is final", "[http][1.1][response_decode][expect]")
+{
+    owning_buffered_reader reader{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n"};
+
+    const auto resp = test::sync_wait(net::http::http11::response_decode(&reader,
+                                                                         net::http::request_method::GET,
+                                                                         std::numeric_limits<std::size_t>::max(),
+                                                                         {},
+                                                                         true));
+    REQUIRE(resp.has_value());
+    CHECK(resp->status_code == net::http::status::SWITCHING_PROTOCOLS);
+    CHECK(resp->body != nullptr);
+}
+
 TEST_CASE("a response's chunked body keeps its trailers where it's told", "[http][1.1][response_decode][trailers]")
 {
     owning_buffered_reader reader{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n"

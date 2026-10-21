@@ -539,6 +539,90 @@ void append_fields(auto& out, fields_view fields)
     }
 }
 
+// encode_head formats a request's head, framing's field among its fields.
+std::string encode_head(const client_request& req, const request_framing& framing)
+{
+    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
+    // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
+    const auto target = req.uri.origin_form();
+
+    std::string head;
+    head.reserve(max_start_line_overhead + target.size() + req.uri.host.size() + req.uri.port.size()
+                 + framing.field.size() + fields_size(req.headers) + connection_te.size());
+
+    // NOTE: unlike the status line, nothing follows the version.
+    const auto version = effective_version(req);
+    head.append(method_string(req.method))
+        .append(" "sv)
+        .append(target)
+        .append(" HTTP/"sv)
+        .append({static_cast<char>(version.major + '0'), '.', static_cast<char>(version.minor + '0')})
+        .append("\r\n"sv);
+
+    // HTTP/1.1 requires a Host header.
+    if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
+    {
+        // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
+        const bool bracketed = req.uri.host.contains(':');
+        head.append(bracketed ? "Host: ["sv : "Host: "sv).append(req.uri.host).append(bracketed ? "]"sv : ""sv);
+        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port))
+            head.append(":"sv).append(req.uri.port);
+        head.append("\r\n"sv);
+    }
+
+    head.append(framing.field);
+    append_fields(head, req.headers);
+
+    // RFC 9110, section 10.1.4: TE is for the next hop only, so a sender of it lists it in Connection.
+    if (req.headers.get_all("TE"sv).has_value() && !req.headers.has_token("Connection"sv, "TE"sv))
+        head.append(connection_te);
+
+    head.append("\r\n"sv);
+    return head;
+}
+
+// write_body writes a request's body as framing says, which isn't none: then, if it's chunked, the last chunk, with
+// make_trailers' fields.
+task<net::http::request_encoder_result>
+write_body(net::io::writer* writer, const client_request& req, request_framing framing) noexcept
+{
+    net::http::http11::chunked_writer chunked{writer};
+    try
+    {
+        std::error_code err;
+
+        switch (framing.how)
+        {
+        case request_framing::kind::none: break;
+        case request_framing::kind::length:
+            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length);
+            break;
+        case request_framing::kind::chunked:
+            // a chunked request without a body (only if it asked for chunked) is just the last chunk.
+            if (req.body != nullptr) err = co_await copy_chunked(*req.body, chunked);
+            break;
+        }
+
+        if (err) co_return std::unexpected(err);
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    }
+
+    if (framing.how == request_framing::kind::chunked)
+    {
+        // the trailers are what's known once the body's been read (e.g. a digest of it). An invalid one fails, before
+        // the last chunk's written, so the request is cut short.
+        // NOTE: outside the try, so whatever make_trailers throws (even std::bad_alloc) comes out of the task as it is.
+        const auto err =
+            req.make_trailers ? co_await finish_trailing(chunked, req.make_trailers) : (co_await chunked.finish()).err;
+        if (err) co_return std::unexpected(err);
+    }
+
+    co_return writer;
+}
+
 // status_line_size is how long append_status_head makes the status line (with its CRLF).
 std::size_t status_line_size(const net::http::server_response& resp) noexcept
 {
@@ -734,80 +818,39 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     // NOTE: can't fail, having been checked.
     const auto framing = *frame_request(req);
 
-    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
-    // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
-    const auto target = req.uri.origin_form();
-
-    std::string head;
-    head.reserve(max_start_line_overhead + target.size() + req.uri.host.size() + req.uri.port.size()
-                 + framing.field.size() + fields_size(req.headers) + connection_te.size());
-
-    // NOTE: unlike the status line, nothing follows the version.
-    const auto version = effective_version(req);
-    head.append(method_string(req.method))
-        .append(" "sv)
-        .append(target)
-        .append(" HTTP/"sv)
-        .append({static_cast<char>(version.major + '0'), '.', static_cast<char>(version.minor + '0')})
-        .append("\r\n"sv);
-
-    // HTTP/1.1 requires a Host header.
-    if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
-    {
-        // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
-        const bool bracketed = req.uri.host.contains(':');
-        head.append(bracketed ? "Host: ["sv : "Host: "sv).append(req.uri.host).append(bracketed ? "]"sv : ""sv);
-        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port))
-            head.append(":"sv).append(req.uri.port);
-        head.append("\r\n"sv);
-    }
-
-    head.append(framing.field);
-    append_fields(head, req.headers);
-
-    // RFC 9110, section 10.1.4: TE is for the next hop only, so a sender of it lists it in Connection.
-    if (req.headers.get_all("TE"sv).has_value() && !req.headers.has_token("Connection"sv, "TE"sv))
-        head.append(connection_te);
-
-    head.append("\r\n"sv);
-
+    const auto head = encode_head(req, framing);
     if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
 
-    chunked_writer chunked{writer};
+    // NOTE: a request without a body (most) has no frame for it.
+    if (framing.how == request_framing::kind::none) co_return writer;
+    co_return co_await write_body(writer, req, framing);
+}
+
+task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept
+{
+    if (auto err = check_request(req); err) co_return std::unexpected(err);
+
+    // NOTE: can't fail, having been checked.
+    const auto head = encode_head(req, *frame_request(req));
+    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
+    co_return writer;
+}
+
+task<request_encoder_result> request_encode_body(io::writer* writer, const client_request& req) noexcept
+{
     try
     {
-        std::error_code err;
+        auto framing = frame_request(req);
+        if (!framing.has_value()) return coro::ready_task<request_encoder_result>(std::unexpected(framing.error()));
+        if (framing->how == request_framing::kind::none) return coro::ready_task<request_encoder_result>(writer);
 
-        switch (framing.how)
-        {
-        case request_framing::kind::none: break;
-        case request_framing::kind::length:
-            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length);
-            break;
-        case request_framing::kind::chunked:
-            // a chunked request without a body (only if it asked for chunked) is just the last chunk.
-            if (req.body != nullptr) err = co_await copy_chunked(*req.body, chunked);
-            break;
-        }
-
-        if (err) co_return std::unexpected(err);
+        return write_body(writer, req, *framing);
     }
     catch (const std::bad_alloc&)
     {
-        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+        return coro::ready_task<request_encoder_result>(
+            std::unexpected(std::make_error_code(std::errc::not_enough_memory)));
     }
-
-    if (framing.how == request_framing::kind::chunked)
-    {
-        // the trailers are what's known once the body's been read (e.g. a digest of it). An invalid one fails, before
-        // the last chunk's written, so the request is cut short.
-        // NOTE: outside the try, so whatever make_trailers throws (even std::bad_alloc) comes out of the task as it is.
-        const auto err =
-            req.make_trailers ? co_await finish_trailing(chunked, req.make_trailers) : (co_await chunked.finish()).err;
-        if (err) co_return std::unexpected(err);
-    }
-
-    co_return writer;
 }
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept
@@ -907,7 +950,8 @@ void call_at_body_start(const server_request& req, io::start_callback callback) 
 coro::task<response_decoder_result> response_decode(io::buffered_reader* reader,
                                                     request_method       method,
                                                     std::size_t          max_header_bytes,
-                                                    informational_ref    on_informational) noexcept
+                                                    informational_ref    on_informational,
+                                                    bool                 stop_at_interim) noexcept
 {
     client_response resp;
     head_reader     head{.reader = reader, .remaining = max_header_bytes};
@@ -940,6 +984,9 @@ coro::task<response_decoder_result> response_decode(io::buffered_reader* reader,
 
         // NOTE: outside the try, so whatever it throws (even std::bad_alloc) comes out of the task as it is.
         if (on_informational) on_informational(resp.status_code, resp.headers);
+
+        // NOTE: without a body, as an interim response has none.
+        if (stop_at_interim) co_return resp;
     }
 
     try

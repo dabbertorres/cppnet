@@ -449,8 +449,28 @@ A response's interim heads are limited altogether, whether or not they're passed
 to the client's limit on a response's head (1 MiB); over HTTP/2, to 1 MiB (with 32 bytes a field, as HTTP/2 counts them),
 past which the stream is reset. Either fails the request with `std::errc::value_too_large`. They don't put off
 `response_header_timeout`, which is for the final head. A request that got one isn't sent again if its connection then
-ends, as the server had it. The client never sends `Expect: 100-continue` by itself, nor waits for a 100 before sending
-the body: a request that sets the field gets the server's 100 passed on, but its body goes at once.
+ends, as the server had it.
+
+A request with `Expect: 100-continue` (which the client never adds by itself) and a body (not of length 0) waits for the
+server's go-ahead before sending the body, over HTTP/1.1: its head goes alone, then the client waits for the server's
+first response, up to `client_options::expect_continue_timeout` (1 s; 0 sends the body at once, as for a request
+without the field). A 100 (Continue), or nothing in time, sends the body; another interim response (e.g. 103) is passed
+on, and the wait goes on, to the same deadline. A final response first (e.g. 413, from a server that won't read the
+body) is returned, and the body's sent only if the connection's to be reused, as its framing needs it (as Go's client
+does); otherwise it isn't, and the connection's closed once the response is done with. A 417 (Expectation Failed) to a
+request whose body wasn't sent has the request sent again at once, once, without its `Expect` field (on another
+connection): the body's still unread, so no `get_body` is needed. A 417 after the body was sent (once the wait was over)
+is returned. `response_header_timeout` starts once the body's sent; while the client waits, each head counts against
+the limit on a response's head by itself (the wait being bounded). Over HTTP/2, the body is sent at once, for now.
+
+```cpp
+net::http::client_request req{.method = net::http::request_method::PUT};
+req.uri = net::url::parse("https://example.com/uploads/big.iso").value();
+req.headers.set("Expect", "100-continue");
+req.set_body(std::move(content));   // sent once the server says to (or doesn't say in time)
+
+auto resp = co_await client.send(std::move(req));   // e.g. 413, without the body having been sent
+```
 
 Trailers are fields that come after the body (RFC 9110, section 6.5): e.g. gRPC's `grpc-status`, or a digest of the
 body. A response's are `resp->trailers()`, there once its body has been read to its end (a read has reported

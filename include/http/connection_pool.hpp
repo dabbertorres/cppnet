@@ -73,6 +73,14 @@ struct client_options
     // connection whose writes stall this long fails, with its streams.
     std::chrono::milliseconds io_timeout = std::chrono::seconds{30};
 
+    // How long a request with "Expect: 100-continue" (which the caller sets: the client never adds it) and a body
+    // waits, once its head is sent, for the server's first response before sending its body anyway: a 100 (Continue)
+    // sends it at once; another interim response is passed on, and the wait goes on; a final response first doesn't
+    // send it unless the connection's to be reused (whose framing needs it), and a 417 (Expectation Failed) then has
+    // the request sent again, at once, without the expectation. 0 sends the body at once, as for a request without it.
+    // Only over HTTP/1.1, so far: over HTTP/2, the body's sent at once. See client::send().
+    std::chrono::milliseconds expect_continue_timeout = std::chrono::seconds{1};
+
     // Whether to speak HTTP/2 (each request a stream of a connection that others share) to servers that do: over TLS,
     // it's offered with ALPN, and used if the server agrees. A request's HTTP/1.x version and Connection field mean
     // nothing over HTTP/2: turning this off is how to send HTTP/1.0, or close a connection after a request.

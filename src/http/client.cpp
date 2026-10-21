@@ -30,6 +30,7 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
+#include "socket.hpp"
 #include "tcp.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
@@ -71,8 +72,9 @@ public:
 
     ~pooled_body() override { finish(false); }
 
-    [[nodiscard]] net::http::detail::connection* connection() const noexcept { return leased.conn.get(); }
-    [[nodiscard]] net::io::buffered_reader*      buffered() const noexcept { return reader.get(); }
+    [[nodiscard]] net::http::detail::connection*   connection() const noexcept { return leased.conn.get(); }
+    [[nodiscard]] net::io::buffered_reader*        buffered() const noexcept { return reader.get(); }
+    [[nodiscard]] const net::http::client_options& options() const noexcept { return pool->options(); }
 
     // attach sets the body that's read from the connection, resp's (keeping its trailers, if it's chunked). length is
     // how long it is, if it's known up front.
@@ -348,6 +350,147 @@ struct sent
     bool                                                       retry = false;
 };
 
+// expects_continue is whether a request waits for 100 (Continue) before sending its body (see
+// client_options::expect_continue_timeout): it says it does (Expect: 100-continue), it's HTTP/1.1 (an HTTP/1.0 server
+// ignores the expectation), it has a body not of length 0, and the wait's not turned off.
+bool expects_continue(const net::http::client_request& request, std::chrono::milliseconds timeout)
+{
+    if (request.body == nullptr || timeout <= std::chrono::milliseconds::zero() || request.version.minor < 1)
+        return false;
+
+    // NOTE: all a request with a body, but without the expectation, costs.
+    if (!request.headers.has_token("Expect"sv, "100-continue"sv)) return false;
+    return request.headers.get_content_length() != 0;
+}
+
+// head_deadline is when a response's head must have come by, from now.
+std::optional<net::io::clock::time_point> head_deadline(const net::http::client_options& options)
+{
+    if (auto wait = limit(options.response_header_timeout)) return net::io::clock::now() + *wait;
+    return std::nullopt;
+}
+
+// await_continue waits for what decides whether a request's body follows its head, which has been sent alone (see
+// client_options::expect_continue_timeout): a 100 (Continue), or nothing within the timeout, says it does (returning
+// nothing); a final response first is returned. Another interim response is passed on (with the 100), and the wait goes
+// on, to the same deadline. Each head, once its first byte's in, has response_header_timeout to come whole.
+net::coro::task<std::expected<std::optional<net::http::client_response>, std::error_code>>
+await_continue(net::io::buffered_reader*            reader,
+               net::socket&                         sock,
+               const net::http::client_request&     request,
+               const net::http::client_options&     options,
+               net::http::http11::informational_ref on_informational)
+{
+    namespace io     = net::io;
+    namespace http11 = net::http::http11;
+    using net::http::status;
+
+    const auto deadline = io::clock::now() + options.expect_continue_timeout;
+    while (true)
+    {
+        // NOTE: checked with heads buffered too, so a server sending interim responses without end doesn't put it off.
+        if (io::clock::now() >= deadline) co_return std::nullopt;
+
+        if (reader->buffered().empty())
+        {
+            sock.set_read_deadline(deadline);
+            if (auto err = co_await reader->fill(); err)
+            {
+                if (err != io::status_condition::timed_out) co_return std::unexpected(err);
+
+                // nothing came (a timed-out read reads nothing): the reads after it start afresh.
+                reader->reset(nullptr);
+                co_return std::nullopt;
+            }
+        }
+
+        sock.set_read_deadline(head_deadline(options));
+        auto resp =
+            co_await http11::response_decode(reader, request.method, max_response_header_bytes, on_informational, true);
+        if (!resp.has_value()) co_return std::unexpected(resp.error());
+
+        if (resp->status_code == status::CONTINUE) co_return std::nullopt;
+        if (!net::http::status_is_information(resp->status_code) || resp->status_code == status::SWITCHING_PROTOCOLS)
+            co_return std::optional{std::move(*resp)};
+    }
+}
+
+// send_body sends the body of a request whose head was sent alone.
+net::coro::task<std::error_code> send_body(net::io::buffered_writer& out, const net::http::client_request& request)
+{
+    auto res = co_await net::http::http11::request_encode_body(&out, request);
+    if (!res.has_value()) co_return res.error();
+    co_return (co_await out.flush()).err;
+}
+
+// deliver gives a response the body that reads it from the connection, which is reused once it's been read if reuse
+// says it may be (the server got all of a request that doesn't close the connection), and the response allows it.
+sent deliver(std::unique_ptr<pooled_body>&    body,
+             net::http::client_response&      resp,
+             const net::http::client_request& request,
+             bool                             reuse)
+{
+    reuse = reuse && net::http::http11::connection_reusable(resp, request.method);
+    body->attach(resp, reuse, known_length(resp, request.method));
+    resp.body = std::move(body);
+    return sent{.response = std::move(resp)};
+}
+
+// send_expecting sends the body of a request that expects 100 (Continue), whose head has been sent alone, once the wait
+// for it's over (see await_continue()); or doesn't, if a final response came first: then it's what the request came
+// to, as it is if the wait fails. Otherwise, the body's been sent (or failed to be, as written then says, though the
+// response is still worth reading), and the response is to be read, with no read deadline left.
+net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&            out,
+                                                    net::socket&                         sock,
+                                                    std::unique_ptr<pooled_body>&        body,
+                                                    net::http::client_request&           request,
+                                                    bool                                 reusable_request,
+                                                    net::http::http11::informational_ref on_informational,
+                                                    net::http::request_encoder_result&   written)
+{
+    const auto& options = body->options();
+
+    auto waited = co_await await_continue(body->buffered(), sock, request, options, on_informational);
+    if (!waited.has_value()) co_return sent{.response = std::unexpected(waited.error())};
+
+    // a 100, or none in time: the body goes. A server may respond before reading all of it (e.g. 413 Content Too
+    // Large), and then close the connection, failing the rest of the write: the response is still worth reading.
+    if (!waited->has_value())
+    {
+        sock.set_read_deadline(std::nullopt);
+
+        const auto err = co_await send_body(out, request);
+        if (err && !closed_early(err)) co_return sent{.response = std::unexpected(err)};
+
+        if (err) written = std::unexpected(err);
+        co_return std::nullopt;
+    }
+
+    // a final response first. Its body's reads are only limited by io_timeout.
+    auto& resp = **waited;
+    sock.set_read_deadline(std::nullopt);
+
+    // RFC 9110, section 10.1.1: something on the way doesn't do expectations, so the request's sent again without
+    // (once: it's gone), at once, and on another connection, as this one's body never came. Its body's untouched, so it
+    // needs no get_body.
+    if (resp.status_code == net::http::status::EXPECTATION_FAILED)
+    {
+        request.headers.remove("Expect"sv);
+
+        // NOTE: never returned, as the request's sent again (or that fails, with its own error).
+        co_return sent{.response = std::unexpected(std::make_error_code(std::errc::protocol_error)), .retry = true};
+    }
+
+    // Go's rule: the body's sent if the connection's to be reused, whose framing needs it, and not if it isn't (the
+    // connection then isn't).
+    const bool kept =
+        reusable_request && options.keep_alive && net::http::http11::connection_reusable(resp, request.method);
+    if (!kept) co_return deliver(body, resp, request, false);
+
+    const auto err = co_await send_body(out, request);
+    co_return deliver(body, resp, request, !err);
+}
+
 // send_http2 sends a request on a stream of an HTTP/2 connection. It may be sent again (on another connection):
 // - whatever it is, if it was refused before anything of it was sent (the connection was ending);
 // - whatever its method, if the server didn't process it (it was refused, or after a GOAWAY's last stream), unless its
@@ -403,10 +546,14 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     const auto retry = [&](std::error_code err)
     { return reused && first && request.body == nullptr && is_idempotent(request.method) && closed_early(err); };
 
+    // a request that expects 100 (Continue) sends its head alone, and its body once it's had the 100, or waited for it.
+    const bool expecting = expects_continue(request, options.expect_continue_timeout);
+
     // the head in one write, rather than one per field.
     io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
 
-    auto res = co_await http11::request_encode(&out, request);
+    auto res = expecting ? co_await http11::request_encode_head(&out, request)
+                         : co_await http11::request_encode(&out, request);
     if (res.has_value())
     {
         if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);
@@ -414,16 +561,13 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
 
     // a server may respond before reading all of the body (e.g. 413 Content Too Large), and then close the
     // connection, failing the rest of the write. The response is still worth reading, if it's there.
-    const bool write_failed = !res.has_value();
+    bool write_failed = !res.has_value();
     if (write_failed)
     {
         if (retry(res.error())) co_return sent{.response = std::unexpected(res.error()), .retry = true};
         if (request.body == nullptr || !closed_early(res.error()))
             co_return sent{.response = std::unexpected(res.error())};
     }
-
-    // NOTE: a deadline, for the final head: interim responses don't put it off.
-    if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
 
     // an interim response says the server has the request, so it's not sent again if the connection then ends (as over
     // HTTP/2, which counts the stream as processed); the caller's told of each (an exception it throws closes the
@@ -434,6 +578,17 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
         interim = true;
         if (request.on_informational) request.on_informational(code, fields);
     };
+
+    // the body goes once the server's said to send it, or not soon enough, unless a final response came first.
+    if (expecting && !write_failed)
+    {
+        if (auto done = co_await send_expecting(out, sock, body, request, reusable_request, on_informational, res))
+            co_return std::move(*done);
+        write_failed = !res.has_value();
+    }
+
+    // NOTE: a deadline, for the final head: interim responses don't put it off.
+    if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
 
     auto resp =
         co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes, on_informational);
@@ -447,11 +602,7 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     }
 
     // the server didn't get all of the request, so the connection is no use for another.
-    const bool reuse = !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
-    body->attach(*resp, reuse, known_length(*resp, request.method));
-    resp->body = std::move(body);
-
-    co_return sent{.response = std::move(*resp)};
+    co_return deliver(body, *resp, request, !write_failed && reusable_request);
 }
 
 // send_on sends a request on what was leased for it: a stream of an HTTP/2 connection, or an HTTP/1.x connection.

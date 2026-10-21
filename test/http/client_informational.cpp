@@ -296,7 +296,7 @@ TEST_CASE("on_informational sees the server's own 100 Continue, if the request e
     served             server{&sched};
     http::client       client{&sched, options_for(http2)};
 
-    // the client doesn't send Expect by itself (nor wait for the 100: the body goes at once), so it's set by hand.
+    // the client doesn't send Expect by itself, so it's set by hand (over HTTP/1.1, it then waits for the 100).
     interims             seen;
     http::client_request req{.method = http::request_method::POST, .uri = net::url::parse(server.url("/echo")).value()};
     req.set_body("hello");

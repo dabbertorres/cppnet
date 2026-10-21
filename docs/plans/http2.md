@@ -29,7 +29,9 @@ DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see
 `refuse()`), done (2026-10-21); and its third, TCP_NOTSENT_LOWAT's part in the socket (`tcp_socket::set_notsent_lowat()`
 and `socket::wait_writable()`), done (2026-10-21); and its fourth, TCP_NOTSENT_LOWAT on the server's HTTP/2
 connections (`server_config::http2_notsent_lowat`, the writer waiting for the socket before each round, and
-`tls::stream::wait_writable()`), done (2026-10-21).
+`tls::stream::wait_writable()`), done (2026-10-21); and its fifth, `Expect: 100-continue` in the client over HTTP/1.1
+(`client_options::expect_continue_timeout`, the encoder's head apart from the body, `response_decode()`'s
+`stop_at_interim`, and 417 sent again without the expectation), done (2026-10-21).
 
 ## Goal
 
@@ -1453,6 +1455,88 @@ idle stream would be a connection error for the peer.
   to be written again), so how much this gains on a slow path is unmeasured here; the hook test is the evidence that the
   writer frames by priority while the socket's held.
 
+### Part 5: Expect: 100-continue in the client, HTTP/1.1 (done 2026-10-21)
+
+- As proposed (see "Expect: 100-continue in the client", Decided questions 30 to 32, all (a)), over HTTP/1.1, but for
+  the decoder's flag (below). `client_options::expect_continue_timeout` (`std::chrono::milliseconds`, 1 s; 0 sends the
+  body at once) sits after `io_timeout`. A request expects (`expects_continue()` in `client.cpp`) when it has a body,
+  the timeout isn't 0, it's HTTP/1.1, its `Expect` has the `100-continue` token (`headers::has_token()`, any case) and
+  its Content-Length (if any) isn't 0; the checks that cost nothing come first, so a request without a body pays
+  nothing, and one with a body but no expectation the one lookup. HTTP/2 is untouched: its requests' bodies still go at
+  once (part 6), and the 417 retry is HTTP/1.1's (it lives in `send_http11`'s path, so HTTP/2's behaviour is as before).
+- The encoder: `http11::request_encode()` is now `encode_head()` (a plain function building the head's string) then
+  `write_body()` (a coroutine, only called for a request with a body, so a bodyless one has no frame more), and
+  `request_encode_head()` and `request_encode_body()` (in `http/http11.hpp`, internal as the header is) are those two
+  halves, each checking the request as the whole does; the bytes are the same either way.
+- `send_http11` writes the head alone (and flushes it) for a request that expects, then awaits `send_expecting()` (a
+  coroutine of its own, so requests without the expectation have no larger frame; `send_http11` was also past
+  clang-tidy's cognitive complexity with it inline). That awaits `await_continue()`: a loop that, while nothing's
+  buffered, `fill()`s the connection's reader with the socket's read deadline at the continue deadline (a timeout reads
+  nothing: the body goes, and `reset(nullptr)` clears the reader's sticky error), then decodes one head under
+  `response_header_timeout` from its first byte. A 100 or the timeout sends the body (`send_body()`:
+  `request_encode_body()` and a flush) and clears the read deadline; then the final head's decoded as before, with
+  `response_header_timeout` from then. A write of the body failing with `closed` leaves the response to read, as when
+  the body goes with its head (e.g. a 413 and a close); other failures fail the request. The deadline's also checked
+  when a head's already buffered, so a server streaming interim responses can't hold the body off past it.
+- Departure: the decoder's flag is `stop_at_interim`, not `stop_at_continue`: `response_decode()` (the overload
+  borrowing its reader) returns *every* interim response (but 101) once it's passed it to `on_informational`, without a
+  body, rather than only a 100. With the decoder looping past a 103 itself, the wait for the next head would run under
+  whatever deadline the head was decoded with (`response_header_timeout`, 30 s), not the continue deadline the plan
+  wants ("the wait goes on (the same deadline)"); and setting the continue deadline for the whole decode instead can't
+  tell a timeout between heads (send the body) from one in the middle of a head (the response is broken), as a head's
+  lines are taken from the reader as they're read. Returning after each interim head puts the wait back in the client's
+  loop. A test shows it: a 103 and then nothing, with a 50 ms timeout, gets the body (with the plan's flag, the client
+  waits for the next head for 30 s, and the test's server gives up after 5).
+- Each call's heads count against `max_header_bytes` by themselves, so while the client waits, each head is limited
+  alone, not with the others (the wait being bounded by `expect_continue_timeout` instead); the heads after the body are
+  limited together as before. `client_request::on_informational`'s comment and the guide say so.
+- A final response first: 417 (to a request whose body wasn't sent) removes the request's `Expect` (the whole field) and
+  returns `sent{.retry = true}` with a placeholder error that's never returned: `send()`'s retry loop sends the request
+  again at once, on a new connection (its retries take one, as a reused connection's failure suggests others have gone
+  too), with `first` false, so it isn't retried again; the 417's connection is closed whatever it said, as the body its
+  framing promised never came. Any other final response: Go's rule, the body's sent if the connection's kept (the
+  request is HTTP/1.1 without `Connection: close`, `client_options::keep_alive` is on, and `connection_reusable()` says
+  the response allows it), and the response returned either way (`deliver()`, now a plain function, attaching the body),
+  the connection reused only if the body went whole. Not in the plan: HTTP/1.0 requests never wait (RFC 9110 has an
+  HTTP/1.0 server ignore the expectation); and heads during the wait get `response_header_timeout` each, from their
+  first byte (the plan didn't say).
+- A limit (not changed): a final response first on a kept connection has the body sent before `send()` returns, while
+  the response's own body is unread; a server that sends a response body larger than the sockets' buffers before reading
+  the request's would stall both sides until `io_timeout` (Go writes the body on another goroutine). Servers that answer
+  before reading either close (cppnet's and Go's say `Connection: close` while the 100 is owed) or read and drop the
+  body, so it's left as is.
+- Tests (no network). `test/http/client_expect_continue.cpp` (`[http][client][expect]`), with a body reader that notes
+  its reads beside the interim responses `on_informational` sees, in order: against cppnet's server, a handler that
+  reads the body gets it after the 100 (the 100 noted once, then the body's reads; the connection kept), and one that
+  answers 413 without reading has its response returned, the body never read, and the connection closed (the server says
+  `Connection: close`). Against raw servers the tests play (`raw_server`, a script each): a 417 to the first request
+  (with and without `Connection: close`) has it sent again without `Expect` on a second connection, the first getting
+  nothing after its head and the second the body whole; one that says nothing gets the body after the 50 ms wait, and so
+  does one that says 103 and then nothing (the 103 passed on); a 103 then, once 200 ms pass with nothing from the
+  client, a 100, gets the body after the 100 (noted 103, 100, then the reads); a 200 first keeping the connection gets
+  the body, and the next request on the same connection; a 200 first with `Connection: close` gets nothing after the
+  head, the body never read; a 417 once the body's been sent (after the wait) is returned; and a request without the
+  expectation (a timeout of an hour), with the wait turned off (0), and with a body of 0, sends its body with its head
+  (the server reads it without answering first, giving up after 5 s). Waits are the tests' own (milliseconds), and each
+  test checks what arrived, not how long it took. `test/http/http11.cpp` (`[expect]`): `request_encode_head()` then
+  `request_encode_body()` write what `request_encode()` does (a Content-Length, chunked with trailers, and no body), the
+  head alone fails as the whole would; and `stop_at_interim` returns a 103 (passed on, its fields kept, no body), then a
+  100, then the final response with its body, and doesn't stop at 101. With `expects_continue()` inverted, six of the
+  nine new client tests fail (the other three are those a body sent at once also satisfies: the wait's end, the 417
+  after the body, and a 200 first on a kept connection); with the 417 retry or Go's rule turned around, the 417,
+  keep-alive and close cases fail; with the decoder stopping only at 100, the decoder test and the 103-then-nothing case
+  fail. `test/http/client_informational.cpp`'s 100 test's comment is updated (over HTTP/1.1, the client now waits for
+  that 100). `fuzz_http11` doesn't use the client's encoder or decoder, so it's unchanged.
+- Measured (`bench_request`, Release, six alternating runs of master's binary and the branch's, at a load average of 2.5
+  to 4.9). The client's HTTP/1.1 path, as stage 5's part 2 measured it (its HTTP/2 run with prior knowledge off, a
+  throwaway change; a GET without a body, so the path without the expectation): 48.6 to 66.0 us a request before (median
+  53.5), 47.9 to 57.6 after (median 54.8), 28.0 allocations a request both. The server's paths don't use what changed
+  (its decoder and encoder are the requests' and responses' other halves), and are as they were: pipelined 1264 to 1458
+  ns before (median 1278), 1269 to 1400 after (median 1288), 1.4 allocations; over a socket 33.1 to 68.7 us before
+  (median 35.9; one run caught a spike), 34.8 to 37.0 after (median 35.9), 3.0 allocations. So nothing the noise shows,
+  as expected: a request without a body pays two branches, and `write_body()`'s frame is only a body's (and directly
+  awaited, so Clang may elide it).
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2488,8 +2572,9 @@ certificate.
       HTTP/2 connection, and the writer waiting for writability before each round (Decided question 29), through a test
       hook; `bench_request` with streams that contend, and part 10's relay by hand. It changes the writer every HTTP/2
       response goes through, so it's alone.
-   5. **Expect: 100-continue, HTTP/1.1.** `client_options::expect_continue_timeout` (Decided question 30), the head
-      flushed apart from the body, `response_decode()`'s `stop_at_continue`, a final response first (Decided question
+   5. **Expect: 100-continue, HTTP/1.1.** Done (2026-10-21; see Learned in stage 6).
+      `client_options::expect_continue_timeout` (Decided question 30), the head flushed apart from the body,
+      `response_decode()`'s `stop_at_continue` (built as `stop_at_interim`), a final response first (Decided question
       31), and 417 sent again without the expectation (Decided question 32); tests against cppnet's server and raw ones.
       The API comes with this part, over the version that's simpler to get right.
    6. **Expect: 100-continue, HTTP/2.** The stream's `continued` and `continue_deadline` (the timer's third deadline),

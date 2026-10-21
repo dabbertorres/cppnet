@@ -133,7 +133,9 @@ struct client_request
     //
     // A response's interim heads are limited altogether, whether or not this is set: over HTTP/1.x, with the final
     // head, to the client's limit on a response's head (1 MiB); over HTTP/2, to 1 MiB (and 32 bytes a field, as HTTP/2
-    // counts them), past which the stream's reset. Either fails the request with std::errc::value_too_large.
+    // counts them), past which the stream's reset. Either fails the request with std::errc::value_too_large. (Over
+    // HTTP/1.x, a request waiting for 100 (Continue) before its body counts each head of the wait by itself, as the
+    // wait's bounded by client_options::expect_continue_timeout.)
     std::function<void(status, const net::http::headers&)> on_informational{};
 
     // make_trailers, if set, is called once the body has been read to its end, to fill the request's trailer fields
