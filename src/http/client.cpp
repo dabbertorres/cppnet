@@ -410,16 +410,28 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
             co_return sent{.response = std::unexpected(res.error())};
     }
 
+    // NOTE: a deadline, for the final head: interim responses don't put it off.
     if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
 
-    auto resp = co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes);
+    // an interim response says the server has the request, so it's not sent again if the connection then ends (as over
+    // HTTP/2, which counts the stream as processed); the caller's told of each (an exception it throws closes the
+    // connection, as the body's destroyed with this frame).
+    bool       interim          = false;
+    const auto on_informational = [&request, &interim](net::http::status code, const net::http::headers& fields)
+    {
+        interim = true;
+        if (request.on_informational) request.on_informational(code, fields);
+    };
+
+    auto resp =
+        co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes, on_informational);
 
     // the body's reads are only limited by io_timeout.
     sock.set_read_deadline(std::nullopt);
     if (!resp.has_value())
     {
         if (write_failed) co_return sent{.response = std::unexpected(res.error())};
-        co_return sent{.response = std::unexpected(resp.error()), .retry = retry(resp.error())};
+        co_return sent{.response = std::unexpected(resp.error()), .retry = !interim && retry(resp.error())};
     }
 
     // the server didn't get all of the request, so the connection is no use for another.

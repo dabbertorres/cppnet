@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -688,6 +690,76 @@ TEST_CASE("response bodies", "[http][1.1][response_decode]")
     REQUIRE(resp.has_value());
     CHECK(resp->status_code == tc.expect_status);
     CHECK(read_body(*resp->body) == tc.expect_body);
+}
+
+TEST_CASE("response_decode passes interim responses on, in order, but 101", "[http][1.1][response_decode][interim]")
+{
+    using net::http::status;
+
+    std::vector<std::pair<status, std::string>> seen; // each one's status, and its Link fields, as "<value>;" each
+    const auto on_informational = [&seen](status code, const net::http::headers& fields)
+    {
+        std::string links;
+        if (const auto values = fields.get_all("Link"sv); values.has_value())
+        {
+            for (const auto& value : *values) links += value + ";";
+        }
+        seen.emplace_back(code, std::move(links));
+    };
+
+    const auto decode = [&](std::string_view text)
+    {
+        return test::sync_wait(net::http::http11::response_decode(std::make_unique<owning_buffered_reader>(text),
+                                                                  net::http::request_method::GET,
+                                                                  std::numeric_limits<std::size_t>::max(),
+                                                                  on_informational));
+    };
+
+    SECTION("interim responses, then the final one")
+    {
+        auto resp = decode("HTTP/1.1 100 Continue\r\n\r\n"
+                           "HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\nLink: </b.js>\r\n\r\n"
+                           "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        REQUIRE(resp.has_value());
+        CHECK(resp->status_code == status::OK);
+        CHECK(resp->headers.size() == 1); // the interim ones' fields aren't the final one's
+        CHECK(read_body(*resp->body) == "ok");
+
+        REQUIRE(seen.size() == 2);
+        CHECK(seen[0] == std::pair{status::CONTINUE, std::string{}});
+        CHECK(seen[1] == std::pair{status::EARLY_HINTS, std::string{"</a.css>;</b.js>;"}});
+    }
+
+    SECTION("101 is final")
+    {
+        auto resp = decode("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n");
+        REQUIRE(resp.has_value());
+        CHECK(resp->status_code == status::SWITCHING_PROTOCOLS);
+        REQUIRE(seen.size() == 1);
+        CHECK(seen[0].first == status::EARLY_HINTS);
+    }
+
+    SECTION("an exception it throws comes out of the task, as it is")
+    {
+        // NOTE: std::bad_alloc, which the decoder reports as an error when it's its own.
+        const auto throwing = [](status /*code*/, const net::http::headers& /*fields*/) { throw std::bad_alloc{}; };
+
+        std::string thrown;
+        try
+        {
+            const auto resp = test::sync_wait(net::http::http11::response_decode(
+                std::make_unique<owning_buffered_reader>("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n"),
+                net::http::request_method::GET,
+                std::numeric_limits<std::size_t>::max(),
+                throwing));
+            CHECK_FALSE(resp.has_value()); // (not reached)
+        }
+        catch (const std::bad_alloc&)
+        {
+            thrown = "bad_alloc";
+        }
+        CHECK(thrown == "bad_alloc");
+    }
 }
 
 TEST_CASE("malformed responses are rejected", "[http][1.1][response_decode]")

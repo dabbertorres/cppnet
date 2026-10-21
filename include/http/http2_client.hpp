@@ -41,6 +41,20 @@ public:
     net::http::headers headers;
     bool               processed = false; // not refused (it may not be retried)
 
+    // interim_head is an informational (1xx) response's head.
+    struct interim_head
+    {
+        status             status_code = status::NONE;
+        net::http::headers headers;
+    };
+
+    // The informational responses received, kept for the request's on_informational (if it has one: wants_interim)
+    // until send()'s task passes them on; and what they've all come to (by hpack::field_size), whether or not they're
+    // kept, which is limited (see on_headers()).
+    bool                      wants_interim = false;
+    std::vector<interim_head> interims;
+    std::size_t               interim_size = 0;
+
     // for sending the request's head, reused.
     std::vector<std::string>  names;
     std::vector<hpack::field> fields;
@@ -187,13 +201,14 @@ private:
     // idle_now is whether it has no streams, nor any reserved (holding the lock).
     [[nodiscard]] bool idle_now() const noexcept { return streams.empty() && reserved == 0; }
 
-    // wait_for_head waits for the response's head, returning the response (with its body, canceled by stop), or why
-    // it didn't come (and in state, whether the connection dropped first).
+    // wait_for_head waits for the response's head, returning the response (with its body, canceled by request.stop),
+    // or why it didn't come (and in state, whether the connection dropped first). It passes the informational
+    // responses that come first to request.on_informational, in order, without the lock.
     coro::task<std::expected<client_response, std::error_code>>
     wait_for_head(std::shared_ptr<http2_client_stream> stream,
                   std::optional<std::error_code>       body_error,
                   send_state*                          state,
-                  const std::stop_token&               stop);
+                  const client_request&                request);
 
     static coro::task<> run_owned(std::shared_ptr<http2_client_connection> self);
 

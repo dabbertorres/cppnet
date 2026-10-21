@@ -83,6 +83,9 @@ constexpr std::string_view method_string(request_method m) noexcept
     }
 }
 
+// status is a response's status code (see http/response.hpp, which includes this header).
+enum class status : std::uint16_t;
+
 // client_request represents an outgoing HTTP request from a client to a server.
 struct client_request
 {
@@ -119,6 +122,19 @@ struct client_request
     // says what following them does) if it's set: e.g. 0 to get a redirect's response, from a client that follows
     // them.
     std::optional<std::size_t> max_redirects{};
+
+    // on_informational is called for each interim (1xx) response that comes before the final one, over HTTP/1.1 and
+    // HTTP/2 (e.g. 100 Continue, or 103 Early Hints, whose Link fields a caller may act on before the final response),
+    // with its status and fields, which are only valid during the call; never for 101, which is final over HTTP/1.1
+    // (and malformed over HTTP/2). It's called on the task sending the request, before send() returns, so must be quick
+    // (as any of the scheduler's tasks); an exception it throws comes out of send(), the request abandoned (its
+    // HTTP/1.x connection closed, or its HTTP/2 stream reset). It's kept for the requests a redirect makes, so it's
+    // called for each one's interim responses. Without it, interim responses are skipped.
+    //
+    // A response's interim heads are limited altogether, whether or not this is set: over HTTP/1.x, with the final
+    // head, to the client's limit on a response's head (1 MiB); over HTTP/2, to 1 MiB (and 32 bytes a field, as HTTP/2
+    // counts them), past which the stream's reset. Either fails the request with std::errc::value_too_large.
+    std::function<void(status, const net::http::headers&)> on_informational{};
 
     // set_body sets the body to content, and the Content-Length to match; and get_body, to read it again (sharing
     // content, rather than copying it), for redirects that send it again.

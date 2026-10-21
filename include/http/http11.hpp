@@ -6,11 +6,13 @@
 #include <system_error>
 
 #include "coro/task.hpp"
+#include "http/headers.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/reader.hpp"
 #include "io/writer.hpp"
+#include "util/function_ref.hpp"
 
 namespace net::http::http11
 {
@@ -59,18 +61,27 @@ void call_at_body_end(const server_request& req, io::end_callback callback) noex
 // nothing to call.
 void call_at_body_start(const server_request& req, io::start_callback callback) noexcept;
 
+// informational_ref is what response_decode() passes each interim (1xx) response to: its status and fields, which are
+// only valid during the call.
+using informational_ref = util::function_ref<void(status, const headers&)>;
+
 // response_decode decodes a response's head, failing as request_decode does. method is the request's: responses to
 // HEAD requests have no body. The body owns reader.
-task<response_decoder_result>
-response_decode(std::unique_ptr<io::buffered_reader> reader,
-                request_method                       method = request_method::GET,
-                std::size_t max_header_bytes                = std::numeric_limits<std::size_t>::max()) noexcept;
+//
+// Interim (1xx) responses before the final one are passed to on_informational, if it's set (otherwise skipped), as
+// they're decoded: but 101, which is final (the connection is then the body). All of the response's heads, interim and
+// final, count against max_header_bytes together. An exception on_informational throws comes out of the task, as it is
+// (the reader's then part way through the response).
+task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
+                                              request_method                       method = request_method::GET,
+                                              std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max(),
+                                              informational_ref on_informational = {}) noexcept;
 
 // response_decode decodes a response's head, as above, but the body borrows reader, which must outlive it.
-task<response_decoder_result>
-response_decode(io::buffered_reader* reader,
-                request_method       method,
-                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
+task<response_decoder_result> response_decode(io::buffered_reader* reader,
+                                              request_method       method,
+                                              std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max(),
+                                              informational_ref on_informational = {}) noexcept;
 
 // connection_reusable returns whether the connection can carry another request once the response's body has been read
 // to its end: the response is HTTP/1.1, without "Connection: close", and its body doesn't end with the connection.

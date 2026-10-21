@@ -7,7 +7,8 @@ client (`http/http2_connection.hpp`, the machinery both sides share, `http/http2
 connections, `test/http/http2_client.cpp`). Stage 5 decided (2026-10-20): interim responses (Early Hints) checked
 end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's priorities, in ten pull requests (see "Stage
 5"); its questions (at the end) all as recommended. Its first part, interim responses on the server (and 100 Continue),
-done (2026-10-20; see Learned in stage 5).
+done (2026-10-20; see Learned in stage 5); its second, interim responses in the client (`on_informational`), done
+(2026-10-20).
 
 ## Goal
 
@@ -490,6 +491,45 @@ idle stream would be a connection error for the peer.
   about 52 over HTTP/2); times within the runs' spread (pipelined 1314 ns before, 1353 after, each varying by 15%
   from run to run; one per read 1446 and 1412; over a socket 33.0 and 32.8 us). The `Expect` lookup is at most a few
   tens of nanoseconds of the pipelined 1.3 us.
+
+### Part 2: interim responses, the client (done 2026-10-20)
+
+- `client_request::on_informational` is as proposed, a `std::function<void(status, const headers&)>` (`status` is
+  declared opaquely in `request.hpp`, as `response.hpp`, which defines it, includes `request.hpp`). Over HTTP/1.1,
+  `http11::response_decode()` takes it as an `http11::informational_ref`, a `util::function_ref` (new,
+  `util/function_ref.hpp`: two pointers, as C++26's `std::function_ref`, which C++23 lacks; unlike it, nullable, and
+  not made from a temporary, which a coroutine taking it would outlive). The decoder calls it outside its `try`, so
+  whatever it throws (even `std::bad_alloc`, which the decoder's own allocations report as `not_enough_memory`) comes
+  out of the task as it is. `response_decoder` (the function pointer type) takes it too.
+- HTTP/1.1's `send_http11` always passes a lambda of its own, which notes that an interim head came and calls the
+  request's callback, if it has one: a request that got an interim response isn't sent again if its reused connection
+  then ends, as the server had it (HTTP/2 already behaved so: any HEADERS marks its stream `processed`, and Go's
+  HTTP/1.1 retries only a failure of the response's first byte). Without a callback the decoder still parses an interim
+  head's fields, as it did, so the lambda costs nothing more.
+- HTTP/2: the session already reported informational blocks (`block_kind::informational`, `:status` among the fields);
+  the client connection dropped them. Now `on_headers()` counts every block's fields (`hpack::field_size`, `:status`
+  included, as Go's `Fields` and the RFC count them) into the stream's `interim_size`, whether or not the request has a
+  callback, and past the session's `max_header_list_size` (the pool's 1 MiB + 3200) fails the stream with
+  `std::errc::value_too_large` and resets it with PROTOCOL_ERROR (Go's code for the stream error, and the session's for
+  one block over the limit). Go bounds them only when no trace function takes them; here they're queued until
+  `send()`'s task passes them on, so they're bounded either way. A request with the callback (`wants_interim`, set in
+  `open()`) has its heads queued on the stream (`interims`, each a status and `headers`: only those allocate) and the
+  stream notified; `wait_for_head()` swaps the queue out under `mu` and calls the callback without it, before it looks
+  at the final head or a failure, so the heads that came before a failure (the limit's too) are still passed on, in
+  order. Informational blocks still never clear the stream's read deadline, nor does waking for them re-arm it, so
+  `response_header_timeout` is the final head's (HTTP/1.1's is a socket deadline, set before decoding).
+- An exception from the callback unwinds `send()`: over HTTP/1.1, `pooled_body`'s destructor closes the connection;
+  over HTTP/2, `send()`'s `defer` calls `done()`, which resets the stream (CANCEL), the connection kept. The tests check
+  the server sees it (its handler's token is stopped), and that the next request is answered.
+- Redirects: the callback stays on the request `redirect()` rewrites, so each hop's interim responses are passed on, as
+  Go calls `Got1xxResponse` for each.
+- The client never sends `Expect: 100-continue` by itself (waiting for 100 before the body stays "still later"); a
+  request that sets it gets the server's 100 passed on, but its body goes at once.
+- Measured (Release, five alternating runs of the binaries before and after): over HTTP/2 (cppnet's client and server),
+  52.0 allocations a request before and after (51.9 to 52.2 from run to run, either way), 80.6 to 83.8 us before, 76.9 to
+  79.8 after (noise: nothing on that path changed but a branch, and a vector's swap per wait); and over HTTP/1.1 with
+  cppnet's client (`bench_request`'s HTTP/2 run with prior knowledge off, a throwaway change), 28.0 allocations both,
+  42.3 to 45.1 us before, 42.8 to 44.0 after. The server's runs are unchanged (1.4, 4.2, 3.0 and 2.0 allocations).
 
 ## Stage 5
 
@@ -1021,8 +1061,9 @@ throughput isn't changed (by frame count and order).
       none to HTTP/1.0; `send(101)` refused; 100 Continue sent by itself (and 417); `status::EARLY_HINTS`; tests over
       both versions; the guide. First: small, a fix (Early Hints don't work over HTTP/1.1 now), and independent of the
       rest.
-   2. **Interim responses, the client.** `client_request::on_informational`, over both versions, and HTTP/2's bound on
-      interim heads. Split from 1 as it's an API of its own (Decided question 4), tested against 1's server.
+   2. **Interim responses, the client.** Done (2026-10-20; see Learned in stage 5). `client_request::on_informational`,
+      over both versions, and HTTP/2's bound on interim heads. Split from 1 as it's an API of its own (Decided question
+      4), tested against 1's server.
    3. **Trailers in the codecs.** `chunked_reader` keeping a trailer section, `chunked_writer::finish(trailers)`,
       `trailer_allowed()`, and `fuzz_http11`'s transcript. Split out as it's the part without I/O, tested on strings,
       which both sides' parts build on.

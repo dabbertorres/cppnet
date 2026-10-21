@@ -255,7 +255,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
         if (sent.err) body_error = sent.err;
     }
 
-    auto resp = co_await wait_for_head(std::move(stream), body_error, state, request.stop);
+    auto resp = co_await wait_for_head(std::move(stream), body_error, state, request);
     taken     = resp.has_value();
     co_return resp;
 }
@@ -273,6 +273,7 @@ http2_client_connection::open(const client_request& request, bool end_stream)
     auto stream           = std::make_shared<http2_client_stream>(this, 0, pool);
     stream->read_timeout  = options.io_timeout;
     stream->write_timeout = options.io_timeout;
+    stream->wants_interim = static_cast<bool>(request.on_informational);
     stream->authority     = authority_of(request);
     stream->path          = request.uri.origin_form();
     if (stream->path.empty()) stream->path = "/";
@@ -372,15 +373,27 @@ coro::task<std::expected<client_response, std::error_code>>
 http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stream,
                                        std::optional<std::error_code>       body_error,
                                        send_state*                          state,
-                                       const std::stop_token&               stop)
+                                       const client_request&                request)
 {
-    client_response resp;
+    client_response                                resp;
+    std::vector<http2_client_stream::interim_head> interims; // taken from the stream, to pass on without the lock
     while (true)
     {
+        // the informational responses that came first, in order, before the final head or the stream's failure.
+        // NOTE: an exception the callback throws comes out of send(), whose frame then resets the stream (done()).
+        for (const auto& head : interims) request.on_informational(head.status_code, head.headers);
+        interims.clear();
+
         std::uint64_t seen = 0;
         {
             std::scoped_lock lock{mu};
             auto&            s = *stream;
+
+            if (!s.interims.empty())
+            {
+                interims.swap(s.interims);
+                continue;
+            }
 
             if (s.head_received)
             {
@@ -415,7 +428,7 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
     }
 
     // NOTE: made without the lock, as it registers stop's callback, which takes it.
-    resp.body = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream), stop);
+    resp.body = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream), request.stop);
     co_return resp;
 }
 
@@ -510,8 +523,36 @@ void http2_client_connection::on_headers(http2::stream_id              id,
     auto& s     = *it->second;
     s.processed = true;
 
-    // informational responses (e.g. 103 Early Hints) aren't passed on.
-    if (kind == http2::block_kind::informational) return;
+    // informational responses (e.g. 103 Early Hints) are kept for send()'s task to pass on, if the request wants them.
+    // They're limited altogether, as their number isn't (Go's limit, when it keeps them): past it, the request fails.
+    // NOTE: neither is progress towards the final head, so the stream's read deadline stays.
+    if (kind == http2::block_kind::informational)
+    {
+        for (const auto& f : fields) s.interim_size += hpack::field_size(f.name, f.value);
+        if (s.interim_size > options.session.local.max_header_list_size)
+        {
+            logger.debug("HTTP/2 stream {}: its informational responses are too large", id);
+            fail_stream(s, std::make_error_code(std::errc::value_too_large));
+            session.reset(id, http2::error_code::protocol_error);
+            s.read_deadline.reset();
+            s.write_deadline.reset();
+            s.changed.notify();
+
+            // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
+            output_drained().notify();
+            return;
+        }
+        if (!s.wants_interim) return;
+
+        auto& head = s.interims.emplace_back();
+        for (const auto& f : fields)
+        {
+            if (f.name == ":status") head.status_code = parse_status(f.value);
+            else if (!f.name.starts_with(':')) head.headers.add(f.name, f.value);
+        }
+        s.changed.notify();
+        return;
+    }
 
     if (kind == http2::block_kind::head)
     {

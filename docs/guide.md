@@ -404,6 +404,34 @@ request set only to the same host and port. No `Referer` is sent. A redirect's r
 discarded if what's left of its body is at most 2 KiB (so its HTTP/1.1 connection is reused), and closed otherwise (an
 HTTP/2 stream is reset).
 
+Interim (1xx) responses before the final one (e.g. 100 Continue, or 103 Early Hints) are skipped, unless the request has
+`client_request::on_informational`: then it's called with each one's status and fields (valid only during the call), in
+order, on the task sending the request, before `send()` returns, over HTTP/1.1 and HTTP/2 alike, and for the requests
+redirects make too. Never for 101, which is final over HTTP/1.1. An exception it throws comes out of `send()`, the
+request abandoned (its HTTP/1.1 connection closed, or its HTTP/2 stream reset). E.g. to act on Early Hints while the
+server's still working on the response:
+
+```cpp
+net::http::client_request req{.uri = net::url::parse("https://example.com/").value()};
+req.on_informational = [&](net::http::status code, const net::http::headers& fields)
+{
+    if (code != net::http::status::EARLY_HINTS) return;
+    if (const auto links = fields.get_all("Link"))
+    {
+        for (const auto& link : *links) preload(link);   // e.g. start fetching what it hints at
+    }
+};
+
+auto resp = co_await client.send(std::move(req));   // the final response
+```
+
+A response's interim heads are limited altogether, whether or not they're passed on: over HTTP/1.1, with the final head,
+to the client's limit on a response's head (1 MiB); over HTTP/2, to 1 MiB (with 32 bytes a field, as HTTP/2 counts them),
+past which the stream is reset. Either fails the request with `std::errc::value_too_large`. They don't put off
+`response_header_timeout`, which is for the final head. A request that got one isn't sent again if its connection then
+ends, as the server had it. The client never sends `Expect: 100-continue` by itself, nor waits for a 100 before sending
+the body: a request that sets the field gets the server's 100 passed on, but its body goes at once.
+
 A request is canceled by its `stop` token (`client_request::stop`, or `get(url, stop)`): requesting stop ends it
 wherever it is (waiting for a connection or an HTTP/2 stream, resolving the host, connecting and the TLS handshake,
 sending the request, waiting for the response's head), failing with `std::errc::operation_canceled`, and once `send()`

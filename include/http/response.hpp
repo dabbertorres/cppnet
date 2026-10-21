@@ -23,6 +23,7 @@
 #include "io/reader.hpp"
 #include "io/writer.hpp"
 #include "url.hpp"
+#include "util/function_ref.hpp"
 
 namespace net::http
 {
@@ -260,9 +261,11 @@ using response_encoder_result = std::expected<io::writer*, std::error_code>;
 using response_decoder_result = std::expected<client_response, std::error_code>;
 
 using response_encoder = coro::task<response_encoder_result> (*)(io::writer*, const server_response&) noexcept;
-using response_decoder = coro::task<response_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
-                                                                 request_method,
-                                                                 std::size_t) noexcept;
+using response_decoder =
+    coro::task<response_decoder_result> (*)(std::unique_ptr<io::buffered_reader>,
+                                            request_method,
+                                            std::size_t,
+                                            util::function_ref<void(status, const headers&)>) noexcept;
 
 namespace detail
 {

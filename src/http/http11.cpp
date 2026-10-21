@@ -871,17 +871,20 @@ void call_at_body_start(const server_request& req, io::start_callback callback) 
     // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
-coro::task<response_decoder_result>
-response_decode(io::buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
+coro::task<response_decoder_result> response_decode(io::buffered_reader* reader,
+                                                    request_method       method,
+                                                    std::size_t          max_header_bytes,
+                                                    informational_ref    on_informational) noexcept
 {
-    try
-    {
-        client_response resp;
-        head_reader     head{.reader = reader, .remaining = max_header_bytes};
+    client_response resp;
+    head_reader     head{.reader = reader, .remaining = max_header_bytes};
 
-        // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are skipped (other than 101,
-        // which is the last thing on the connection in HTTP/1.1).
-        do
+    // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are passed to on_informational
+    // (if it's set), or skipped; other than 101, which is the last thing on the connection in HTTP/1.1. All of a
+    // response's heads count against max_header_bytes together.
+    while (true)
+    {
+        try
         {
             resp.headers = {};
 
@@ -895,8 +898,19 @@ response_decode(io::buffered_reader* reader, request_method method, std::size_t 
             if (auto err = parse_status_line(*line, resp); err) co_return std::unexpected(err);
             if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
         }
-        while (status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS);
+        catch (const std::bad_alloc&)
+        {
+            co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+        }
 
+        if (!status_is_information(resp.status_code) || resp.status_code == status::SWITCHING_PROTOCOLS) break;
+
+        // NOTE: outside the try, so whatever it throws (even std::bad_alloc) comes out of the task as it is.
+        if (on_informational) on_informational(resp.status_code, resp.headers);
+    }
+
+    try
+    {
         auto body = make_response_body(reader, resp, method);
         if (!body.has_value()) co_return std::unexpected(body.error());
         resp.body = std::move(*body);
@@ -911,9 +925,10 @@ response_decode(io::buffered_reader* reader, request_method method, std::size_t 
 
 coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,
                                                     request_method                       method,
-                                                    std::size_t                          max_header_bytes) noexcept
+                                                    std::size_t                          max_header_bytes,
+                                                    informational_ref                    on_informational) noexcept
 {
-    auto resp = co_await response_decode(reader.get(), method, max_header_bytes);
+    auto resp = co_await response_decode(reader.get(), method, max_header_bytes, on_informational);
     if (!resp.has_value()) co_return resp;
 
     try
