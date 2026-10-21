@@ -37,6 +37,9 @@ add_fuzzer(
   "${PROJECT_SOURCE_DIR}/src/http/structured_fields.cpp"
 )
 add_fuzzer(
+  fuzz_http2_scheduler http2_scheduler.cpp "${PROJECT_SOURCE_DIR}/src/http/http2_scheduler.cpp"
+)
+add_fuzzer(
   fuzz_structured_fields structured_fields.cpp "${PROJECT_SOURCE_DIR}/src/http/priority.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/structured_fields.cpp"
 )

@@ -141,7 +141,7 @@ public:
     [[nodiscard]] bool has_peer_settings() const noexcept { return settings_received; }
 
     // send_window is how much may be sent on the stream now: the smaller of its window and the connection's (0 if it
-    // can't send).
+    // can't send); for stream 0, the connection's.
     [[nodiscard]] std::int64_t send_window(stream_id stream) const noexcept;
 
     [[nodiscard]] const settings& peer_settings() const noexcept { return peer; }

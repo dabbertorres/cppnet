@@ -1061,6 +1061,8 @@ void session::take_output(std::vector<std::byte>& out)
 
 std::int64_t session::send_window(stream_id stream) const noexcept
 {
+    if (stream == 0) return std::max<std::int64_t>(connection_send_window, 0);
+
     const auto it = streams.find(stream);
     if (it == streams.end() || it->second.local_closed) return 0;
     return std::max<std::int64_t>(std::min(it->second.send_window, connection_send_window), 0);

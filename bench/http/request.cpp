@@ -11,7 +11,9 @@
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
 //   allocations are counted with the server's (as they share the process): for what a stream costs. And the bytes a
 //   request and its response come to each way (frames, HPACK's blocks and all), counted by a relay between another
-//   client and the server, in a run of their own: for what HPACK's dynamic table saves.
+//   client and the server, in a run of their own: for what HPACK's dynamic table saves. And several streams at once,
+//   each a larger response (written in pieces, as a file's served), so they contend for the connection: for what the
+//   server's scheduling of their DATA costs (see docs/plans/http2.md, Priorities).
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
 // costs (see docs/plans/middleware.md), with the metrics' own work; and with the metrics on the route instead (use()),
 // with each router: for what middleware on routes costs. And through http::timeout on the route, pipelined and over a
@@ -130,11 +132,27 @@ constexpr int         socket_requests = 50'000;
 constexpr int         http2_requests  = 20'000;
 constexpr int         counted_bytes   = 1'000; // requests
 
+// the contending streams' responses: contending at once, a round of them at a time.
+constexpr std::size_t bulk_size        = std::size_t{256} * 1'024;
+constexpr std::size_t bulk_write       = std::size_t{64} * 1'024;
+constexpr int         contending       = 8;
+constexpr int         contended_rounds = 300;
+
 task<void> plaintext(const http::server_request& /*req*/, http::response_writer& resp)
 {
     resp.headers().set("Server"sv, "cppnet"sv).set("Content-Type"sv, "text/plain"sv);
     auto* out = co_await resp.send(http::status::OK, body.size());
     co_await net::io::write_all(*out, body);
+}
+
+// bulk answers with bulk_size bytes, written bulk_write at a time (as a file's served).
+task<void> bulk(const http::server_request& /*req*/, http::response_writer& resp)
+{
+    static const std::string piece(bulk_write, 'b');
+
+    resp.headers().set("Content-Type"sv, "application/octet-stream"sv);
+    auto* out = co_await resp.send(http::status::OK, bulk_size);
+    for (std::size_t sent = 0; sent < bulk_size; sent += bulk_write) co_await net::io::write_all(*out, piece);
 }
 
 // waits_once answers as plaintext does, after waiting once: for a turn on another pool.
@@ -588,6 +606,114 @@ task<http2_outcome> send_http2_requests(http::client* client, std::string url)
     co_return out;
 }
 
+// contention is what the contending requests share: how many have finished, and how many failed (or came short).
+struct contention
+{
+    std::atomic<std::uint64_t> finished{0};
+    std::atomic<int>           failed{0};
+};
+
+// fetch GETs url, and reads its response's body to the end, counting it finished (and failed, if it isn't all
+// bulk_size bytes).
+task<void> fetch(net::io::scheduler* scheduler, http::client* client, std::string_view url, contention* counts)
+{
+    std::size_t read = 0;
+    if (auto resp = co_await client->get(url); resp.has_value())
+    {
+        std::vector<std::byte> scratch(std::size_t{16} * 1'024);
+        while (true)
+        {
+            auto res = co_await resp->body->read(scratch);
+            read += res.count;
+            if (res.err) break;
+        }
+    }
+
+    if (read != bulk_size) counts->failed.fetch_add(1);
+    counts->finished.fetch_add(1);
+    scheduler->notify_all(counts->finished);
+}
+
+// contend_round sends contending requests to url at once, and waits for them, returning whether they all got their
+// responses.
+task<bool> contend_round(net::io::scheduler* scheduler, http::client* client, std::string_view url, contention* counts)
+{
+    const auto want = counts->finished.load() + contending;
+    for (int i = 0; i < contending; ++i)
+    {
+        if (!scheduler->spawn(fetch(scheduler, client, url, counts))) co_return false;
+    }
+    for (auto seen = counts->finished.load(); seen < want; seen = counts->finished.load())
+        (void)co_await scheduler->wait_on(counts->finished, seen);
+    co_return counts->failed.load() == 0;
+}
+
+// send_contending sends contending requests to url at once, a round at a time (after warming up), counting the
+// allocations meanwhile.
+task<http2_outcome> send_contending(net::io::scheduler* scheduler, http::client* client, std::string url)
+{
+    contention counts;
+    for (int i = 0; i < 20; ++i)
+    {
+        if (!co_await contend_round(scheduler, client, url, &counts)) co_return http2_outcome{.failed = i};
+    }
+
+    http2_outcome out;
+    const auto    at    = allocations.load();
+    const auto    start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < contended_rounds; ++i)
+    {
+        if (!co_await contend_round(scheduler, client, url, &counts))
+        {
+            out.failed = i;
+            break;
+        }
+    }
+
+    out.took        = std::chrono::steady_clock::now() - start;
+    out.allocations = allocations.load() - at;
+    co_return out;
+}
+
+// measure_contended serves contending streams over cleartext HTTP/2 (one connection, from cppnet's client), and prints
+// the time a round of them takes, and the allocations per response (the client's and the server's together).
+template<typename Router>
+void measure_contended(const Router& router)
+{
+    auto               workers = std::make_shared<net::coro::thread_pool>(2);
+    net::io::scheduler scheduler{workers};
+
+    http::server server{
+        &scheduler,
+        router,
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    scheduler.spawn(server.serve());
+
+    http::client_options options;
+    options.http2_prior_knowledge = true;
+    http::client client{&scheduler, options};
+
+    const auto url = std::format("http://127.0.0.1:{}/bulk", server.local_port());
+    const auto out = scheduler.run_to_completion(send_contending(&scheduler, &client, url));
+    if (out.failed >= 0) std::println(stderr, "a contending HTTP/2 round {} failed", out.failed);
+
+    const auto per_round = std::chrono::duration<double, std::micro>(out.took).count() / contended_rounds;
+    const auto bytes     = static_cast<double>(bulk_size) * contending;
+    std::println("over HTTP/2, {} streams at once ({} KiB each, written {} KiB at a time; {} workers):",
+                 contending,
+                 bulk_size / 1'024,
+                 bulk_write / 1'024,
+                 workers->concurrency());
+    std::println("{:>10.1f} us per round ({:.0f} MiB/s)", per_round, bytes / per_round * 1e6 / (1'024.0 * 1'024.0));
+    std::println("{:>10.1f} allocations per response",
+                 static_cast<double>(out.allocations) / (static_cast<double>(contended_rounds) * contending));
+
+    server.close();
+    scheduler.shutdown();
+}
+
 // http2_bytes is what count_http2_bytes counted: the bytes each way (up from the client, down from the server).
 struct http2_bytes
 {
@@ -721,6 +847,7 @@ int main()
         [&](net::io::scheduler* /*sched*/) { return waiting; },
         waiting_request);
     measure_http2(router);
+    measure_contended(http::make_static_router(http::GET("/bulk"_route, bulk)));
     measure("pipelined, through http_metrics",
             http::chain(net::instrument::http_metrics{}, router),
             [](std::string_view input) { return net::io::string_reader{input}; });

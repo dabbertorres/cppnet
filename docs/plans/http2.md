@@ -18,7 +18,9 @@ seventh, HPACK's indexing on in both sides' sessions (`indexing::automatic`, the
 `session_config::encoder_table_size`), done (2026-10-21); and its eighth, Structured Fields and `http::priority`
 (`http/structured_fields.hpp`, `http/priority.hpp`, `fuzz_structured_fields`), done (2026-10-21); and its ninth,
 priority signals (PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES in the session, each server stream's priority,
-`server_config::http2_priorities`; recorded, not yet acted on), done (2026-10-21).
+`server_config::http2_priorities`), done (2026-10-21); and its tenth, scheduling the server's responses by priority
+(`http/http2_scheduler.hpp`, the connection's contended path, `fuzz_http2_scheduler`), done (2026-10-21): stage 5 is
+done.
 
 ## Goal
 
@@ -1103,6 +1105,116 @@ idle stream would be a connection error for the peer.
   would move between levels (`update(stream, priority)` in the plan). The default for clients that never signal is
   incremental, so with the scheduler they share the connection round-robin, as now.
 
+### Part 10: scheduling by priority (done 2026-10-21)
+
+- The scheduler (`http/http2_scheduler.hpp`, internal, without I/O): `scheduler_node` is a stream's place, its id, its
+  priority (the stream's, which part 9 kept in `http2_stream`: now `current_priority()`, set through `update()`) and
+  intrusive links; `http2_stream_base` derives from it, so a stream joining allocates nothing (24 bytes a stream, the id
+  repeated). `http2_scheduler` has eight levels (an urgency past 7, which `parse_priority()` never makes, is 7's), each
+  a circular list of its non-incremental streams by id (a stream joins from the end, as it usually has the highest id)
+  and a ring of its incremental ones (joining at the end: just before the one that goes next). `next(ready)` takes the
+  most urgent level with a ready stream; within it, the kind whose turn it is goes if it has one ready, and passes the
+  turn, otherwise the other goes and the turn stays (so a kind that had none ready goes first once it has); turns start
+  with incremental, as Go's do. Go flips one toggle for the connection at every frame, whatever went; this flips a
+  level's only when its turn's kind went, which is the same when both kinds are ready, and exact otherwise. The first
+  ready non-incremental stream by id goes (Go's moves its list's head to the one that went, so after a blocked stream
+  its order is no longer by id); the ring moves on past the one that went. `update()` to the same priority doesn't move
+  a stream (a client repeating a PRIORITY_UPDATE doesn't send its stream to the end of its ring). Only streams with a
+  write waiting are in it, so readiness is a window: the connection's (`session::send_window(0)`, new, checked once
+  before looking through) and the stream's.
+- Writing (`http2_connection_base`; the server's only, `scheduling`, from the session's role: the client's request
+  bodies go as before). `stream_writer::write()` is no longer a coroutine: `step_write()` takes a step under the lock,
+  and a write that doesn't have to wait returns a ready task (as the plan wanted the uncontended path to cost nothing;
+  it costs less: a write's coroutine frame, an allocation, and the second lock `wake_writer()` took); one that has to,
+  `write_waiting()`, a coroutine. Uncontended (Decided question 21): while no stream's queued and less than `max_ahead`
+  (64 KiB) of DATA waits for the writer or is being written (`data_queued`, `data_writing`, which the writer sets from
+  the first as it takes the output, and clears once it's written: so what's in the writer's hands counts too, else
+  another 64 KiB could go direct while it writes), and the output's under `max_output`, a write submits a frame at a
+  time (each cut as the session cuts them: so a response's frames are the same whichever way it goes). What doesn't go
+  (past `max_ahead`, or without a window) joins the scheduler as its span (`sending`, `sending_done`), and waits on the
+  stream's notifier: a write waiting for a window is queued too, rather than waiting for its own wakeup, so the writer
+  frames it when the window grows, and the handler isn't woken for nothing. The writer, each time round, under the lock:
+  `fill()`, then `take_output()` (control frames and heads first, as they were submitted, then the DATA `fill()`
+  framed). `fill()` takes `next()` a frame at a time (at most MAX_FRAME_SIZE), until `max_ahead`, waking each stream
+  whose span is all framed (taken out first). A stream that fails is taken out by `fail_stream()` (and
+  `remove_stream()`), under the lock, so the writer never touches the span of a write that's returned. As a write
+  returns only once it's all framed, a stream's end (an empty DATA, or trailers) follows its data.
+- So a single write larger than `max_ahead` (a response alone) now goes 64 KiB a round through the scheduler, and
+  returns once it's framed (64 KiB, and TCP's buffers, from the end), where it was copied into the session whole (as far
+  as the windows allowed) and returned at once: the same frames (a test checks a 1 MiB write's are 64 whole frames), in
+  more, smaller writes to the socket, and a handler now feels the socket (`test/http/http2_server.cpp`'s test of a
+  connection ending with much still to send relied on the handler returning with 8 MiB queued: its client now reads
+  until the handler's returned, about 1 MiB, here, still to come, then stops).
+- Holding a turn (not in the plan; learned by hand, through a throttling relay, below): a handler that writes a frame at
+  a time (16 KiB, as copying a file does) leaves the scheduler each time its write's framed, and is back microseconds
+  later; but the writer, if the socket takes what it framed at once, is back sooner, and filled the round with the
+  others. Ending the round there wasn't enough (a u=0 response, written 16 KiB at a time, got half the connection from
+  u=7 ones). So when a write's all framed and its stream would lose its turn (it's non-incremental, or its urgency has
+  no one left, and others are queued), the round ends and its turn's held (`turn_held`): nothing more is framed until
+  it's queued again, has ended or failed, or `hold_turn` (1 ms) has passed (the timer wakes the writer for it), so a
+  handler that's slow to write again (e.g. reading what it sends from elsewhere) holds the connection up for a
+  millisecond at most each time. Then the u=0 response had all of it. Incremental streams sharing an urgency don't hold
+  (they'd share anyway). Go has the same gap (its handlers wait for each 4 KiB chunk to be written) without the hold.
+- Deadlines, with a write waiting in the scheduler: queuing arms the write deadline (as a wait for a window did);
+  framing some of it resets it and arms it again (it's still waiting), a window growing likewise (but the waiting write
+  isn't woken); the timer resets a stream whose deadline passes, which `fail_stream()` takes out of the scheduler, and
+  the write returns `timed_out` with what was framed. But a write waiting its turn (it has a window, and the writer has
+  written within its timeout: `waiting_turn()`, from `wrote_at`, the time of the writer's last write while streams were
+  queued) has its deadline put off, from when the writer last wrote, rather than being reset: a bulk response behind an
+  urgent one that takes the connection for longer than `write_timeout` isn't the client's fault (a test reads slowly so
+  an urgent 6 MiB takes two seconds while a u=7 one waits, with a one-second `write_timeout`; it failed with the check
+  off). A client's reset, the connection ending (its streams fail) and a graceful close (GOAWAY; queued writes go on)
+  work as they did, as tests check.
+- `http2_priorities = false`: every stream's u=3 incremental (part 9), so contended responses take turns, a frame each.
+- Departures from the plan: a write without a window queues (rather than waiting for its window itself); the writer's
+  output counts against `max_ahead` while it's written; the hold; deadlines put off while waiting a turn; and the writes
+  that don't wait return without a coroutine. The plan's TCP_NOTSENT_LOWAT stays later, and matters: macOS's autotuned
+  send buffer (up to 4 MiB) is past reordering, so by hand a u=0 response started a second into the others went after 2
+  MiB of theirs (below), until the server's send buffer was set small.
+- Tests. The scheduler alone (`test/http/http2_scheduler.cpp`, `[http][http2][scheduler]`): urgency order, the
+  non-incremental by id (and one queued later with a lower id going first), the ring (a stream joining last), the turns,
+  streams not ready (each kind; a kind keeping its turn; a less urgent level going meanwhile; none), updates (up a
+  level, to the end of a ring, into a level's ordered list, the same not moving, one not queued only taking it),
+  removals (the ring's next, the ordered list's first, last and only, one not queued) and an urgency past 7. Over a
+  socket (`test/http/server_scheduling.cpp`, `[http][http2][server][scheduler]`), with `test::h2_client` (which gained
+  `hold_windows`, not consuming DATA, and `data_log`, the non-empty DATA frames in order): the client uses up the
+  connection's 65535 bytes with a first response (the plug) it never gives back, requests the responses under test (each
+  written in one write), which all queue, and a probe request whose handler waits until they have
+  (`detail::wait_queued_streams(req, n)`, internal, which waits on the writer's notifier: a write that queues wakes the
+  writer); then consuming the plug's data (the client's session sends WINDOW_UPDATE at once, as its window's empty) lets
+  the server send, in the scheduler's order. So: urgent first ("UUNNBBB"), non-incremental by id whatever order their
+  handlers queued in, incremental in rounds (in the order they queued, so the test checks the rounds), the two kinds
+  taking turns, clients that never signal and `http2_priorities = false` in rounds, a PRIORITY_UPDATE after the first
+  frame, a response's Priority lowering its stream, trailers after the data (a DATA after them would be malformed), a
+  queued write timing out (and its handler's token stopped, waited for, as it's stopped once the lock's released), reset
+  by the client (its write returning what was framed, `cancel`, the rest going to the other), the client closing the
+  connection, the server's `close()` (the queued responses finishing, then the connection ending), a response alone
+  (whole frames), and the waiting turn above. 50 runs of `[http2][scheduler]` in a row, and the suite with `ctest -j8`,
+  passed.
+- `fuzz_http2_scheduler` (new: cheap, and the intrusive lists are where a bug would hide): a script of adds, removes,
+  updates and `next()`s (with a mask of streams not ready, and of those to take out as they're picked) over 16 streams,
+  through the scheduler and a model of plain containers (a sorted vector and a deque per level), which must pick the
+  same, and agree on what's queued. 300 s (806,000 runs) found nothing; two deliberate breaks (not moving the ring's
+  first when it's removed; inserting into the ordered list one place off) were found within seconds.
+- Measured (`bench_request`, Release, five alternating runs of master's binary and the branch's, the new case built into
+  both). Over HTTP/2, a stream at a time: 80.6 to 86.7 us a request before (median 81.9), 82.0 to 86.9 after (median
+  83.8: within the spread, as part 9's 79.3 to 86.2 was), and 51.8 allocations a request before, 49.6 after (the body's
+  write, which doesn't wait, without its coroutine frame). The new case, 8 streams at once over one connection from
+  cppnet's client, 256 KiB each written 64 KiB at a time (u=3 incremental: the client sends no priorities): 1250 to 1315
+  us a round before (median 1288, about 1550 MiB/s), 1215 to 1322 after (median 1219, about 1640 MiB/s), and 90.9
+  allocations a response before, 96.3 after (the writes that queue, each with its coroutine, and the writer's smaller
+  rounds; with the windows of 64 KiB cppnet's client gives a stream, most writes wait either way). HTTP/1.1, untouched:
+  pipelined 1168 to 1187 ns before, 1175 to 1191 after; over a socket 27.8 to 29.9 us before, 28.0 to 32.2 after.
+- Interop by hand (throwaway programs in the scratchpad): a server answering `/bytes/:n` (written 16 KiB at a time).
+  curl 8.7.1 (nghttp2 1.64), `--http2-prior-knowledge --parallel`, multiplexing on one connection: 6 responses of 10
+  bytes to 3 MB, and 3 rounds of 20 of 8 MiB, every body compared and right. Go 1.27.1's client (`Protocols`'
+  `SetUnencryptedHTTP2`), 7 responses at once with Priority fields (two u=7 of 2 MiB, two u=3, two u=5 incremental, and
+  a u=0 started a second later, 512 KiB each), through a Python relay passing 2 MB/s to the client: every body right;
+  without the hold, the u=0 one took about 600 ms to frame (half the connection); with it, about 240 ms (all of it: 512
+  KiB at 2 MB/s), the u=3 ones one after the other, the u=5 ones together, then the u=7 ones one after the other. With
+  the server's send buffer left to autotune, the u=0 response went after about 2 MiB already in it (above). Directly (no
+  relay), everything's done in 20 ms, before the u=0 one starts. No h2load nor nghttp (not installed).
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1661,8 +1773,8 @@ throughput isn't changed (by frame count and order).
       updates, the response's field), recorded but not yet acted on; tests on bytes. Split from 10 as the protocol's
       rules are tested on bytes, apart from the writer. (`server_config::http2_priorities` came with it, rather than
       with 10: what it turns off is recorded here.)
-   10. **Scheduling by priority.** The scheduler, the connection's contended path; tests over a socket, and
-      `bench_request` with streams that contend. Last: it changes the writer every HTTP/2
+   10. **Scheduling by priority.** Done (2026-10-21; see Learned in stage 5). The scheduler, the connection's contended
+      path; tests over a socket, and `bench_request` with streams that contend. Last: it changes the writer every HTTP/2
       response goes through, so it comes once the rest is in, and alone.
 
    Trailers come before HPACK and priorities as they're what a user needs (gRPC); HPACK's two parts, internal, before

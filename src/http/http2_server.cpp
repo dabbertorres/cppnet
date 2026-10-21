@@ -34,6 +34,7 @@
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/http2_connection.hpp"
+#include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
 #include "http/priority.hpp"
 #include "http/request.hpp"
@@ -123,12 +124,11 @@ public:
     // the request expects 100 Continue before its client sends the body, which is to come (see run_stream()).
     bool expects_continue = false;
 
-    // The response's priority (RFC 9218): the request's Priority field's, or the connection's default (see
-    // request_priority()), then each PRIORITY_UPDATE's, then merged with the response's Priority field once its final
-    // head is sent, if prioritized (server_config::http2_priorities). Guarded by the connection's lock. Nothing acts
-    // on it yet (docs/plans/http2.md, stage 5's tenth part: the scheduler).
-    http::priority priority    = unprioritized;
-    bool           prioritized = false;
+    // The response's priority (RFC 9218), the scheduler's (current_priority(), set through the connection's
+    // send_order.update(), so a stream waiting to send moves): the request's Priority field's, or the connection's
+    // default (see request_priority()), then each PRIORITY_UPDATE's, then merged with the response's Priority field
+    // once its final head is sent, if prioritized (server_config::http2_priorities). Guarded by the connection's lock.
+    bool prioritized = false;
 
     // req.body, as start_stream() made it.
     stream_reader* body = nullptr;
@@ -266,8 +266,9 @@ namespace
                 if (const auto lines = resp.headers.get_all("priority"sv))
                 {
                     std::string joined;
-                    stream.priority =
-                        parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined), stream.priority);
+                    c.send_order.update(stream,
+                                        parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined),
+                                                       stream.current_priority()));
                 }
             }
 
@@ -337,9 +338,16 @@ std::optional<priority> stream_priority(const server_request& req)
     if (body == nullptr) return std::nullopt;
 
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): a server_request's body is a server's stream's.
-    auto&            stream = static_cast<http2_stream&>(*body->owner());
+    const auto&      stream = static_cast<const http2_stream&>(*body->owner());
     std::scoped_lock lock{stream.conn->mu};
-    return stream.priority;
+    return stream.current_priority();
+}
+
+coro::task<bool> wait_queued_streams(const server_request& req, std::size_t n)
+{
+    const auto* body = dynamic_cast<const stream_reader*>(req.body.get());
+    if (body == nullptr) return coro::ready_task<bool>(false);
+    return body->owner()->conn->wait_queued(n);
 }
 
 namespace
@@ -547,7 +555,8 @@ namespace
         if (!cookie.empty()) req.headers.set("cookie"sv, std::move(cookie));
 
         // (before the request may be refused below: what its fields show of the client counts all the same.)
-        stream->priority    = request_priority(req, signals);
+        // (the stream isn't the scheduler's yet: its priority's just set.)
+        send_order.update(*stream, request_priority(req, signals));
         stream->prioritized = options.priorities;
 
         req.method = parse_method(method);
@@ -640,7 +649,7 @@ namespace
         // (the session reports it only for a stream whose head it has, and the stream may have been answered without
         // a handler, e.g. a 501.)
         priority_aware = true;
-        if (const auto it = streams.find(id); it != streams.end()) it->second->priority = p;
+        if (const auto it = streams.find(id); it != streams.end()) send_order.update(*it->second, p);
     }
 
     void http2_server_connection::refuse(http2::stream_id id, status code, bool request_ended)

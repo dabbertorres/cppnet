@@ -27,6 +27,7 @@
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -44,6 +45,13 @@ namespace
 
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
+
+    // How much of a server's DATA may wait for the writer (or be being written) before its streams' writes wait in the
+    // scheduler for their turns (see step_write()): what the scheduler can't reorder, as it's framed already.
+    constexpr std::size_t max_ahead = std::size_t{64} * 1'024;
+
+    // How long a stream whose write was all framed keeps its turn for its handler's next write (see fill()).
+    constexpr auto hold_turn = std::chrono::milliseconds{1};
 
     // How long, and how much, the reader goes on reading once the connection's ending, for the peer to close its side
     // (see run()), as an HTTP/1.1 server lingers after an error response.
@@ -212,66 +220,158 @@ void http2_stream_base::hand_over_trailers() noexcept
 
 io::handle stream_reader::native_handle() const noexcept { return stream->conn->native_handle(); }
 
+namespace
+{
+
+    // write_waiting goes on with a stream's write once its first step has to wait.
+    coro::task<io::result> write_waiting(http2_connection_base&             c,
+                                         http2_stream_base&                 s,
+                                         std::span<const std::byte>         data,
+                                         http2_connection_base::write_state state,
+                                         http2_connection_base::write_step  step)
+    {
+        // (a step that isn't done has something to wait for.)
+        while (!step.done && step.wait != nullptr)
+        {
+            (void)co_await step.wait->wait(step.seen);
+            step = c.step_write(s, data, state);
+        }
+        co_return step.result;
+    }
+
+}
+
 coro::task<io::result> stream_writer::write(std::span<const std::byte> data)
 {
-    auto&       c       = *stream->conn;
-    std::size_t written = 0;
+    auto&                              c = *stream->conn;
+    http2_connection_base::write_state state;
 
-    while (true)
+    auto step = c.step_write(*stream, data, state);
+    if (step.done) return coro::ready_task<io::result>(step.result);
+    return write_waiting(c, *stream, data, state, step);
+}
+
+http2_connection_base::write_step
+http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
+{
+    const auto done = [](std::size_t count, std::error_code err = {})
     {
-        bool            wait_for_writer = false;
-        std::uint64_t   seen            = 0;
-        std::error_code failed; // submitting failed
+        return write_step{
+            .done   = true,
+            .result = io::result{.count = count, .err = err},
+            .wait   = nullptr,
+            .seen   = 0
+        };
+    };
+    const auto wait_for = [](coro::notifier& n)
+    { return write_step{.done = false, .result = {}, .wait = &n, .seen = n.value()}; };
+
+    write_step      step;
+    std::error_code failed; // submitting failed
+    bool            output = false;
+    {
+        std::scoped_lock lock{mu};
+
+        if (state.queued)
         {
-            std::scoped_lock lock{c.mu};
-            auto&            s = *stream;
-
-            if (s.failure) co_return io::result{.count = written, .err = s.failure};
-
-            if (c.session.output_size() > max_output)
-            {
-                // the writer's behind (the peer reads slowly): wait for it, rather than queueing more; for as long as
-                // the stream may go without progress.
-                wait_for_writer = true;
-                seen            = c.output_drained().value();
-                c.arm_deadline(s.write_deadline, s.write_timeout);
-            }
-            else
-            {
-                const auto sent = c.session.submit_data(s.id, data.subspan(written), false);
-                if (!sent.has_value())
-                {
-                    c.fail_stream(s, sent.error());
-                    failed = sent.error();
-                }
-                else
-                {
-                    written += *sent;
-                    if (*sent > 0) s.write_deadline.reset();
-
-                    if (written < data.size())
-                    {
-                        // no window: wait for the peer to give some back.
-                        seen = s.changed.value();
-                        c.arm_deadline(s.write_deadline, s.write_timeout);
-                    }
-                }
-            }
+            // the writer frames the rest: the write's done once it's all framed (the stream's out of the scheduler),
+            // or the stream's failed (which took it out).
+            if (s.failure) return done(state.written + s.sending_done, s.failure);
+            if (!s.queued()) return done(data.size());
+            return wait_for(s.changed);
         }
 
-        if (failed)
+        if (s.failure) return done(state.written, s.failure);
+
+        if (scheduling)
         {
-            // the handler's token, which its own callbacks may be registered on, so it's after unlocking.
-            c.stop_pending();
-            co_return io::result{.count = written, .err = failed};
+            // at once while no one waits for a turn (nor for the writer to catch up with control frames and heads);
+            // the rest waits its turn (and the window, if that's what it's waiting for).
+            if (send_order.empty() && session.output_size() <= max_output) failed = submit_at_once(s, data, state);
+            if (!failed && state.written < data.size())
+            {
+                queue_rest(s, data, state);
+                step = wait_for(s.changed);
+            }
+        }
+        else if (session.output_size() > max_output)
+        {
+            // the writer's behind (the peer reads slowly): wait for it, rather than queueing more; for as long as the
+            // stream may go without progress.
+            step = wait_for(drained);
+            arm_deadline(s.write_deadline, s.write_timeout);
+        }
+        else
+        {
+            failed = submit_windowed(s, data, state);
+
+            // no window: wait for the peer to give some back.
+            if (!failed && state.written < data.size()) step = wait_for(s.changed);
         }
 
-        c.wake_writer();
-        if (written == data.size()) co_return io::result{.count = written};
-
-        if (wait_for_writer) (void)co_await c.output_drained().wait(seen);
-        else (void)co_await stream->changed.wait(seen);
+        output = session.has_output();
     }
+
+    if (failed)
+    {
+        // the handler's token, which its own callbacks may be registered on, so it's after unlocking.
+        stop_pending();
+        return done(state.written, failed);
+    }
+
+    // (a write that's queued has the writer frame it, whether or not there's output yet.)
+    if (output || state.queued) writer_wakeup.notify();
+    if (state.written == data.size()) return done(state.written);
+    return step;
+}
+
+std::error_code
+http2_connection_base::submit_at_once(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
+{
+    // a frame at a time (cut as the session cuts them), while less than max_ahead waits for the writer.
+    const std::size_t frame = session.peer_settings().max_frame_size;
+    while (state.written < data.size() && data_queued + data_writing < max_ahead)
+    {
+        const auto rest  = data.subspan(state.written);
+        const auto chunk = rest.first(std::min(rest.size(), frame));
+        const auto sent  = session.submit_data(s.id, chunk, false);
+        if (!sent.has_value())
+        {
+            fail_stream(s, sent.error());
+            return sent.error();
+        }
+
+        state.written += *sent;
+        data_queued += *sent;
+        if (*sent > 0) s.write_deadline.reset();
+        if (*sent < chunk.size()) break; // no window
+    }
+    return {};
+}
+
+void http2_connection_base::queue_rest(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
+{
+    s.sending      = data.subspan(state.written);
+    s.sending_done = 0;
+    send_order.add(s);
+    arm_deadline(s.write_deadline, s.write_timeout);
+    state.queued = true;
+}
+
+std::error_code
+http2_connection_base::submit_windowed(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
+{
+    const auto sent = session.submit_data(s.id, data.subspan(state.written), false);
+    if (!sent.has_value())
+    {
+        fail_stream(s, sent.error());
+        return sent.error();
+    }
+
+    state.written += *sent;
+    if (*sent > 0) s.write_deadline.reset();
+    if (state.written < data.size()) arm_deadline(s.write_deadline, s.write_timeout);
+    return {};
 }
 
 io::handle stream_writer::native_handle() const noexcept { return stream->conn->native_handle(); }
@@ -286,6 +386,7 @@ http2_connection_base::http2_connection_base(io::scheduler*               schedu
     , pool{scheduler->pool()}
     , conn{conn}
     , logger{logger}
+    , scheduling{side == http2::role::server}
     , writer_wakeup{pool}
     , drained{pool}
 {}
@@ -313,6 +414,9 @@ void http2_connection_base::fail_stream(http2_stream_base& s, std::error_code er
 {
     if (s.failure) return;
     s.failure = err;
+
+    // the writer mustn't touch the span of a write that's returning.
+    send_order.remove(s);
 
     // NOTE: a copy (sharing its state, so not allocating), as the stream may be gone once it's stopped.
     if (s.stop.stop_possible() && !s.stop.stop_requested()) to_stop.push_back(s.stop);
@@ -455,6 +559,7 @@ void http2_connection_base::remove_stream(http2::stream_id id)
     if (const auto unread = s.received.size() - s.received_start; unread > 0) session.consume(id, unread);
     s.received.clear();
     s.received_start = 0;
+    send_order.remove(s);
 
     active.erase(it);
 }
@@ -496,11 +601,17 @@ void http2_connection_base::on_stream_reset(http2::stream_id id, std::error_code
 
 void http2_connection_base::on_window_update(http2::stream_id id)
 {
-    // a stream that may send again has made progress, as far as its write deadline's concerned.
+    // a stream that may send again has made progress, as far as its write deadline's concerned. A write waiting in
+    // the scheduler isn't woken (the writer, which receive() wakes, frames it), and its deadline starts again, as it
+    // waits still (for its turn).
     const auto grew = [this](http2_stream_base& s)
     {
-        if (session.send_window(s.id) > 0) s.write_deadline.reset();
-        s.changed.notify();
+        if (session.send_window(s.id) > 0)
+        {
+            s.write_deadline.reset();
+            if (s.queued()) arm_deadline(s.write_deadline, s.write_timeout);
+        }
+        if (!s.queued()) s.changed.notify();
     };
 
     if (id != 0)
@@ -522,22 +633,21 @@ coro::task<> http2_connection_base::write_loop()
 {
     co_await pool->schedule();
 
-    auto&                  writer = as_writer(conn);
-    std::vector<std::byte> out;
+    auto&                         writer = as_writer(conn);
+    std::vector<std::byte>        out;
+    std::vector<std::stop_source> stopping; // the streams fill() failed
+    bool                          wrote = false;
 
     while (true)
     {
         const auto seen   = writer_wakeup.value();
-        bool       ending = false;
-        {
-            std::scoped_lock lock{mu};
-            session.take_output(out);
-            ending = is_ending;
-        }
+        const bool ending = take_output(out, std::exchange(wrote, false), stopping);
+        stop_all(stopping);
 
         if (!out.empty())
         {
             const auto res = co_await io::write_all(writer, out);
+            wrote          = true;
             drained.notify();
             if (res.err)
             {
@@ -584,6 +694,27 @@ coro::task<> http2_connection_base::write_loop()
     (void)co_await shutdown(conn);
 }
 
+bool http2_connection_base::take_output(std::vector<std::byte>&        out,
+                                        bool                           wrote,
+                                        std::vector<std::stop_source>& stopping)
+{
+    std::scoped_lock lock{mu};
+
+    // what was written is past: a stream that's waiting its turn meanwhile isn't held up by the peer (see
+    // waiting_turn()).
+    data_writing = 0;
+    if (wrote && !send_order.empty()) wrote_at = io::clock::now();
+
+    // the control frames and heads (in the order they were submitted, as HPACK's encoding is), then DATA in the
+    // streams' turns.
+    if (scheduling) fill();
+    session.take_output(out);
+    data_writing = std::exchange(data_queued, 0);
+
+    stopping.swap(to_stop);
+    return is_ending;
+}
+
 coro::task<> http2_connection_base::timer_loop()
 {
     co_await pool->schedule();
@@ -605,6 +736,9 @@ coro::task<> http2_connection_base::timer_loop()
                 next           = check_streams(now);
                 const auto own = check_connection(now);
                 if (own.has_value() && (!next.has_value() || *own < *next)) next = own;
+
+                // (the writer's woken below, each time.)
+                if (turn_held != 0 && (!next.has_value() || turn_held_until < *next)) next = turn_held_until;
             }
 
             // (perhaps ended just now:) the reader lingers until linger_until (see run()).
@@ -650,6 +784,11 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
             return false;
         };
 
+        // a write that's waiting its turn, while the writer writes others', isn't held up by the peer: its deadline's
+        // put off to its timeout from when the writer last wrote.
+        if (s->write_deadline.has_value() && *s->write_deadline <= now && waiting_turn(*s, now))
+            s->write_deadline = wrote_at.value_or(now) + s->write_timeout;
+
         // NOTE: both checked, so the one that hasn't expired still counts for when to check next.
         const bool read_expired  = expired(s->read_deadline);
         const bool write_expired = expired(s->write_deadline);
@@ -669,6 +808,106 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
     // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
     if (timed_out) drained.notify();
     return next;
+}
+
+bool http2_connection_base::waiting_turn(const http2_stream_base& s, io::clock::time_point now) const
+{
+    return s.queued() && session.send_window(s.id) > 0 && wrote_at.has_value() && *wrote_at + s.write_timeout > now;
+}
+
+void http2_connection_base::fill()
+{
+    // (none's ready without the connection's window: not looked through.)
+    if (send_order.empty() || session.send_window(0) <= 0) return;
+
+    // the stream that ended the last round keeps its turn (see below) until it writes again, ends or fails, or for
+    // hold_turn: until then, nothing else is framed (the timer wakes the writer once it's over).
+    if (turn_still_held()) return;
+
+    const std::size_t frame = session.peer_settings().max_frame_size;
+    const auto        ready = [this](const scheduler_node& n) { return session.send_window(n.stream()) > 0; };
+    while (data_queued + data_writing < max_ahead)
+    {
+        auto* n = send_order.next(ready);
+        if (n == nullptr) break;
+
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): the scheduler's nodes are streams.
+        auto&      s     = static_cast<http2_stream_base&>(*n);
+        const auto rest  = s.sending.subspan(s.sending_done);
+        const auto chunk = rest.first(std::min(rest.size(), frame));
+        const auto sent  = session.submit_data(s.id, chunk, false);
+        if (!sent.has_value())
+        {
+            // (it's taken out of the scheduler.)
+            fail_stream(s, sent.error());
+            s.changed.notify();
+            continue;
+        }
+
+        if (*sent == 0) break; // (ready() said it had a window: never, but it mustn't spin)
+
+        // progress: the write's done, or its deadline starts again for the rest.
+        s.sending_done += *sent;
+        data_queued += *sent;
+        s.write_deadline.reset();
+        if (s.sending_done == s.sending.size())
+        {
+            send_order.remove(s);
+            s.changed.notify();
+
+            // its handler's next write keeps its turn, rather than the next stream taking it (a less urgent one, or
+            // the next of a non-incremental one's urgency; but not an incremental one sharing its urgency, which would
+            // anyway): its handler usually writes again within microseconds, but the writer, if the socket takes what
+            // it's framed at once, would be back sooner. So the round ends here, and the turn's held, for hold_turn
+            // at most, so a handler that's slower (e.g. reading what it sends from elsewhere) doesn't hold the
+            // connection up for long. (Without it, a handler writing a frame at a time got about half the connection
+            // when it was more urgent than all the others: learned in stage 5's tenth part.)
+            if (hold_turn_of(s)) break;
+        }
+        else
+        {
+            arm_deadline(s.write_deadline, s.write_timeout);
+        }
+    }
+}
+
+bool http2_connection_base::hold_turn_of(const http2_stream_base& s)
+{
+    const auto p = s.current_priority();
+    if (send_order.empty() || (p.incremental && send_order.has_urgency(p.urgency))) return false;
+
+    turn_held       = s.id;
+    turn_held_until = io::clock::now() + hold_turn;
+    if (!timer_target.has_value() || turn_held_until < *timer_target) wake_timer();
+    return true;
+}
+
+bool http2_connection_base::turn_still_held()
+{
+    if (turn_held == 0) return false;
+
+    const auto it   = active.find(turn_held);
+    const bool done = it == active.end() || it->second->queued() || it->second->ended || it->second->failure;
+    if (!done && io::clock::now() < turn_held_until) return true;
+
+    turn_held = 0;
+    return false;
+}
+
+coro::task<bool> http2_connection_base::wait_queued(std::size_t n)
+{
+    while (true)
+    {
+        const auto seen = writer_wakeup.value();
+        {
+            std::scoped_lock lock{mu};
+            if (is_ending) co_return false;
+            if (send_order.size() >= n) co_return true;
+        }
+
+        // (a write that queues wakes the writer.)
+        (void)co_await writer_wakeup.wait(seen);
+    }
 }
 
 void http2_connection_base::end(std::error_code why)

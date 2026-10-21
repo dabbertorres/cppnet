@@ -717,14 +717,20 @@ scheduler.spawn(server.serve());
   resp.headers().set("Priority", net::http::to_string({.urgency = 7}));   // "u=7"
   ```
 
-  The HTTP/2 server records each response's priority (unless `server_config::http2_priorities` is off): the request's
-  field, or the client's `PRIORITY_UPDATE` frames (which replace it, even one sent before the request), then the
-  response's field, merged over it when its head is sent (what it leaves out keeps the client's). A client that has
-  never sent a priority gets its responses shared alike (as `u=3, i`), rather than one at a time; so does one sending
-  `Via`, `Forwarded` or `X-Forwarded-For` (an intermediary, whose `Priority` fields are its clients', so ignored). It
-  doesn't act on them yet: a later version sends HTTP/2 responses by them. A client sets a request's priority with the
-  same field (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other signal. A field
-  sent as several lines is one value, its lines joined with commas: `req.headers.get()` gives only the first.
+  The HTTP/2 server sends responses by their priorities (unless `server_config::http2_priorities` is off): the request's
+  field, or the client's `PRIORITY_UPDATE` frames (which replace it, even one sent before the request, and move a
+  response under way), then the response's field, merged over it when its head is sent (what it leaves out keeps the
+  client's). When a connection's responses contend for it, the most urgent go first (the less urgent wait, for as long
+  as there's more urgent data to send); of one urgency, those that aren't incremental go one at a time, in the order
+  they were requested, and incremental ones take turns, a frame each (and the two kinds take turns with each other). A
+  client that has never sent a priority gets its responses shared alike (as `u=3, i`), rather than one at a time; so
+  does one sending `Via`, `Forwarded` or `X-Forwarded-For` (an intermediary, whose `Priority` fields are its clients',
+  so ignored). Only what hasn't been handed to the connection's writer can be reordered: a response alone goes at once,
+  and a handler's write returns once its data's been framed, in its turn (so it waits while more urgent ones are sent,
+  which doesn't count against its `write_timeout` while the server's writing to the client). A client sets a request's
+  priority with the same field (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other
+  signal, and sends its request bodies as they're written, whatever their priorities. A field sent as several lines is
+  one value, its lines joined with commas: `req.headers.get()` gives only the first.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

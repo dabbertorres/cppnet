@@ -684,7 +684,8 @@ TEST_CASE("an HTTP/2 connection that ends reads what the client still sends, rat
     r.GET("/huge",
           [&written, &sched](const http::server_request&, http::response_writer& resp) -> task<void>
           {
-              // at once (into the session: the windows don't hold it back), so the handler returns.
+              // in one write, which returns once it's all framed (the windows don't hold it back): with the last of
+              // it still in the server's output, and in TCP's buffers.
               const std::string body(size, 'h');
               auto*             out = co_await resp.send(http::status::OK, body.size());
               co_await net::io::write_all(*out, body);
@@ -715,9 +716,9 @@ TEST_CASE("an HTTP/2 connection that ends reads what the client still sends, rat
         const auto sent = co_await net::io::write_all(*conn, output);
         REQUIRE_FALSE(sent.err);
 
-        // the handler's returned, with most of the response still to be sent, and (by now) the connection's ended.
-        for (auto seen = written->load(); seen == 0; seen = written->load())
-            (void)co_await sched->wait_on(*written, seen);
+        // the client reads until the handler's returned, with the end of the response still to be sent (about 1
+        // MiB, here: what's queued, and what TCP's buffers hold), then stops reading; by then, the connection's ended.
+        (void)co_await c.pump([&] { return written->load() != 0; });
         (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
 
         // the client sends something more (as it sends WINDOW_UPDATEs as it reads): the server mustn't reset the

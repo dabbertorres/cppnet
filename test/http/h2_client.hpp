@@ -96,6 +96,13 @@ struct h2_client final : http2::session_events
     int                                  finished    = 0;
     int                                  pings       = 0; // acknowledged
 
+    // hold_windows keeps the DATA received from being consumed, so the server's windows grow only by window_update()
+    // (e.g. to hold its responses until they've all queued, then let them go). DATA's received all the same.
+    bool hold_windows = false;
+
+    // data_log is the non-empty DATA frames received on the connection, in order: their streams and lengths.
+    std::vector<std::pair<http2::stream_id, std::size_t>> data_log;
+
     // blocks are the header blocks received on each stream, as they were encoded (HPACK's representations, from
     // HEADERS and its CONTINUATIONs), in order.
     std::map<http2::stream_id, std::vector<std::vector<std::byte>>> blocks;
@@ -139,7 +146,8 @@ struct h2_client final : http2::session_events
         auto& r = responses[id];
         ++r.data_frames;
         r.body.append(reinterpret_cast<const char*>(data.data()), data.size());
-        s.consume(id, data.size());
+        if (!data.empty()) data_log.emplace_back(id, data.size());
+        if (!hold_windows) s.consume(id, data.size());
         if (end) done(r);
     }
 
