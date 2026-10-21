@@ -7,7 +7,9 @@
 #include <utility>
 #include <vector>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 using namespace std::string_view_literals;
 
@@ -201,4 +203,52 @@ TEST_CASE("has_token finds an element of a list-based field", "[http][headers][g
     // a quoted string is one element, not the token inside it.
     CHECK_FALSE(fields.has_token("Connection"sv, "close"sv));
     CHECK_FALSE(fields.has_token("Transfer-Encoding"sv, "chunked"sv));
+}
+
+TEST_CASE("trailer_allowed refuses Go's list of fields that can't be trailers", "[http][headers][trailer_allowed]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        bool             allowed;
+    };
+
+    auto tc = GENERATE(test_case{.name = "Server-Timing", .allowed = true},
+                       test_case{.name = "grpc-status", .allowed = true},
+                       test_case{.name = "X-Checksum", .allowed = true},
+                       test_case{.name = "Digest", .allowed = true},
+                       test_case{.name = "Set-Cookie", .allowed = true}, // (hyper refuses it; Go doesn't)
+                       test_case{.name = "Content-MD5", .allowed = true},
+                       test_case{.name = "Hosts", .allowed = true}, // (only whole names are refused)
+                       test_case{.name = "If", .allowed = true},    // (If- is a prefix)
+                       test_case{.name = "Iff-Thing", .allowed = true},
+                       test_case{.name = "If-Match", .allowed = false},
+                       test_case{.name = "if-none-match", .allowed = false},
+                       test_case{.name = "IF-", .allowed = false},
+                       test_case{.name = "If-Anything-At-All", .allowed = false},
+                       test_case{.name = "Authorization", .allowed = false},
+                       test_case{.name = "Cache-Control", .allowed = false},
+                       test_case{.name = "Connection", .allowed = false},
+                       test_case{.name = "Content-Encoding", .allowed = false},
+                       test_case{.name = "Content-Length", .allowed = false},
+                       test_case{.name = "content-length", .allowed = false},
+                       test_case{.name = "Content-Range", .allowed = false},
+                       test_case{.name = "Content-Type", .allowed = false},
+                       test_case{.name = "Expect", .allowed = false},
+                       test_case{.name = "Host", .allowed = false},
+                       test_case{.name = "Keep-Alive", .allowed = false},
+                       test_case{.name = "Max-Forwards", .allowed = false},
+                       test_case{.name = "Pragma", .allowed = false},
+                       test_case{.name = "Proxy-Authenticate", .allowed = false},
+                       test_case{.name = "Proxy-Authorization", .allowed = false},
+                       test_case{.name = "Proxy-Connection", .allowed = false},
+                       test_case{.name = "Range", .allowed = false},
+                       test_case{.name = "Realm", .allowed = false},
+                       test_case{.name = "TE", .allowed = false},
+                       test_case{.name = "Trailer", .allowed = false},
+                       test_case{.name = "TRANSFER-ENCODING", .allowed = false},
+                       test_case{.name = "WWW-Authenticate", .allowed = false});
+
+    CAPTURE(tc.name);
+    CHECK(net::http::trailer_allowed(tc.name) == tc.allowed);
 }

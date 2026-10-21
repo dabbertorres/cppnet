@@ -2,7 +2,8 @@
 // - decoding doesn't crash (the decoders are noexcept, so exceptions count).
 // - it decodes exactly the same when the connection delivers one byte at a time, so nothing depends on how reads are
 //   split up (e.g. a short read in the middle of a chunk's CRLF).
-// - every field it accepts can be written back out unchanged: no line breaks or other controls get through.
+// - every field it accepts can be written back out unchanged: no line breaks or other controls get through. Trailers
+//   too, which also must be ones that may be trailers, and read back the same once chunked_writer has written them.
 #include "http/http11.hpp"
 
 #include <algorithm>
@@ -17,10 +18,11 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 #include "coro/sync_wait.hpp"
 #include "coro/task.hpp"
+#include "http/chunked_reader.hpp"
+#include "http/chunked_writer.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -29,6 +31,7 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
+#include "io/string_writer.hpp"
 
 namespace
 {
@@ -60,6 +63,47 @@ private:
     std::abort();
 }
 
+// check_fields fails if fields has one that couldn't be written back out unchanged, and appends them to out.
+void check_fields(const net::http::headers& fields, std::string_view prefix, std::string& out)
+{
+    for (const auto& [name, values] : fields)
+    {
+        if (!net::http::is_valid_field_name(name)) fail("accepted an invalid field name", name);
+
+        for (const auto& value : values)
+        {
+            if (!net::http::is_valid_field_value(value)) fail("accepted an invalid field value", value);
+            out.append(prefix).append(name).append(": ").append(value).append("\n");
+        }
+    }
+}
+
+// check_trailers fails if trailers has a field that can't be a trailer, or doesn't read back the same once written.
+void check_trailers(const net::http::headers& trailers)
+{
+    for (const auto& field : trailers)
+    {
+        if (!net::http::trailer_allowed(field.first)) fail("kept a field that can't be a trailer", field.first);
+    }
+
+    net::io::string_writer<char>      written;
+    net::http::http11::chunked_writer writer{&written};
+    if (auto res = test::sync_wait(writer.finish(&trailers)); res.err)
+        fail("couldn't write the trailers back", res.err.message());
+
+    const auto                        text = written.build();
+    net::io::string_reader<char>      in{text};
+    net::io::buffered_reader          buffered{&in};
+    net::http::http11::chunked_reader reader{&buffered};
+    net::http::headers                again;
+    reader.keep_trailers(&again);
+
+    std::string buf(1, '\0');
+    if (auto res = test::sync_wait(reader.read(buf)); res.err != net::io::errc::end_of_stream)
+        fail("couldn't read the trailers back", text, res.err.message());
+    if (again != trailers) fail("the trailers read back differently", text);
+}
+
 // transcript decodes requests from reader as the server would, and describes what it decoded.
 std::string transcript(net::io::reader* conn)
 {
@@ -79,16 +123,12 @@ std::string transcript(net::io::reader* conn)
              + " " + std::to_string(req->version.major) + "." + std::to_string(req->version.minor)
              + " host=" + req->host + "\n";
 
-        for (const auto& [name, values] : req->headers)
-        {
-            if (!net::http::is_valid_field_name(name)) fail("accepted an invalid field name", name);
+        check_fields(req->headers, "", out);
 
-            for (const auto& value : values)
-            {
-                if (!net::http::is_valid_field_value(value)) fail("accepted an invalid field value", value);
-                out.append(name).append(": ").append(value).append("\n");
-            }
-        }
+        // (as the server will, once it keeps them: http2.md's stage 5, part 4.)
+        net::http::headers trailers;
+        if (auto* chunked = dynamic_cast<net::http::http11::chunked_reader*>(req->body.get()); chunked != nullptr)
+            chunked->keep_trailers(&trailers);
 
         // reads of an odd size, so they straddle chunks.
         std::string body;
@@ -101,10 +141,15 @@ std::string transcript(net::io::reader* conn)
             if (res.err)
             {
                 out += "body: " + body + " (" + res.err.message() + ")\n";
-                if (res.err != net::io::errc::end_of_stream) return out;
-                break;
+                if (res.err == net::io::errc::end_of_stream) break;
+
+                if (!trailers.empty()) fail("a body that failed kept trailers", res.err.message());
+                return out;
             }
         }
+
+        check_fields(trailers, "trailer ", out);
+        check_trailers(trailers);
     }
 
     return out;

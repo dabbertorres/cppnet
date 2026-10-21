@@ -8,7 +8,8 @@ connections, `test/http/http2_client.cpp`). Stage 5 decided (2026-10-20): interi
 end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's priorities, in ten pull requests (see "Stage
 5"); its questions (at the end) all as recommended. Its first part, interim responses on the server (and 100 Continue),
 done (2026-10-20; see Learned in stage 5); its second, interim responses in the client (`on_informational`), done
-(2026-10-20).
+(2026-10-20); its third, trailers in the codecs (`chunked_reader`, `chunked_writer::finish(trailers)`,
+`trailer_allowed()`), done (2026-10-20).
 
 ## Goal
 
@@ -530,6 +531,43 @@ idle stream would be a connection error for the peer.
   79.8 after (noise: nothing on that path changed but a branch, and a vector's swap per wait); and over HTTP/1.1 with
   cppnet's client (`bench_request`'s HTTP/2 run with prior knowledge off, a throwaway change), 28.0 allocations both,
   42.3 to 45.1 us before, 42.8 to 44.0 after. The server's runs are unchanged (1.4, 4.2, 3.0 and 2.0 allocations).
+
+### Part 3: trailers in the codecs (done 2026-10-20)
+
+- `http::trailer_allowed(name)` is in `http/headers.hpp` (public, as proposed): Go's list, an `If-` prefix (ignoring
+  case) and the 21 names, compared ignoring case one after another; only called for a message that has trailers.
+- `chunked_reader` takes the `headers*` by a setter, `keep_trailers()`, as it takes its callbacks (`call_at_end()`,
+  `call_at_start()`), rather than as a constructor argument: the client's response body is made inside
+  `response_decode()` (`make_response_body()`), before the `pooled_body` whose trailers it's to fill exists, so part 5
+  needs to set it afterwards anyway; part 4 can set it beside `call_at_body_end()` (or pass it through
+  `reuse_or_make()`, which a setter doesn't stop). Null by default, so the server and client don't keep any yet.
+- What the reader keeps: the section replaces what the headers held (cleared as it starts), a repeated name is one field
+  with each value in order (as `headers::add()` keeps them), and a section that fails (malformed, too long, or cut
+  short) leaves them empty, so no one sees part of one. A `std::bad_alloc` adding one fails the read with
+  `not_enough_memory`.
+- The section's lines are now limited to `http11::max_fields` whether they're kept or not, and the fields dropped count
+  too, so a body decodes the same either way (the fuzzer's property); before, only `max_trailers` (8 KiB) limited it,
+  which let some 2,000 tiny lines through. As in a head, the line past the limit fails with `value_too_large` before
+  it's parsed, malformed or not.
+- `chunked_writer::finish(const headers* trailers = nullptr)` checks every field with `valid_fields()` before it writes
+  anything, those it would drop too (a line break in one is the caller's bug either way; Decided question 12). It
+  formats the last chunk into an `io::buffered_writer`'s buffer (`prepare()`, found with a `dynamic_cast`, as
+  `response_encode()` finds it) and returns a ready task, otherwise writes it as one string. Before, `finish()` was
+  always a coroutine awaiting another (`write_full()`), so a chunked response's end now usually needs no frame; the
+  server's chunked responses gain that, though `bench_request` (whose responses have a Content-Length) doesn't show
+  it. A null writer (`response_writer`'s placeholder `chunked_writer{nullptr}`) fails with `invalid_argument`.
+- `fuzz_http11`: until part 4 gives `server_request` its trailers, the fuzzer finds a chunked body with a
+  `dynamic_cast` and calls `keep_trailers()` itself. The transcript has each request's trailers (`trailer name:
+  value`), each checked to be a valid field and allowed; they're written back with `finish()` and read back the same
+  (`operator==`); and a body that fails must have kept none. Ran for 150 s from a few seeds with trailers (127,000
+  runs), as well as its ctest run.
+- Measured (`bench_request`, Release, five alternating runs of the binaries before and after, best of each):
+  allocations unchanged everywhere (1.4 per request pipelined, 4.2 one per read, 3.0 over a socket, 2.0 to a handler
+  that waits, 52.0 over HTTP/2, and the middleware runs' 2.4, 1.4, 2.4, 3.4, 2.4 and 4.0). Times: over a socket 27.7
+  us both, to a handler that waits 36.4 and 36.3, over HTTP/2 80.8 and 79.2; pipelined 1110 ns before and 1118 after,
+  one per read 1302 and 1319, and the pipelined middleware runs 1 to 3% slower at best, within or at the edge of each
+  run's spread (1 to 4%). None of those requests or responses is chunked, so nothing they run changed; it's taken for
+  noise, or code layout.
 
 ## Stage 5
 
@@ -1064,9 +1102,9 @@ throughput isn't changed (by frame count and order).
    2. **Interim responses, the client.** Done (2026-10-20; see Learned in stage 5). `client_request::on_informational`,
       over both versions, and HTTP/2's bound on interim heads. Split from 1 as it's an API of its own (Decided question
       4), tested against 1's server.
-   3. **Trailers in the codecs.** `chunked_reader` keeping a trailer section, `chunked_writer::finish(trailers)`,
-      `trailer_allowed()`, and `fuzz_http11`'s transcript. Split out as it's the part without I/O, tested on strings,
-      which both sides' parts build on.
+   3. **Trailers in the codecs.** Done (2026-10-20; see Learned in stage 5). `chunked_reader` keeping a trailer
+      section, `chunked_writer::finish(trailers)`, `trailer_allowed()`, and `fuzz_http11`'s transcript. Split out as
+      it's the part without I/O, tested on strings, which both sides' parts build on.
    4. **Trailers on the server.** `server_request::trailers`, `response_writer::trailers()`, over HTTP/1.1 and HTTP/2
       (whose session already handles them); tests with raw requests and `test::h2_client`. One side, both versions: the
       API is the same over either, and the server's tests don't need the client's part.

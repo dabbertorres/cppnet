@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "http/headers.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -14,10 +15,12 @@ namespace net::http::http11
 {
 
 // chunked_reader reads a body in the chunked transfer coding (RFC 9112, section 7.1), up to its end: nothing after
-// it is read. Chunk extensions and trailers are skipped.
+// it is read. Chunk extensions are skipped; the trailer section's fields are kept, if keep_trailers() says where, or
+// checked and dropped.
 //
 // A malformed body fails with std::errc::illegal_byte_sequence, one that ends early with std::errc::connection_aborted,
-// and a chunk size line or trailer section that's too long with std::errc::value_too_large.
+// and a chunk size line or trailer section that's too long (over max_trailers bytes, or http11::max_fields field
+// lines) with std::errc::value_too_large.
 class chunked_reader : public io::reader
 {
 public:
@@ -48,6 +51,13 @@ public:
     // that finds it (before it returns).
     void call_at_end(io::end_callback callback) noexcept { at_end = callback; }
 
+    // keep_trailers sets where the trailer section's fields go (or, if trailers is null, nowhere: they're checked and
+    // dropped). Once the read that finds the body's end has read them, *trailers holds them (what it held before is
+    // cleared then), before call_at_end()'s callback is called: but those that can't be trailers (see
+    // trailer_allowed()), which are dropped. A trailer section that fails leaves it empty. trailers must outlive the
+    // reads.
+    void keep_trailers(headers* trailers) noexcept { kept = trailers; }
+
     // call_at_start sets what's awaited before the first read into a non-empty span reads anything (see
     // io::start_callback).
     void call_at_start(io::start_callback callback) noexcept { at_start = callback; }
@@ -60,8 +70,9 @@ private:
     std::unique_ptr<io::buffered_reader> owned           = nullptr;
     io::buffered_reader*                 parent          = nullptr;
     std::size_t                          chunk_remaining = 0;
-    bool                                 after_chunk     = false; // a chunk was read, but not the CRLF after it
-    bool                                 done            = false; // the last chunk and trailers have been read
+    bool                                 after_chunk     = false;   // a chunk was read, but not the CRLF after it
+    bool                                 done            = false;   // the last chunk and trailers have been read
+    headers*                             kept            = nullptr; // where trailers go, if anywhere
     io::end_callback                     at_end;
     io::start_callback                   at_start;
 };

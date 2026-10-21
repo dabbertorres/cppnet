@@ -1,6 +1,7 @@
 #include "http/headers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstddef>
@@ -381,6 +382,41 @@ bool valid_fields(const headers& fields) noexcept
         fields,
         [](const auto& field)
         { return is_valid_field_name(field.first) && std::ranges::all_of(field.second, is_valid_field_value); });
+}
+
+bool trailer_allowed(std::string_view name) noexcept
+{
+    // Go's httpguts.ValidTrailerHeader's list (as of October 2026).
+    constexpr std::array disallowed{
+        "Authorization"sv,
+        "Cache-Control"sv,
+        "Connection"sv,
+        "Content-Encoding"sv,
+        "Content-Length"sv,
+        "Content-Range"sv,
+        "Content-Type"sv,
+        "Expect"sv,
+        "Host"sv,
+        "Keep-Alive"sv,
+        "Max-Forwards"sv,
+        "Pragma"sv,
+        "Proxy-Authenticate"sv,
+        "Proxy-Authorization"sv,
+        "Proxy-Connection"sv,
+        "Range"sv,
+        "Realm"sv,
+        "Te"sv,
+        "Trailer"sv,
+        "Transfer-Encoding"sv,
+        "Www-Authenticate"sv,
+    };
+
+    using net::util::to_lower_ascii;
+    if (name.size() >= 3 && to_lower_ascii(name[0]) == 'i' && to_lower_ascii(name[1]) == 'f' && name[2] == '-')
+        return false;
+
+    return std::ranges::none_of(disallowed,
+                                [name](std::string_view other) { return net::util::equal_ignore_case(name, other); });
 }
 
 // NOLINTNEXTLINE(bugprone-exception-escape): substr's positions are in range.

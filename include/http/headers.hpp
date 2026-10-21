@@ -162,6 +162,12 @@ private:
 // changing what's around them (e.g. a value with a line break, which would start another field).
 [[nodiscard]] bool valid_fields(const headers& fields) noexcept;
 
+// trailer_allowed is whether a field may be sent, or is kept when received, as a trailer (RFC 9110, section 6.5): not
+// one that RFC 9110 (section 6.5.1) rules out, as Go's ValidTrailerHeader decides: framing, routing, authentication,
+// request modifiers, response controls and content format (e.g. Content-Length, Host, Authorization, Cache-Control,
+// Content-Type, Trailer, and every If-* field). Names are compared ignoring case.
+[[nodiscard]] bool trailer_allowed(std::string_view name) noexcept;
+
 // parse_field_line splits a field line ("name: value") into its name and value, without the whitespace around the
 // value. It fails if the line is malformed, including obsolete line folding (a line starting with whitespace).
 [[nodiscard]] std::optional<std::pair<std::string_view, std::string_view>>

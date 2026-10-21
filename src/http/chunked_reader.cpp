@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <expected>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include "coro/task.hpp"
 #include "http/headers.hpp"
+#include "http/http11.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/util.hpp"
@@ -123,19 +125,45 @@ coro::task<std::error_code> chunked_reader::read_chunk_size()
 
 coro::task<std::error_code> chunked_reader::read_trailers()
 {
+    if (kept != nullptr) kept->clear();
+
+    // a section that fails leaves no part of itself.
+    auto failed = [this](std::error_code err)
+    {
+        if (kept != nullptr) kept->clear();
+        return err;
+    };
+
     std::size_t remaining = max_trailers;
 
-    while (true)
+    for (std::size_t count = 0;; ++count)
     {
         auto read = co_await io::read_terminated_line(parent, remaining);
-        if (!read.has_value()) co_return truncated(read.error());
+        if (!read.has_value()) co_return failed(truncated(read.error()));
         const auto& line = read.value();
         remaining -= line.size() + 2;
 
         if (line.empty()) co_return std::error_code{};
 
-        // trailers aren't kept, but must be well-formed.
-        if (!parse_field_line(line).has_value()) co_return malformed();
+        // as a head's field lines are limited (see http11::max_fields), whether they're kept or not, so a body decodes
+        // the same either way.
+        if (count == max_fields) co_return failed(std::make_error_code(std::errc::value_too_large));
+
+        auto field = parse_field_line(line);
+        if (!field.has_value()) co_return failed(malformed());
+
+        // fields that can't be trailers are dropped, rather than failing the body (and are never taken for the
+        // header's, e.g. a Content-Length).
+        if (kept == nullptr || !trailer_allowed(field->first)) continue;
+
+        try
+        {
+            kept->add(field->first, field->second);
+        }
+        catch (const std::bad_alloc&)
+        {
+            co_return failed(std::make_error_code(std::errc::not_enough_memory));
+        }
     }
 }
 
