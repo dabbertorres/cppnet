@@ -543,6 +543,52 @@ TEST_CASE("an HTTP/2 response's trailers follow its data when it contends", "[ht
                     }));
 }
 
+TEST_CASE("HTTP/2 responses with a Content-Length end with their last DATA frame when they contend",
+          "[http][http2][server][scheduler][end-stream]")
+{
+    net::io::scheduler sched{make_pool()};
+    outcomes           o{&sched};
+    test_server        server{&sched, &o};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            // framed by the writer, in turns: each one's last frame ends its stream
+                                            // (docs/plans/http2.md, stage 6's first part), with no empty DATA frame
+                                            // after it; one of a frame and a half too.
+                                            const std::array responses{
+                                                response{.name = "a",   .size = 3 * frame, .priority = "u=3, i"},
+                                                response{.name = "b",   .size = 2 * frame, .priority = "u=3, i"},
+                                                response{.name = "c", .size = frame + 100, .priority = "u=3, i"},
+                                            };
+                                            held       h{c};
+                                            const bool queued = co_await h.start(responses);
+                                            REQUIRE(queued);
+                                            bool ok = co_await h.give((6 * frame) + 100);
+                                            REQUIRE(ok);
+                                            ok = co_await h.finish();
+                                            REQUIRE(ok);
+
+                                            // (in rounds, in the order they queued in, until each has sent its frames.)
+                                            const auto order = h.frames("ABC");
+                                            CAPTURE(order);
+                                            CHECK(order.size() == 7);
+
+                                            const std::array<std::size_t, 3> last{frame, frame, 100};
+                                            const std::array<int, 3>         frames{3, 2, 2};
+                                            for (std::size_t i = 0; i < h.ids.size(); ++i)
+                                            {
+                                                const auto& r = c.responses[h.ids[i]];
+                                                CAPTURE(i);
+                                                CHECK_FALSE(r.reset);
+                                                CHECK(r.body.size() == responses.at(i).size);
+                                                CHECK(r.data_frames == frames.at(i));
+                                                CHECK(r.ended_by_data == last.at(i));
+                                            }
+                                        }));
+}
+
 TEST_CASE("an HTTP/2 response waiting in the scheduler times out if it can't be sent",
           "[http][http2][server][scheduler][timeouts]")
 {
@@ -735,7 +781,8 @@ TEST_CASE("an HTTP/2 response alone goes out as before: whole frames, without wa
 
             const auto& r = c.responses[id];
             CHECK(r.body.size() == size);
-            CHECK(r.data_frames == (size / frame) + 1); // and the empty one ending the stream
+            CHECK(r.data_frames == size / frame); // the last ending the stream (none empty after it)
+            CHECK(r.ended_by_data == frame);
             CHECK(c.data_log.size() == size / frame);
             CHECK(std::ranges::all_of(c.data_log, [](const auto& f) { return f.second == frame; }));
         }(&sched, server.port()));

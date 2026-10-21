@@ -143,8 +143,21 @@ struct served
                   resp.trailers().set("Content-Type", "text/plain");
               });
 
-        // a body with a Content-Length, then trailers: only HTTP/2 sends them.
+        // a body with a Content-Length, then trailers, declared (Trailer) before its head's sent: only HTTP/2 sends
+        // them.
         r.GET("/length",
+              [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+              {
+                  resp.headers().set("Trailer", "Server-Timing, Grpc-Status");
+                  auto* body = co_await resp.send(http::status::OK, 5);
+                  co_await net::io::write_all(*body, "hello"sv);
+                  resp.trailers().set("Server-Timing", "db;dur=53");
+                  resp.trailers().set("Grpc-Status", "0");
+              });
+
+        // a body with a Content-Length, then trailers not declared: dropped over HTTP/2 too, as its last DATA ends
+        // the stream.
+        r.GET("/undeclared",
               [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
               {
                   auto* body = co_await resp.send(http::status::OK, 5);
@@ -357,7 +370,8 @@ TEST_CASE("a response's trailers are the client's once its body's been read to i
     {
         std::string_view path;
         bool             http2;
-        bool             has_trailers; // a chunked body has them over HTTP/1.1; any over HTTP/2
+        bool             has_trailers; // a chunked body has them over HTTP/1.1; over HTTP/2, any whose last DATA
+                                       // doesn't end the stream
         std::string_view body;
     };
 
@@ -365,6 +379,8 @@ TEST_CASE("a response's trailers are the client's once its body's been read to i
                              test_case{.path = "/chunked", .http2 = true, .has_trailers = true, .body = "hello"},
                              test_case{.path = "/length", .http2 = false, .has_trailers = false, .body = "hello"},
                              test_case{.path = "/length", .http2 = true, .has_trailers = true, .body = "hello"},
+                             test_case{.path = "/undeclared", .http2 = false, .has_trailers = false, .body = "hello"},
+                             test_case{.path = "/undeclared", .http2 = true, .has_trailers = false, .body = "hello"},
                              test_case{.path = "/empty", .http2 = false, .has_trailers = false, .body = ""},
                              test_case{.path = "/empty", .http2 = true, .has_trailers = true, .body = ""});
     CAPTURE(tc.path, tc.http2);

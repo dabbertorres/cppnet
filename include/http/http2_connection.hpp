@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -173,6 +174,12 @@ public:
     bool            ended = false; // this side has sent END_STREAM
     std::error_code failure;       // reset, timed out, or the connection ended (see fail_stream())
 
+    // What's left to send of a body whose length is known, if its last DATA frame ends the stream (docs/plans/http2.md,
+    // stage 6's first part): set as the head's sent (a response's Content-Length, or a request's), unless trailers are
+    // to follow. The frame that brings it to 0 carries END_STREAM, and the stream's then ended. None: something else
+    // ends it (the head, trailers, or an empty DATA frame).
+    std::optional<std::size_t> data_left;
+
     // The stop source of the stream's handler's token (server_request::stop): the server's streams have one, the
     // client's none. It's stopped when the stream fails, once the lock's released (see fail_stream()).
     std::stop_source stop{std::nostopstate};
@@ -282,6 +289,8 @@ public:
     // rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
     // stream's end (an empty DATA, or trailers) still follows its data, and only max_ahead of DATA (and what's in the
     // socket's buffers) is past reordering.
+    //
+    // Either way, a body of known length ends with its last DATA frame (see http2_stream_base::data_left).
     write_step step_write(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
 
     // wake_writer tells the writer there's output, if there is: called without the lock.
@@ -293,6 +302,9 @@ public:
 
     // output_drained is notified as the writer writes.
     coro::notifier& output_drained() noexcept { return drained; }
+
+    // get_logger is the connection's logger (e.g. for what its streams' heads and ends drop).
+    [[nodiscard]] spdlog::logger& get_logger() const noexcept { return logger; }
 
     // fail_stream fails s with err, unless it has failed already (holding the lock), queuing its stop source (if it
     // has one) for stop_pending() to stop. Waking its waits is the caller's.
@@ -386,6 +398,11 @@ private:
     std::error_code submit_at_once(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
     void            queue_rest(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
     std::error_code submit_windowed(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
+
+    // submit_body submits data of a stream's body to the session (as far as the windows allow; see
+    // http2::session::submit_data()), with END_STREAM if it's the last of a body of known length (see
+    // http2_stream_base::data_left), marking the stream ended once that's all gone (holding the lock).
+    std::expected<std::size_t, std::error_code> submit_body(http2_stream_base& s, std::span<const std::byte> data);
 
     // take_output is the writer's turn with the lock, after it's written (wrote) or been woken: fill() (if the
     // connection schedules), then the session's output into out, and the stop sources to stop into stopping. It returns

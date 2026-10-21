@@ -178,11 +178,12 @@ protected:
     void                                 maybe_end() override;
 
 private:
-    // open opens a stream for request, sending its head (and ending the stream there, if end_stream), holding the
-    // lock: unless its stop was requested (failing with std::errc::operation_canceled). Either way, it takes the
-    // stream reserved for it, if there was one.
-    std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request& request,
-                                                                              bool                  end_stream);
+    // open opens a stream for request, sending its head, holding the lock: unless its stop was requested (failing
+    // with std::errc::operation_canceled). Either way, it takes the stream reserved for it, if there was one.
+    // ends_after is how much DATA ends the stream, if that's known (no trailers follow): 0 ends it with the head, more
+    // with the body's last DATA frame (see http2_stream_base::data_left); none leaves it to end_request().
+    std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request&      request,
+                                                                              std::optional<std::size_t> ends_after);
 
     // body_result is what sending a request's body came to: why it stopped short, if it did; and whether that's the
     // body's fault (it failed, or was shorter than its Content-Length), rather than the stream's.
@@ -198,9 +199,9 @@ private:
     send_body(client_request& request, http2_client_stream& stream, std::optional<std::size_t> length);
 
     // end_request ends the request on the stream, once its body's been sent: with make_trailers' fields, if it's set
-    // and leaves any, otherwise an empty DATA frame (unless the stream's ended, or failed). It fails with
-    // std::errc::invalid_argument, sending nothing, if a trailer can't be sent (see append_fields()); whatever
-    // make_trailers throws comes out of it.
+    // and leaves any, otherwise an empty DATA frame (unless the stream's ended, e.g. with the body's last DATA, or
+    // failed). It fails with std::errc::invalid_argument, sending nothing, if a trailer can't be sent (see
+    // append_fields()); whatever make_trailers throws comes out of it.
     std::error_code end_request(const client_request& request, http2_client_stream& stream);
 
     // abandon resets a stream whose request can't be finished, so the server doesn't take what it has as all of it.

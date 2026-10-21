@@ -11,6 +11,7 @@
 #include <format>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -2108,4 +2109,95 @@ TEST_CASE("a server's SETTINGS_HEADER_TABLE_SIZE lowered then raised: the client
     };
 
     sched.run_to_completion(test(&sched, &outcomes));
+}
+
+TEST_CASE("an HTTP/2 request's body of known length ends with its last DATA frame, unless trailers follow",
+          "[http][http2][client][end-stream]")
+{
+    enum class body_kind : std::uint8_t
+    {
+        length,  // with a Content-Length
+        unknown, // without one
+        none,    // no body
+    };
+
+    struct test_case
+    {
+        std::string_view           name;
+        body_kind                  kind;
+        std::size_t                size;
+        bool                       trailers;
+        int                        frames;        // DATA frames, empty ones too
+        std::optional<std::size_t> ended_by_data; // the DATA frame that ended the stream, if one did: its length
+        bool                       head_ended = false;
+    };
+
+    // (the client reads a body 16 KiB at a time, and sends what it reads as a frame of at most 16384 bytes.)
+    const auto tc = GENERATE(test_case{.name          = "a Content-Length",
+                                       .kind          = body_kind::length,
+                                       .size          = 5,
+                                       .trailers      = false,
+                                       .frames        = 1,
+                                       .ended_by_data = 5},
+                             test_case{.name          = "a Content-Length of several frames",
+                                       .kind          = body_kind::length,
+                                       .size          = 40'000,
+                                       .trailers      = false,
+                                       .frames        = 3,
+                                       .ended_by_data = 40'000 - (2 * 16'384)},
+                             test_case{.name          = "a Content-Length and make_trailers",
+                                       .kind          = body_kind::length,
+                                       .size          = 5,
+                                       .trailers      = true,
+                                       .frames        = 1,
+                                       .ended_by_data = std::nullopt},
+                             test_case{.name          = "an unknown length",
+                                       .kind          = body_kind::unknown,
+                                       .size          = 5,
+                                       .trailers      = false,
+                                       .frames        = 2,
+                                       .ended_by_data = 0},
+                             test_case{.name          = "a Content-Length of 0",
+                                       .kind          = body_kind::length,
+                                       .size          = 0,
+                                       .trailers      = false,
+                                       .frames        = 0,
+                                       .ended_by_data = std::nullopt,
+                                       .head_ended    = true},
+                             test_case{.name          = "make_trailers without a body",
+                                       .kind          = body_kind::none,
+                                       .size          = 0,
+                                       .trailers      = true,
+                                       .frames        = 0,
+                                       .ended_by_data = std::nullopt});
+    CAPTURE(tc.name);
+
+    outcome            out; // (before the scheduler, which waits for the request)
+    net::io::scheduler sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, outcome* out, test_case tc) -> task<>
+    {
+        auto            fake = co_await connect_fake(sched, {.io_timeout = 3s});
+        test::h2_client server{&fake.socket, &fake.socket, &fake.socket, http2::role::server};
+
+        http::client_request req{.method = http::request_method::POST,
+                                 .uri    = net::url::parse("http://example.com/upload").value()};
+        const std::string    body(tc.size, 'x');
+        if (tc.kind == body_kind::length) req.set_body(body);
+        else if (tc.kind == body_kind::unknown) req.body = std::make_unique<net::io::owned_string_reader>(body);
+        if (tc.trailers) req.make_trailers = [](http::trailer_fields& t) { t.set("X-Checksum", "abc"); };
+
+        const bool exchanged = co_await exchange(sched, fake, server, std::move(req), 1, out);
+        REQUIRE(exchanged);
+
+        const auto& r = server.responses[1];
+        CHECK(r.body == body);
+        CHECK(r.head_ended == tc.head_ended);
+        CHECK(r.data_frames == tc.frames);
+        CHECK(r.ended_by_data == tc.ended_by_data);
+        CHECK(test::trailer(r, "x-checksum") == (tc.trailers ? "abc" : "(none)"));
+        fake.conn->close();
+    };
+
+    sched.run_to_completion(test(&sched, &out, tc));
 }

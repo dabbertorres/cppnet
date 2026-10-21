@@ -111,13 +111,34 @@ http::router make_router(net::io::scheduler* sched)
               set_trailers(resp);
           });
 
-    // a body with a Content-Length, then trailers: dropped over HTTP/1.1.
+    // a body with a Content-Length, then trailers: dropped over HTTP/1.1, and over HTTP/2 too, as they weren't
+    // declared when the head was sent (the last DATA ends the stream).
     r.GET("/length",
           [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
           {
               auto* body = co_await resp.send(http::status::OK, 5);
               co_await net::io::write_all(*body, "hello"sv);
               set_trailers(resp);
+          });
+
+    // a body with a Content-Length, its trailers declared (Trailer) before its head's sent, then set: sent over
+    // HTTP/2.
+    r.GET("/length-declared",
+          [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              resp.headers().set("Trailer", "Server-Timing, Grpc-Status");
+              auto* body = co_await resp.send(http::status::OK, 5);
+              co_await net::io::write_all(*body, "hello"sv);
+              set_trailers(resp);
+          });
+
+    // a body with a Content-Length, its trailers set before its head's sent: sent over HTTP/2.
+    r.GET("/length-early",
+          [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              set_trailers(resp);
+              auto* body = co_await resp.send(http::status::OK, 5);
+              co_await net::io::write_all(*body, "hello"sv);
           });
 
     // trailers, but no body.
@@ -157,12 +178,14 @@ http::router make_router(net::io::scheduler* sched)
     return r;
 }
 
-// served_by is middleware that adds a trailer once the rest of the chain has answered.
+// served_by is middleware that adds a trailer once the rest of the chain has answered: declared first (Trailer), so
+// that over HTTP/2 a response with a Content-Length doesn't end with its last DATA, before it's set.
 struct served_by
 {
     template<class Next>
     task<void> operator()(http::server_request& req, http::response_writer& resp, Next& next) const
     {
+        resp.headers().add("Trailer", "X-Served-By");
         co_await next(req, resp);
         resp.trailers().set("X-Served-By", "middleware");
     }
@@ -419,13 +442,15 @@ TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[h
                                         [](h2_client& c) -> task<>
                                         {
                                             const auto chunked  = c.request("GET", "/chunked");
-                                            const auto length   = c.request("GET", "/length");
+                                            const auto length   = c.request("GET", "/length-declared");
                                             const auto empty    = c.request("GET", "/empty");
                                             const auto declared = c.request("GET", "/declared");
                                             const auto head     = c.request("HEAD", "/chunked");
                                             const auto invalid  = c.request("GET", "/invalid");
                                             const auto thrown   = c.request("GET", "/throw");
-                                            const bool finished = co_await c.pump([&] { return c.finished == 7; });
+                                            const auto early    = c.request("GET", "/length-early");
+                                            const auto late     = c.request("GET", "/length");
+                                            const bool finished = co_await c.pump([&] { return c.finished == 9; });
                                             REQUIRE(finished);
 
                                             const std::vector<std::pair<std::string, std::string>> expected{
@@ -439,11 +464,27 @@ TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[h
                                             CHECK(r1.body == "hello");
                                             CHECK(r1.trailers == expected);
 
-                                            // after a body with a Content-Length.
+                                            // after a body with a Content-Length, declared before its head (so its
+                                            // last DATA doesn't end the stream)...
                                             const auto& r2 = c.responses[length];
                                             CHECK(header(r2, "content-length") == "5");
                                             CHECK(r2.body == "hello");
+                                            CHECK_FALSE(r2.ended_by_data.has_value());
                                             CHECK(r2.trailers == expected);
+
+                                            // ...or set before it.
+                                            const auto& r8 = c.responses[early];
+                                            CHECK(r8.body == "hello");
+                                            CHECK_FALSE(r8.ended_by_data.has_value());
+                                            CHECK(r8.trailers == expected);
+
+                                            // set after its head, undeclared: dropped, as its last DATA ended the
+                                            // stream (Decided question 26 of stage 6).
+                                            const auto& r9 = c.responses[late];
+                                            CHECK(r9.body == "hello");
+                                            CHECK(r9.ended_by_data == 5U);
+                                            CHECK(r9.data_frames == 1);
+                                            CHECK(r9.trailers.empty());
 
                                             // straight after a head without a body.
                                             const auto& r3 = c.responses[empty];

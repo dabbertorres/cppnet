@@ -250,7 +250,7 @@ namespace
     };
 
     coro::task<std::expected<io::writer*, std::error_code>>
-    http2_send_head(http2_stream& stream, const server_response& resp, bool end_stream)
+    http2_send_head(http2_stream& stream, const server_response& resp, std::optional<std::size_t> body_length)
     {
         auto& c = *stream.conn;
         {
@@ -272,11 +272,12 @@ namespace
                 }
             }
 
-            // a response to HEAD has no body (nor trailers), whatever its head says; one without a body is followed
-            // by its trailers, if it has any (or declares them), which end the stream instead.
+            // a response to HEAD has no body (nor trailers), whatever its head says. One without a body ends with its
+            // head, and one with a Content-Length with its last DATA, unless it has trailers (or declares them) by
+            // now, which end the stream instead (Decided question 26 of stage 6): ones set later are dropped.
+            const bool final    = !status_is_information(resp.status_code);
             const bool trailing = !resp.trailers.empty() || resp.headers.get_all("Trailer"sv).has_value();
-            const bool end =
-                (end_stream && !trailing) || (stream.head_request && !status_is_information(resp.status_code));
+            const bool end      = final && (stream.head_request || (body_length == std::size_t{0} && !trailing));
 
             stream.status_text = std::to_string(static_cast<int>(resp.status_code));
             stream.fields.clear();
@@ -288,6 +289,7 @@ namespace
                 return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(err));
 
             if (end) stream.ended = true;
+            else if (final && !trailing) stream.data_left = body_length;
         }
 
         c.wake_writer();
@@ -301,6 +303,13 @@ namespace
         {
             std::scoped_lock lock{c.mu};
             if (stream.failure) return coro::ready_task<io::result>(io::result{.err = stream.failure});
+
+            // the stream ended with its head or its last DATA, as none were set nor declared by then: those set since
+            // can't be sent.
+            if (stream.ended && !stream.resp.trailers.empty() && !stream.head_request)
+                c.get_logger().debug(
+                    "dropped the trailers set after the head of HTTP/2 stream {}, which ended without them",
+                    stream.id);
 
             if (!stream.ended)
             {

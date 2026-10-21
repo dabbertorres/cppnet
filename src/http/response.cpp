@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -140,12 +141,12 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
 
     if (const auto* h2 = std::get_if<http2_backend>(&backend))
     {
-        // HTTP/2 frames the body itself: with its length, if it's known; ended by finish() otherwise, or with the head
-        // if there's none.
+        // HTTP/2 frames the body itself: with its length, if it's known, ending with its last DATA (or with the head,
+        // if there's none); ended by finish() otherwise.
         if (how == framing::length && has_content) resp->headers.set_content_length(body_length);
-        const bool end = how == framing::length && body_length == 0 && !interim;
+        const auto length = how == framing::length && !interim ? std::optional{body_length} : std::nullopt;
 
-        auto sending = h2->ops->send_head(*h2->stream, *resp, end);
+        auto sending = h2->ops->send_head(*h2->stream, *resp, length);
         if (sending.finished_without_coroutine())
             return coro::ready_task<io::writer*>(take_encoding(std::move(sending).result(), how, body_length));
         return finish_send(std::move(sending), how, body_length);
@@ -266,7 +267,7 @@ coro::task<std::error_code> response_writer::send_continue()
 
     if (const auto* h2 = std::get_if<http2_backend>(&backend))
     {
-        auto sent = co_await h2->ops->send_head(*h2->stream, head, false);
+        auto sent = co_await h2->ops->send_head(*h2->stream, head, std::nullopt);
         co_return sent.has_value() ? std::error_code{} : sent.error();
     }
 

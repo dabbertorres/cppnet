@@ -221,13 +221,18 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     const auto length   = request.body != nullptr ? request.headers.get_content_length() : std::nullopt;
     const bool has_body = request.body != nullptr && (!length.has_value() || *length > 0);
 
-    // trailers follow the body, or the head, if there's none (which then doesn't end the stream).
-    const bool trailing = static_cast<bool>(request.make_trailers);
+    // trailers follow the body, or the head, if there's none (which then doesn't end the stream). Without them, the
+    // head ends the stream if there's no body, and the body's last DATA if its length is known; end_request() does
+    // otherwise.
+    const bool                 trailing = static_cast<bool>(request.make_trailers);
+    std::optional<std::size_t> ends_after;
+    if (!trailing && !has_body) ends_after = 0;
+    else if (!trailing) ends_after = length;
 
     std::shared_ptr<http2_client_stream> stream;
     {
         std::unique_lock lock{mu};
-        auto             opened = open(request, !has_body && !trailing);
+        auto             opened = open(request, ends_after);
         if (!opened.has_value())
         {
             // nothing was sent, nor the body read: a refused request may be sent again (on another connection),
@@ -286,7 +291,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
 }
 
 std::expected<std::shared_ptr<http2_client_stream>, std::error_code>
-http2_client_connection::open(const client_request& request, bool end_stream)
+http2_client_connection::open(const client_request& request, std::optional<std::size_t> ends_after)
 {
     // the stream reserved for it (if it was), whether or not it can be opened.
     if (reserved > 0) --reserved;
@@ -316,6 +321,8 @@ http2_client_connection::open(const client_request& request, bool end_stream)
     if (!id.has_value()) return std::unexpected(id.error());
     stream->id = *id;
 
+    const bool end_stream = ends_after == std::size_t{0};
+
     if (auto err = session.submit_headers(*id, fields, end_stream))
     {
         session.reset(*id, http2::error_code::internal_error);
@@ -323,6 +330,7 @@ http2_client_connection::open(const client_request& request, bool end_stream)
     }
 
     stream->ended = end_stream;
+    if (!end_stream) stream->data_left = ends_after;
     streams.emplace(*id, stream);
     add_stream(*stream);
     idle_from.reset();
@@ -402,6 +410,7 @@ std::error_code http2_client_connection::end_request(const client_request& reque
     trailer_fields trailers;
     if (request.make_trailers) request.make_trailers(trailers);
 
+    // NOTE: a body of known length without trailers has ended the stream with its last DATA (see open()).
     std::scoped_lock lock{mu};
     if (stream.failure || stream.ended) return {};
 

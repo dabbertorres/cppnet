@@ -59,7 +59,8 @@ struct h2_client final : http2::session_events
         std::string                                      body;
         int                                              data_frames = 0;     // DATA frames, empty ones too
         bool                                             head_ended  = false; // the head ended the stream
-        bool                                             done        = false;
+        std::optional<std::size_t>                       ended_by_data; // the DATA frame that ended it: its length
+        bool                                             done = false;
         std::error_code                                  reset;
         int                                              order = 0; // when it was done
 
@@ -148,7 +149,11 @@ struct h2_client final : http2::session_events
         r.body.append(reinterpret_cast<const char*>(data.data()), data.size());
         if (!data.empty()) data_log.emplace_back(id, data.size());
         if (!hold_windows) s.consume(id, data.size());
-        if (end) done(r);
+        if (end)
+        {
+            r.ended_by_data = data.size();
+            done(r);
+        }
     }
 
     void on_stream_reset(http2::stream_id id, std::error_code err) override

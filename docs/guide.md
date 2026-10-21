@@ -542,7 +542,8 @@ scheduler.spawn(server.serve());
   `net::http::trailer_fields`: a `headers` holding 2 fields in itself rather than 8, as there are few), kept apart from
   `req.headers`, there once the handler has read the body to its end, and empty until then: a chunked body's trailer
   section over HTTP/1.1, the HEADERS frame after the body over HTTP/2. A response's are `resp.trailers()`, sent when the
-  response ends, once the handler has returned (so middleware may add to them after `next()`):
+  response ends, once the handler has returned (so middleware may add to them after `next()`, declaring them first:
+  see below):
 
   ```cpp
   auto* body = co_await resp.send(net::http::status::OK);   // no Content-Length: chunked, over HTTP/1.1
@@ -553,8 +554,18 @@ scheduler.spawn(server.serve());
   Over HTTP/1.1 only a chunked body has trailers (in its last chunk), so they're sent only for a body sent with
   `send(status)` to an HTTP/1.1 client, and dropped otherwise: after a body with a Content-Length, to an HTTP/1.0
   client, and for HEAD. A handler with trailers to send uses `send(status)`. Over HTTP/2 they're sent whatever the
-  body: a response without one is followed by them, if they're set (or a `Trailer` field declares them) by the time
-  its head is sent. Either way, they're sent whatever the request's `TE`. `net::http::trailer_allowed(name)` is
+  body, but a response with a Content-Length (or without a body) ends with its last DATA frame (or its head), so they
+  must be set, or declared by a `Trailer` field, by the time its head is sent: then they follow the body; set later,
+  undeclared, they're dropped. So middleware that adds trailers after `next()` declares them before calling it:
+
+  ```cpp
+  resp.headers().add("Trailer", "Server-Timing");            // before the head's sent
+  co_await next(req, resp);
+  resp.trailers().set("Server-Timing", timing);              // sent after the body, with or without a Content-Length
+  ```
+
+  A response sent with `send(status)` ends once the handler has returned, so its trailers may be set until then.
+  Either way, they're sent whatever the request's `TE`. `net::http::trailer_allowed(name)` is
   whether a field may be a trailer: not one for framing, routing, authentication, request modifiers, response
   controls or the content's format (e.g. `Content-Length`, `Host`, `Authorization`, `Cache-Control`, `Content-Type`,
   `If-*`, `Trailer`), which are dropped, received or sent. A trailer whose name or value can't be sent (e.g. a value

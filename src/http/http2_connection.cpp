@@ -334,7 +334,7 @@ http2_connection_base::submit_at_once(http2_stream_base& s, std::span<const std:
     {
         const auto rest  = data.subspan(state.written);
         const auto chunk = rest.first(std::min(rest.size(), frame));
-        const auto sent  = session.submit_data(s.id, chunk, false);
+        const auto sent  = submit_body(s, chunk);
         if (!sent.has_value())
         {
             fail_stream(s, sent.error());
@@ -361,7 +361,7 @@ void http2_connection_base::queue_rest(http2_stream_base& s, std::span<const std
 std::error_code
 http2_connection_base::submit_windowed(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
 {
-    const auto sent = session.submit_data(s.id, data.subspan(state.written), false);
+    const auto sent = submit_body(s, data.subspan(state.written));
     if (!sent.has_value())
     {
         fail_stream(s, sent.error());
@@ -372,6 +372,20 @@ http2_connection_base::submit_windowed(http2_stream_base& s, std::span<const std
     if (*sent > 0) s.write_deadline.reset();
     if (state.written < data.size()) arm_deadline(s.write_deadline, s.write_timeout);
     return {};
+}
+
+std::expected<std::size_t, std::error_code> http2_connection_base::submit_body(http2_stream_base&         s,
+                                                                               std::span<const std::byte> data)
+{
+    // the last of a body of known length ends the stream (if all of it goes: the session ends it only then), rather
+    // than an empty DATA frame after it. (Its writer, a limit_writer, never gives more than what's left.)
+    const bool last = s.data_left.has_value() && *s.data_left == data.size();
+    const auto sent = session.submit_data(s.id, data, last);
+    if (!sent.has_value()) return sent;
+
+    if (s.data_left.has_value()) *s.data_left -= std::min(*sent, *s.data_left);
+    if (last && *sent == data.size()) s.ended = true;
+    return sent;
 }
 
 io::handle stream_writer::native_handle() const noexcept { return stream->conn->native_handle(); }
@@ -835,7 +849,7 @@ void http2_connection_base::fill()
         auto&      s     = static_cast<http2_stream_base&>(*n);
         const auto rest  = s.sending.subspan(s.sending_done);
         const auto chunk = rest.first(std::min(rest.size(), frame));
-        const auto sent  = session.submit_data(s.id, chunk, false);
+        const auto sent  = submit_body(s, chunk);
         if (!sent.has_value())
         {
             // (it's taken out of the scheduler.)
@@ -861,8 +875,9 @@ void http2_connection_base::fill()
             // it's framed at once, would be back sooner. So the round ends here, and the turn's held, for hold_turn
             // at most, so a handler that's slower (e.g. reading what it sends from elsewhere) doesn't hold the
             // connection up for long. (Without it, a handler writing a frame at a time got about half the connection
-            // when it was more urgent than all the others: learned in stage 5's tenth part.)
-            if (hold_turn_of(s)) break;
+            // when it was more urgent than all the others: learned in stage 5's tenth part.) A stream whose last DATA
+            // this was has nothing more to write.
+            if (!s.ended && hold_turn_of(s)) break;
         }
         else
         {

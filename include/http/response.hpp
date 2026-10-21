@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -307,10 +308,14 @@ namespace detail
     // response_writer doesn't depend on HTTP/2's server (as it doesn't on HTTP/1.1's encoder).
     struct http2_stream_ops
     {
-        // send_head sends a response's head (ending the stream, if end_stream), returning the writer for its body.
-        coro::task<response_encoder_result> (*send_head)(http2_stream&          stream,
-                                                         const server_response& resp,
-                                                         bool                   end_stream);
+        // send_head sends a response's head, returning the writer for its body. body_length is the body's length,
+        // if the head gives it (its Content-Length, or 0 for a status without content): the stream ends with the head
+        // if it's 0, and with the body's last DATA frame otherwise, unless trailers (or a Trailer field) are set by
+        // then, which end it instead (docs/plans/http2.md, Decided question 26). None for a body of unknown length,
+        // which finish() ends, and for an interim response.
+        coro::task<response_encoder_result> (*send_head)(http2_stream&              stream,
+                                                         const server_response&     resp,
+                                                         std::optional<std::size_t> body_length);
 
         // finish ends the stream's response, if it hasn't been.
         coro::task<io::result> (*finish)(http2_stream& stream);
@@ -340,9 +345,11 @@ public:
     // otherwise (with a Content-Length, to an HTTP/1.0 client, and for HEAD). They're sent whatever the request's TE.
     // Fields that can't be trailers are dropped (see trailer_allowed()); an invalid name or value (e.g. a line break)
     // fails finish() with std::errc::invalid_argument, and the response is cut short (the connection closed, or the
-    // stream reset), so the client doesn't take it as complete. Over HTTP/2, a response without a body ends with its
-    // head, unless trailers (or a Trailer field, which declares them, as RFC 9110 says a sender should) are set by the
-    // time it's sent: then they follow the head.
+    // stream reset), so the client doesn't take it as complete. Over HTTP/2, a response with a Content-Length (or
+    // without a body) ends with its last DATA frame (or its head), unless trailers (or a Trailer field, which declares
+    // them, as RFC 9110 says a sender should) are set by the time its head is sent: then they follow the body, and
+    // trailers set later, undeclared, are dropped. So middleware that adds trailers after the handler it wraps declares
+    // them (Trailer) before calling it. A response sent with send(status) is ended by finish(), whenever they're set.
     net::http::trailer_fields& trailers() noexcept;
 
     // send sends the response's status and headers, with a Content-Length of content_length (except for statuses

@@ -23,7 +23,8 @@ priority signals (PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES in the sess
 done. Stage 6 decided (2026-10-21): finishing HTTP/2 (TCP_NOTSENT_LOWAT on the server's connections, ending streams
 with their last DATA, 431 for a header list over the limit, `Expect: 100-continue` in the client, scheduling and
 reprioritizing the client's requests, and connection coalescing with the ORIGIN frame), in twelve pull requests (see
-"Stage 6"); its questions (at the end) all as recommended.
+"Stage 6"); its questions (at the end) all as recommended. Its first part, ending a body of known length with its last
+DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6).
 
 ## Goal
 
@@ -1220,6 +1221,69 @@ idle stream would be a connection error for the peer.
   the server's send buffer left to autotune, the u=0 response went after about 2 MiB already in it (above). Directly (no
   relay), everything's done in 20 ms, before the u=0 one starts. No h2load nor nghttp (not installed).
 
+## Learned in stage 6
+
+### Part 1: ending streams with their last DATA (done 2026-10-21)
+
+- As proposed (see "Ending a stream with its last DATA"), on both sides. `http2_stream_base::data_left` (an
+  `std::optional<std::size_t>`, 16 bytes in the base) is what's left to send of a body whose last DATA frame ends the
+  stream. Every write path submits DATA through one function, `http2_connection_base::submit_body()` (holding the
+  lock): it asks the session for END_STREAM when the data is exactly what's left, and marks the stream `ended` once
+  it's all gone (the session sets END_STREAM only on the frame that sends the last of the data, so a write cut short by
+  the windows doesn't end it). `submit_at_once()`, `fill()` and `submit_windowed()` call it; nothing else changed in
+  them. A handler can't write past what's left, as `response_writer`'s `limit_writer` (and the client's
+  `limit_reader`) cut a write to it, so `data_left` never goes below 0 (it's clamped regardless).
+- The server: `http2_stream_ops::send_head` takes the body's length, an `std::optional<std::size_t>`, in place of its
+  `bool end_stream` (from which the old flag follows: 0 ends the stream with the head): `response_writer::start()`
+  passes the Content-Length (0 for a status without content), and none for `send(status)` and interim heads (and
+  `send_continue()`'s 100). `http2_send_head()` sets `data_left` when the head is final, doesn't end the stream, and no
+  trailers nor `Trailer` field are set (Decided question 26 (a)); HEAD's head ends the stream as before.
+  `http2_finish()` then finds the stream ended and sends nothing, logging at debug if trailers were set since
+  (through `http2_connection_base::get_logger()`, new: the free function has no logger of its own).
+  `response_writer::trailers()`' comment, and the guide, say that such a response's trailers must be set or declared
+  by the time its head is sent, and show middleware declaring them before `next()`.
+- The client: `open()` takes `ends_after` (an `std::optional<std::size_t>`) in place of its `bool end_stream`: 0 ends
+  the stream with the head (no body, no `make_trailers`), more sets `data_left` (a Content-Length and no
+  `make_trailers`), none leaves the end to `end_request()` (trailers, or a body of unknown length), which returns at
+  once for a stream that's ended.
+- Not in the plan: `fill()` doesn't hold the turn of a stream its frame has just ended (part 10's hold, for a handler's
+  next write, which won't come); `turn_still_held()` would have let it go at the next round anyway, but the round would
+  have ended there. And a handler that throws (or is stopped) after writing all of its Content-Length now leaves a
+  complete response, as one without a body already did: the stream ended with its last DATA, and the reset
+  `run_stream()` then asks for does nothing if the request has ended too (the session has forgotten the stream), or is
+  an RST_STREAM after the response's END_STREAM if the request's body is still coming. That's Decided question 26 (a)'s
+  point (the response is complete as soon as its last byte is), so it's noted rather than changed; one written short
+  is reset as before.
+- Tests (no network). `test::h2_client` records the length of the DATA frame that ended a stream, if one did
+  (`response::ended_by_data`). `test/http/server_end_stream.cpp` (`[http][http2][server][end-stream]`): a response with
+  a Content-Length ends with its last DATA, written in one write, in several, cut into frames, in whole frames, and
+  writes of a frame and more (on connections of their own, so the writes go at once), and a handler that throws once
+  it's written it all (complete, not reset); one larger than its stream's window, whose rest the writer frames as the
+  window grows; one without a body and one to HEAD end with their heads, and ones sent with `send(status)` (5 bytes, and
+  none) with an empty DATA; a handler writing less than its Content-Length is reset (INTERNAL_ERROR, no frame ended the
+  stream). `test/http/server_scheduling.cpp`: three Content-Length responses contending, in rounds, each ending with its
+  last frame (one of a frame and 100 bytes). `test/http/http2_client.cpp` (`[http][http2][client][end-stream]`, against
+  `test::h2_client` as the server): a request body with a Content-Length (5 bytes, and 40000 in three frames) ends with
+  its last DATA, one with `make_trailers` with them (its DATA not ending it), one of unknown length with an empty DATA,
+  one of 0 and its head, and `make_trailers` without a body after the head. Changed: `server_trailers.cpp`'s "whatever
+  its body" test now has a Content-Length response's trailers declared (`Trailer`) before its head, or set before it,
+  and checks that ones set after, undeclared, are dropped (the last DATA ended the stream); its middleware
+  (`served_by`) declares its trailer before `next()`, as the guide now says to; `client_trailers.cpp`'s Content-Length
+  route declares its trailers, and a route that doesn't checks that HTTP/2 drops them too; and
+  `server_scheduling.cpp`'s response alone now has 64 DATA frames for its 1 MiB, not 65 (no empty one after them).
+  With `submit_body()` never asking for END_STREAM, the new tests fail (both sides', and the contended one).
+- `fuzz_http2` is unchanged, as the plan expected: the session's interface didn't change (its scripts already end
+  streams with DATA that carries END_STREAM). Its 10-second run, and the other fuzzers', pass.
+- Measured (`bench_request`, Release, eleven alternating runs of master's binary and the branch's, on a machine busy
+  with other work: a load average near 6, so the times spread widely). Bytes: the first request's response 141 bytes
+  down before, 132 after, and every later one 49 before, 40 after (21 up, unchanged: the request has no body): the 9
+  bytes of the empty DATA frame, as the plan expected. (One run's second response took 63 bytes: its `date` changed
+  second, so it went as a new literal, not an index.) Over HTTP/2, a stream at a time: 85.4 to 141.9 us a request before
+  (median 106.0), 84.9 to 190.8 after (median 107.1), and 49.3 to 49.6 allocations a request before (median 49.4), 49.1
+  to 49.4 after (median 49.3). 8 streams at once: 1372 to 1988 us a round before (median 1523), 1313 to 2731 after
+  (median 1524), and 96.2 to 98.8 allocations a response before (median 97.3), 95.9 to 98.5 after (median 96.6). So no
+  difference in time that the noise shows, and slightly fewer allocations, as a frame less goes through the writer.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2238,10 +2302,11 @@ certificate.
    priorities' three, the largest change.
 
 6. **Decided (2026-10-21), in twelve pull requests, in this order** (see "Stage 6"; each mergeable and tested alone):
-   1. **Ending streams with their last DATA.** A body of known length ends with its last DATA frame, on both sides:
-      `http2_stream_base::data_left`, set from the response's Content-Length (`http2_stream_ops::send_head` takes it)
-      and the request's; trailers set after the head of such a response dropped unless declared (Decided question 26).
-      First: small, on the wire alone (9 bytes a response), and independent of the rest.
+   1. **Ending streams with their last DATA.** Done (2026-10-21; see Learned in stage 6). A body of known length ends
+      with its last DATA frame, on both sides: `http2_stream_base::data_left`, set from the response's Content-Length
+      (`http2_stream_ops::send_head` takes it) and the request's; trailers set after the head of such a response
+      dropped unless declared (Decided question 26). First: small, on the wire alone (9 bytes a response), and
+      independent of the rest.
    2. **431 for a header list over the limit.** The session reports a request's head over MAX_HEADER_LIST_SIZE
       (`on_header_list_too_large()`) rather than resetting it, and the server answers it with `refuse()`; tests on bytes
       and with `test::h2_client`. Small, the server's only, and apart from the writer.
