@@ -32,6 +32,10 @@ add_fuzzer(
   "${PROJECT_SOURCE_DIR}/src/http/http2_session.cpp"
 )
 add_fuzzer(
+  fuzz_structured_fields structured_fields.cpp "${PROJECT_SOURCE_DIR}/src/http/priority.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/structured_fields.cpp"
+)
+add_fuzzer(
   fuzz_request_target request_target.cpp "${PROJECT_SOURCE_DIR}/src/url.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/request_target.cpp"
 )

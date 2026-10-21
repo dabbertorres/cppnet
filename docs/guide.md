@@ -707,6 +707,19 @@ scheduler.spawn(server.serve());
   place among `max_connections` until they return. A handler that throws once its response is under way has its
   stream reset, so the client doesn't take what it got as the whole response; one the server's `abort()` stopped, with
   its response incomplete, has it reset with CANCEL.
+- **Priority** (RFC 9218): a request's `Priority` field says how urgent its response is (`u`, 0 to 7, 3 by default) and
+  whether the client uses it as it arrives (`i`). `http/priority.hpp` reads and writes it: `parse_priority(value)`
+  gives a `priority` (what's missing or invalid keeping the default, or a `base` given as its second argument; what it
+  doesn't know ignored; and a value that doesn't parse taken as none), and `to_string()` makes a field's value, e.g.
+  for a bulk download's response, which the client also gets:
+
+  ```cpp
+  resp.headers().set("Priority", net::http::to_string({.urgency = 7}));   // "u=7"
+  ```
+
+  The server doesn't act on priorities yet: a later version sends HTTP/2 responses by them (the client's field, and
+  the handler's). A field sent as several lines is one value, its lines joined with commas: `req.headers.get()` gives
+  only the first.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 
@@ -837,13 +850,15 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `dns/resolver.hpp` (and `dns/config.hpp`), `ip_addr.hpp`, `url.hpp` | names, addresses and URLs  |
 | `http/client.hpp`                      | the HTTP client                                           |
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
+| `http/priority.hpp`                    | `http::priority`: reading and writing a `Priority` field (RFC 9218) |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
 | `tls/tls.hpp`                          | TLS                                                       |
 | `tls/version.hpp`, `tls/certificate.hpp` | `tls::version` and `tls::certificate` (included by `tls/tls.hpp` and `http/request.hpp`; without TLS too) |
 | `instrument/...`                       | metrics and tracing                                       |
 | `exception.hpp`                        | `gai_category()`                                          |
 
-The rest are what those are built from (e.g. `http/http11.hpp`, the HTTP/1.1 codec; and HTTP/2's, `http/hpack.hpp`
-and `http/http2*.hpp`, of which `http/server.hpp` and `http/client.hpp` include only `http/http2_config.hpp`, for their
+The rest are what those are built from (e.g. `http/http11.hpp`, the HTTP/1.1 codec; `http/structured_fields.hpp`,
+the parser of Structured Fields (RFC 9651) that `http/priority.hpp` reads with; and HTTP/2's, `http/hpack.hpp` and
+`http/http2*.hpp`, of which `http/server.hpp` and `http/client.hpp` include only `http/http2_config.hpp`, for their
 configurations). `detail` namespaces, and what the headers' comments say is for the scheduler or I/O objects (e.g.
 `thread_pool::poller`), aren't for applications.

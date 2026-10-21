@@ -15,7 +15,9 @@ done (2026-10-20; see Learned in stage 5); its second, interim responses in the 
 rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)"); its sixth, HPACK's dynamic table built
 (its storage, the encoder's table and `hpack::indexing`, with the sessions still on `none`), done (2026-10-20); and its
 seventh, HPACK's indexing on in both sides' sessions (`indexing::automatic`, the encoder held to 4096 by
-`session_config::encoder_table_size`), done (2026-10-21).
+`session_config::encoder_table_size`), done (2026-10-21); and its eighth, Structured Fields and `http::priority`
+(`http/structured_fields.hpp`, `http/priority.hpp`, `fuzz_structured_fields`; nothing uses them yet), done
+(2026-10-21).
 
 ## Goal
 
@@ -895,6 +897,91 @@ idle stream would be a connection error for the peer.
   first after Go's SETTINGS) starting with `3fe103`; with 65536, no size update.
 
 
+### Part 8: Structured Fields and `http::priority` (done 2026-10-21)
+
+- `http/structured_fields.hpp` (internal, as `hpack.hpp` is; `net::http::sf`, as RFC 9651's grammar names its rules):
+  RFC 9651's parsing (section 4.2), every bare item type, inner lists and parameters, of Items and Lists as well as
+  Dictionaries: they share everything but the keys (a Dictionary's members are a List's with a key in front), so the
+  two more entry points cost a few lines, and with them the whole httpwg suite applies (below). `parse_item(value)`
+  returns a `std::expected<sf::item, std::error_code>`; `parse_list(value, on_member(const member&))` and
+  `parse_dictionary(value, on_member(std::string_view key, const member&))` call back as each member is parsed (a
+  template over a function pointer and a context, as `hpack::decoder::decode()`), failing with `invalid_argument`
+  for the whole value. Calling back as it goes, rather than checking the whole value first and then reporting (two
+  passes), means a caller sees the members before what's malformed, and must drop what it made of them, as
+  `parse_priority()` does (it gathers into locals, and applies them only if the value parsed); documented on both.
+  A Dictionary's repeated keys are each reported: RFC 9651's ordered map replacing the earlier with the later (in the
+  earlier's place) is the caller's, which `parse_priority()` gets by taking the last.
+- Nothing's allocated. A `member` is a `std::variant<item, inner_list>`; an `item` a `bare_item` and its `parameters`;
+  a `bare_item` its type, a number and a view of its text. The number is an Integer's value, a Decimal's in
+  thousandths (exact, as a Decimal has at most 12 integer digits and 3 fractional ones, rather than a `double`), a
+  Boolean's (0 or 1) or a Date's; `integer()`, `decimal()` (a `double`), `boolean()` and `date()` give it if the type's
+  right. The text is a String's, Token's, Byte Sequence's or Display String's as the field has it, without its
+  delimiters: escapes, base64 and percent-encoding still in it, so a Token's is its value, as is a String's without a
+  backslash, and `sf::decode(item, out)` appends any of their values (a Display String's as UTF-8, a Byte Sequence's
+  bytes). `parameters` and `inner_list` are views of their text, which the parser checked as it went, and which
+  iterating reads again (`detail::view_iterator`, with the same functions the parser used; the end is
+  `std::default_sentinel_t`); `parameters::find(key)` gives the last with the key. Sizes (libc++): `bare_item` 32
+  bytes, `parameters` 16, `item` 48, `inner_list` 32, `member` 56.
+- To RFC 9651's letter: only SP at the value's ends (a tab there fails, as the suite's "leading space" test says),
+  OWS (SP or HTAB) around commas, SP within inner lists and after a `;`; keys `lcalpha / "*"` then `lcalpha / DIGIT /
+  "_" / "-" / "." / "*"`; Integers at most 15 digits, Decimals 12 and 1 to 3 (`-0` is 0); Strings and Display
+  Strings `%x20-7E` only (Display Strings' hex lowercase, and their bytes strict UTF-8: no overlong forms, surrogates,
+  or past U+10FFFF; a lead byte followed by a plain character fails); Dates Integers, over the whole syntactic range
+  (the suite's ±999,999,999,999,999 are SHOULDs we take). Byte Sequences take what the RFC says parsers SHOULD NOT
+  fail on: no padding, more than needed, and bits set past the last byte (dropped by `decode()`); but `=` only at
+  the end (the suite's MUST fails), and not a length of 4n + 1 characters, which no bytes can have (Go's base64
+  refuses it too). Every SHOULD-level case of the suite (`can_fail`, 8 of them) is accepted, to its canonical form.
+- Several lines: RFC 9651, section 4.2, has a field's lines joined with commas before parsing, which
+  `parse_priority()` documents its value as. `sf::join_lines(std::span<const std::string> lines, std::string& buffer)`
+  joins them with ", " (empty lines too: the suite's List of "1", "", "42" must fail, as an empty member), returning a
+  single line as it is (no copy: what nearly every request has) and none as "". For part 9, the server's streams:
+  `if (const auto lines = req.headers.get_all("priority")) p = parse_priority(sf::join_lines({lines->begin(),
+  lines->end()}, buffer), p);` (a `values_range`'s iterators are pointers, so the span needs no copy; `buffer` a
+  `std::string` of the connection's, used only when there are several lines).
+- `http/priority.hpp` (public): `priority`, `parse_priority(value, base = {}) noexcept` and `to_string()` as proposed.
+  Duplicates: the plan's "the last `u`, as a Dictionary does", so a Dictionary's value is its last member, and then RFC
+  9218 judges it: `u=1, u=9` leaves base's urgency (9 is out of range), and `u=9, u=1` gives 1. Go's
+  `parseRFC9218Priority` (from memory of x/net's, unverified) differs: its callback over `httpsfv.ParseDictionary`
+  sets the urgency only for a valid member, so there the last valid one wins (`u=1, u=9` gives 1); nghttp2 (from
+  memory too) ignores the whole field for an invalid `u` or `i`. Ours is what the two RFCs say read together, and
+  the difference only shows for a sender repeating a key with an invalid value. Parameters on `u` or `i` are ignored
+  (they're still an Integer or a Boolean), and so is an inner list. `to_string()` writes an urgency past 7 as it is
+  (documented: whoever reads it ignores it), rather than clamping it.
+- Tests. The httpwg's structured-field-tests (https://github.com/httpwg/structured-field-tests, commit 3c6d776; the
+  IETF Trust's BSD-3-Clause-style licence, which allows redistribution with its notice, kept in the header):
+  `tools/structured_fields/gen_tests.py` makes `test/http/structured_field_tests.hpp` from a checkout, 1587 cases
+  from every parsing file but `large-generated.json` (its values, up to 22 KB each, are made by
+  `test/http/structured_fields.cpp` instead, its 11 cases), not `serialisation-tests/` (for serializers). Each case is
+  its lines, its kind (Item, List or Dictionary), whether it must or may fail, and its canonical form if that isn't its
+  lines joined; a case a line, positional, between `clang-format off` and a `NOLINT` of the designated-initializer
+  and raw-string checks (designated and formatted it was 395 KB; this way 180 KB, NULs and controls as octal escapes,
+  string_view literals as some have NULs). The test joins the lines (`join_lines()`), parses them as their kind,
+  serializes what it gets with `test/http/sf_serializer.hpp` (RFC 9651's section 4.1, test-only: the library only
+  parses; shared with the fuzzer) and compares it with the canonical form: all 1587 pass, the 8 `can_fail` ones
+  too. Then (`[http][structured-fields]`): a Dictionary of every type, its views within the value, decoded values,
+  inner lists' items and parameters, repeated parameters and `find()`; repeated keys each reported; a failure after
+  members (seen, then the error); empty Lists, Dictionaries and inner lists; numbers at their limits (Decimals in
+  thousandths); `join_lines()` (no copy for one line, empty lines kept, a String split over two lines); and Display
+  Strings' UTF-8 (surrogates, overlong, past U+10FFFF, cut short) and Byte Sequences' lengths and padding.
+  `[http][priority]`: RFC 9218's examples, base kept for what's missing, section 8's merging (`parse_priority(response,
+  parse_priority(request))`), out-of-range and wrongly typed values (every other type, an inner list, a bare `u`),
+  repeated keys (last, then judged), unknown members and parameters, malformed values leaving base whole (an empty
+  member, a trailing comma, an uppercase key, spaces around `=`, a 16-digit Integer, an unterminated String, a leading
+  tab, a Display String that isn't UTF-8), spaces and tabs between members, lines joined, and `to_string()` for all 16
+  priorities through `parse_priority()` and back.
+- `fuzz_structured_fields` (its sources `structured_fields.cpp` and `priority.cpp`): the input parsed as an Item, a
+  List and a Dictionary, each the same twice, and what parses serialized (canonical) parsing to the same and
+  serializing the same again; `parse_priority()` over two bases ({0, false} and {7, true}) agreeing with the
+  Dictionary (each base whole for a value that doesn't parse); its results through `to_string()` and back; and the
+  priority checks again on the input with "u=1, i, " before it. That last was added after a deliberate break (an
+  invalid `u` not replacing a valid one, i.e. Go's rule) went unfound for 300 s three times without it (random bytes
+  rarely make a valid `u` then an invalid one); with it, the break was found within 2 s in each of three runs. Seeded
+  with the suite's values, 300 s (1.1 million runs) and 600 s (1.9 million) found nothing on the code before that
+  check, and 600 s (1.4 million) on the final code; the 10 s ctest run passes.
+- What part 9 needs from this: `parse_priority()` over the default for the request's lines (and over the stream's
+  for the response's, section 8's merging; over the default again for a PRIORITY_UPDATE, which carries a complete
+  set), and `join_lines()` for the lines; nothing else.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1445,9 +1532,9 @@ throughput isn't changed (by frame count and order).
    7. **HPACK's indexing, on.** Done (2026-10-21; see Learned in stage 5). The policy (Decided questions 13 and 14),
       the encoder's cap (`encoder_table_size`), the sessions indexing; `bench_request`'s bytes per request; curl and
       h2load by hand. A wire change, so its own pull request, to measure and to revert alone.
-   8. **Structured Fields and `http::priority`.** RFC 9651's Dictionary parsing, `parse_priority()`, `to_string()`,
-      `fuzz_structured_fields`. Without I/O, and nothing uses it yet: split out so the parser is reviewed (and fuzzed)
-      on its own.
+   8. **Structured Fields and `http::priority`.** Done (2026-10-21; see Learned in stage 5). RFC 9651's Dictionary
+      parsing, `parse_priority()`, `to_string()`, `fuzz_structured_fields`. Without I/O, and nothing uses it yet: split
+      out so the parser is reviewed (and fuzzed) on its own.
    9. **Priority signals.** The session's PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES, `on_priority_update`, and
       each server stream's priority (the request's field, updates, the response's field), recorded but not yet acted
       on; tests on bytes. Split from 10 as the protocol's rules are tested on bytes, apart from the writer.
