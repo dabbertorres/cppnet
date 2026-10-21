@@ -1729,7 +1729,10 @@ TEST_CASE("the system's trust store verifies a public server", "[tls][.network]"
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be
     //       required. badssl.com speaks TLS 1.2 without the Extended Master Secret extension, which mustn't be either,
     //       unless asked for.
-    const std::string host        = GENERATE("example.com", "letsencrypt.org", "badssl.com");
+    // NOTE: badssl.com is left out for now: from CI's runners it reset the connection (or timed out) about every other
+    //       run, mostly the second handshake in a row. Its expected failure below stays, for when it's brought back (or
+    //       a local server that likewise lacks the extension takes its place).
+    const std::string host        = GENERATE("example.com", "letsencrypt.org" /*, "badssl.com" */);
     const bool        require_ems = GENERATE(false, true);
     CAPTURE(host, require_ems);
 
