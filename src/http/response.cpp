@@ -47,6 +47,15 @@ std::string format_date(std::chrono::system_clock::time_point t)
     return std::format("{:%a, %d %b %Y %H:%M:%S} GMT", std::chrono::floor<std::chrono::seconds>(t));
 }
 
+const headers& client_response::trailers() const noexcept
+{
+    // NOTE: a body the caller put in place of the client's has none.
+    static const net::http::headers none;
+
+    const auto* source = dynamic_cast<const detail::trailer_source*>(body.get());
+    return source != nullptr ? source->trailers() : none;
+}
+
 status parse_status(std::string_view str) noexcept
 {
     using enum status;

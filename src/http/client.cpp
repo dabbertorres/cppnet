@@ -48,7 +48,11 @@ constexpr std::size_t max_response_header_bytes = std::size_t{1'024} * 1'024;
 // Its request's stop token (set on the connection's socket, so a read waiting for it is canceled) fails the reads once
 // stop is requested, unless the body was done with before: the connection is then closed, as what's left of the
 // response is unknown. A failed read's error is returned again by the reads after it.
-class pooled_body final : public net::io::reader
+//
+// It keeps a chunked body's trailers (see client_response::trailers()), which outlive the body's reader.
+class pooled_body final
+    : public net::io::reader
+    , public net::http::detail::trailer_source
 {
 public:
     pooled_body(std::shared_ptr<net::http::detail::connection_pool> pool,
@@ -70,10 +74,13 @@ public:
     [[nodiscard]] net::http::detail::connection* connection() const noexcept { return leased.conn.get(); }
     [[nodiscard]] net::io::buffered_reader*      buffered() const noexcept { return reader.get(); }
 
-    // attach sets the body that's read from the connection. length is how long it is, if it's known up front.
-    void attach(std::unique_ptr<net::io::reader> decoded, bool reuse, std::optional<std::size_t> length)
+    // attach sets the body that's read from the connection, resp's (keeping its trailers, if it's chunked). length is
+    // how long it is, if it's known up front.
+    void attach(net::http::client_response& resp, bool reuse, std::optional<std::size_t> length)
     {
-        body      = std::move(decoded);
+        net::http::http11::keep_body_trailers(resp, kept);
+
+        body      = std::move(resp.body);
         reusable  = reuse;
         remaining = length;
 
@@ -120,6 +127,8 @@ public:
         return leased.conn != nullptr ? net::http::detail::native_handle(*leased.conn) : -1;
     }
 
+    [[nodiscard]] const net::http::headers& trailers() const noexcept override { return kept; }
+
 private:
     // finish returns the connection to the pool, which may reuse it if the whole body was read.
     void finish(bool complete) noexcept
@@ -145,6 +154,7 @@ private:
     std::optional<std::size_t>                          remaining;
     std::stop_token                                     stop;
     std::error_code                                     failed; // a read failed (see read())
+    net::http::headers                                  kept;   // the body's trailers, once it's read to its end
 };
 
 // limit is a timeout from client_options, where 0 is no limit.
@@ -294,8 +304,10 @@ std::expected<bool, std::error_code> redirect(net::http::client_request&        
         if (request.method != request_method::GET && request.method != request_method::HEAD)
             request.method = request_method::GET;
 
-        request.body     = nullptr;
-        request.get_body = nullptr;
+        // NOTE: its trailers go with it, as they describe it.
+        request.body          = nullptr;
+        request.get_body      = nullptr;
+        request.make_trailers = nullptr;
         for (const auto field : {"Content-Length"sv,
                                  "Content-Type"sv,
                                  "Content-Encoding"sv,
@@ -436,7 +448,7 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
 
     // the server didn't get all of the request, so the connection is no use for another.
     const bool reuse = !write_failed && reusable_request && http11::connection_reusable(*resp, request.method);
-    body->attach(std::move(resp->body), reuse, known_length(*resp, request.method));
+    body->attach(*resp, reuse, known_length(*resp, request.method));
     resp->body = std::move(body);
 
     co_return sent{.response = std::move(*resp)};

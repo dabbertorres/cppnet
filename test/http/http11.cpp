@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -904,6 +905,112 @@ TEST_CASE("request bodies that can't be framed aren't sent", "[http][1.1][reques
         req.body = body_of("hello");
         CHECK(encode_request(req) == invalid_argument());
     }
+}
+
+TEST_CASE("a chunked request's last chunk carries make_trailers' fields", "[http][1.1][request_encode][trailers]")
+{
+    using net::http::request_method;
+
+    int  calls = 0;
+    auto req   = make_request(request_method::PUT);
+    req.body   = body_of("hello");
+
+    SECTION("which are called for once the body's been read, dropping those that can't be trailers")
+    {
+        req.make_trailers = [&](net::http::headers& trailers)
+        {
+            ++calls;
+            trailers.set("X-Digest"sv, "abc"sv);
+            trailers.set("Content-Type"sv, "text/plain"sv);
+        };
+        CHECK(encode_request(req)
+              == "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n"
+                 "X-Digest: abc\r\n\r\n");
+        CHECK(calls == 1);
+    }
+
+    SECTION("without a body, if it asked for chunked")
+    {
+        req.body = body_of("");
+        req.headers.set("Transfer-Encoding"sv, "chunked"sv);
+        req.make_trailers = [&](net::http::headers& trailers)
+        {
+            ++calls;
+            trailers.set("X-Digest"sv, "none"sv);
+        };
+        CHECK(encode_request(req)
+              == "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Digest: "
+                 "none\r\n\r\n");
+        CHECK(calls == 1);
+    }
+
+    SECTION("but not with a Content-Length, which has no last chunk")
+    {
+        req.set_body("hello");
+        req.make_trailers = [&](net::http::headers& /*trailers*/) { ++calls; };
+        CHECK(encode_request(req) == "PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello");
+        CHECK(calls == 0);
+    }
+
+    SECTION("an invalid one fails, without the last chunk")
+    {
+        req.make_trailers = [](net::http::headers& trailers) { trailers.set("X-Bad"sv, "a\r\nb"sv); };
+
+        net::io::string_writer<char> out;
+        auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error() == std::errc::invalid_argument);
+        CHECK(out.build() == "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+    }
+}
+
+TEST_CASE("a request's TE is listed in Connection", "[http][1.1][request_encode][trailers]")
+{
+    auto req = make_request(net::http::request_method::GET);
+
+    SECTION("added")
+    {
+        req.headers.set("TE"sv, "trailers"sv);
+        CHECK(encode_request(req) == "GET / HTTP/1.1\r\nHost: example.com\r\nTE: trailers\r\nConnection: TE\r\n\r\n");
+    }
+
+    SECTION("beside what Connection has")
+    {
+        req.headers.set("TE"sv, "trailers"sv);
+        req.headers.set("Connection"sv, "close"sv);
+        CHECK(encode_request(req)
+              == "GET / HTTP/1.1\r\nHost: example.com\r\nTE: trailers\r\nConnection: close\r\nConnection: TE\r\n\r\n");
+    }
+
+    SECTION("unless it's there already, in any case")
+    {
+        req.headers.set("te"sv, "trailers"sv);
+        req.headers.set("Connection"sv, "keep-alive, te"sv);
+        CHECK(encode_request(req)
+              == "GET / HTTP/1.1\r\nHost: example.com\r\nte: trailers\r\nConnection: keep-alive, te\r\n\r\n");
+    }
+
+    SECTION("nor without TE")
+    {
+        CHECK(encode_request(req) == "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    }
+}
+
+TEST_CASE("a response's chunked body keeps its trailers where it's told", "[http][1.1][response_decode][trailers]")
+{
+    owning_buffered_reader reader{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n"
+                                  "Server-Timing: db;dur=53\r\nContent-Length: 5\r\n\r\n"};
+
+    auto resp = test::sync_wait(net::http::http11::response_decode(&reader, net::http::request_method::GET));
+    REQUIRE(resp.has_value());
+
+    net::http::headers trailers;
+    net::http::http11::keep_body_trailers(*resp, trailers);
+    CHECK(trailers.empty());
+
+    CHECK(read_body(*resp->body) == "hello");
+    CHECK(trailers.size() == 1);
+    CHECK(trailers.get("Server-Timing"sv) == "db;dur=53");
 }
 
 TEST_CASE("encoded request bodies decode", "[http][1.1][request_encode][body]")

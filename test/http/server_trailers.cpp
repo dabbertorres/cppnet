@@ -382,7 +382,8 @@ TEST_CASE("an HTTP/2 handler reads a request's trailers once it's read its body"
                                             // still finds them only once it's read it to its end.
                                             const auto id = c.request("POST", "/echo", "hello", false);
                                             c.send_trailers(id, trailers);
-                                            REQUIRE(co_await c.wait_for(id));
+                                            const bool done = co_await c.wait_for(id);
+                                            REQUIRE(done);
 
                                             const auto& r = c.responses[id];
                                             CAPTURE(r.reset.message());
@@ -397,7 +398,8 @@ TEST_CASE("an HTTP/2 handler reads a request's trailers once it's read its body"
                                             // and a request whose trailers come straight after its head.
                                             const auto bare = c.request("POST", "/echo", {}, false);
                                             c.send_trailers(bare, std::span{trailers}.first(1));
-                                            REQUIRE(co_await c.wait_for(bare));
+                                            const bool done_bare = co_await c.wait_for(bare);
+                                            REQUIRE(done_bare);
                                             CHECK(c.responses[bare].body == "|x-checksum=abc;");
                                         }));
 }
@@ -423,7 +425,8 @@ TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[h
                                             const auto head     = c.request("HEAD", "/chunked");
                                             const auto invalid  = c.request("GET", "/invalid");
                                             const auto thrown   = c.request("GET", "/throw");
-                                            REQUIRE(co_await c.pump([&] { return c.finished == 7; }));
+                                            const bool finished = co_await c.pump([&] { return c.finished == 7; });
+                                            REQUIRE(finished);
 
                                             const std::vector<std::pair<std::string, std::string>> expected{
                                                 {"server-timing", "db;dur=53"},
@@ -489,8 +492,9 @@ TEST_CASE("middleware adds an HTTP/2 response's trailers after the handler", "[h
                                         server.local_port(),
                                         [](h2_client& c) -> task<>
                                         {
-                                            const auto id = c.request("GET", "/length");
-                                            REQUIRE(co_await c.wait_for(id));
+                                            const auto id   = c.request("GET", "/length");
+                                            const bool done = co_await c.wait_for(id);
+                                            REQUIRE(done);
 
                                             const auto& r = c.responses[id];
                                             CHECK(trailer(r, "server-timing") == "db;dur=53");

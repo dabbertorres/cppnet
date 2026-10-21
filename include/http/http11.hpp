@@ -89,6 +89,11 @@ task<response_decoder_result> response_decode(io::buffered_reader* reader,
                                               std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max(),
                                               informational_ref on_informational = {}) noexcept;
 
+// keep_body_trailers has the body of a response that response_decode() decoded (borrowing its reader) keep its trailer
+// section's fields in trailers (see chunked_reader::keep_trailers()): only a chunked body has any. trailers must
+// outlive the body's reads; without it, they're checked and dropped.
+void keep_body_trailers(const client_response& resp, headers& trailers) noexcept;
+
 // connection_reusable returns whether the connection can carry another request once the response's body has been read
 // to its end: the response is HTTP/1.1, without "Connection: close", and its body doesn't end with the connection.
 bool connection_reusable(const client_response& resp, request_method method) noexcept;

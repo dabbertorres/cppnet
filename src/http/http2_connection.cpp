@@ -98,7 +98,12 @@ std::error_code append_fields(const headers&             from,
     const bool request = section == field_section::request;
     for (const auto& [name, values] : from)
     {
-        if (connection_specific(name) || (has_connection && from.has_token("Connection"sv, name))) continue;
+        // NOTE: but a request's TE, which HTTP/1.1 lists in Connection (RFC 9110, section 10.1.4), and HTTP/2 allows
+        //       (as trailers), whether or not Connection names it.
+        if (connection_specific(name)) continue;
+        if (has_connection && from.has_token("Connection"sv, name)
+            && !(request && util::equal_ignore_case(std::string_view{name}, "te"sv)))
+            continue;
         if (request && util::equal_ignore_case(std::string_view{name}, "host"sv)) continue;
         if (section == field_section::trailers && !trailer_allowed(name)) continue;
 

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -429,6 +430,9 @@ task<std::error_code> write_full(net::io::writer& out, std::span<const std::byte
     co_return std::error_code{};
 }
 
+// connection_te is the field line that lists TE in Connection (see request_encode()).
+constexpr std::string_view connection_te = "Connection: TE\r\n";
+
 // max_start_line_overhead is enough for a request or status line, apart from the request's target: e.g. the method,
 // version, status code and reason phrase, and the line's end and the head's.
 constexpr std::size_t max_start_line_overhead = 128;
@@ -459,11 +463,10 @@ task<std::error_code> copy_length(net::io::reader& body, net::io::writer& out, s
     co_return std::error_code{};
 }
 
-// copy_chunked copies body, until it ends, as chunks.
-task<std::error_code> copy_chunked(net::io::reader& body, net::io::writer& out)
+// copy_chunked copies body, until it ends, as chunks (but not the last chunk, which ends them).
+task<std::error_code> copy_chunked(net::io::reader& body, net::http::http11::chunked_writer& chunked)
 {
-    net::http::http11::chunked_writer chunked{&out};
-    std::vector<std::byte>            buf(body_buffer);
+    std::vector<std::byte> buf(body_buffer);
 
     while (true)
     {
@@ -480,7 +483,17 @@ task<std::error_code> copy_chunked(net::io::reader& body, net::io::writer& out)
         if (res.count == 0) co_return make_error_code(net::io::errc::no_progress);
     }
 
-    co_return (co_await chunked.finish()).err;
+    co_return std::error_code{};
+}
+
+// finish_trailing writes the last chunk, with make_trailers' fields as its trailer section: a coroutine of its own, so
+// only a request that has them has their headers in a frame.
+task<std::error_code> finish_trailing(net::http::http11::chunked_writer&              chunked,
+                                      const std::function<void(net::http::headers&)>& make_trailers)
+{
+    net::http::headers trailers;
+    make_trailers(trailers);
+    co_return (co_await chunked.finish(&trailers)).err;
 }
 
 bool is_default_port(std::string_view scheme, std::string_view port) noexcept
@@ -726,7 +739,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
     std::string head;
     head.reserve(max_start_line_overhead + target.size() + req.uri.host.size() + req.uri.port.size()
-                 + framing.field.size() + fields_size(req.headers));
+                 + framing.field.size() + fields_size(req.headers) + connection_te.size());
 
     // NOTE: unlike the status line, nothing follows the version.
     const auto version = effective_version(req);
@@ -750,10 +763,16 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
     head.append(framing.field);
     append_fields(head, req.headers);
+
+    // RFC 9110, section 10.1.4: TE is for the next hop only, so a sender of it lists it in Connection.
+    if (req.headers.get_all("TE"sv).has_value() && !req.headers.has_token("Connection"sv, "TE"sv))
+        head.append(connection_te);
+
     head.append("\r\n"sv);
 
     if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
 
+    chunked_writer chunked{writer};
     try
     {
         std::error_code err;
@@ -766,14 +785,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
             break;
         case request_framing::kind::chunked:
             // a chunked request without a body (only if it asked for chunked) is just the last chunk.
-            if (req.body != nullptr)
-            {
-                err = co_await copy_chunked(*req.body, *writer);
-            }
-            else
-            {
-                err = co_await write_full(*writer, std::as_bytes(std::span{"0\r\n\r\n"sv}));
-            }
+            if (req.body != nullptr) err = co_await copy_chunked(*req.body, chunked);
             break;
         }
 
@@ -782,6 +794,16 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
     catch (const std::bad_alloc&)
     {
         co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    }
+
+    if (framing.how == request_framing::kind::chunked)
+    {
+        // the trailers are what's known once the body's been read (e.g. a digest of it). An invalid one fails, before
+        // the last chunk's written, so the request is cut short.
+        // NOTE: outside the try, so whatever make_trailers throws (even std::bad_alloc) comes out of the task as it is.
+        const auto err =
+            req.make_trailers ? co_await finish_trailing(chunked, req.make_trailers) : (co_await chunked.finish()).err;
+        if (err) co_return std::unexpected(err);
     }
 
     co_return writer;
@@ -951,6 +973,16 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
     }
 
     co_return resp;
+}
+
+void keep_body_trailers(const client_response& resp, headers& trailers) noexcept
+{
+    // NOTE: the bodies make_response_body() makes, told apart as call_at_body_end() does.
+    auto* body = resp.body.get();
+    if (body == nullptr || typeid(*body) != typeid(chunked_reader)) return;
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): the type is checked first.
+    static_cast<chunked_reader*>(body)->keep_trailers(&trailers);
 }
 
 bool connection_reusable(const client_response& resp, request_method method) noexcept

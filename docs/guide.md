@@ -432,6 +432,40 @@ past which the stream is reset. Either fails the request with `std::errc::value_
 ends, as the server had it. The client never sends `Expect: 100-continue` by itself, nor waits for a 100 before sending
 the body: a request that sets the field gets the server's 100 passed on, but its body goes at once.
 
+Trailers are fields that come after the body (RFC 9110, section 6.5): e.g. gRPC's `grpc-status`, or a digest of the
+body. A response's are `resp->trailers()`, there once its body has been read to its end (a read has reported
+`io::errc::end_of_stream`), and empty until then: a chunked body's trailer section over HTTP/1.1, the HEADERS frame
+after the body over HTTP/2. They're kept apart from `resp->headers`, without the fields that can't be trailers (see
+`net::http::trailer_allowed()`), and are the body's: valid as long as it is (a body put in its place has none). A
+request's are filled by `client_request::make_trailers`, called once its body has been read to its end, on the task
+sending it, and again each time the body's sent again (a 307 or 308, or a retry): over HTTP/2 for any request (one
+without a body sends its head, then them), over HTTP/1.1 only for a body sent chunked (without a Content-Length), and
+not called otherwise.
+
+```cpp
+auto  upload = std::make_unique<digesting_reader>(file);   // e.g. a reader that hashes what's read of it
+auto* digest = upload.get();
+
+net::http::client_request req{.method = net::http::request_method::PUT,
+                              .uri    = net::url::parse("https://example.com/upload").value()};
+req.body          = std::move(upload);                     // no Content-Length: chunked, over HTTP/1.1
+req.make_trailers = [digest](net::http::headers& trailers) { trailers.set("Content-Digest", digest->value()); };
+req.headers.set("TE", "trailers");                         // this caller reads the response's trailers
+
+auto resp = co_await client.send(std::move(req));
+if (!resp) co_return;
+
+auto body = co_await net::io::read_all(*resp->body);
+if (body && resp->trailers().get("Grpc-Status") != "0") co_return;   // once the body's been read to its end
+```
+
+A trailer that can't be sent (e.g. a value with a line break) fails the request with `std::errc::invalid_argument`, cut
+short: its HTTP/1.1 connection closed without the last chunk, or its HTTP/2 stream reset, so the server doesn't take it
+for complete. The client never sends `TE: trailers` itself (it says the caller won't drop the response's trailers,
+which only the caller knows): a caller that relies on them sets it, and over HTTP/1.1 `TE` is then listed in
+`Connection`, as RFC 9110 has a sender do; over HTTP/2 only `TE: trailers` is sent. A 301, 302 or 303's request, which
+drops the body, drops `make_trailers` with it.
+
 A request is canceled by its `stop` token (`client_request::stop`, or `get(url, stop)`): requesting stop ends it
 wherever it is (waiting for a connection or an HTTP/2 stream, resolving the host, connecting and the TLS handshake,
 sending the request, waiting for the response's head), failing with `std::errc::operation_canceled`, and once `send()`

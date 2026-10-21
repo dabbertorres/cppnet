@@ -10,7 +10,8 @@ end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's prioriti
 done (2026-10-20; see Learned in stage 5); its second, interim responses in the client (`on_informational`), done
 (2026-10-20); its third, trailers in the codecs (`chunked_reader`, `chunked_writer::finish(trailers)`,
 `trailer_allowed()`), done (2026-10-20); its fourth, trailers on the server (`server_request::trailers`,
-`response_writer::trailers()`), done (2026-10-20).
+`response_writer::trailers()`), done (2026-10-20); its fifth, trailers in the client (`client_response::trailers()`,
+`client_request::make_trailers`), done (2026-10-20).
 
 ## Goal
 
@@ -632,6 +633,69 @@ idle stream would be a connection error for the peer.
   `clear()`s of empty `headers`, a `typeid` check, and a test for HEAD; the pipelined run's 2% is at the edge of its
   spread, and taken for noise or layout.
 
+### Part 5: trailers in the client (done 2026-10-20)
+
+- `client_response::trailers()` and `client_request::make_trailers` as proposed. `detail::trailer_source` is in
+  `response.hpp` (a pure virtual `trailers()`, protected special members); `trailers()` finds it with a `dynamic_cast`
+  of the body, and returns a static empty `headers` for a body that isn't the client's (or none). The client hands the
+  caller its own bodies only: `pooled_body` (HTTP/1.1) and `http2_response_body` (HTTP/2); redirects' `discard()` reads
+  the responses it drops, and there's no decompression nor other wrapper, so nothing hides them.
+- HTTP/1.1, receiving: `pooled_body` keeps them in a `headers` member (`kept`), as its chunked reader (and buffered
+  reader) are dropped once the body's done; `attach()` (which now takes the response) calls
+  `http11::keep_body_trailers(const client_response&, headers&)`, a new overload beside the server's, which tells the
+  chunked reader apart by `typeid`. HTTP/2, receiving: the client's `on_headers()` keeps a trailers block's allowed
+  fields in the stream's `received_trailers` (part 4's, on the heap only for a message that has some), and
+  `http2_response_body` points the stream's `trailers_to` at its own `kept`, so the stream reader hands them over as it
+  returns the end, on the body's task. Both bodies grow by a `headers` (680 bytes with libc++), each still one
+  allocation per response, as before.
+- HTTP/1.1, sending: `request_encode()` owns the `chunked_writer`; `copy_chunked()` no longer finishes, and the last
+  chunk is written after the body's `try`: by `finish()`, or, with `make_trailers` set, by `finish_trailing()`, a
+  coroutine of its own (so only a request that has trailers has their `headers` in a frame), which calls it, then
+  `finish(&trailers)`. Called outside the `try`, so whatever it throws (even `std::bad_alloc`) comes out of the task as
+  it is. Only for a chunked request: one with a Content-Length doesn't call it, nor one without a body, unless the
+  caller asked for chunked (`Transfer-Encoding: chunked`), which is then just the last chunk, with them. An invalid
+  trailer fails the encode with `invalid_argument` before the last chunk is written (what was buffered of the request
+  isn't flushed, so a short body may not reach the server at all), and the `pooled_body` closes the connection.
+- HTTP/2, sending: decided beyond the plan, a request without a body calls it too, as Go's transport does (a request
+  with trailers doesn't end the stream with its head): the head goes without END_STREAM when `make_trailers` is set
+  (`send()`'s `trailing`), and `send_body()` (reading nothing for a length of 0) ends the request with `end_request()`,
+  a plain function (so the `headers` are on the stack, not in `send_body()`'s frame), which calls it and then, under the
+  lock, `append_fields(..., field_section::trailers)` into the stream's `names` and `fields` (the head's, already
+  encoded), HEADERS with END_STREAM, or an empty DATA if none are left. An invalid one: nothing's sent, and the stream's
+  `abandon()`ed (reset with CANCEL, as for a body that fails: the server's INTERNAL_ERROR is for its own responses),
+  failing the request with `invalid_argument` as a body failure (the caller's mistake, not retried). An exception from
+  `make_trailers` abandons the stream too, then comes out of `send()`.
+- Redirects: `make_trailers` stays on a 307 or 308's request (called again, as the body's read again), and is dropped
+  by a 301, 302 or 303's, with the body they describe. Retries call it again
+  (over HTTP/1.1 only a bodyless request is retried, which calls it only if the caller asked for chunked).
+- TE (Decided question 8): nothing sends `TE: trailers` by itself. HTTP/1.1's encoder didn't list a caller's TE in
+  Connection; now `request_encode()` adds a `Connection: TE` line when the request has TE and Connection doesn't list
+  it (one more field line beside a caller's Connection, which RFC 9110 has recipients combine). HTTP/2's
+  `append_fields()` already dropped TE values other than `trailers`, but also dropped `te` altogether when Connection
+  named it (as a caller following RFC 9110 for HTTP/1.1 would): it now keeps a request's `te: trailers` whatever
+  Connection says (Connection itself is never sent).
+- Tests (`test/http/client_trailers.cpp`, `[http][client][trailers]`, against cppnet's server, over both versions):
+  a response's trailers once its body's end has been read, empty before and after its first byte, apart from the
+  headers, after a chunked body, a Content-Length (HTTP/2 only) and no body (HTTP/2 only); disallowed ones dropped
+  (against servers the test plays: raw HTTP/1.1, and `test::h2_client` as a server, as cppnet's server drops them
+  itself); `make_trailers`' fields reaching the handler's `req.trailers` (a disallowed one dropped) for a chunked body,
+  a Content-Length and no body, called once over HTTP/2 and only for the chunked body over HTTP/1.1; a 307 calling it
+  again, a 303 not; an invalid one failing the request with `invalid_argument`, the handler's body read failing (the
+  connection closed, or the stream reset), and the client going on; a caller's TE (`trailers` or `gzip`, with and
+  without its own `Connection: TE`): over HTTP/1.1 as given with TE in Connection once, over HTTP/2 only `trailers`; a
+  body the caller replaced (or removed) having none; and the next responses on a connection (one with other
+  trailers, one without) having their own, the first's kept, one connection. And `test/http/http11.cpp`: the
+  encoder's last chunk with them (not called with a Content-Length, an invalid one failing without the last chunk),
+  `Connection: TE` added unless it's there, and a response's chunked body keeping them through `keep_body_trailers()`.
+- Measured (`bench_request`, Release, five alternating runs of the binaries before and after): over HTTP/2 (cppnet's
+  client and server) 51.9 to 52.0 allocations a request before, 51.8 to 51.9 after (the same: nothing per request was
+  added), 79.9 to 86.9 us before and 81.4 to 85.9 after; over HTTP/1.1 with cppnet's client (prior knowledge off, a
+  throwaway change, as in part 2) 28.0 allocations both, 42.6 to 43.1 us before and 42.1 to 45.1 after. The server's
+  runs are unchanged in allocations (1.4, 4.2, 3.0, 2.0, and the middleware runs' 2.4, 1.4, 2.4, 3.4, 2.4 and 4.0),
+  and their best times within each other's spread (pipelined 1115 ns before, 1127 after; over a socket 29.1 and 28.1
+  us). What a request without trailers now does more: a test of `make_trailers`, an empty `headers` made and destroyed
+  (HTTP/2's `end_request()`), and over HTTP/1.1 a look for TE among the request's fields.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1172,8 +1236,8 @@ throughput isn't changed (by frame count and order).
       `response_writer::trailers()`, over HTTP/1.1 and HTTP/2 (whose session already handles them); tests with raw
       requests and `test::h2_client`. One side, both versions: the API is the same over either, and the server's tests
       don't need the client's part.
-   5. **Trailers in the client.** `client_response::trailers()` and `client_request::make_trailers`, over both
-      versions; tested against 4's server, so after it.
+   5. **Trailers in the client.** Done (2026-10-20; see Learned in stage 5). `client_response::trailers()` and
+      `client_request::make_trailers`, over both versions; tested against 4's server, so after it.
    6. **HPACK's table, built.** `dynamic_table`'s storage (no allocation per entry: the decoder gains at once), the
       encoder's table, search, eviction and size updates, and `hpack::indexing`, with HTTP/2's sessions on `none`, so
       nothing changes on the wire; `fuzz_hpack`'s new properties (with `automatic`). Split from 7 so the mechanics are

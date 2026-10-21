@@ -46,8 +46,11 @@ namespace
     // http2_response_body reads a response's body from its stream, which it holds (and its connection): destroying it
     // before the body's end resets the stream. Given a stop token that can be stopped, it cancels the stream when stop
     // is requested, and its reads fail with std::errc::operation_canceled once it is, unless the body had already
-    // ended (or failed): what's buffered isn't read.
-    class http2_response_body final : public io::reader
+    // ended (or failed): what's buffered isn't read. It keeps the response's trailers, which the stream's reader hands
+    // over as it reaches the body's end (see client_response::trailers()).
+    class http2_response_body final
+        : public io::reader
+        , public trailer_source
     {
     public:
         // NOTE: not holding the connection's lock: the stop callback is registered here, and runs at once (taking the
@@ -59,6 +62,9 @@ namespace
             , stream{std::move(stream)}
             , reader{this->stream.get()}
         {
+            // NOTE: only the body's reads (after this, on its reader's task) look at it, holding the lock.
+            this->stream->trailers_to = &kept;
+
             if (!stop.stop_possible()) return;
 
             this->stop = stop;
@@ -87,6 +93,8 @@ namespace
         using io::reader::read;
 
         [[nodiscard]] io::handle native_handle() const noexcept override { return conn->native_handle(); }
+
+        [[nodiscard]] const headers& trailers() const noexcept override { return kept; }
 
     private:
         coro::task<io::result> read_stoppable(std::span<std::byte> data)
@@ -118,7 +126,20 @@ namespace
         std::stop_token                                           stop;
         std::optional<http2_client_connection::stop_registration> on_stop;
         std::error_code                                           finished; // what ended it, given a token
+        headers                                                   kept;     // the trailers, once it's read to its end
     };
+
+    // keep_trailers keeps a trailers block's fields in the stream (without those that can't be trailers), for its
+    // body's reader to hand over at the end (holding the lock).
+    void keep_trailers(http2_stream_base& s, std::span<const hpack::field> fields)
+    {
+        for (const auto& f : fields)
+        {
+            if (!trailer_allowed(f.name)) continue;
+            if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<headers>();
+            s.received_trailers->add(f.name, f.value);
+        }
+    }
 
     // authority_of is a request's :authority: the caller's Host, if it has one (RFC 9113, section 8.3.1, as it isn't
     // sent as a field; without whitespace around it, as other fields); otherwise the URI's host and port, without the
@@ -199,10 +220,13 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     const auto length   = request.body != nullptr ? request.headers.get_content_length() : std::nullopt;
     const bool has_body = request.body != nullptr && (!length.has_value() || *length > 0);
 
+    // trailers follow the body, or the head, if there's none (which then doesn't end the stream).
+    const bool trailing = static_cast<bool>(request.make_trailers);
+
     std::shared_ptr<http2_client_stream> stream;
     {
         std::unique_lock lock{mu};
-        auto             opened = open(request, !has_body);
+        auto             opened = open(request, !has_body && !trailing);
         if (!opened.has_value())
         {
             // nothing was sent, nor the body read: a refused request may be sent again (on another connection),
@@ -245,12 +269,12 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     // a server may answer before it's read all of the body (e.g. 413 Content Too Large), and reset the stream, failing
     // the rest: the response is still worth having.
     std::optional<std::error_code> body_error;
-    if (has_body)
+    if (has_body || trailing)
     {
-        const auto sent = co_await send_body(request, *stream, length);
+        const auto sent = co_await send_body(request, *stream, has_body ? length : std::optional<std::size_t>{0});
 
-        // the body couldn't be read, or was shorter than its Content-Length: the request is the caller's mistake (as
-        // over HTTP/1.1), whatever the server made of it.
+        // the body couldn't be read, was shorter than its Content-Length, or a trailer couldn't be sent: the request
+        // is the caller's mistake (as over HTTP/1.1), whatever the server made of it.
         if (sent.body_failed) co_return std::unexpected(sent.err);
         if (sent.err) body_error = sent.err;
     }
@@ -311,7 +335,8 @@ coro::task<http2_client_connection::body_result> http2_client_connection::send_b
                                                                                     http2_client_stream&       stream,
                                                                                     std::optional<std::size_t> length)
 {
-    // no more than its Content-Length: the server would take what's past it as malformed. (Less is checked below.)
+    // no more than its Content-Length: the server would take what's past it as malformed. (Less is checked below.) A
+    // length of 0 reads nothing (e.g. a request without a body, sending only trailers).
     io::limit_reader body{request.body.get(),
                           length.value_or(std::numeric_limits<std::size_t>::max()),
                           io::limit_reader::mode::up_to};
@@ -346,17 +371,58 @@ coro::task<http2_client_connection::body_result> http2_client_connection::send_b
         }
     }
 
+    // NOTE: an exception make_trailers throws comes out of send(): the request can't be finished.
+    std::error_code invalid;
+    try
     {
-        std::scoped_lock lock{mu};
-        if (!stream.failure && !stream.ended)
-        {
-            stream.ended = true;
-            if (auto ended = session.submit_data(stream.id, {}, true); !ended.has_value())
-                stream.failure = ended.error();
-        }
+        invalid = end_request(request, stream);
     }
+    catch (...)
+    {
+        abandon(stream, std::make_error_code(std::errc::operation_canceled));
+        throw;
+    }
+
+    // a trailer that can't be sent: the server mustn't take the request as complete.
+    if (invalid)
+    {
+        abandon(stream, invalid);
+        co_return body_result{.err = invalid, .body_failed = true};
+    }
+
     wake_writer();
     co_return body_result{};
+}
+
+std::error_code http2_client_connection::end_request(const client_request& request, http2_client_stream& stream)
+{
+    // the trailers are what's known once the body's been read (e.g. a digest of it).
+    // NOTE: not in send_body()'s frame, so a request without them doesn't make it larger.
+    headers trailers;
+    if (request.make_trailers) request.make_trailers(trailers);
+
+    std::scoped_lock lock{mu};
+    if (stream.failure || stream.ended) return {};
+
+    // they end the stream, if there are any it can send; an empty DATA frame does otherwise. If one can't be sent,
+    // nothing is.
+    stream.fields.clear();
+    if (!trailers.empty())
+    {
+        if (auto err = append_fields(trailers, stream.names, stream.fields, field_section::trailers)) return err;
+    }
+
+    stream.ended = true;
+    if (!stream.fields.empty())
+    {
+        if (auto err = session.submit_headers(stream.id, stream.fields, true)) stream.failure = err;
+    }
+    else if (auto ended = session.submit_data(stream.id, {}, true); !ended.has_value())
+    {
+        stream.failure = ended.error();
+    }
+
+    return {};
 }
 
 void http2_client_connection::abandon(http2_client_stream& stream, std::error_code err)
@@ -566,7 +632,10 @@ void http2_client_connection::on_headers(http2::stream_id              id,
         s.read_deadline.reset();
     }
 
-    // trailers end the body (and aren't passed on).
+    // trailers end the body: kept (without those that can't be trailers) for the body's reader to hand over once it
+    // reaches the end, so whoever reads them does once the body's been read, and they don't change meanwhile.
+    if (kind == http2::block_kind::trailers) keep_trailers(s, fields);
+
     if (end_stream)
     {
         s.received_end = true;

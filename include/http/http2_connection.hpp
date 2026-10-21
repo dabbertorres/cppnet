@@ -194,7 +194,8 @@ public:
 enum class field_section : std::uint8_t
 {
     response, // a response's head
-    request,  // a request's head: without Host, which :authority replaces, and TE unless it's "trailers"
+    request,  // a request's head: without Host, which :authority replaces, and TE unless it's "trailers" (kept even if
+              // Connection names it, as HTTP/1.1 has it do)
     trailers, // either's trailers: without the fields that can't be trailers (see trailer_allowed())
 };
 

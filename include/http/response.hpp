@@ -203,6 +203,27 @@ constexpr bool status_is_client_error(status s) noexcept
 }
 constexpr bool status_is_server_error(status s) noexcept { return status::INTERNAL_SERVER_ERROR <= s; }
 
+namespace detail
+{
+    // trailer_source is what the client's response bodies implement for client_response::trailers(), which finds it
+    // with a dynamic_cast: the trailer fields the body kept, once it's been read to its end.
+    class trailer_source
+    {
+    public:
+        // trailers are the body's trailer fields: empty until a read has reported its end, and for a body without
+        // any. Valid as long as the body is.
+        [[nodiscard]] virtual const headers& trailers() const noexcept = 0;
+
+    protected:
+        trailer_source() noexcept                                 = default;
+        trailer_source(const trailer_source&) noexcept            = default;
+        trailer_source& operator=(const trailer_source&) noexcept = default;
+        trailer_source(trailer_source&&) noexcept                 = default;
+        trailer_source& operator=(trailer_source&&) noexcept      = default;
+        ~trailer_source()                                         = default;
+    };
+}
+
 // client_response represents an incoming HTTP response from a server to a client.
 struct client_response
 {
@@ -246,6 +267,13 @@ struct client_response
     }
 
     ~client_response() noexcept = default;
+
+    // trailers are the response's trailer fields, once its body has been read to its end (a read has reported
+    // io::errc::end_of_stream): over HTTP/1.1, a chunked body's trailer section; over HTTP/2, a HEADERS frame after the
+    // body. Empty until then, for a response without any, and for a body that isn't the client's (e.g. one the caller
+    // put in its place). They're kept apart from headers (RFC 9110, section 6.5), and without the fields that can't be
+    // trailers (see trailer_allowed()), which are dropped. They're the body's: valid as long as it is.
+    [[nodiscard]] const net::http::headers& trailers() const noexcept;
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.

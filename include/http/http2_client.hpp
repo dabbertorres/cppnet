@@ -191,9 +191,16 @@ private:
         bool            body_failed = false;
     };
 
-    // send_body sends the request's body on the stream: length bytes of it, if that's set.
+    // send_body sends the request's body on the stream (length bytes of it, if that's set), then ends it (see
+    // end_request()).
     coro::task<body_result>
     send_body(client_request& request, http2_client_stream& stream, std::optional<std::size_t> length);
+
+    // end_request ends the request on the stream, once its body's been sent: with make_trailers' fields, if it's set
+    // and leaves any, otherwise an empty DATA frame (unless the stream's ended, or failed). It fails with
+    // std::errc::invalid_argument, sending nothing, if a trailer can't be sent (see append_fields()); whatever
+    // make_trailers throws comes out of it.
+    std::error_code end_request(const client_request& request, http2_client_stream& stream);
 
     // abandon resets a stream whose request can't be finished, so the server doesn't take what it has as all of it.
     void abandon(http2_client_stream& stream, std::error_code err);

@@ -136,6 +136,21 @@ struct client_request
     // counts them), past which the stream's reset. Either fails the request with std::errc::value_too_large.
     std::function<void(status, const net::http::headers&)> on_informational{};
 
+    // make_trailers, if set, is called once the body has been read to its end, to fill the request's trailer fields
+    // (e.g. a digest of the body, which its reader computed), which are sent after it: over HTTP/2, as a HEADERS frame
+    // ending the stream (an empty DATA frame ends it instead if it leaves them empty), for any request, even one
+    // without a body (it's called once the head's sent, and the head doesn't end the stream); over HTTP/1.1, in the
+    // last chunk, so only for a body sent chunked (without a Content-Length), and it isn't called otherwise. Fields
+    // that can't be trailers are dropped (see trailer_allowed()); an invalid name or value (e.g. a line break) fails
+    // the request with std::errc::invalid_argument, cut short (its HTTP/1.1 connection closed, or its HTTP/2 stream
+    // reset), so the server doesn't take it as complete.
+    //
+    // As get_body, it runs on the task sending the request, so must be quick; an exception it throws comes out of
+    // send(), the request abandoned. It's called again each time the body is sent again (a redirect's 307 or 308, or
+    // a retry). Nothing sends TE: trailers (which says the caller won't drop the response's trailers) unless the
+    // caller sets it; over HTTP/1.1, TE is then listed in Connection (RFC 9110, section 10.1.4).
+    std::function<void(net::http::headers&)> make_trailers{};
+
     // set_body sets the body to content, and the Content-Length to match; and get_body, to read it again (sharing
     // content, rather than copying it), for redirects that send it again.
     void set_body(std::string content)
