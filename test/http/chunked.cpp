@@ -82,7 +82,7 @@ struct read_result
 // read_chunked reads a chunked body from text, and returns it, and what follows it, keeping its trailers in trailers
 // (if it isn't null). By default, the text arrives a byte at a time.
 std::pair<read_result, std::string>
-read_chunked(std::string_view text, bool trickle = true, net::http::headers* trailers = nullptr)
+read_chunked(std::string_view text, bool trickle = true, net::http::trailer_fields* trailers = nullptr)
 {
     trickle_reader                    trickled{text};
     net::io::string_reader<char>      whole{text};
@@ -116,7 +116,7 @@ read_chunked(std::string_view text, bool trickle = true, net::http::headers* tra
 }
 
 // lines lists fields' field lines, in order.
-std::vector<std::string> lines(const net::http::headers& fields)
+std::vector<std::string> lines(net::http::fields_view fields)
 {
     std::vector<std::string> out;
     for (const auto& [name, values] : fields)
@@ -228,7 +228,7 @@ TEST_CASE("chunked bodies keep their trailers", "[http][1.1][chunked][chunked_re
     const auto trickle = GENERATE(true, false);
     CAPTURE(trickle);
 
-    net::http::headers trailers;
+    net::http::trailer_fields trailers;
     trailers.set("X-Stale", "from before"); // (cleared when the trailer section is read)
 
     auto [result, rest] = read_chunked("5\r\nhello\r\n0\r\n"
@@ -258,7 +258,7 @@ TEST_CASE("chunked bodies keep their trailers", "[http][1.1][chunked][chunked_re
 
 TEST_CASE("chunked bodies without trailers leave none", "[http][1.1][chunked][chunked_reader][trailers]")
 {
-    net::http::headers trailers;
+    net::http::trailer_fields trailers;
     trailers.set("X-Stale", "from before");
 
     auto [result, rest] = read_chunked("5\r\nhello\r\n0\r\n\r\n", true, &trailers);
@@ -272,8 +272,8 @@ TEST_CASE("trailer sections are limited", "[http][1.1][chunked][chunked_reader][
     const auto keep = GENERATE(true, false);
     CAPTURE(keep);
 
-    net::http::headers trailers;
-    auto*              into = keep ? &trailers : nullptr;
+    net::http::trailer_fields trailers;
+    auto*                     into = keep ? &trailers : nullptr;
 
     SECTION("up to max_fields field lines")
     {
@@ -320,8 +320,8 @@ TEST_CASE("malformed trailers fail the body", "[http][1.1][chunked][chunked_read
                                "X-Delete: a\x7f"sv);
     CAPTURE(keep, line);
 
-    net::http::headers trailers;
-    const auto         text = "5\r\nhello\r\n0\r\nX-Good: kept\r\n" + std::string{line} + "\r\nX-After: too\r\n\r\n";
+    net::http::trailer_fields trailers;
+    const auto text = "5\r\nhello\r\n0\r\nX-Good: kept\r\n" + std::string{line} + "\r\nX-After: too\r\n\r\n";
 
     auto [result, rest] = read_chunked(text, true, keep ? &trailers : nullptr);
     CHECK(result.err == std::errc::illegal_byte_sequence);
@@ -334,13 +334,13 @@ TEST_CASE("trailers are kept before the end callback is called", "[http][1.1][ch
 {
     struct seen
     {
-        net::http::headers* trailers = nullptr;
-        int                 calls    = 0;
-        std::string         checksum;
+        net::http::trailer_fields* trailers = nullptr;
+        int                        calls    = 0;
+        std::string                checksum;
     };
 
-    net::http::headers trailers;
-    seen               state{.trailers = &trailers, .calls = 0, .checksum = {}};
+    net::http::trailer_fields trailers;
+    seen                      state{.trailers = &trailers, .calls = 0, .checksum = {}};
 
     net::io::string_reader<char>      in{"3\r\nabc\r\n0\r\nX-Checksum: 900150983cd24fb0\r\n\r\n"sv};
     net::io::buffered_reader          buffered{&in};
@@ -399,7 +399,7 @@ TEST_CASE("chunked bodies are encoded with trailers", "[http][1.1][chunked][chun
 
     SECTION("several, with a repeated name")
     {
-        net::http::headers trailers;
+        net::http::trailer_fields trailers;
         trailers.set("X-Checksum", "abc");
         trailers.set("Server-Timing", {"db;dur=53", "app;dur=47.2"});
         trailers.set("grpc-status", "0");
@@ -414,16 +414,16 @@ TEST_CASE("chunked bodies are encoded with trailers", "[http][1.1][chunked][chun
 
     SECTION("none")
     {
-        const net::http::headers empty;
-        const bool               given = GENERATE(true, false);
-        res                            = test::sync_wait(given ? chunked.finish(&empty) : chunked.finish());
+        const net::http::trailer_fields empty;
+        const bool                      given = GENERATE(true, false);
+        res                                   = test::sync_wait(given ? chunked.finish(&empty) : chunked.finish());
         CHECK_FALSE(res.err);
         CHECK(written() == "5\r\nhello\r\n0\r\n\r\n");
     }
 
     SECTION("those that can't be trailers are dropped")
     {
-        net::http::headers trailers;
+        net::http::trailer_fields trailers;
         trailers.set("Content-Length", "5");
         trailers.set("X-Kept", "yes");
         trailers.set("If-None-Match", "*");
@@ -436,7 +436,7 @@ TEST_CASE("chunked bodies are encoded with trailers", "[http][1.1][chunked][chun
 
     SECTION("an invalid one writes nothing")
     {
-        net::http::headers trailers;
+        net::http::trailer_fields trailers;
         trailers.set("X-Fine", "yes");
         const auto name  = GENERATE("X-Bad"sv, "Bad Name"sv, ""sv);
         const auto value = GENERATE("a\r\nX-Injected: b"sv, "fine"sv);
@@ -455,7 +455,7 @@ TEST_CASE("chunked bodies are encoded with trailers", "[http][1.1][chunked][chun
 
 TEST_CASE("trailers read back as they were written", "[http][1.1][chunked][trailers]")
 {
-    net::http::headers sent;
+    net::http::trailer_fields sent;
     sent.set("X-Checksum", "abc");
     sent.set("Server-Timing", {"db;dur=53", "app;dur=47.2"});
     sent.set("grpc-message", "a message, with spaces\tand a tab");
@@ -466,7 +466,7 @@ TEST_CASE("trailers read back as they were written", "[http][1.1][chunked][trail
     CHECK_FALSE(test::sync_wait(chunked.write("hello"sv)).err);
     CHECK_FALSE(test::sync_wait(chunked.finish(&sent)).err);
 
-    net::http::headers received;
+    net::http::trailer_fields received;
     auto [result, rest] = read_chunked(out.build(), true, &received);
     CHECK_FALSE(result.err);
     CHECK(result.body == "hello");

@@ -212,7 +212,7 @@ namespace detail
     public:
         // trailers are the body's trailer fields: empty until a read has reported its end, and for a body without
         // any. Valid as long as the body is.
-        [[nodiscard]] virtual const headers& trailers() const noexcept = 0;
+        [[nodiscard]] virtual const trailer_fields& trailers() const noexcept = 0;
 
     protected:
         trailer_source() noexcept                                 = default;
@@ -273,7 +273,7 @@ struct client_response
     // body. Empty until then, for a response without any, and for a body that isn't the client's (e.g. one the caller
     // put in its place). They're kept apart from headers (RFC 9110, section 6.5), and without the fields that can't be
     // trailers (see trailer_allowed()), which are dropped. They're the body's: valid as long as it is.
-    [[nodiscard]] const net::http::headers& trailers() const noexcept;
+    [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept;
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.
@@ -285,7 +285,7 @@ struct server_response
     io::writer*        body = nullptr;
 
     // The response's trailer fields, sent after the body (see response_writer::trailers()).
-    net::http::headers trailers{};
+    net::http::trailer_fields trailers{};
 };
 
 using response_encoder_result = std::expected<io::writer*, std::error_code>;
@@ -343,7 +343,7 @@ public:
     // stream reset), so the client doesn't take it as complete. Over HTTP/2, a response without a body ends with its
     // head, unless trailers (or a Trailer field, which declares them, as RFC 9110 says a sender should) are set by the
     // time it's sent: then they follow the head.
-    net::http::headers& trailers() noexcept;
+    net::http::trailer_fields& trailers() noexcept;
 
     // send sends the response's status and headers, with a Content-Length of content_length (except for statuses
     // that have no content: 1xx, 204 and 304), and returns the writer for its body. Writing more than content_length

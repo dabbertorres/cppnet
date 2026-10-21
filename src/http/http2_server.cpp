@@ -415,7 +415,7 @@ namespace
                 for (const auto& f : fields)
                 {
                     if (!trailer_allowed(f.name)) continue;
-                    if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<headers>();
+                    if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<trailer_fields>();
                     s.received_trailers->add(f.name, f.value);
                 }
 

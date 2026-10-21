@@ -47,10 +47,10 @@ std::string format_date(std::chrono::system_clock::time_point t)
     return std::format("{:%a, %d %b %Y %H:%M:%S} GMT", std::chrono::floor<std::chrono::seconds>(t));
 }
 
-const headers& client_response::trailers() const noexcept
+const trailer_fields& client_response::trailers() const noexcept
 {
     // NOTE: a body the caller put in place of the client's has none.
-    static const net::http::headers none;
+    static const trailer_fields none;
 
     const auto* source = dynamic_cast<const detail::trailer_source*>(body.get());
     return source != nullptr ? source->trailers() : none;
@@ -89,7 +89,7 @@ response_writer::response_writer(detail::http2_stream*           stream,
 
 headers& response_writer::headers() noexcept { return resp->headers; }
 
-headers& response_writer::trailers() noexcept { return resp->trailers; }
+trailer_fields& response_writer::trailers() noexcept { return resp->trailers; }
 
 coro::task<io::writer*> response_writer::send(status status_code, std::size_t content_length)
 {

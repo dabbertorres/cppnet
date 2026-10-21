@@ -53,7 +53,7 @@ namespace
 
 // describe is a request's body and trailers, as the echo handler answers: "body|name=value,value;...", and "early "
 // first if the trailers were there before the body had been read to its end.
-std::string describe(bool early, std::string_view body, const http::headers& trailers)
+std::string describe(bool early, std::string_view body, const http::trailer_fields& trailers)
 {
     std::string out = early ? "early " : "";
     out.append(body).append("|");

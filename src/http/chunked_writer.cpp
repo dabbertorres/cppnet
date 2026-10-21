@@ -44,13 +44,12 @@ net::coro::task<net::io::result> write_full(net::io::writer* out, std::string_vi
 }
 
 // last_chunk_size is how long append_last_chunk makes the last chunk, with trailers' allowed fields.
-std::size_t last_chunk_size(const net::http::headers* trailers) noexcept
+std::size_t last_chunk_size(net::http::fields_view trailers) noexcept
 {
     // "0\r\n", the field lines, then "\r\n".
     std::size_t size = 5;
-    if (trailers == nullptr) return size;
 
-    for (const auto& [name, values] : *trailers)
+    for (const auto& [name, values] : trailers)
     {
         if (!net::http::trailer_allowed(name)) continue;
         for (const auto& value : values) size += name.size() + value.size() + 4;
@@ -61,17 +60,14 @@ std::size_t last_chunk_size(const net::http::headers* trailers) noexcept
 
 // append_last_chunk appends the last chunk, with a field line for each value of trailers' allowed fields, to out (a
 // string, or a span_appender).
-void append_last_chunk(auto& out, const net::http::headers* trailers)
+void append_last_chunk(auto& out, net::http::fields_view trailers)
 {
     out.append("0\r\n"sv);
 
-    if (trailers != nullptr)
+    for (const auto& [name, values] : trailers)
     {
-        for (const auto& [name, values] : *trailers)
-        {
-            if (!net::http::trailer_allowed(name)) continue;
-            for (const auto& value : values) out.append(name).append(": "sv).append(value).append("\r\n"sv);
-        }
+        if (!net::http::trailer_allowed(name)) continue;
+        for (const auto& value : values) out.append(name).append(": "sv).append(value).append("\r\n"sv);
     }
 
     out.append("\r\n"sv);
@@ -93,7 +89,7 @@ struct span_appender
 
 // write_last_chunk writes the last chunk, with trailers' allowed fields, when it can't be formatted into the writer's
 // buffer (see finish()).
-net::coro::task<net::io::result> write_last_chunk(net::io::writer* out, const net::http::headers* trailers)
+net::coro::task<net::io::result> write_last_chunk(net::io::writer* out, net::http::fields_view trailers)
 {
     try
     {
@@ -141,17 +137,17 @@ coro::task<io::result> chunked_writer::write(std::span<const std::byte> data)
     co_return {.count = count};
 }
 
-coro::task<io::result> chunked_writer::finish(const headers* trailers)
+coro::task<io::result> chunked_writer::finish(const trailer_fields* trailers)
 {
     if (parent == nullptr)
         return coro::ready_task<io::result>(io::result{.err = std::make_error_code(std::errc::invalid_argument)});
 
-    // without trailers, it's just "0\r\n\r\n".
-    if (trailers != nullptr && trailers->empty()) trailers = nullptr;
+    // without trailers (none, or none given), it's just "0\r\n\r\n".
+    const fields_view section = trailers != nullptr ? fields_view{*trailers} : fields_view{};
 
     // nothing's written if a trailer can't be, so the caller can cut the body short instead (rather than end it
     // without them, or with only some).
-    if (trailers != nullptr && !valid_fields(*trailers))
+    if (!valid_fields(section))
         return coro::ready_task<io::result>(io::result{.err = std::make_error_code(std::errc::invalid_argument)});
 
     // usually, it's a connection's buffered writer, with room for it: then it's formatted straight into the buffer,
@@ -160,10 +156,10 @@ coro::task<io::result> chunked_writer::finish(const headers* trailers)
     {
         try
         {
-            if (auto out = buffered->prepare(last_chunk_size(trailers)); !out.empty())
+            if (auto out = buffered->prepare(last_chunk_size(section)); !out.empty())
             {
                 span_appender appender{.out = out};
-                append_last_chunk(appender, trailers);
+                append_last_chunk(appender, section);
                 return coro::ready_task<io::result>();
             }
         }
@@ -173,7 +169,7 @@ coro::task<io::result> chunked_writer::finish(const headers* trailers)
         }
     }
 
-    return write_last_chunk(parent, trailers);
+    return write_last_chunk(parent, section);
 }
 
 }

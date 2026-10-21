@@ -56,7 +56,7 @@ public:
     // cleared then), before call_at_end()'s callback is called: but those that can't be trailers (see
     // trailer_allowed()), which are dropped. A trailer section that fails leaves it empty. trailers must outlive the
     // reads.
-    void keep_trailers(headers* trailers) noexcept { kept = trailers; }
+    void keep_trailers(trailer_fields* trailers) noexcept { kept = trailers; }
 
     // call_at_start sets what's awaited before the first read into a non-empty span reads anything (see
     // io::start_callback).
@@ -72,7 +72,7 @@ private:
     std::size_t                          chunk_remaining = 0;
     bool                                 after_chunk     = false;   // a chunk was read, but not the CRLF after it
     bool                                 done            = false;   // the last chunk and trailers have been read
-    headers*                             kept            = nullptr; // where trailers go, if anywhere
+    trailer_fields*                      kept            = nullptr; // where trailers go, if anywhere
     io::end_callback                     at_end;
     io::start_callback                   at_start;
 };

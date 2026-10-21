@@ -157,8 +157,8 @@ public:
     // was received, which moves them to trailers_to, if it's set (e.g. a request's): so whoever looks at them does on
     // the reader's task, once it's read to the end, never as the connection's reader adds them. Made only for a
     // message that has them, so a stream without any isn't larger for them.
-    std::unique_ptr<headers> received_trailers;
-    headers*                 trailers_to = nullptr;
+    std::unique_ptr<trailer_fields> received_trailers;
+    trailer_fields*                 trailers_to = nullptr;
 
     // hand_over_trailers moves the trailers received to trailers_to, if both are there (holding the lock).
     void hand_over_trailers() noexcept;
@@ -203,8 +203,10 @@ enum class field_section : std::uint8_t
 // so names mustn't be touched until fields are sent), values without the whitespace around them (see trim_value),
 // without connection-specific fields (nor those Connection names; nor what section leaves out), and with credentials
 // never indexed. It fails with std::errc::invalid_argument, appending nothing, if a field's name or value isn't valid
-// (see valid_fields), as HTTP/1.1's encoder does: any field's, even one it would leave out.
-[[nodiscard]] std::error_code append_fields(const headers&             from,
+// (see valid_fields), as HTTP/1.1's encoder does: any field's, even one it would leave out. from is headers, or
+// trailer_fields (it's defined for those only).
+template<std::size_t N>
+[[nodiscard]] std::error_code append_fields(const basic_headers<N>&    from,
                                             std::vector<std::string>&  names,
                                             std::vector<hpack::field>& fields,
                                             field_section              section = field_section::response);

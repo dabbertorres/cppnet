@@ -127,7 +127,7 @@ public:
         return leased.conn != nullptr ? net::http::detail::native_handle(*leased.conn) : -1;
     }
 
-    [[nodiscard]] const net::http::headers& trailers() const noexcept override { return kept; }
+    [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept override { return kept; }
 
 private:
     // finish returns the connection to the pool, which may reuse it if the whole body was read.
@@ -154,7 +154,7 @@ private:
     std::optional<std::size_t>                          remaining;
     std::stop_token                                     stop;
     std::error_code                                     failed; // a read failed (see read())
-    net::http::headers                                  kept;   // the body's trailers, once it's read to its end
+    net::http::trailer_fields                           kept;   // the body's trailers, once it's read to its end
 };
 
 // limit is a timeout from client_options, where 0 is no limit.

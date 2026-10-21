@@ -30,7 +30,7 @@ public:
     //
     // NOTE: if the writer is buffered (an io::buffered_writer) with room for it all, the last chunk is formatted into
     //       its buffer without a coroutine (as HTTP/1.1's heads are), and written by its next flush.
-    coro::task<io::result> finish(const headers* trailers = nullptr);
+    coro::task<io::result> finish(const trailer_fields* trailers = nullptr);
 
     [[nodiscard]] io::handle native_handle() const noexcept override { return parent->native_handle(); }
 

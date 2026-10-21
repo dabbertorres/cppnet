@@ -157,7 +157,7 @@ TEST_CASE("HTTP/2 sends neither connection-specific fields, nor those Connection
 
 TEST_CASE("HTTP/2 sends only the fields that may be trailers as trailers", "[http][http2][connection][trailers]")
 {
-    const net::http::headers from{
+    const net::http::trailer_fields from{
         { "Server-Timing",   {"db;dur=53"}},
         {"Content-Length",           {"0"}},
         {      "If-Match",       {"\"a\""}},
@@ -177,7 +177,7 @@ TEST_CASE("HTTP/2 sends only the fields that may be trailers as trailers", "[htt
     CHECK(got == std::vector<std::string>{"server-timing: db;dur=53", "grpc-status: 0"});
 
     // one it would drop is still checked, as HTTP/1.1's chunked_writer checks it.
-    net::http::headers bad;
+    net::http::trailer_fields bad;
     bad.add("Grpc-Status", "0");
     bad.add("Content-Length", "1\r\n2");
     fields.clear();

@@ -149,7 +149,7 @@ struct client_request
     // send(), the request abandoned. It's called again each time the body is sent again (a redirect's 307 or 308, or
     // a retry). Nothing sends TE: trailers (which says the caller won't drop the response's trailers) unless the
     // caller sets it; over HTTP/1.1, TE is then listed in Connection (RFC 9110, section 10.1.4).
-    std::function<void(net::http::headers&)> make_trailers{};
+    std::function<void(net::http::trailer_fields&)> make_trailers{};
 
     // set_body sets the body to content, and the Content-Length to match; and get_body, to read it again (sharing
     // content, rather than copying it), for redirects that send it again.
@@ -231,7 +231,7 @@ struct server_request
     // empty): over HTTP/1.1, a chunked body's trailer section; over HTTP/2, a HEADERS frame after the body. They're
     // kept apart from headers (RFC 9110, section 6.5), and without the fields that can't be trailers (see
     // trailer_allowed()), which are dropped. clear() empties them.
-    net::http::headers trailers{};
+    net::http::trailer_fields trailers{};
 
     // path_value is the value of the route's parameter name: e.g. "42" for "id", for the route "/users/:id" and the
     // path "/users/42". It's empty if the route has no such parameter (a parameter never matches an empty segment).

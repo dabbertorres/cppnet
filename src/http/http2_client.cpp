@@ -94,7 +94,7 @@ namespace
 
         [[nodiscard]] io::handle native_handle() const noexcept override { return conn->native_handle(); }
 
-        [[nodiscard]] const headers& trailers() const noexcept override { return kept; }
+        [[nodiscard]] const trailer_fields& trailers() const noexcept override { return kept; }
 
     private:
         coro::task<io::result> read_stoppable(std::span<std::byte> data)
@@ -126,7 +126,7 @@ namespace
         std::stop_token                                           stop;
         std::optional<http2_client_connection::stop_registration> on_stop;
         std::error_code                                           finished; // what ended it, given a token
-        headers                                                   kept;     // the trailers, once it's read to its end
+        trailer_fields                                            kept;     // the trailers, once it's read to its end
     };
 
     // keep_trailers keeps a trailers block's fields in the stream (without those that can't be trailers), for its
@@ -136,7 +136,7 @@ namespace
         for (const auto& f : fields)
         {
             if (!trailer_allowed(f.name)) continue;
-            if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<headers>();
+            if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<trailer_fields>();
             s.received_trailers->add(f.name, f.value);
         }
     }
@@ -398,7 +398,7 @@ std::error_code http2_client_connection::end_request(const client_request& reque
 {
     // the trailers are what's known once the body's been read (e.g. a digest of it).
     // NOTE: not in send_body()'s frame, so a request without them doesn't make it larger.
-    headers trailers;
+    trailer_fields trailers;
     if (request.make_trailers) request.make_trailers(trailers);
 
     std::scoped_lock lock{mu};

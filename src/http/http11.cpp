@@ -46,6 +46,7 @@ using namespace std::string_view_literals;
 using net::coro::task;
 using net::http::client_request;
 using net::http::client_response;
+using net::http::fields_view;
 using net::http::headers;
 using net::http::parse_method;
 using net::http::parse_request_target;
@@ -488,10 +489,10 @@ task<std::error_code> copy_chunked(net::io::reader& body, net::http::http11::chu
 
 // finish_trailing writes the last chunk, with make_trailers' fields as its trailer section: a coroutine of its own, so
 // only a request that has them has their headers in a frame.
-task<std::error_code> finish_trailing(net::http::http11::chunked_writer&              chunked,
-                                      const std::function<void(net::http::headers&)>& make_trailers)
+task<std::error_code> finish_trailing(net::http::http11::chunked_writer&                     chunked,
+                                      const std::function<void(net::http::trailer_fields&)>& make_trailers)
 {
-    net::http::headers trailers;
+    net::http::trailer_fields trailers;
     make_trailers(trailers);
     co_return (co_await chunked.finish(&trailers)).err;
 }
@@ -503,7 +504,7 @@ bool is_default_port(std::string_view scheme, std::string_view port) noexcept
 }
 
 // fields_size is how long append_fields makes the field lines for fields.
-std::size_t fields_size(const headers& fields) noexcept
+std::size_t fields_size(fields_view fields) noexcept
 {
     std::size_t size = 0;
     for (const auto& [name, values] : fields)
@@ -530,7 +531,7 @@ struct span_appender
 
 // append_fields appends a field line for each of the values in fields: joining a field's values with commas would
 // change fields that aren't lists (e.g. Set-Cookie).
-void append_fields(auto& out, const headers& fields)
+void append_fields(auto& out, fields_view fields)
 {
     for (const auto& [name, values] : fields)
     {
@@ -975,7 +976,7 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
     co_return resp;
 }
 
-void keep_body_trailers(const client_response& resp, headers& trailers) noexcept
+void keep_body_trailers(const client_response& resp, trailer_fields& trailers) noexcept
 {
     // NOTE: the bodies make_response_body() makes, told apart as call_at_body_end() does.
     auto* body = resp.body.get();

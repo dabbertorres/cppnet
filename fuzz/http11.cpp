@@ -63,7 +63,7 @@ private:
 }
 
 // check_fields fails if fields has one that couldn't be written back out unchanged, and appends them to out.
-void check_fields(const net::http::headers& fields, std::string_view prefix, std::string& out)
+void check_fields(net::http::fields_view fields, std::string_view prefix, std::string& out)
 {
     for (const auto& [name, values] : fields)
     {
@@ -78,7 +78,7 @@ void check_fields(const net::http::headers& fields, std::string_view prefix, std
 }
 
 // check_trailers fails if trailers has a field that can't be a trailer, or doesn't read back the same once written.
-void check_trailers(const net::http::headers& trailers)
+void check_trailers(const net::http::trailer_fields& trailers)
 {
     for (const auto& field : trailers)
     {
@@ -94,7 +94,7 @@ void check_trailers(const net::http::headers& trailers)
     net::io::string_reader<char>      in{text};
     net::io::buffered_reader          buffered{&in};
     net::http::http11::chunked_reader reader{&buffered};
-    net::http::headers                again;
+    net::http::trailer_fields         again;
     reader.keep_trailers(&again);
 
     std::string buf(1, '\0');

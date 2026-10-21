@@ -449,7 +449,7 @@ auto* digest = upload.get();
 net::http::client_request req{.method = net::http::request_method::PUT,
                               .uri    = net::url::parse("https://example.com/upload").value()};
 req.body          = std::move(upload);                     // no Content-Length: chunked, over HTTP/1.1
-req.make_trailers = [digest](net::http::headers& trailers) { trailers.set("Content-Digest", digest->value()); };
+req.make_trailers = [digest](net::http::trailer_fields& trailers) { trailers.set("Content-Digest", digest->value()); };
 req.headers.set("TE", "trailers");                         // this caller reads the response's trailers
 
 auto resp = co_await client.send(std::move(req));
@@ -537,12 +537,12 @@ scheduler.spawn(server.serve());
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).
-- **Trailers** are fields that come after the body (RFC 9110, section 6.5), e.g. what's known only once the body's
-  done: a digest of it, `Server-Timing`, or gRPC's `grpc-status`. A request's are `req.trailers` (a `headers`, kept
-  apart from `req.headers`), there once the handler has read the body to its end, and empty until then: a chunked
-  body's trailer section over HTTP/1.1, the HEADERS frame after the body over HTTP/2. A response's are
-  `resp.trailers()`, sent when the response ends, once the handler has returned (so middleware may add to them after
-  `next()`):
+- **Trailers** are fields that come after the body (RFC 9110, section 6.5), e.g. what's known only once the body's done:
+  a digest of it, `Server-Timing`, or gRPC's `grpc-status`. A request's are `req.trailers` (a
+  `net::http::trailer_fields`: a `headers` holding 2 fields in itself rather than 8, as there are few), kept apart from
+  `req.headers`, there once the handler has read the body to its end, and empty until then: a chunked body's trailer
+  section over HTTP/1.1, the HEADERS frame after the body over HTTP/2. A response's are `resp.trailers()`, sent when the
+  response ends, once the handler has returned (so middleware may add to them after `next()`):
 
   ```cpp
   auto* body = co_await resp.send(net::http::status::OK);   // no Content-Length: chunked, over HTTP/1.1

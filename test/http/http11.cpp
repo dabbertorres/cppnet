@@ -917,7 +917,7 @@ TEST_CASE("a chunked request's last chunk carries make_trailers' fields", "[http
 
     SECTION("which are called for once the body's been read, dropping those that can't be trailers")
     {
-        req.make_trailers = [&](net::http::headers& trailers)
+        req.make_trailers = [&](net::http::trailer_fields& trailers)
         {
             ++calls;
             trailers.set("X-Digest"sv, "abc"sv);
@@ -933,7 +933,7 @@ TEST_CASE("a chunked request's last chunk carries make_trailers' fields", "[http
     {
         req.body = body_of("");
         req.headers.set("Transfer-Encoding"sv, "chunked"sv);
-        req.make_trailers = [&](net::http::headers& trailers)
+        req.make_trailers = [&](net::http::trailer_fields& trailers)
         {
             ++calls;
             trailers.set("X-Digest"sv, "none"sv);
@@ -947,14 +947,14 @@ TEST_CASE("a chunked request's last chunk carries make_trailers' fields", "[http
     SECTION("but not with a Content-Length, which has no last chunk")
     {
         req.set_body("hello");
-        req.make_trailers = [&](net::http::headers& /*trailers*/) { ++calls; };
+        req.make_trailers = [&](net::http::trailer_fields& /*trailers*/) { ++calls; };
         CHECK(encode_request(req) == "PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello");
         CHECK(calls == 0);
     }
 
     SECTION("an invalid one fails, without the last chunk")
     {
-        req.make_trailers = [](net::http::headers& trailers) { trailers.set("X-Bad"sv, "a\r\nb"sv); };
+        req.make_trailers = [](net::http::trailer_fields& trailers) { trailers.set("X-Bad"sv, "a\r\nb"sv); };
 
         net::io::string_writer<char> out;
         auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
@@ -1004,7 +1004,7 @@ TEST_CASE("a response's chunked body keeps its trailers where it's told", "[http
     auto resp = test::sync_wait(net::http::http11::response_decode(&reader, net::http::request_method::GET));
     REQUIRE(resp.has_value());
 
-    net::http::headers trailers;
+    net::http::trailer_fields trailers;
     net::http::http11::keep_body_trailers(*resp, trailers);
     CHECK(trailers.empty());
 

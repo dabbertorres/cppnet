@@ -78,7 +78,8 @@ std::string_view trim_value(std::string_view value) noexcept
     return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
 }
 
-std::error_code append_fields(const headers&             from,
+template<std::size_t N>
+std::error_code append_fields(const basic_headers<N>&    from,
                               std::vector<std::string>&  names,
                               std::vector<hpack::field>& fields,
                               field_section              section)
@@ -121,6 +122,15 @@ std::error_code append_fields(const headers&             from,
 
     return {};
 }
+
+template std::error_code append_fields(const headers&             from,
+                                       std::vector<std::string>&  names,
+                                       std::vector<hpack::field>& fields,
+                                       field_section              section);
+template std::error_code append_fields(const trailer_fields&      from,
+                                       std::vector<std::string>&  names,
+                                       std::vector<hpack::field>& fields,
+                                       field_section              section);
 
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 {

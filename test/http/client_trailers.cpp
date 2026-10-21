@@ -57,7 +57,7 @@ using namespace std::string_view_literals;
 using net::coro::task;
 
 // describe is fields as "name=value;...", names lowercased (as HTTP/2 sends them), in order.
-std::string describe(const http::headers& fields)
+std::string describe(http::fields_view fields)
 {
     std::string out;
     for (const auto& [name, values] : fields)
@@ -303,7 +303,7 @@ std::unique_ptr<net::io::reader> chunked_body(std::string content)
 // add_digest is a make_trailers that counts its calls, adding a trailer that may be, and one that can't (dropped).
 auto add_digest(int* calls)
 {
-    return [calls](http::headers& trailers)
+    return [calls](http::trailer_fields& trailers)
     {
         ++*calls;
         trailers.set("X-Digest", "abc");
@@ -541,7 +541,7 @@ TEST_CASE("a trailer that can't be sent fails the request, cut short", "[http][c
         // more than the client's buffer, so the server has the head (and handler) before the request fails.
         auto req          = request(http::request_method::POST, server->url("/sink"));
         req.body          = chunked_body(std::string(100'000, 'x'));
-        req.make_trailers = [](http::headers& trailers) { trailers.set("X-Bad", "a\r\nb"); };
+        req.make_trailers = [](http::trailer_fields& trailers) { trailers.set("X-Bad", "a\r\nb"); };
 
         const auto out = co_await send(client, std::move(req));
         CHECK(out.err == std::errc::invalid_argument);

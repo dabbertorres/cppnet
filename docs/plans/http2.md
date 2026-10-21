@@ -11,7 +11,8 @@ done (2026-10-20; see Learned in stage 5); its second, interim responses in the 
 (2026-10-20); its third, trailers in the codecs (`chunked_reader`, `chunked_writer::finish(trailers)`,
 `trailer_allowed()`), done (2026-10-20); its fourth, trailers on the server (`server_request::trailers`,
 `response_writer::trailers()`), done (2026-10-20); its fifth, trailers in the client (`client_response::trailers()`,
-`client_request::make_trailers`), done (2026-10-20).
+`client_request::make_trailers`), done (2026-10-20); and then trailers held in `trailer_fields`, 2 fields inline
+rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)").
 
 ## Goal
 
@@ -695,6 +696,41 @@ idle stream would be a connection error for the peer.
   and their best times within each other's spread (pipelined 1115 ns before, 1127 after; over a socket 29.1 and 28.1
   us). What a request without trailers now does more: a test of `make_trailers`, an empty `headers` made and destroyed
   (HTTP/2's `end_request()`), and over HTTP/1.1 a look for TE among the request's fields.
+
+### Trailers' size (after part 5)
+
+- Parts 3 to 5 held trailers in a `headers`: 680 bytes with libc++ (8 fields of 80 bytes held inline), for something
+  almost always empty, or a field or two (gRPC's `grpc-status` and `grpc-message`, `Server-Timing`). The user chose
+  (2026-10-20) to hold 2 inline: `headers` became `basic_headers<N>` (`using headers = basic_headers<8>`, unchanged),
+  and `trailer_fields = basic_headers<2>` (200 bytes) is the type of every trailers member and API:
+  `server_request::trailers`, `server_response::trailers` (`response_writer::trailers()`), `client_response::trailers()`
+  (`detail::trailer_source`) and the client's bodies' `kept`, HTTP/2's `received_trailers` and `trailers_to` (the
+  hand-over still a move), `chunked_reader::keep_trailers()`, `chunked_writer::finish()`,
+  `http11::keep_body_trailers()`'s client overload, and `client_request::make_trailers`. More than 2 still work, and
+  allocate, as `headers`' do past 8.
+- A template, rather than a capacity-erased base under `util::small_vector` (LLVM's `SmallVectorImpl`): `small_vector`
+  is a `std::array` and a `std::vector`, with no base to erase N into, and a template keeps `headers`' code as it was.
+  The members stay in `headers.cpp`, explicitly instantiated for 8 and 2 (`extern template` in the header). A field is
+  `header_field` whatever N, so what only reads fields takes a `fields_view` (`std::span<const header_field>`, which
+  either converts to): `valid_fields()`, `same_fields()` (behind an `operator==` comparing any two), and HTTP/1.1's
+  encoder pieces; HTTP/2's `append_fields()`, which looks fields up, is a template instantiated for both.
+- Clang's code for `headers` was compared function by function (Release objects, before and after). Two changes were
+  needed to keep it: `for_each_element` (behind `get_list()` and `has_token()`) became a free function local to
+  `headers.cpp`, as the member template, given lambdas from a class template's members, had external linkage and
+  stopped being inlined into its callers; and `begin()`, `end()`, `size()` and `empty()` are defined in the class, so
+  a `fields_view` is made without calls (they were out of line before, so the encoder makes fewer calls than it did).
+  HTTP/2's `append_fields()` now calls `connection_specific()` rather than inlining it (it has two callers now).
+- Sizes (libc++, before and after): `trailer_fields` 680 to 200 bytes; `server_request` 1776 to 1296;
+  `server_response` 1384 to 904; the HTTP/2 server's stream 3544 to 2584; `pooled_body` 832 to 352;
+  `http2_response_body` 856 to 376.
+- Measured (`bench_request`, Release, five alternating runs of the binaries before and after): allocations unchanged
+  everywhere (1.4 a request pipelined, 4.2 one per read, 3.0 and 2.0 over a socket, 51.7 to 52.1 over HTTP/2, the
+  middleware runs' 2.4, 1.4, 2.4, 3.4, 2.4 and 4.0); over a socket and HTTP/2, times within each other's spread (27.6 to
+  29.3 us before, 27.9 to 28.8 after; HTTP/2 80.1 to 85.6 and 80.9 to 84.1). The runs from memory came out 2 to 3%
+  slower (pipelined 1116 to 1161 ns before, 1156 to 1198 after): not from the code, it seems, as the same build with
+  `trailer_fields` holding 8 (the old sizes) was as fast as before (1119 to 1130 ns, against 1127 to 1170 in those
+  runs), and this one nearly so with the bench's coroutine frame padded back to the old offsets (its `server_request`
+  and `server_response` are locals of the frame; 1128 to 1181): it's where the frame's locals fall.
 
 ## Stage 5
 

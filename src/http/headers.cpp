@@ -31,16 +31,50 @@ std::string_view trim_ows(std::string_view str) noexcept
     return str.substr(start, str.find_last_not_of(ows) - start + 1);
 }
 
-// find_field finds key's field in the first used of fields (const or not), or returns null.
-auto* find_field(auto& fields, std::size_t used, std::string_view key) noexcept
+// find_field finds key's field in the count fields from first (const or not), or returns null.
+template<typename Field>
+Field* find_field(Field* first, std::size_t count, std::string_view key) noexcept
 {
-    auto* first = fields.data();
-    auto* last  = first + used;
-    auto* it    = std::find_if(first,
-                               last,
-                               [&](const auto& field)
-                               { return net::util::equal_ignore_case(std::string_view{field.first}, key); });
+    auto* last = first + count;
+    auto* it   = std::find_if(first,
+                              last,
+                              [&](const auto& field)
+                              { return net::util::equal_ignore_case(std::string_view{field.first}, key); });
     return it != last ? it : nullptr;
+}
+
+// for_each_element calls visit with each element of a list-based field (see get_list), field (or none, if it's null),
+// until it returns false.
+//
+// NOTE: a free function in this namespace, rather than a member, so its instantiations are local to this file, and
+// clang
+//       inlines each into its one caller (a member's, with a lambda from a member of the class template, would have
+//       external linkage, and wasn't inlined).
+template<typename F>
+void for_each_element(const net::http::header_field* field, F visit)
+{
+    if (field == nullptr) return;
+
+    for (std::string_view value : field->second)
+    {
+        bool        quoted  = false;
+        std::size_t start   = 0;
+        const auto  element = [&](std::size_t end)
+        {
+            auto trimmed = trim_ows(value.substr(start, end - start));
+            start        = end + 1;
+            return trimmed.empty() || visit(trimmed);
+        };
+
+        for (std::size_t i = 0; i < value.size(); ++i)
+        {
+            if (quoted && value[i] == '\\') ++i; // skip what's escaped
+            else if (value[i] == '"') quoted = !quoted;
+            else if (!quoted && value[i] == ',' && !element(i)) return;
+        }
+
+        if (!element(value.size())) return;
+    }
 }
 
 // set_values makes vals just val, reusing the memory of the first value.
@@ -67,7 +101,8 @@ namespace net::http
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
-headers::headers(std::initializer_list<std::pair<std::string, std::vector<std::string>>> init)
+template<std::size_t N>
+basic_headers<N>::basic_headers(std::initializer_list<std::pair<std::string, std::vector<std::string>>> init)
 {
     for (const auto& [key, vals] : init)
     {
@@ -75,23 +110,34 @@ headers::headers(std::initializer_list<std::pair<std::string, std::vector<std::s
     }
 }
 
-headers::headers(headers&& other) noexcept
+template<std::size_t N>
+basic_headers<N>::basic_headers(basic_headers&& other) noexcept
     : fields{std::move(other.fields)}
     , used{std::exchange(other.used, 0)}
 {}
 
-headers& headers::operator=(headers&& other) noexcept
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::operator=(basic_headers&& other) noexcept
 {
     fields = std::move(other.fields);
     used   = std::exchange(other.used, 0);
     return *this;
 }
 
-const headers::field_type* headers::find(std::string_view key) const noexcept { return find_field(fields, used, key); }
+template<std::size_t N>
+const header_field* basic_headers<N>::find(std::string_view key) const noexcept
+{
+    return find_field(fields.data(), used, key);
+}
 
-headers::field_type* headers::find(std::string_view key) noexcept { return find_field(fields, used, key); }
+template<std::size_t N>
+header_field* basic_headers<N>::find(std::string_view key) noexcept
+{
+    return find_field(fields.data(), used, key);
+}
 
-headers::field_type& headers::add_field(std::string_view key)
+template<std::size_t N>
+header_field& basic_headers<N>::add_field(std::string_view key)
 {
     if (used < fields.size())
     {
@@ -105,7 +151,8 @@ headers::field_type& headers::add_field(std::string_view key)
     return field;
 }
 
-headers::values_type& headers::assign(std::string_view key)
+template<std::size_t N>
+header_values& basic_headers<N>::assign(std::string_view key)
 {
     auto* field = find(key);
     auto& vals  = field != nullptr ? field->second : add_field(key).second;
@@ -113,17 +160,23 @@ headers::values_type& headers::assign(std::string_view key)
     return vals;
 }
 
+template<std::size_t N>
 template<typename V>
-headers& headers::set_one(std::string_view key, V&& val)
+basic_headers<N>& basic_headers<N>::set_one(std::string_view key, V&& val)
 {
     auto* field = find(key);
     set_values(field != nullptr ? field->second : add_field(key).second, std::forward<V>(val));
     return *this;
 }
 
-headers& headers::set(std::string_view key, std::string val) { return set_one(key, std::move(val)); }
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set(std::string_view key, std::string val)
+{
+    return set_one(key, std::move(val));
+}
 
-headers& headers::set(std::string_view key, std::vector<std::string>&& vals)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set(std::string_view key, std::vector<std::string>&& vals)
 {
     auto& out   = assign(key);
     auto  taken = std::move(vals);
@@ -131,30 +184,38 @@ headers& headers::set(std::string_view key, std::vector<std::string>&& vals)
     return *this;
 }
 
-headers& headers::add(std::string_view key, std::string val)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::add(std::string_view key, std::string val)
 {
     if (auto* field = find(key); field != nullptr) field->second.push_back(std::move(val));
     else set_values(add_field(key).second, std::move(val));
     return *this;
 }
 
-headers& headers::set(std::string_view key, std::string_view val) { return set_one(key, val); }
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set(std::string_view key, std::string_view val)
+{
+    return set_one(key, val);
+}
 
-headers& headers::set(std::string_view key, std::initializer_list<std::string_view> vals)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set(std::string_view key, std::initializer_list<std::string_view> vals)
 {
     auto& out = assign(key);
     for (auto val : vals) out.emplace_back(val);
     return *this;
 }
 
-headers& headers::add(std::string_view key, std::string_view val)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::add(std::string_view key, std::string_view val)
 {
     if (auto* field = find(key); field != nullptr) field->second.emplace_back(val);
     else set_values(add_field(key).second, val);
     return *this;
 }
 
-headers& headers::remove(std::string_view key)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::remove(std::string_view key)
 {
     auto* field = find(key);
     if (field == nullptr) return *this;
@@ -165,11 +226,20 @@ headers& headers::remove(std::string_view key)
     return *this;
 }
 
-void headers::clear() noexcept { used = 0; }
+template<std::size_t N>
+void basic_headers<N>::clear() noexcept
+{
+    used = 0;
+}
 
-headers& headers::set_content_length(std::size_t length) { return set("Content-Length"sv, std::to_string(length)); }
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set_content_length(std::size_t length)
+{
+    return set("Content-Length"sv, std::to_string(length));
+}
 
-headers& headers::set_content_type(const content_type& content_type)
+template<std::size_t N>
+basic_headers<N>& basic_headers<N>::set_content_type(const content_type& content_type)
 {
     // nothing to add
     if (content_type.type.empty()) return *this;
@@ -183,7 +253,8 @@ headers& headers::set_content_type(const content_type& content_type)
     return set("Content-Type"sv, ss.str());
 }
 
-[[nodiscard]] std::optional<std::string_view> headers::get(std::string_view key) const
+template<std::size_t N>
+std::optional<std::string_view> basic_headers<N>::get(std::string_view key) const
 {
     const auto* field = find(key);
     if (field == nullptr || field->second.empty()) return std::nullopt;
@@ -191,9 +262,14 @@ headers& headers::set_content_type(const content_type& content_type)
     return std::string_view{field->second.front()};
 }
 
-[[nodiscard]] std::optional<std::string_view> headers::operator[](std::string_view key) const { return get(key); }
+template<std::size_t N>
+std::optional<std::string_view> basic_headers<N>::operator[](std::string_view key) const
+{
+    return get(key);
+}
 
-[[nodiscard]] std::optional<headers::values_range> headers::get_all(std::string_view key) const
+template<std::size_t N>
+auto basic_headers<N>::get_all(std::string_view key) const -> std::optional<values_range>
 {
     const auto* field = find(key);
     if (field == nullptr) return std::nullopt;
@@ -201,10 +277,11 @@ headers& headers::set_content_type(const content_type& content_type)
     return values_range{field->second.begin(), field->second.end()};
 }
 
-std::vector<std::string_view> headers::get_list(std::string_view key) const
+template<std::size_t N>
+std::vector<std::string_view> basic_headers<N>::get_list(std::string_view key) const
 {
     std::vector<std::string_view> out;
-    for_each_element(key,
+    for_each_element(find(key),
                      [&](std::string_view element)
                      {
                          out.push_back(element);
@@ -213,10 +290,11 @@ std::vector<std::string_view> headers::get_list(std::string_view key) const
     return out;
 }
 
-bool headers::has_token(std::string_view key, std::string_view token) const
+template<std::size_t N>
+bool basic_headers<N>::has_token(std::string_view key, std::string_view token) const
 {
     bool found = false;
-    for_each_element(key,
+    for_each_element(find(key),
                      [&](std::string_view element)
                      {
                          found = util::equal_ignore_case(element, token);
@@ -225,35 +303,8 @@ bool headers::has_token(std::string_view key, std::string_view token) const
     return found;
 }
 
-template<typename F>
-void headers::for_each_element(std::string_view key, F visit) const
-{
-    const auto* field = find(key);
-    if (field == nullptr) return;
-
-    for (std::string_view value : field->second)
-    {
-        bool        quoted  = false;
-        std::size_t start   = 0;
-        const auto  element = [&](std::size_t end)
-        {
-            auto trimmed = trim_ows(value.substr(start, end - start));
-            start        = end + 1;
-            return trimmed.empty() || visit(trimmed);
-        };
-
-        for (std::size_t i = 0; i < value.size(); ++i)
-        {
-            if (quoted && value[i] == '\\') ++i; // skip what's escaped
-            else if (value[i] == '"') quoted = !quoted;
-            else if (!quoted && value[i] == ',' && !element(i)) return;
-        }
-
-        if (!element(value.size())) return;
-    }
-}
-
-[[nodiscard]] std::optional<std::size_t> headers::get_content_length() const
+template<std::size_t N>
+std::optional<std::size_t> basic_headers<N>::get_content_length() const
 {
     std::optional<std::size_t> length;
 
@@ -274,7 +325,8 @@ void headers::for_each_element(std::string_view key, F visit) const
     return length;
 }
 
-[[nodiscard]] std::optional<content_type> headers::get_content_type() const
+template<std::size_t N>
+std::optional<content_type> basic_headers<N>::get_content_type() const
 {
     auto maybe = get("Content-Type"sv);
     if (!maybe.has_value()) return std::nullopt;
@@ -320,36 +372,36 @@ void headers::for_each_element(std::string_view key, F visit) const
     return out;
 }
 
-[[nodiscard]] std::optional<headers::values_range> headers::get_content_encoding() const
+template<std::size_t N>
+auto basic_headers<N>::get_content_encoding() const -> std::optional<values_range>
 {
     return get_all("Content-Encoding"sv);
 }
 
-[[nodiscard]] std::optional<headers::values_range> headers::get_transfer_encoding() const
+template<std::size_t N>
+auto basic_headers<N>::get_transfer_encoding() const -> std::optional<values_range>
 {
     return get_all("Transfer-Encoding"sv);
 }
 
-[[nodiscard]] bool headers::is_chunked() const
+template<std::size_t N>
+bool basic_headers<N>::is_chunked() const
 {
     auto codings = get_list("Transfer-Encoding"sv);
     return !codings.empty() && util::equal_ignore_case(codings.back(), "chunked"sv);
 }
 
-[[nodiscard]] headers::keys_iterator headers::begin() const { return fields.data(); }
-[[nodiscard]] headers::keys_iterator headers::end() const { return fields.data() + used; }
+// NOTE: after every member's definition, so each is instantiated here (see the extern templates in the header).
+template class basic_headers<8>;
+template class basic_headers<2>;
 
-[[nodiscard]] bool headers::empty() const noexcept { return used == 0; }
-
-[[nodiscard]] std::size_t headers::size() const noexcept { return used; }
-
-bool operator==(const headers& lhs, const headers& rhs) noexcept
+bool same_fields(fields_view lhs, fields_view rhs) noexcept
 {
     return lhs.size() == rhs.size()
         && std::ranges::all_of(lhs,
                                [&](const auto& field)
                                {
-                                   const auto* other = rhs.find(field.first);
+                                   const auto* other = find_field(rhs.data(), rhs.size(), field.first);
                                    return other != nullptr && other->second == field.second;
                                });
 }
@@ -376,7 +428,7 @@ bool is_valid_field_value(std::string_view value) noexcept
                                 });
 }
 
-bool valid_fields(const headers& fields) noexcept
+bool valid_fields(fields_view fields) noexcept
 {
     return std::ranges::all_of(
         fields,
