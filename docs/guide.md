@@ -203,6 +203,26 @@ have to wait for the socket are affected. A read canceled while it waits has rea
 again; a canceled write's result counts what it wrote. `shutdown_write()` ends the outgoing side (the peer reads the
 end of the stream).
 
+`co_await socket.wait_writable()` waits until the kernel counts the socket writable, writing nothing (its result's
+count is 0): at once, without a coroutine, if `poll()` says so; otherwise as a write waits, so the write deadline,
+timeout and stop token apply, and it can't wait alongside a write (whichever comes second fails with
+`std::errc::device_or_resource_busy`). With `tcp_socket::set_notsent_lowat(bytes)` (TCP_NOTSENT_LOWAT; 0 turns it off),
+a TCP socket counts as writable only while what's written but not yet sent is under the mark (on Linux, once it's under
+half of it), so a writer that waits for that before each write keeps little queued in the kernel (where it can no
+longer be reordered, e.g. by priority), however large the send buffer grows, without limiting what's in flight. Linux's
+`send()` stops at the mark by itself, but macOS's doesn't, so wait before writing:
+
+```cpp
+(void)sock->set_nodelay();
+(void)sock->set_notsent_lowat(16 * 1024);   // std::errc::not_supported where there's no such option
+
+while (/* more to write */)
+{
+    if (auto ready = co_await sock->wait_writable(); ready.err) { /* timed out, canceled, ... */ }
+    co_await net::io::write_all(*sock, next_chunk());   // chosen as late as possible
+}
+```
+
 ## DNS
 
 ```cpp

@@ -127,6 +127,18 @@ public:
     // set_nodelay turns Nagle's algorithm off (TCP_NODELAY), so a small write is sent right away, rather than when what
     // was sent before is acknowledged.
     [[nodiscard]] std::expected<void, std::error_code> set_nodelay(bool nodelay = true) const noexcept;
+
+    // set_notsent_lowat sets the socket's TCP_NOTSENT_LOWAT: the most it holds written but not yet sent before it no
+    // longer counts as writable (see socket::wait_writable()), so that a writer that waits for that keeps little more
+    // than what's in flight (which the congestion window governs) queued in the kernel, where it can't be reordered.
+    // What's in flight isn't limited, so a path with a long round trip still fills its window. 0 turns it off (on
+    // Linux, back to the net.ipv4.tcp_notsent_lowat sysctl's, unlimited by default); more than INT_MAX is INT_MAX.
+    // Linux's send() stops at the mark (std::errc::resource_unavailable_try_again, as for a full buffer), and its
+    // poll() and epoll say writable again only once what's not sent is under half of it; macOS's send() doesn't look at
+    // it (only its poll() and kqueue do, which, with Nagle's algorithm on, also say writable while what's not sent is
+    // under a segment), so a writer must wait for writability before writing, which works the same on both. It fails
+    // with std::errc::not_supported where the system has no such option.
+    [[nodiscard]] std::expected<void, std::error_code> set_notsent_lowat(std::size_t bytes) const noexcept;
 };
 
 namespace detail

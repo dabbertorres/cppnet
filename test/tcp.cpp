@@ -11,6 +11,7 @@
 #include <exception>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,6 +32,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
@@ -76,6 +78,33 @@ std::string closed_port()
     return std::to_string(ntohs(addr.sin_port));
 }
 
+}
+
+TEST_CASE("set_notsent_lowat sets TCP_NOTSENT_LOWAT, and 0 turns it off", "[tcp][notsent-lowat]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd != -1);
+    const net::tcp_socket sock{&sched, fd};
+
+    const auto mark = [fd]
+    {
+        int       value = -1;
+        socklen_t size  = sizeof(value);
+        REQUIRE(::getsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, &size) == 0);
+        return value;
+    };
+
+    REQUIRE(sock.set_notsent_lowat(16'384).has_value());
+    CHECK(mark() == 16'384);
+
+    REQUIRE(sock.set_notsent_lowat(0).has_value());
+    CHECK(mark() == 0);
+
+    // more than an int holds is as much as it holds.
+    REQUIRE(sock.set_notsent_lowat(std::size_t{1} << 40U).has_value());
+    CHECK(mark() == std::numeric_limits<int>::max());
 }
 
 TEST_CASE("connecting to a port nothing listens on is refused", "[tcp][connect]")

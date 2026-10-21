@@ -81,6 +81,19 @@ public:
     using io::reader::read;
     using io::writer::write;
 
+    // wait_writable waits until the socket is writable by the kernel's reckoning: a write would take something without
+    // waiting; for a TCP socket with a mark (see tcp_socket::set_notsent_lowat()), what's written but not yet sent is
+    // under it too (macOS's poll() then looks only at the mark, so a write may still have to wait for the send buffer,
+    // as writes do); or a write would fail at once (e.g. the connection was reset), the write then saying why. Its
+    // result's count is 0 (as a write of nothing's), and its err why it ended otherwise. It asks the kernel first
+    // (poll(), which doesn't wait), returning without a coroutine (see coro::ready_task) if it's writable; otherwise
+    // it waits as a write does, through the socket's write operation, so the write deadline, timeout and stop token
+    // apply (std::errc::timed_out, std::errc::operation_canceled), and it can't wait alongside a write: whichever
+    // comes second fails with std::errc::device_or_resource_busy, as a second write would. (As the scheduler's events
+    // are edge-triggered, a readiness it kept from earlier may be stale: the kernel's asked again each time the socket
+    // is reported, and the wait goes on until it says writable.)
+    coro::task<io::result> wait_writable() noexcept;
+
     [[nodiscard]] io::handle native_handle() const noexcept override { return fd; }
 
     // get_scheduler is the scheduler the socket waits with (e.g. for its pool, to resume what waits alongside it).
@@ -170,6 +183,10 @@ private:
                                  std::size_t                   already,
                                  const detail::socket_address* to = nullptr) noexcept;
 
+        // claim_writable readies it to wait until the socket's writable, writing nothing (see wait_writable()),
+        // returning false if it's already in use.
+        [[nodiscard]] bool claim_writable() noexcept;
+
         bool       start(std::coroutine_handle<> awaiting) noexcept override;
         io::result result() noexcept override;
         void       cancel() noexcept override;
@@ -183,6 +200,9 @@ private:
         std::optional<io::clock::time_point> deadline;
         std::optional<io::clock::duration>   timeout;
         io::result                           res;
+
+        // only_writable is whether it waits until the socket's writable, rather than writing (see wait_writable()).
+        bool only_writable = false;
     };
 
     // try_read reads, unless it would have to wait (then returning nothing). If from isn't null, it reads a datagram,
@@ -195,6 +215,10 @@ private:
     [[nodiscard]] std::optional<io::result> try_write(std::span<const std::byte>    data,
                                                       std::size_t&                  written,
                                                       const detail::socket_address* to = nullptr) const noexcept;
+
+    // poll_writable asks the kernel whether the socket's writable (see wait_writable()), without waiting: nothing if
+    // it isn't.
+    [[nodiscard]] std::optional<io::result> poll_writable() const noexcept;
 
     // NOTE: the read deadline is the read operation's (see read_operation::set_read_deadline()).
     io::scheduler*                       scheduler;

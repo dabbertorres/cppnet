@@ -16,6 +16,7 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -277,6 +278,22 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
     return coro::operation_task(writing);
 }
 
+coro::task<io::result> socket::wait_writable() noexcept
+{
+    if (fd == invalid_fd || scheduler == nullptr)
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)});
+
+    if (auto res = poll_writable(); res.has_value()) return coro::ready_task<io::result>(*res);
+
+    // the scheduler asks again each time the socket's reported writable (see write_operation::perform()).
+    if (!writing.claim_writable())
+        return coro::ready_task<io::result>(
+            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+
+    return coro::operation_task(writing);
+}
+
 bool socket::read_operation::claim(std::span<std::byte> into, detail::socket_address* from) noexcept
 {
     if (!try_claim()) return false;
@@ -334,12 +351,27 @@ bool socket::write_operation::claim(std::span<const std::byte>    from,
 {
     if (!try_claim()) return false;
 
-    this->to = to;
-    data     = from;
-    written  = already;
-    timeout  = sock->write_timeout;
-    deadline = wait_deadline(sock->write_deadline, timeout);
-    res      = {};
+    this->to      = to;
+    data          = from;
+    written       = already;
+    timeout       = sock->write_timeout;
+    deadline      = wait_deadline(sock->write_deadline, timeout);
+    res           = {};
+    only_writable = false;
+    return true;
+}
+
+bool socket::write_operation::claim_writable() noexcept
+{
+    if (!try_claim()) return false;
+
+    to            = nullptr;
+    data          = {};
+    written       = 0;
+    timeout       = sock->write_timeout;
+    deadline      = wait_deadline(sock->write_deadline, timeout);
+    res           = {};
+    only_writable = true;
     return true;
 }
 
@@ -350,6 +382,18 @@ bool socket::write_operation::start(std::coroutine_handle<> awaiting) noexcept
 
 bool socket::write_operation::perform() noexcept
 {
+    // NOTE: a socket reported writable may not be any more: the scheduler keeps an event that comes while nothing waits
+    //       (they're edge-triggered), which may be from before it filled up. So it asks the kernel, and waits for the
+    //       next event if it isn't.
+    if (only_writable)
+    {
+        auto writable = sock->poll_writable();
+        if (!writable.has_value()) return false;
+
+        res = *writable;
+        return true;
+    }
+
     const auto before = written;
 
     auto wrote = sock->try_write(data, written, to);
@@ -471,6 +515,32 @@ std::optional<io::result> socket::try_write(std::span<const std::byte>    data,
     }
 
     return io::result{.count = written};
+}
+
+std::optional<io::result> socket::poll_writable() const noexcept
+{
+    pollfd entry{.fd = fd, .events = POLLOUT, .revents = 0};
+
+    while (true)
+    {
+        const int num = ::poll(&entry, 1, 0);
+        if (num > 0) break;
+        if (num == 0) return std::nullopt;
+
+        auto err = errno;
+        if (err == EINTR) continue;
+        return io::result{
+            .count = 0,
+            .err   = {err, std::system_category()}
+        };
+    }
+
+    if ((entry.revents & POLLNVAL) != 0)
+        return io::result{.count = 0, .err = std::make_error_code(std::errc::bad_file_descriptor)};
+
+    // POLLOUT; or POLLERR or POLLHUP, with or without it, for a socket a write would fail on at once (e.g. one that was
+    // reset): the write says why.
+    return io::result{};
 }
 
 void socket::close(bool graceful, std::chrono::seconds graceful_timeout) noexcept

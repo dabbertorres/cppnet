@@ -24,9 +24,10 @@ done. Stage 6 decided (2026-10-21): finishing HTTP/2 (TCP_NOTSENT_LOWAT on the s
 with their last DATA, 431 for a header list over the limit, `Expect: 100-continue` in the client, scheduling and
 reprioritizing the client's requests, and connection coalescing with the ORIGIN frame), in twelve pull requests (see
 "Stage 6"); its questions (at the end) all as recommended. Its first part, ending a body of known length with its last
-DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6); and its second,
+DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6); its second,
 431 for a request's header list over the limit (`session_events::on_header_list_too_large()`, answered by the server's
-`refuse()`), done (2026-10-21).
+`refuse()`), done (2026-10-21); and its third, TCP_NOTSENT_LOWAT's part in the socket (`tcp_socket::set_notsent_lowat()`
+and `socket::wait_writable()`), done (2026-10-21).
 
 ## Goal
 
@@ -1325,6 +1326,56 @@ idle stream would be a connection error for the peer.
 - `fuzz_http2`'s properties are unchanged; its recorder implements the new event. Its 10-second run, and a 90-second
   one, pass.
 
+### Part 3: TCP_NOTSENT_LOWAT, the socket's part (done 2026-10-21)
+
+- As proposed (see "TCP_NOTSENT_LOWAT", Decided question 29 (a)), but for the result's type.
+  `tcp_socket::set_notsent_lowat(bytes)` (beside `set_nodelay()`, `const`, `std::expected<void, std::error_code>`) sets
+  TCP_NOTSENT_LOWAT, more than `INT_MAX` clamped to it, 0 turning it off (on Linux, back to the sysctl's, unlimited by
+  default); where `<netinet/tcp.h>` has no TCP_NOTSENT_LOWAT (FreeBSD's, from memory) it fails with `not_supported`.
+  `socket::wait_writable()` asks `poll()` (no wait) first and returns a ready task if the socket's writable (no
+  coroutine, as a write that doesn't wait); otherwise it claims the socket's write operation in a mode of its own
+  (`write_operation::claim_writable()`, `only_writable`), whose `perform()` (under the shard's lock, as a write's)
+  polls rather than sends: so the scheduler's waits, deadlines, timeout and stop token are the write's, a stale `ready`
+  flag is asked about again (`perform()` from `suspend_handle()`), and so is every event, until `poll()` says writable.
+  A POLLERR or POLLHUP counts as writable (the write then says why); POLLNVAL is `bad_file_descriptor`. A write's own
+  path gained a store in `claim()` and a branch in `perform()`, both only when it waits, so `bench_request` wasn't run.
+- Departure: `wait_writable()` returns `coro::task<io::result>` (count 0, as a write of nothing), not a task of an
+  `std::error_code`. It's the write operation's task (a `coro::operation<io::result>`), whose claim is what keeps it
+  from overlapping a write (whichever comes second gets `device_or_resource_busy`, as a second write does); a task of
+  another type would need an operation of its own, so a second claim and a second `handle_operation`'s state in every
+  socket (some 200 bytes), with the overlap then refused only by the scheduler's one waiter a direction, or a claim
+  shared across two operations, which `release()` (not virtual, for HALO) can't do. Part 4's writer reads `.err`.
+- The kernels. macOS (Darwin 24.6), by probes over loopback: `send()` ignores the mark (a writer with a mark of 4,096
+  wrote the peer's whole window, then its send buffer's worth); `poll()` says not writable once what's not sent is past
+  the mark, but with Nagle's algorithm on not before it's past a segment (16,384 unsent with 4 KiB writes, against
+  8,192 with TCP_NODELAY, which the server sets on its connections); 0 reads back as 0. Over macOS's loopback, which
+  delivers apart from `send()`, a socket found not writable right after a burst is often writable again without the
+  peer reading, as an acknowledgement still to come opens the window (in the probes, about one time in twenty with a
+  mark): so "not writable" isn't a settled state until nothing's in flight. Then the peer's window is closed, or
+  too small for macOS's sender to use (it held about 3 KiB of window unused for over a second, its send window
+  reported by TCP_CONNECTION_INFO), and it stays so until the peer reads. Also seen: a listener's SO_RCVBUF didn't keep
+  the accepted socket's receive buffer from growing (it read back 326,640 for 16,384). Linux, from memory of its sources
+  (no Linux here; CI's jobs are the check): `tcp_poll()` says writable once what's not sent is under half the mark
+  (`__sk_stream_is_writeable(sk, 1)`), as the EPOLLOUT wakeup does, and sets SOCK_NOSPACE when it isn't, so the wakeup
+  comes; `send()` stops at the mark. So a `poll()` after an edge agrees with it on Linux, and on macOS the edge and
+  `poll()` apply the same check; what the second look is for is the flag an edge left while nothing waited.
+- Tests (no network; `test/socket.cpp`, `[socket][wait-writable]`, and `test/tcp.cpp`'s `[tcp][notsent-lowat]`): the
+  mark read back with `getsockopt()` (16,384; 0; and `INT_MAX` for 2^40). Over a loopback connection with small buffers
+  and TCP_NODELAY, whose peer doesn't read: `wait_writable()` returns a ready task on a fresh socket (with a mark and
+  without), and `bad_file_descriptor` on a closed one; once filled, it waits until the peer reads (resumed by hand, it
+  hasn't finished, then the peer drains until it has), with a mark and without, and with a mark it isn't writable
+  though what the socket holds is under half its send buffer; it ends with `timed_out` at the write deadline and the
+  write timeout, `operation_canceled` on the stop token; and a write that has to wait while it waits gets
+  `device_or_resource_busy`, as does a second wait, and so does a wait while a write waits, each going on to finish when
+  the peer reads. The fill writes while `poll()` says writable, until it isn't and nothing's in flight (Linux:
+  SIOCOUTQ equal to SIOCOUTQNSD; macOS: TCP_CONNECTION_INFO's bytes sent, less those sent again, equal to what's been
+  acknowledged, what's written less SO_NWRITE), polling as the existing socket tests' `eventually()` does: stopping at
+  the first "not writable" failed about one run in three on macOS (mostly the cases without a mark); settled, 250 runs
+  of the new tests passed. The
+  writes during the fill leave the scheduler a `ready` flag every time: with `perform()` not asking `poll()`, the
+  waiting tests fail every run (the wait ends at once); without the fast path, the ready-task test fails; with the
+  option not set, the read-back and the under-half-the-buffer check fail.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2351,7 +2402,8 @@ certificate.
    2. **431 for a header list over the limit.** Done (2026-10-21; see Learned in stage 6). The session reports a request's head over MAX_HEADER_LIST_SIZE
       (`on_header_list_too_large()`) rather than resetting it, and the server answers it with `refuse()`; tests on bytes
       and with `test::h2_client`. Small, the server's only, and apart from the writer.
-   3. **TCP_NOTSENT_LOWAT, the socket's part.** `tcp_socket::set_notsent_lowat()` and `socket::wait_writable()` (a
+   3. **TCP_NOTSENT_LOWAT, the socket's part.** Done (2026-10-21; see Learned in stage 6).
+      `tcp_socket::set_notsent_lowat()` and `socket::wait_writable()` (a
       `poll()` for the level, then the scheduler's write wait), tested over loopback sockets. Split from 4 so the I/O
       layer's part, which differs between the kernels, is reviewed and tested on its own.
    4. **TCP_NOTSENT_LOWAT, the server's writer.** `server_config::http2_notsent_lowat` (Decided question 28) set on each

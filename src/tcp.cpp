@@ -11,6 +11,7 @@
 #include <cstring>
 #include <expected>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -703,6 +704,19 @@ std::expected<void, std::error_code> tcp_socket::set_nodelay(bool nodelay) const
     if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) == -1)
         return std::unexpected(std::error_code{errno, std::system_category()});
     return {};
+}
+
+std::expected<void, std::error_code> tcp_socket::set_notsent_lowat(std::size_t bytes) const noexcept
+{
+#ifdef TCP_NOTSENT_LOWAT
+    const int value = static_cast<int>(std::min<std::size_t>(bytes, std::numeric_limits<int>::max()));
+    if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, sizeof(value)) == -1)
+        return std::unexpected(std::error_code{errno, std::system_category()});
+    return {};
+#else
+    (void)bytes;
+    return std::unexpected(std::make_error_code(std::errc::not_supported));
+#endif
 }
 
 io::clock::time_point
