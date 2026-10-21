@@ -41,8 +41,8 @@
 #include "url.hpp"
 #include "util/defer.hpp"
 
-// The client's Expect: 100-continue over HTTP/1.1 (client_options::expect_continue_timeout): the HTTP/2 plan's stage 6,
-// fifth part.
+// The client's Expect: 100-continue (client_options::expect_continue_timeout): over HTTP/1.1, the HTTP/2 plan's stage
+// 6, fifth part; over HTTP/2, its sixth (at the end).
 namespace
 {
 
@@ -168,8 +168,8 @@ task<outcome> send(http::client* client, http::client_request req)
 // served is cppnet's server on 127.0.0.1, which sends 100 (Continue) when a handler first reads the body.
 struct served
 {
-    explicit served(net::io::scheduler* sched)
-        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), routes()}
+    explicit served(net::io::scheduler* sched, const http::server_config& config = {})
+        : server{sched, net::listener::make(sched, "127.0.0.1", "0").value(), routes(), config}
     {
         REQUIRE(sched->spawn(server.serve()));
     }
@@ -704,4 +704,401 @@ TEST_CASE("an HTTP/1.1 request that doesn't wait for 100 sends its body with its
     CHECK(out.body == test.body);
     CHECK(server.bodies == std::vector<std::string>{std::string{test.body}});
     CHECK(log.seen().empty() == test.body.empty()); // no interim response; the body read, if there's one
+}
+
+// Over HTTP/2 (the HTTP/2 plan's stage 6, sixth part).
+namespace
+{
+
+namespace http2 = net::http::http2;
+
+http::client_options h2_options_with(std::chrono::milliseconds expect_continue_timeout)
+{
+    auto options                  = options_with(expect_continue_timeout);
+    options.http2_prior_knowledge = true;
+    return options;
+}
+
+// background is a request sent on a task of its own, while the test plays the server: what it came to, once finished.
+struct background
+{
+    outcome                    result;
+    std::atomic<std::uint64_t> finished{0};
+
+    // wait waits (up to 5 seconds) for the request to have finished, returning whether it has.
+    task<bool> wait(net::io::scheduler* sched) const { return test::stop_probe::reach(sched, finished, 1); }
+};
+
+task<> send_in_background(net::io::scheduler* sched, http::client* client, http::client_request req, background* out)
+{
+    out->result = co_await send(client, std::move(req));
+    test::stop_probe::bump(sched, out->finished);
+}
+
+// h2_host is a host the client speaks HTTP/2 to (with prior knowledge), whose connection the test accepts, to play the
+// server on it with test::h2_client.
+struct h2_host
+{
+    explicit h2_host(net::io::scheduler* sched)
+        : listener{net::listener::make(sched, "127.0.0.1", "0").value()}
+    {}
+
+    [[nodiscard]] std::string url() const { return std::format("http://127.0.0.1:{}/", listener.local_port()); }
+
+    net::listener listener;
+};
+
+// played is a connection the test accepted, and the server it plays on it.
+struct played
+{
+    explicit played(net::tcp_socket accepted)
+        : socket{std::move(accepted)}
+        , server{&socket, &socket, &socket, http2::role::server}
+    {}
+
+    net::tcp_socket socket;
+    test::h2_client server;
+};
+
+task<std::unique_ptr<played>> accept(h2_host* host)
+{
+    auto accepted = co_await host->listener.accept();
+    REQUIRE(accepted.has_value());
+    co_return std::make_unique<played>(std::move(*accepted));
+}
+
+// head_in is whether a request's head (stream id) has come, in done()'s form for pump().
+auto head_in(test::h2_client& server, http2::stream_id id)
+{
+    return [&server, id] { return server.responses.contains(id) && !server.responses[id].headers.empty(); };
+}
+
+// body_begun is whether any of a request's body (stream id) has come, or it's ended.
+auto body_begun(test::h2_client& server, http2::stream_id id)
+{
+    return [&server, id] { return server.responses[id].data_frames > 0 || server.responses[id].done; };
+}
+
+// quiet is whether nothing of a request's body comes for a while: e.g. while it waits for 100 (Continue).
+task<bool> quiet(test::h2_client& server, http2::stream_id id, net::io::clock::duration wait)
+{
+    const bool begun = co_await server.pump(body_begun(server, id), wait);
+    co_return !begun && server.timed_out;
+}
+
+// answer answers a request (stream id) with 200 and its body (once it's all come), and waits for the client to have
+// read it.
+task<bool> answer(net::io::scheduler* sched, test::h2_client& server, http2::stream_id id, background* out)
+{
+    const bool whole = co_await server.wait_for(id);
+    if (!whole) co_return false;
+
+    server.respond(id, "200", server.responses[id].body);
+    const bool written = co_await server.pump([] { return true; });
+    if (!written) co_return false;
+    co_return co_await out->wait(sched);
+}
+
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 sends its body once the server's 100 comes", "[http][http2][client][expect]")
+{
+    // the 100 is waited for whether or not the request wants interim responses.
+    const bool informational = GENERATE(true, false);
+    CAPTURE(informational);
+
+    order              log; // (before the scheduler, whose tasks use it)
+    net::io::scheduler sched{make_pool()};
+
+    // a client still waiting fails the handler's read of the body, sooner than the wait would end.
+    http::server_config config;
+    config.body_read_timeout = 2s;
+    served server{&sched, config};
+
+    // long enough that the body can only go for the 100.
+    http::client client{&sched, h2_options_with(30s)};
+
+    auto req = post(server.url("/echo"), "hello", &log);
+    if (!informational) req.on_informational = nullptr;
+
+    const auto out = sched.run_to_completion(send(&client, std::move(req)));
+
+    CAPTURE(out.err.message());
+    CHECK(out.status == 200);
+    CHECK(out.body == "hello");
+
+    // the 100 (once, if it's passed on), then the body's reads.
+    const auto seen = log.seen();
+    CAPTURE(seen);
+    REQUIRE(seen.size() >= (informational ? 2 : 1));
+    CHECK(std::ranges::count(seen, std::string{"100"}) == (informational ? 1 : 0));
+    if (informational) CHECK(seen.front() == "100");
+    CHECK(seen[informational ? 1 : 0] == "read");
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 doesn't send its body if the server answers 413 first",
+          "[http][http2][client][expect]")
+{
+    order              log;
+    net::io::scheduler sched{make_pool()};
+    served             server{&sched};
+    http::client       client{&sched, h2_options_with(30s)};
+
+    const auto out = sched.run_to_completion(send(&client, post(server.url("/refuse"), "hello", &log)));
+
+    CAPTURE(out.err.message());
+    CHECK(out.status == 413);
+    CHECK(out.body.empty());
+    CHECK(log.reads() == 0);
+    CHECK(log.seen().empty());
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 sends its body once the wait's over", "[http][http2][client][expect]")
+{
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(300ms)};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, h2_host* host, order* log, background* out) -> task<>
+    {
+        REQUIRE(sched->spawn(send_in_background(sched, client, post(host->url(), "hello", log), out)));
+
+        auto       conn   = co_await accept(host);
+        auto&      server = conn->server;
+        const bool in     = co_await server.pump(head_in(server, 1));
+        REQUIRE(in);
+        CHECK(test::header(server.responses[1], "expect") == "100-continue");
+
+        // nothing for a while (the wait's 300 ms), then the body (the timer's ended the wait).
+        const bool waiting = co_await quiet(server, 1, 100ms);
+        CHECK(waiting);
+        const bool answered = co_await answer(sched, server, 1, out);
+        REQUIRE(answered);
+        CHECK(server.responses[1].body == "hello");
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, &log, &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 200);
+    CHECK(out.result.body == "hello");
+    const auto seen = log.seen();
+    CAPTURE(seen);
+    REQUIRE_FALSE(seen.empty());
+    CHECK(seen.front() == "read"); // no interim response
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 passes other interim responses on, and goes on waiting",
+          "[http][http2][client][expect]")
+{
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(30s)};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, h2_host* host, order* log, background* out) -> task<>
+    {
+        REQUIRE(sched->spawn(send_in_background(sched, client, post(host->url(), "hello", log), out)));
+
+        auto       conn   = co_await accept(host);
+        auto&      server = conn->server;
+        const bool in     = co_await server.pump(head_in(server, 1));
+        REQUIRE(in);
+
+        // a 103, then nothing for a while: the client still waits.
+        server.respond(1, "103", {}, false);
+        const bool waiting = co_await quiet(server, 1, 200ms);
+        CHECK(waiting);
+
+        server.respond(1, "100", {}, false);
+        const bool answered = co_await answer(sched, server, 1, out);
+        REQUIRE(answered);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, &log, &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 200);
+    CHECK(out.result.body == "hello");
+    const auto seen = log.seen();
+    CAPTURE(seen);
+    REQUIRE(seen.size() >= 3);
+    CHECK(seen[0] == "103");
+    CHECK(seen[1] == "100");
+    CHECK(seen[2] == "read");
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 sends its body after a 2xx first, once the wait's over",
+          "[http][http2][client][expect]")
+{
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(300ms)};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, h2_host* host, order* log, background* out) -> task<>
+    {
+        REQUIRE(sched->spawn(send_in_background(sched, client, post(host->url(), "hello", log), out)));
+
+        auto       conn   = co_await accept(host);
+        auto&      server = conn->server;
+        const bool in     = co_await server.pump(head_in(server, 1));
+        REQUIRE(in);
+
+        // the whole response first: the body still comes, once the wait's over (the stream may be full-duplex).
+        server.respond(1, "200", "ok");
+        const bool waiting = co_await quiet(server, 1, 100ms);
+        CHECK(waiting);
+        const bool whole = co_await server.wait_for(1);
+        REQUIRE(whole);
+        CHECK(server.responses[1].body == "hello");
+        CHECK_FALSE(server.responses[1].reset);
+
+        const bool finished = co_await out->wait(sched);
+        REQUIRE(finished);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, &log, &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 200);
+    CHECK(out.result.body == "ok");
+    CHECK(log.reads() > 0);
+}
+
+TEST_CASE("an HTTP/2 request expecting 100 doesn't send its body after a final response above 299 first",
+          "[http][http2][client][expect]")
+{
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(30s)};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, h2_host* host, order* log, background* out) -> task<>
+    {
+        REQUIRE(sched->spawn(send_in_background(sched, client, post(host->url(), "hello", log), out)));
+
+        auto       conn   = co_await accept(host);
+        auto&      server = conn->server;
+        const bool in     = co_await server.pump(head_in(server, 1));
+        REQUIRE(in);
+
+        server.respond(1, "403", "no");
+        const bool written = co_await server.pump([] { return true; });
+        REQUIRE(written);
+
+        // the response is read whole, then dropped: the stream's reset, as the request never ended, without any of
+        // its body.
+        const bool finished = co_await out->wait(sched);
+        REQUIRE(finished);
+        const bool reset = co_await server.wait_for(1);
+        REQUIRE(reset);
+        CHECK(server.responses[1].reset == http2::error_code::cancel);
+        CHECK(server.responses[1].data_frames == 0);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, &log, &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 403);
+    CHECK(out.result.body == "no");
+    CHECK(log.reads() == 0);
+}
+
+TEST_CASE("an HTTP/2 request that gets 417 instead of 100 is sent again without the expectation",
+          "[http][http2][client][expect]")
+{
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(30s)};
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, h2_host* host, order* log, background* out) -> task<>
+    {
+        REQUIRE(sched->spawn(send_in_background(sched, client, post(host->url(), "hello", log), out)));
+
+        auto       conn   = co_await accept(host);
+        auto&      server = conn->server;
+        const bool in     = co_await server.pump(head_in(server, 1));
+        REQUIRE(in);
+
+        server.respond(1, "417");
+
+        // again, on the same connection (a new stream), with its body at once; the first reset without any.
+        const bool again = co_await server.pump(head_in(server, 3));
+        REQUIRE(again);
+        CHECK(test::header(server.responses[3], "expect") == "(none)");
+        const bool answered = co_await answer(sched, server, 3, out);
+        REQUIRE(answered);
+        CHECK(server.responses[3].body == "hello");
+
+        CHECK(server.responses[1].reset == http2::error_code::cancel);
+        CHECK(server.responses[1].data_frames == 0);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, &log, &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 200);
+    CHECK(out.result.body == "hello");
+    REQUIRE_FALSE(log.seen().empty());
+    CHECK(log.seen().front() == "read"); // the 417 isn't an interim response
+}
+
+TEST_CASE("an HTTP/2 request that doesn't wait for 100 sends its body with its head", "[http][http2][client][expect]")
+{
+    struct test_case
+    {
+        std::string_view          name;
+        bool                      expect  = false;
+        std::chrono::milliseconds timeout = 1h;
+        std::string_view          body;
+    };
+
+    const auto tc = GENERATE(test_case{.name = "without the expectation", .expect = false, .body = "hello"},
+                             test_case{.name = "the wait turned off", .expect = true, .timeout = 0ms, .body = "hello"},
+                             test_case{.name = "a body of 0", .expect = true, .body = ""});
+    CAPTURE(tc.name);
+
+    order              log;
+    background         out;
+    net::io::scheduler sched{make_pool()};
+    h2_host            host{&sched};
+    http::client       client{&sched, h2_options_with(tc.timeout)};
+
+    auto req = post(host.url(), tc.body, &log);
+    if (!tc.expect) req.headers.remove("Expect");
+
+    const auto test = [](net::io::scheduler*  sched,
+                         http::client*        client,
+                         h2_host*             host,
+                         http::client_request req,
+                         background*          out) -> task<>
+    {
+        const bool spawned = sched->spawn(send_in_background(sched, client, std::move(req), out));
+        REQUIRE(spawned);
+
+        // the whole request, without anything from the server first.
+        auto       conn     = co_await accept(host);
+        const bool answered = co_await answer(sched, conn->server, 1, out);
+        REQUIRE(answered);
+    };
+
+    sched.run_to_completion(test(&sched, &client, &host, std::move(req), &out));
+
+    CAPTURE(out.result.err.message());
+    CHECK(out.result.status == 200);
+    CHECK(out.result.body == tc.body);
+    CHECK(log.seen().empty() == tc.body.empty()); // no interim response; the body read, if there's one
 }

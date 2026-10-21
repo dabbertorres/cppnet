@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -281,6 +282,12 @@ namespace detail
     // expectation_of is what req expects. Its Expect field is a list: each of its members must be 100-continue (in
     // any case, without parameters, which it has none of), or the expectation is unknown.
     [[nodiscard]] expectation expectation_of(const server_request& req);
+
+    // expects_continue is whether a client's request waits for 100 (Continue) before sending its body (see
+    // client_options::expect_continue_timeout, which timeout is): it has a body not of length 0, the wait's not turned
+    // off, and its Expect field has the 100-continue token (in any case). Over HTTP/1.x, its version must also be 1.1
+    // (an HTTP/1.0 server ignores the expectation), which is the caller's to check; over HTTP/2, it's whatever it is.
+    [[nodiscard]] bool expects_continue(const client_request& request, std::chrono::milliseconds timeout);
 }
 
 using request_decoder_result = std::expected<server_request, std::error_code>;

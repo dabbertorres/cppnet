@@ -348,20 +348,10 @@ struct sent
 {
     std::expected<net::http::client_response, std::error_code> response;
     bool                                                       retry = false;
+
+    // the retry may go on the same HTTP/2 connection (a new stream): after a 417, which says nothing of the connection.
+    bool same_connection = false;
 };
-
-// expects_continue is whether a request waits for 100 (Continue) before sending its body (see
-// client_options::expect_continue_timeout): it says it does (Expect: 100-continue), it's HTTP/1.1 (an HTTP/1.0 server
-// ignores the expectation), it has a body not of length 0, and the wait's not turned off.
-bool expects_continue(const net::http::client_request& request, std::chrono::milliseconds timeout)
-{
-    if (request.body == nullptr || timeout <= std::chrono::milliseconds::zero() || request.version.minor < 1)
-        return false;
-
-    // NOTE: all a request with a body, but without the expectation, costs.
-    if (!request.headers.has_token("Expect"sv, "100-continue"sv)) return false;
-    return request.headers.get_content_length() != 0;
-}
 
 // head_deadline is when a response's head must have come by, from now.
 std::optional<net::io::clock::time_point> head_deadline(const net::http::client_options& options)
@@ -496,13 +486,27 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
 // - whatever its method, if the server didn't process it (it was refused, or after a GOAWAY's last stream), unless its
 //   body's been read;
 // - if it's safe to repeat, and has no body, if the connection dropped (without GOAWAY) before its response's head: as
-//   HTTP/1.1's are, when a reused connection turns out to have been closed.
+//   HTTP/1.1's are, when a reused connection turns out to have been closed;
+// - without its expectation, at once, if it expected 100 (Continue) and had a 417 before its body was sent: on the same
+//   connection, as a 417 says nothing of it.
 net::coro::task<sent>
 send_http2(net::http::detail::connection_pool::lease leased, net::http::client_request& request, bool first)
 {
     net::http::detail::http2_client_connection::send_state state;
 
     auto resp = co_await leased.http2->send(request, &state);
+
+    // RFC 9110, section 10.1.1: as over HTTP/1.1 (see send_expecting()), its body untouched. The 417's dropped (its
+    // stream reset, as the request never ended), and the retry's on a new stream.
+    if (state.expectation_failed)
+    {
+        request.headers.remove("Expect"sv);
+
+        // NOTE: never returned, as the request's sent again (or that fails, with its own error).
+        co_return sent{.response        = std::unexpected(std::make_error_code(std::errc::protocol_error)),
+                       .retry           = true,
+                       .same_connection = true};
+    }
     if (resp.has_value() || !first) co_return sent{.response = std::move(resp)};
 
     const bool refused = resp.error() == net::http::http2::error_code::refused_stream;
@@ -547,7 +551,9 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     { return reused && first && request.body == nullptr && is_idempotent(request.method) && closed_early(err); };
 
     // a request that expects 100 (Continue) sends its head alone, and its body once it's had the 100, or waited for it.
-    const bool expecting = expects_continue(request, options.expect_continue_timeout);
+    // (an HTTP/1.0 server ignores the expectation.)
+    const bool expecting =
+        request.version.minor >= 1 && detail::expects_continue(request, options.expect_continue_timeout);
 
     // the head in one write, rather than one per field.
     io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
@@ -713,7 +719,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
         const auto dest = destination_of(request);
         if (!dest.has_value()) co_return std::unexpected(dest.error());
 
-        // the HTTP/2 connection the last attempt was on: a retry is on another.
+        // the HTTP/2 connection the last attempt was on: a retry is on another (but after a 417).
         std::shared_ptr<detail::http2_client_connection> tried;
         sent                                             result;
 
@@ -733,6 +739,7 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
             // it, too).
             tried  = leased->http2;
             result = co_await send_on(pool, std::move(*leased), request, attempt == 0, dest->reusable);
+            if (result.same_connection) tried = nullptr;
 
             // NOTE: a response that arrived as stop was requested is dropped, with its connection (HTTP/1.x) or
             //       stream.

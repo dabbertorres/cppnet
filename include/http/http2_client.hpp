@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -36,10 +37,22 @@ public:
     using http2_stream_base::http2_stream_base;
 
     // Guarded by the connection's lock.
-    bool               head_received = false;
-    status             status_code   = status::NONE;
+    // NOTE: the status and the flags together, so they take one word.
+    status status_code   = status::NONE;
+    bool   head_received = false;
+    bool   processed     = false; // not refused (it may not be retried)
+    bool   wants_interim = false; // the request has on_informational (see interims)
+
+    // A request expecting 100 (Continue) waits for it before sending its body (see http2_client_connection::send()):
+    // continued is set once a 100 has come (whether or not the request wants interim responses), and continue_waited
+    // once the wait's timed out (by the connection's timer, at continue_deadline, while awaiting_continue: without
+    // failing the stream).
+    bool                  continued         = false;
+    bool                  continue_waited   = false;
+    bool                  awaiting_continue = false;
+    io::clock::time_point continue_deadline{};
+
     net::http::headers headers;
-    bool               processed = false; // not refused (it may not be retried)
 
     // interim_head is an informational (1xx) response's head.
     struct interim_head
@@ -51,7 +64,7 @@ public:
     // The informational responses received, kept for the request's on_informational (if it has one: wants_interim)
     // until send()'s task passes them on; and what they've all come to (by hpack::field_size), whether or not they're
     // kept, which is limited (see on_headers()).
-    bool                      wants_interim = false;
+    // NOTE: wants_interim is with the flags above.
     std::vector<interim_head> interims;
     std::size_t               interim_size = 0;
 
@@ -101,6 +114,10 @@ public:
         // The connection ended, without the server's GOAWAY, before the response's head (or any informational
         // response): the server may or may not have processed it.
         bool dropped = false;
+
+        // It expected 100 (Continue), and its response (returned) is a 417 (Expectation Failed) that came before its
+        // body was sent: so it may be sent again, without the expectation (see client::send()).
+        bool expectation_failed = false;
     };
 
     // start runs the connection, as one of the scheduler's tasks, returning false if the scheduler's stopping.
@@ -127,6 +144,13 @@ public:
     //
     // request.stop cancels it (and then the response's body): the stream is reset (CANCEL), failing its waits with
     // std::errc::operation_canceled, and the connection goes on. Stopped before the stream's opened, nothing's sent.
+    //
+    // A request expecting 100 (Continue) (see detail::expects_continue(), with the options' expect_continue_timeout)
+    // sends its head without ending the stream, then waits before sending its body (docs/plans/http2.md, stage 6's
+    // sixth part): a 100, or none within the timeout, sends it; another interim response is passed on, and the wait
+    // goes on. A final response first, above 299, has the body never sent (the stream's reset once the response is
+    // done with, unless the server's reset it), and a 417 says so in state (expectation_failed); a 2xx goes on waiting
+    // for the timeout, then sends it (as Go's client does, for streams that are full-duplex).
     coro::task<std::expected<client_response, std::error_code>> send(client_request& request,
                                                                      send_state*     state = nullptr);
 
@@ -208,6 +232,24 @@ private:
     // abandon resets a stream whose request can't be finished, so the server doesn't take what it has as all of it.
     void abandon(http2_client_stream& stream, std::error_code err);
 
+    // await_continue waits for what decides whether the body of a request expecting 100 (Continue) is sent, its head
+    // having been sent (see send()), passing on the interim responses that come meanwhile: true for a 100, or none in
+    // time (also after a 2xx); false for a final response above 299 (a 417 noted in state, if it's given), or the
+    // stream failing.
+    coro::task<bool> await_continue(http2_client_stream& stream, const client_request& request, send_state* state);
+
+    // expect_continue starts a stream's wait for 100 (Continue), to the timeout, telling the timer; stop_awaiting ends
+    // it, if it's on. Both holding the lock.
+    void expect_continue(http2_client_stream& s);
+    void stop_awaiting(http2_client_stream& s) noexcept;
+
+    // check_continues ends the waits for 100 (Continue) that have timed out (holding the lock), returning when the
+    // next does.
+    std::optional<io::clock::time_point> check_continues(io::clock::time_point now);
+
+    // on_interim takes an informational response's head (holding the lock: on_headers()'s).
+    void on_interim(http2_client_stream& s, std::span<const hpack::field> fields);
+
     // idle_now is whether it has no streams, nor any reserved (holding the lock).
     [[nodiscard]] bool idle_now() const noexcept { return streams.empty() && reserved == 0; }
 
@@ -232,7 +274,8 @@ private:
     bool                                                                       draining    = false; // drain()ed
     std::optional<io::clock::time_point> idle_from = io::clock::now(); // when it was last idle (none: not yet looked)
     std::size_t open_seen   = 0; // the session's open streams, when last looked at: fewer now means one's been freed
-    bool        goaway_told = false; // the pool's been told of the server's GOAWAY (as a stream freed)
+    bool        goaway_told = false;   // the pool's been told of the server's GOAWAY (as a stream freed)
+    std::size_t awaiting_continue = 0; // streams waiting for 100 (Continue): none, and the timer doesn't look for them
 };
 
 }

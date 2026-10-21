@@ -1,5 +1,6 @@
 #include "http/http2_client.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <compare>
 #include <cstddef>
@@ -142,6 +143,24 @@ namespace
         }
     }
 
+    // request_ends_after is how much DATA ends a request's stream, if that's known (see
+    // http2_client_connection::open()). Trailers follow the body, or the head, if there's none (which then doesn't end
+    // the stream). Without them, the head ends the stream if there's no body, and the body's last DATA if its length is
+    // known; end_request() does otherwise.
+    std::optional<std::size_t> request_ends_after(bool has_body, bool trailing, std::optional<std::size_t> length)
+    {
+        if (trailing) return std::nullopt;
+        if (!has_body) return 0;
+        return length;
+    }
+
+    // is_continue is whether an informational response's fields say 100 (Continue).
+    bool is_continue(std::span<const hpack::field> fields) noexcept
+    {
+        const auto it = std::ranges::find(fields, std::string_view{":status"}, &hpack::field::name);
+        return it != fields.end() && parse_status(it->value) == status::CONTINUE;
+    }
+
     // authority_of is a request's :authority: the caller's Host, if it has one (RFC 9113, section 8.3.1, as it isn't
     // sent as a field; without whitespace around it, as other fields); otherwise the URI's host and port, without the
     // scheme's default port, as HTTP/1.1's Host.
@@ -221,13 +240,13 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     const auto length   = request.body != nullptr ? request.headers.get_content_length() : std::nullopt;
     const bool has_body = request.body != nullptr && (!length.has_value() || *length > 0);
 
-    // trailers follow the body, or the head, if there's none (which then doesn't end the stream). Without them, the
-    // head ends the stream if there's no body, and the body's last DATA if its length is known; end_request() does
-    // otherwise.
-    const bool                 trailing = static_cast<bool>(request.make_trailers);
-    std::optional<std::size_t> ends_after;
-    if (!trailing && !has_body) ends_after = 0;
-    else if (!trailing) ends_after = length;
+    const bool trailing   = static_cast<bool>(request.make_trailers);
+    const auto ends_after = request_ends_after(has_body, trailing, length);
+
+    // a request expecting 100 (Continue) sends its body once it's had one, or waited long enough (see
+    // await_continue()). NOTE: the checks that cost nothing first: a request with a body, but without the expectation,
+    // costs the one lookup.
+    const bool expecting = has_body && expects_continue(request, options.expect_continue_timeout);
 
     std::shared_ptr<http2_client_stream> stream;
     {
@@ -253,6 +272,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
             co_return std::unexpected(opened.error());
         }
         stream = std::move(*opened);
+        if (expecting) expect_continue(*stream);
     }
     wake_writer();
 
@@ -275,7 +295,9 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     // a server may answer before it's read all of the body (e.g. 413 Content Too Large), and reset the stream, failing
     // the rest: the response is still worth having.
     std::optional<std::error_code> body_error;
-    if (has_body || trailing)
+    bool                           sending = has_body || trailing;
+    if (expecting) sending = co_await await_continue(*stream, request, state);
+    if (sending)
     {
         const auto sent = co_await send_body(request, *stream, has_body ? length : std::optional<std::size_t>{0});
 
@@ -435,6 +457,100 @@ std::error_code http2_client_connection::end_request(const client_request& reque
     return {};
 }
 
+coro::task<bool>
+http2_client_connection::await_continue(http2_client_stream& stream, const client_request& request, send_state* state)
+{
+    std::vector<http2_client_stream::interim_head> interims; // taken from the stream, to pass on without the lock
+    while (true)
+    {
+        // NOTE: an exception the callback throws comes out of send(), whose frame then resets the stream (done()).
+        for (const auto& head : interims) request.on_informational(head.status_code, head.headers);
+        interims.clear();
+
+        std::uint64_t seen = 0;
+        {
+            std::scoped_lock lock{mu};
+            auto&            s = stream;
+
+            // in order: the interim responses before what comes after them.
+            if (!s.interims.empty())
+            {
+                interims.swap(s.interims);
+                continue;
+            }
+
+            // a final response first, above 299 (Decided question 31, Go's rule): the body's not sent, the server
+            // having refused the request (e.g. 413 Content Too Large), or the expectation (417, which the request may
+            // be sent again for, without it: Decided question 32).
+            if (s.head_received && static_cast<std::uint16_t>(s.status_code) > 299)
+            {
+                stop_awaiting(s);
+                if (s.status_code == status::EXPECTATION_FAILED && state != nullptr) state->expectation_failed = true;
+                co_return false;
+            }
+
+            // reset, canceled, or the connection's ended: wait_for_head() says what came of it.
+            if (s.failure)
+            {
+                stop_awaiting(s);
+                co_return false;
+            }
+
+            // a 100, or none in time. A 2xx first goes on waiting for the timeout (the stream may be full-duplex).
+            if (s.continued || s.continue_waited)
+            {
+                stop_awaiting(s);
+                co_return true;
+            }
+
+            seen = s.changed.value();
+        }
+
+        (void)co_await stream.changed.wait(seen);
+    }
+}
+
+void http2_client_connection::expect_continue(http2_client_stream& s)
+{
+    s.awaiting_continue = true;
+    s.continue_deadline = io::clock::now() + options.expect_continue_timeout;
+    ++awaiting_continue;
+
+    // (the timer finds when it's due once it looks.)
+    wake_timer();
+}
+
+void http2_client_connection::stop_awaiting(http2_client_stream& s) noexcept
+{
+    if (!s.awaiting_continue) return;
+    s.awaiting_continue = false;
+    --awaiting_continue;
+}
+
+std::optional<io::clock::time_point> http2_client_connection::check_continues(io::clock::time_point now)
+{
+    // NOTE: a connection without requests waiting (nearly every one) doesn't look.
+    if (awaiting_continue == 0) return std::nullopt;
+
+    // a wait that's timed out sends the body: the stream doesn't fail.
+    std::optional<io::clock::time_point> next;
+    for (auto& [id, s] : streams)
+    {
+        if (!s->awaiting_continue) continue;
+        if (s->continue_deadline <= now)
+        {
+            stop_awaiting(*s);
+            s->continue_waited = true;
+            s->changed.notify();
+        }
+        else if (!next.has_value() || s->continue_deadline < *next)
+        {
+            next = s->continue_deadline;
+        }
+    }
+    return next;
+}
+
 void http2_client_connection::abandon(http2_client_stream& stream, std::error_code err)
 {
     // the request can't be finished: the server mustn't take what it has as all of it.
@@ -516,9 +632,11 @@ void http2_client_connection::done(http2::stream_id id)
         const auto       it = streams.find(id);
         if (it != streams.end())
         {
-            // a response not read to its end: the server needn't send the rest.
-            const auto& s = *it->second;
-            if (!s.received_end && !s.failure) session.reset(id, http2::error_code::cancel);
+            // a response not read to its end: the server needn't send the rest. A request not sent to its end (its
+            // body not sent, as a final response came first, refusing it) is reset too, so the stream closes.
+            auto& s = *it->second;
+            if ((!s.received_end || !s.ended) && !s.failure) session.reset(id, http2::error_code::cancel);
+            stop_awaiting(s);
 
             remove_stream(id);
             streams.erase(it);
@@ -600,34 +718,9 @@ void http2_client_connection::on_headers(http2::stream_id              id,
     auto& s     = *it->second;
     s.processed = true;
 
-    // informational responses (e.g. 103 Early Hints) are kept for send()'s task to pass on, if the request wants them.
-    // They're limited altogether, as their number isn't (Go's limit, when it keeps them): past it, the request fails.
-    // NOTE: neither is progress towards the final head, so the stream's read deadline stays.
     if (kind == http2::block_kind::informational)
     {
-        for (const auto& f : fields) s.interim_size += hpack::field_size(f.name, f.value);
-        if (s.interim_size > options.session.local.max_header_list_size)
-        {
-            logger.debug("HTTP/2 stream {}: its informational responses are too large", id);
-            fail_stream(s, std::make_error_code(std::errc::value_too_large));
-            session.reset(id, http2::error_code::protocol_error);
-            s.read_deadline.reset();
-            s.write_deadline.reset();
-            s.changed.notify();
-
-            // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
-            output_drained().notify();
-            return;
-        }
-        if (!s.wants_interim) return;
-
-        auto& head = s.interims.emplace_back();
-        for (const auto& f : fields)
-        {
-            if (f.name == ":status") head.status_code = parse_status(f.value);
-            else if (!f.name.starts_with(':')) head.headers.add(f.name, f.value);
-        }
-        s.changed.notify();
+        on_interim(s, fields);
         return;
     }
 
@@ -651,6 +744,47 @@ void http2_client_connection::on_headers(http2::stream_id              id,
         s.received_end = true;
         s.read_deadline.reset();
     }
+    s.changed.notify();
+}
+
+void http2_client_connection::on_interim(http2_client_stream& s, std::span<const hpack::field> fields)
+{
+    // informational responses (e.g. 103 Early Hints) are kept for send()'s task to pass on, if the request wants them.
+    // They're limited altogether, as their number isn't (Go's limit, when it keeps them): past it, the request fails.
+    // NOTE: neither is progress towards the final head, so the stream's read deadline stays.
+    for (const auto& f : fields) s.interim_size += hpack::field_size(f.name, f.value);
+    if (s.interim_size > options.session.local.max_header_list_size)
+    {
+        logger.debug("HTTP/2 stream {}: its informational responses are too large", s.id);
+        fail_stream(s, std::make_error_code(std::errc::value_too_large));
+        session.reset(s.id, http2::error_code::protocol_error);
+        s.read_deadline.reset();
+        s.write_deadline.reset();
+        s.changed.notify();
+
+        // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
+        output_drained().notify();
+        return;
+    }
+
+    // a 100 (Continue) is what a request expecting it waits for, whether or not it wants interim responses.
+    if (!s.wants_interim)
+    {
+        if (s.awaiting_continue && is_continue(fields))
+        {
+            s.continued = true;
+            s.changed.notify();
+        }
+        return;
+    }
+
+    auto& head = s.interims.emplace_back();
+    for (const auto& f : fields)
+    {
+        if (f.name == ":status") head.status_code = parse_status(f.value);
+        else if (!f.name.starts_with(':')) head.headers.add(f.name, f.value);
+    }
+    if (head.status_code == status::CONTINUE) s.continued = true;
     s.changed.notify();
 }
 
@@ -693,9 +827,11 @@ void http2_client_connection::after_receive()
 
 std::optional<io::clock::time_point> http2_client_connection::check_connection(io::clock::time_point now)
 {
+    // (a connection with none waits for 100 (Continue).)
+    if (!idle_now()) return check_continues(now);
+
     // a connection without streams (nor any reserved) is closed once it's been idle for idle_timeout (at once, if
     // that's 0).
-    if (!idle_now()) return std::nullopt;
 
     if (!idle_from.has_value()) idle_from = now;
     const auto timeout = options.idle_timeout;

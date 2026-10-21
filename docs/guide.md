@@ -452,16 +452,19 @@ past which the stream is reset. Either fails the request with `std::errc::value_
 ends, as the server had it.
 
 A request with `Expect: 100-continue` (which the client never adds by itself) and a body (not of length 0) waits for the
-server's go-ahead before sending the body, over HTTP/1.1: its head goes alone, then the client waits for the server's
-first response, up to `client_options::expect_continue_timeout` (1 s; 0 sends the body at once, as for a request
-without the field). A 100 (Continue), or nothing in time, sends the body; another interim response (e.g. 103) is passed
-on, and the wait goes on, to the same deadline. A final response first (e.g. 413, from a server that won't read the
-body) is returned, and the body's sent only if the connection's to be reused, as its framing needs it (as Go's client
-does); otherwise it isn't, and the connection's closed once the response is done with. A 417 (Expectation Failed) to a
-request whose body wasn't sent has the request sent again at once, once, without its `Expect` field (on another
-connection): the body's still unread, so no `get_body` is needed. A 417 after the body was sent (once the wait was over)
-is returned. `response_header_timeout` starts once the body's sent; while the client waits, each head counts against
-the limit on a response's head by itself (the wait being bounded). Over HTTP/2, the body is sent at once, for now.
+server's go-ahead before sending the body, over HTTP/1.1 and HTTP/2: its head goes alone (over HTTP/2, without ending
+the stream), then the client waits for the server's first response, up to `client_options::expect_continue_timeout`
+(1 s; 0 sends the body at once, as for a request without the field). A 100 (Continue), or nothing in time, sends the
+body; another interim response (e.g. 103) is passed on, and the wait goes on, to the same deadline. A final response
+first (e.g. 413, from a server that won't read the body) is returned, and what becomes of the body is Go's client's
+rule. Over HTTP/1.1, it's sent only if the connection's to be reused, as its framing needs it; otherwise it isn't, and
+the connection's closed once the response is done with. Over HTTP/2, it isn't sent after a status above 299 (the
+stream's reset once the response is done with), and is after a 2xx, once the wait's over, as the server may be reading
+and writing at once (`send()` returns once it's gone). A 417 (Expectation Failed) to a request whose body wasn't sent
+has the request sent again at once, once, without its `Expect` field (over HTTP/1.1 on another connection, over HTTP/2
+on the same one): the body's still unread, so no `get_body` is needed. A 417 after the body was sent (once the wait was
+over) is returned. `response_header_timeout` starts once the body's sent; while the client waits over HTTP/1.1, each
+head counts against the limit on a response's head by itself (the wait being bounded).
 
 ```cpp
 net::http::client_request req{.method = net::http::request_method::PUT};

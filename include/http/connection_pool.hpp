@@ -76,9 +76,10 @@ struct client_options
     // How long a request with "Expect: 100-continue" (which the caller sets: the client never adds it) and a body
     // waits, once its head is sent, for the server's first response before sending its body anyway: a 100 (Continue)
     // sends it at once; another interim response is passed on, and the wait goes on; a final response first doesn't
-    // send it unless the connection's to be reused (whose framing needs it), and a 417 (Expectation Failed) then has
-    // the request sent again, at once, without the expectation. 0 sends the body at once, as for a request without it.
-    // Only over HTTP/1.1, so far: over HTTP/2, the body's sent at once. See client::send().
+    // send it unless the connection's to be reused (over HTTP/1.1, whose framing needs it) or it's a 2xx (over HTTP/2,
+    // once the wait's over), and a 417 (Expectation Failed) then has the request sent again, at once, without the
+    // expectation. 0 sends the body at once, as for a request without it. Over HTTP/1.1 and HTTP/2: see
+    // client::send().
     std::chrono::milliseconds expect_continue_timeout = std::chrono::seconds{1};
 
     // Whether to speak HTTP/2 (each request a stream of a connection that others share) to servers that do: over TLS,

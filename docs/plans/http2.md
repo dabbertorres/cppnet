@@ -31,7 +31,9 @@ and `socket::wait_writable()`), done (2026-10-21); and its fourth, TCP_NOTSENT_L
 connections (`server_config::http2_notsent_lowat`, the writer waiting for the socket before each round, and
 `tls::stream::wait_writable()`), done (2026-10-21); and its fifth, `Expect: 100-continue` in the client over HTTP/1.1
 (`client_options::expect_continue_timeout`, the encoder's head apart from the body, `response_decode()`'s
-`stop_at_interim`, and 417 sent again without the expectation), done (2026-10-21).
+`stop_at_interim`, and 417 sent again without the expectation), done (2026-10-21); and its sixth, `Expect: 100-continue`
+in the client over HTTP/2 (the stream's wait, `continue_deadline` checked by the connection's timer, and 417 sent again
+on the same connection), done (2026-10-21).
 
 ## Goal
 
@@ -1537,6 +1539,81 @@ idle stream would be a connection error for the peer.
   as expected: a request without a body pays two branches, and `write_body()`'s frame is only a body's (and directly
   awaited, so Clang may elide it).
 
+### Part 6: Expect: 100-continue in the client, HTTP/2 (done 2026-10-21)
+
+- As proposed (see "Expect: 100-continue in the client", Decided questions 30 to 32, all (a)), over HTTP/2, but for
+  where the timer looks (below). Which requests expect is part 5's rule, now shared: `detail::expects_continue()` (in
+  `http/request.hpp`, beside the server's `expectation_of()`; it was `client.cpp`'s) checks the body, the timeout, the
+  `100-continue` token and a Content-Length not 0, and `send_http11` adds HTTP/1.1's version check (HTTP/2 has no
+  HTTP/1.0 case). `http2_client_options::expect_continue_timeout` is the pool's `client_options` one (0 by default, so
+  connections made directly, as tests do, send bodies at once). A request without a body pays nothing; one with a body,
+  the one lookup, as over HTTP/1.1.
+- The stream (`http2_client_stream`): `continued`, `continue_waited`, `awaiting_continue` and `continue_deadline`. The
+  deadline's a plain `io::clock::time_point`, meaningful while `awaiting_continue`, rather than an `std::optional`, and
+  the flags are packed with `status_code` and the stream's other flags (`head_received`, `processed`, `wants_interim`,
+  moved together), so the stream's no larger: one word of status and six flags, and one of the deadline, where there
+  were two words each padded around a flag or two.
+- `send()`: the head goes as for any request with a body (without END_STREAM); `expect_continue()`, under the lock that
+  opens the stream, sets the stream's wait, counts it in the connection's `awaiting_continue`, and wakes the timer (it
+  can't see the timer's target, which is the base's, so it wakes it whatever the deadline: once per request that
+  expects). Then `await_continue()`, a coroutine of its own (so `send()`'s frame only holds its awaiter), loops on the
+  stream's notifier: interim heads queued for `on_informational` are passed on first, in order (without the lock); then
+  a final head above 299 ends the wait without the body (a 417 setting `send_state::expectation_failed`); then the
+  stream failing (reset, canceled, the connection ended) does too, `wait_for_head()` saying what came of it; then
+  `continued` or `continue_waited` sends the body (`send_body()`, as before). A 2xx first waits on for the timeout (Go's
+  rule, Decided question 31). A 100 and a final head above 299 found together: the final head wins, as it's the server's
+  last word.
+- `on_headers()`'s informational part is now `on_interim()` (`on_headers()` was past clang-tidy's cognitive complexity
+  with the 100's case; `send()`'s `ends_after` is `request_ends_after()`, for the same reason): a 100 sets `continued`
+  whether or not the request wants interim responses (without `on_informational`, only if the stream's waiting, which
+  costs a search for `:status`).
+- Departure: the timer's third deadline isn't checked by the base's `check_streams()`, which both sides share, but by
+  the client's `check_connection()` (`check_continues()`), which the timer calls under the lock beside it, and which
+  looks through the connection's streams only while `awaiting_continue` isn't 0. So the server's streams and timer don't
+  change, and a connection without such requests (nearly every one) doesn't look. A wait past its deadline gets
+  `continue_waited` and a notify; the stream doesn't fail. `stop_awaiting()` takes a stream off the count, wherever its
+  wait ends: `await_continue()`, the timer, or `done()` (send()'s frame destroyed while it waits).
+- Not in the plan: `done()` now resets (CANCEL) a stream whose request didn't end (`!ended`: its body withheld) as well
+  as one whose response didn't. "As now" left a 403 that came with END_STREAM, before a body that's then never sent,
+  half-closed (local) in the session for ever, counting against the server's MAX_CONCURRENT_STREAMS; cppnet's server
+  resets such a stream itself (NO_ERROR, once its handler returns without reading), but others may not.
+- 417 (Decided question 32): `send()` returns the 417 (its body attached as any response's) with `expectation_failed`
+  set; `send_http2` drops it (its stream reset, as the request never ended), removes `Expect`, and returns `sent{.retry
+  = true}` with `same_connection`, which has `client::send()`'s retry loop clear `tried`, so the request goes again at
+  once on a new stream of the same connection (or whichever the pool gives). The plan left the connection to the retry
+  loop, which would have skipped this one (a retry is "on another", for refused and dropped requests) and, as the host
+  speaks HTTP/2, connected anew: a 417 says only that something doesn't do expectations, nothing of the connection, and
+  a stream costs nothing. As over HTTP/1.1 it's retried whatever the attempt (the request no longer expects, so once).
+  Without a `send_state` (a caller of `send()` itself, as some tests are), the 417 is returned.
+- A limit (not changed): `send()` sends the body before it waits for the head, so after a 2xx first the response is
+  returned only once the timeout's passed and the body's gone; Go's transport returns it at once, writing the body on
+  another goroutine. A full-duplex use (the server streaming its response while reading the request) waits for the
+  timeout first, which a caller wanting that doesn't set `Expect` for. And a stream refused (REFUSED_STREAM) during the
+  wait, whose body's still unread, could be sent again as one refused before it's sent is; it isn't (as before, a
+  request with a body isn't retried once its stream's opened).
+- Tests (no network), in `test/http/client_expect_continue.cpp` (`[http][http2][client][expect]`), with part 5's `order`
+  and `noting_reader`. Against cppnet's server (prior knowledge): a handler that reads the body gets it after the 100
+  (noted once, then the body's reads), with and without `on_informational` (the server's `body_read_timeout` at 2 s, so
+  a client that didn't see the 100 fails the test rather than sending the body after its 30 s wait); one that answers
+  413 without reading has its response returned and the body never read. Against `test::h2_client` as the server (an
+  `h2_host` the client connects to, through the pool): silence, with a 300 ms wait, gets nothing for 100 ms, then the
+  body (the timer's check); a 103, nothing for 200 ms (the 30 s wait goes on), then a 100, gets the body after the 100
+  (noted 103, 100, then the reads); a 200 first (with its body, ending the stream), with a 300 ms wait, gets nothing for
+  100 ms, then the body, and the 200 returned; a 403 first has the response read whole, then its stream reset (CANCEL),
+  no DATA sent; a 417 first has the request sent again on stream 3 of the same connection without `expect`, its body
+  whole, and stream 1 reset without DATA; and without the expectation (a timeout of an hour), with the wait off (0), and
+  with a body of 0, the body comes with the head, the server answering nothing first. Waits are the tests' own, each
+  checked by what arrives. With the wait never taken, seven of the eight new tests fail (the eighth is the at-once one);
+  with the timer never ending a wait, the silence and 200-first tests fail; with `continued` not set for a request
+  without `on_informational`, that case fails; with `done()` not resetting a request that didn't end, the 403 test
+  fails; with the retry on another connection, the 417 test fails.
+- Measured (`bench_request`, Release, ten alternating runs of master's binary and the branch's, on a busy machine: load
+  averages of 3.4 to 58). The HTTP/2 case, a stream at a time with cppnet's client and server (a GET, so the path
+  without the expectation, which pays one branch: `has_body` is false): 108.0 to 796.0 us a request before (median
+  152.7; the worst under a load of 58), 107.3 to 306.4 after (median 156.7), 48.2 to 49.4 allocations a request both
+  (the client's and the server's together, varying with the connection's setup). So nothing the noise shows, as
+  expected: the stream's no larger, and a connection without requests waiting has its timer look at one count.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2577,9 +2654,10 @@ certificate.
       `response_decode()`'s `stop_at_continue` (built as `stop_at_interim`), a final response first (Decided question
       31), and 417 sent again without the expectation (Decided question 32); tests against cppnet's server and raw ones.
       The API comes with this part, over the version that's simpler to get right.
-   6. **Expect: 100-continue, HTTP/2.** The stream's `continued` and `continue_deadline` (the timer's third deadline),
-      `send()` waiting before `send_body()`, and HTTP/2's rule for a final response first; tests against cppnet's server
-      and `test::h2_client` as the server. After 5, whose API and 417 handling it shares.
+   6. **Expect: 100-continue, HTTP/2.** Done (2026-10-21; see Learned in stage 6). The stream's `continued` and
+      `continue_deadline` (the timer's third deadline), `send()` waiting before `send_body()`, and HTTP/2's rule for a
+      final response first; tests against cppnet's server and `test::h2_client` as the server. After 5, whose API and
+      417 handling it shares.
    7. **The client's request bodies through the scheduler.** The client's streams on the server's write path
       (`scheduling` for both roles: at once when uncontended, otherwise in turns; writes that don't wait without a
       coroutine), every stream u=3 incremental, so contended bodies take turns a frame at a time; `bench_request` with 8

@@ -72,6 +72,7 @@ connection_pool::connection_pool(io::scheduler* scheduler, client_options option
     , http2_config{
           .response_header_timeout = config.response_header_timeout,
           .io_timeout              = config.io_timeout,
+          .expect_continue_timeout = config.expect_continue_timeout,
           .idle_timeout            = config.keep_alive ? config.idle_timeout : std::chrono::milliseconds::zero(),
       }
 {

@@ -134,6 +134,10 @@ struct http2_client_options
     std::chrono::milliseconds response_header_timeout{}; // 0: no limit
     std::chrono::milliseconds io_timeout{};              // 0: no limit
 
+    // How long a request expecting 100 (Continue) waits for it before sending its body anyway (see
+    // client_options::expect_continue_timeout); 0 sends it at once.
+    std::chrono::milliseconds expect_continue_timeout{};
+
     // How long the connection may be idle (no streams, nor any reserved) before it's closed; 0 closes it as soon as
     // its last stream is done.
     std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};

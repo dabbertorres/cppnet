@@ -1,6 +1,7 @@
 #include "http/request.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <string_view>
 
@@ -49,6 +50,15 @@ detail::expectation detail::expectation_of(const server_request& req)
         std::ranges::all_of(members,
                             [](std::string_view member) { return util::equal_ignore_case(member, "100-continue"sv); });
     return all_continue ? expectation::continue_100 : expectation::unknown;
+}
+
+bool detail::expects_continue(const client_request& request, std::chrono::milliseconds timeout)
+{
+    if (request.body == nullptr || timeout <= std::chrono::milliseconds::zero()) return false;
+
+    // NOTE: all a request with a body, but without the expectation, costs.
+    if (!request.headers.has_token("Expect"sv, "100-continue"sv)) return false;
+    return request.headers.get_content_length() != 0;
 }
 
 }
