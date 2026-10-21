@@ -27,6 +27,7 @@
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/http2_connection.hpp"
+#include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
 #include "http/priority.hpp"
 #include "http/request.hpp"
@@ -153,6 +154,11 @@ namespace
         if (!has_body) return 0;
         return length;
     }
+
+    // body_priority is every request body's priority in the connection's scheduler (docs/plans/http2.md, stage 6's
+    // seventh part): RFC 9218's urgency, incremental, as the server takes a client that never signals, so bodies sent
+    // at once share the connection a frame each.
+    constexpr priority body_priority{.urgency = 3, .incremental = true};
 
     // is_continue is whether an informational response's fields say 100 (Continue).
     bool is_continue(std::span<const hpack::field> fields) noexcept
@@ -342,6 +348,7 @@ http2_client_connection::open(const client_request& request, std::optional<std::
     const auto id = session.open_stream();
     if (!id.has_value()) return std::unexpected(id.error());
     stream->id = *id;
+    stream->set_stream(*id);
 
     const bool end_stream = ends_after == std::size_t{0};
 
@@ -353,6 +360,7 @@ http2_client_connection::open(const client_request& request, std::optional<std::
 
     stream->ended = end_stream;
     if (!end_stream) stream->data_left = ends_after;
+    send_order.update(*stream, body_priority);
     streams.emplace(*id, stream);
     add_stream(*stream);
     idle_from.reset();
@@ -447,11 +455,11 @@ std::error_code http2_client_connection::end_request(const client_request& reque
     stream.ended = true;
     if (!stream.fields.empty())
     {
-        if (auto err = session.submit_headers(stream.id, stream.fields, true)) stream.failure = err;
+        if (auto err = session.submit_headers(stream.id, stream.fields, true)) fail_stream(stream, err);
     }
     else if (auto ended = session.submit_data(stream.id, {}, true); !ended.has_value())
     {
-        stream.failure = ended.error();
+        fail_stream(stream, ended.error());
     }
 
     return {};
@@ -556,7 +564,7 @@ void http2_client_connection::abandon(http2_client_stream& stream, std::error_co
     // the request can't be finished: the server mustn't take what it has as all of it.
     {
         std::scoped_lock lock{mu};
-        if (!stream.failure) stream.failure = err;
+        fail_stream(stream, err);
         session.reset(stream.id, http2::error_code::cancel);
     }
     wake_writer();
@@ -659,17 +667,14 @@ void http2_client_connection::cancel(http2::stream_id id)
         const auto       it = streams.find(id);
         if (it == streams.end()) return;
 
-        // its waits (for the response's head, its body, or a window to send the request's body) see it fail; the
-        // server, its reset (unless it's done with the stream already).
+        // its waits (for the response's head, its body, or its turn to send the request's body, which returns what
+        // was framed of it) see it fail; the server, its reset (unless it's done with the stream already).
         auto& s = *it->second;
         fail_stream(s, std::make_error_code(std::errc::operation_canceled));
         session.reset(id, http2::error_code::cancel);
         s.read_deadline.reset();
         s.write_deadline.reset();
         s.changed.notify();
-
-        // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
-        output_drained().notify();
 
         // the session's done with the stream, so a request waiting for one may have it, though the request's response
         // hasn't been dropped yet (as after_receive() tells).
@@ -761,9 +766,6 @@ void http2_client_connection::on_interim(http2_client_stream& s, std::span<const
         s.read_deadline.reset();
         s.write_deadline.reset();
         s.changed.notify();
-
-        // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
-        output_drained().notify();
         return;
     }
 

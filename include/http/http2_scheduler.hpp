@@ -8,14 +8,15 @@
 #include "http/http2.hpp"
 #include "http/priority.hpp"
 
-// HTTP/2's scheduling of the server's responses by their priority (RFC 9218; docs/plans/http2.md, stage 5's tenth
-// part), without I/O: which of the streams waiting to send DATA sends the next frame. Not for applications.
+// HTTP/2's scheduling of streams' DATA by their priority (RFC 9218; docs/plans/http2.md, stage 5's tenth part: the
+// server's responses; and stage 6's seventh: the client's request bodies), without I/O: which of the streams waiting to
+// send DATA sends the next frame. Not for applications.
 namespace net::http::detail
 {
 
-// scheduler_node is a stream's place in an http2_scheduler, and its priority: the stream holds it (a server's streams
-// derive from it), and the scheduler links its nodes through it, so a stream joining the scheduler allocates nothing.
-// It's guarded as its scheduler is.
+// scheduler_node is a stream's place in an http2_scheduler, and its priority: the stream holds it (a connection's
+// streams derive from it), and the scheduler links its nodes through it, so a stream joining the scheduler allocates
+// nothing. It's guarded as its scheduler is.
 class scheduler_node
 {
 public:
@@ -30,6 +31,10 @@ public:
     ~scheduler_node()                                = default;
 
     [[nodiscard]] http2::stream_id stream() const noexcept { return key; }
+
+    // set_stream sets the stream's id, while it isn't queued: for a stream made before its id's known (a client's,
+    // whose head is made before the stream's opened).
+    void set_stream(http2::stream_id stream) noexcept { key = stream; }
 
     // current_priority is the stream's priority, which http2_scheduler::update() sets.
     [[nodiscard]] priority current_priority() const noexcept { return prio; }

@@ -117,8 +117,8 @@ private:
 };
 
 // stream_writer writes what a stream sends (a response's body, or a request's) as DATA, waiting for the
-// flow-control windows to have room (and, for a server's response that has to wait, its turn: see
-// http2_connection_base::write_step()). A write that can go at once returns without a coroutine.
+// flow-control windows to have room, and its turn (see http2_connection_base::step_write()). A write that can go at
+// once returns without a coroutine.
 class stream_writer final : public io::writer
 {
 public:
@@ -136,8 +136,8 @@ private:
 };
 
 // http2_stream_base is what a stream's reader and writer use: what it's received, and how it's ended. Its fields are
-// guarded by its connection's lock. It's a scheduler_node, for the server's (whose connection schedules its streams'
-// DATA by priority): its priority, and its place among the streams waiting to send.
+// guarded by its connection's lock. It's a scheduler_node (its connection schedules its streams' DATA by priority): its
+// priority, and its place among the streams waiting to send.
 class http2_stream_base : public scheduler_node
 {
 public:
@@ -194,7 +194,7 @@ public:
     std::chrono::milliseconds read_timeout{};
     std::chrono::milliseconds write_timeout{};
 
-    // What a write waiting in the connection's scheduler has left to send (the handler's span, valid while its write
+    // What a write waiting in the connection's scheduler has left to send (the writer's span, valid while its write
     // is awaited), and how much of it the connection's writer has framed: the writer frames it, a frame at a time,
     // while the stream's queued, and takes it out once it's all framed (or the stream fails, which takes it out first),
     // so it never touches the span once the write has returned.
@@ -260,8 +260,9 @@ public:
     connection_mutex mu;
     http2::session   session;
 
-    // The streams waiting to send DATA, in their turns by priority (a server's: see step_write()), guarded by mu. A
-    // server sets its streams' priorities through it (update()), so a waiting stream moves when its priority changes.
+    // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
+    // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
+    // from the client's signals, a client's u=3 incremental (for now: docs/plans/http2.md, stage 6's seventh part).
     http2_scheduler send_order;
 
     // write_state is how far a stream's write has gone, from one step to the next.
@@ -283,14 +284,12 @@ public:
 
     // step_write takes a step of a stream's write of data (taking the lock), as far as it can go without waiting.
     //
-    // A client's request body (as Go's, the client doesn't schedule) is submitted to the session as far as the windows
-    // allow, and waits for them to grow (or, past max_output of output waiting, for the writer to catch up).
-    //
-    // A server's response (docs/plans/http2.md, stage 5's tenth part; Decided question 21) is submitted to the session
-    // at once, a frame at a time, while less than max_ahead of DATA waits for the writer (or is being written) and no
-    // stream waits in the scheduler: so a connection whose responses don't contend for it pays nothing for the
-    // scheduler. Otherwise (or for what doesn't fit, or has no window), the stream waits in the scheduler with the
-    // rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
+    // A write (a server's response, docs/plans/http2.md, stage 5's tenth part, Decided question 21; or a client's
+    // request body, stage 6's seventh part, Decided question 33) is submitted to the session at once, a frame at a
+    // time, while less than max_ahead of DATA waits for the writer (or is being written), no stream waits in the
+    // scheduler, and the output's under max_output: so a connection whose streams don't contend for it pays nothing
+    // for the scheduler. Otherwise (or for what doesn't fit, or has no window), the stream waits in the scheduler with
+    // the rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
     // stream's end (an empty DATA, or trailers) still follows its data, and only max_ahead of DATA (and what's in the
     // socket's buffers) is past reordering.
     //
@@ -303,9 +302,6 @@ public:
     // arm_deadline sets one of a stream's deadlines for a wait, timeout from now, unless it's set already (holding the
     // lock): telling the timer, if it's sooner than it knew.
     void arm_deadline(std::optional<io::clock::time_point>& deadline, std::chrono::milliseconds timeout);
-
-    // output_drained is notified as the writer writes.
-    coro::notifier& output_drained() noexcept { return drained; }
 
     // get_logger is the connection's logger (e.g. for what its streams' heads and ends drop).
     [[nodiscard]] spdlog::logger& get_logger() const noexcept { return logger; }
@@ -324,6 +320,10 @@ public:
     void stop_pending();
 
     [[nodiscard]] io::handle native_handle() const noexcept { return detail::native_handle(conn); }
+
+    // unqueue takes a stream out of the scheduler (taking the lock): for a write destroyed while it waits there, whose
+    // span the writer mustn't touch once it's gone.
+    void unqueue(http2_stream_base& s);
 
     // wait_queued waits until at least n streams wait in the scheduler (true), or the connection's ending (false): for
     // tests, to know that streams have queued (e.g. with no window to send) before letting them send.
@@ -391,7 +391,7 @@ private:
     // connection's ending and what's left is written; then it shuts the connection down. With waits_writable (the
     // server's, with TCP_NOTSENT_LOWAT set: docs/plans/http2.md, stage 6's fourth part), a round after one that wrote
     // first waits for the connection to be writable (wait_for_socket()): what's written but not yet sent under the
-    // mark. So fill() frames only when the socket can take more, and meanwhile handlers' writes queue (past
+    // mark. So fill() frames only when the socket can take more, and meanwhile streams' writes queue (past
     // max_ahead) for their turns: what's past reordering is the mark (in the kernel) and a round (in the writer's
     // hands), not the send buffer. Control frames wait with the DATA: TCP would deliver them after what the kernel
     // holds anyway. A wait that fails ends the connection as a write that fails does (the socket's write deadline,
@@ -408,24 +408,22 @@ private:
 
     // fill submits DATA from the streams waiting in the scheduler, a frame at a time in their order, until max_ahead
     // of DATA waits for the writer, or none is ready (has a window); it wakes each stream whose write it's all framed
-    // (holding the lock). A stream whose write it's framed keeps its turn for the handler's next write, briefly
+    // (holding the lock). A stream whose write it's framed keeps its turn for its writer's next write, briefly
     // (turn_held), when the others' would otherwise take it.
     void fill();
 
-    // step_write()'s parts (holding the lock): submit_at_once submits a server's write as far as it may go at once,
-    // queue_rest queues the rest in the scheduler, and submit_windowed submits a client's as far as the windows allow
-    // (arming its deadline if it must wait). Each failing to submit fails the stream.
+    // step_write()'s parts (holding the lock): submit_at_once submits a write as far as it may go at once (failing the
+    // stream if it can't submit), and queue_rest queues the rest in the scheduler.
     std::error_code submit_at_once(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
     void            queue_rest(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
-    std::error_code submit_windowed(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
 
     // submit_body submits data of a stream's body to the session (as far as the windows allow; see
     // http2::session::submit_data()), with END_STREAM if it's the last of a body of known length (see
     // http2_stream_base::data_left), marking the stream ended once that's all gone (holding the lock).
     std::expected<std::size_t, std::error_code> submit_body(http2_stream_base& s, std::span<const std::byte> data);
 
-    // take_output is the writer's turn with the lock, after it's written (wrote) or been woken: fill() (if the
-    // connection schedules), then the session's output into out, and the stop sources to stop into stopping. It returns
+    // take_output is the writer's turn with the lock, after it's written (wrote) or been woken: fill(), then the
+    // session's output into out, and the stop sources to stop into stopping. It returns
     // whether the connection's ending.
     bool take_output(std::vector<std::byte>& out, bool wrote, std::vector<std::stop_source>& stopping);
 
@@ -440,15 +438,12 @@ private:
     // is then put off (see check_streams()).
     [[nodiscard]] bool waiting_turn(const http2_stream_base& s, io::clock::time_point now) const;
 
-    // Whether the connection schedules its streams' DATA (a server's: see step_write()).
-    const bool scheduling;
-
     // Whether the writer waits for the connection to be writable before each round, and with what (see write_loop()).
     const bool        waits_writable;
     writable_function writable;
 
     // Guarded by mu.
-    std::size_t                          data_queued  = 0; // DATA submitted (by streams that schedule) not yet taken
+    std::size_t                          data_queued  = 0; // DATA submitted not yet taken
     std::size_t                          data_writing = 0; // of the writer's output, DATA (as data_queued counts it)
     std::optional<io::clock::time_point> wrote_at;         // when the writer was back from writing, streams scheduled
     http2::stream_id                     turn_held = 0;    // the stream whose turn fill() holds, until...
@@ -459,7 +454,6 @@ private:
     std::optional<io::clock::time_point> timer_target;
 
     coro::notifier             writer_wakeup; // output to write, or the connection's ending
-    coro::notifier             drained;       // the writer has written some
     std::atomic<std::uint64_t> timer_word{0}; // the timer's, for scheduler::wait_on()
 
     coro::async_scope workers; // the writer and the timer

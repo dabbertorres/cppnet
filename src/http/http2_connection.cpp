@@ -33,6 +33,7 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
+#include "util/defer.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http::detail
@@ -47,11 +48,11 @@ namespace
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
 
-    // How much of a server's DATA may wait for the writer (or be being written) before its streams' writes wait in the
-    // scheduler for their turns (see step_write()): what the scheduler can't reorder, as it's framed already.
+    // How much DATA may wait for the writer (or be being written) before streams' writes wait in the scheduler for
+    // their turns (see step_write()): what the scheduler can't reorder, as it's framed already.
     constexpr std::size_t max_ahead = std::size_t{64} * 1'024;
 
-    // How long a stream whose write was all framed keeps its turn for its handler's next write (see fill()).
+    // How long a stream whose write was all framed keeps its turn for its writer's next write (see fill()).
     constexpr auto hold_turn = std::chrono::milliseconds{1};
 
     // How long, and how much, the reader goes on reading once the connection's ending, for the peer to close its side
@@ -224,13 +225,20 @@ io::handle stream_reader::native_handle() const noexcept { return stream->conn->
 namespace
 {
 
-    // write_waiting goes on with a stream's write once its first step has to wait.
+    // write_waiting goes on with a stream's write once its first step has to wait (in the scheduler).
     coro::task<io::result> write_waiting(http2_connection_base&             c,
                                          http2_stream_base&                 s,
                                          std::span<const std::byte>         data,
                                          http2_connection_base::write_state state,
                                          http2_connection_base::write_step  step)
     {
+        // destroyed while it waits (e.g. a client's send() whose task is destroyed): the writer mustn't touch data,
+        // which goes with the caller's frame, after this one.
+        util::defer unqueue{[&c, &s, &step] noexcept
+                            {
+                                if (!step.done) c.unqueue(s);
+                            }};
+
         // (a step that isn't done has something to wait for.)
         while (!step.done && step.wait != nullptr)
         {
@@ -284,30 +292,13 @@ http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byt
 
         if (s.failure) return done(state.written, s.failure);
 
-        if (scheduling)
+        // at once while no one waits for a turn (nor for the writer to catch up with control frames and heads); the
+        // rest waits its turn (and the window, if that's what it's waiting for).
+        if (send_order.empty() && session.output_size() <= max_output) failed = submit_at_once(s, data, state);
+        if (!failed && state.written < data.size())
         {
-            // at once while no one waits for a turn (nor for the writer to catch up with control frames and heads);
-            // the rest waits its turn (and the window, if that's what it's waiting for).
-            if (send_order.empty() && session.output_size() <= max_output) failed = submit_at_once(s, data, state);
-            if (!failed && state.written < data.size())
-            {
-                queue_rest(s, data, state);
-                step = wait_for(s.changed);
-            }
-        }
-        else if (session.output_size() > max_output)
-        {
-            // the writer's behind (the peer reads slowly): wait for it, rather than queueing more; for as long as the
-            // stream may go without progress.
-            step = wait_for(drained);
-            arm_deadline(s.write_deadline, s.write_timeout);
-        }
-        else
-        {
-            failed = submit_windowed(s, data, state);
-
-            // no window: wait for the peer to give some back.
-            if (!failed && state.written < data.size()) step = wait_for(s.changed);
+            queue_rest(s, data, state);
+            step = wait_for(s.changed);
         }
 
         output = session.has_output();
@@ -359,22 +350,6 @@ void http2_connection_base::queue_rest(http2_stream_base& s, std::span<const std
     state.queued = true;
 }
 
-std::error_code
-http2_connection_base::submit_windowed(http2_stream_base& s, std::span<const std::byte> data, write_state& state)
-{
-    const auto sent = submit_body(s, data.subspan(state.written));
-    if (!sent.has_value())
-    {
-        fail_stream(s, sent.error());
-        return sent.error();
-    }
-
-    state.written += *sent;
-    if (*sent > 0) s.write_deadline.reset();
-    if (state.written < data.size()) arm_deadline(s.write_deadline, s.write_timeout);
-    return {};
-}
-
 std::expected<std::size_t, std::error_code> http2_connection_base::submit_body(http2_stream_base&         s,
                                                                                std::span<const std::byte> data)
 {
@@ -403,11 +378,9 @@ http2_connection_base::http2_connection_base(io::scheduler*               schedu
     , pool{scheduler->pool()}
     , conn{conn}
     , logger{logger}
-    , scheduling{side == http2::role::server}
     , waits_writable{waits_writable}
     , writable{std::move(writable)}
     , writer_wakeup{pool}
-    , drained{pool}
 {}
 
 void http2_connection_base::wake_writer()
@@ -613,9 +586,6 @@ void http2_connection_base::on_stream_reset(http2::stream_id id, std::error_code
     auto& s = *it->second;
     fail_stream(s, err);
     s.changed.notify();
-
-    // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
-    drained.notify();
 }
 
 void http2_connection_base::on_window_update(http2::stream_id id)
@@ -680,7 +650,6 @@ coro::task<> http2_connection_base::write_loop()
         {
             const auto res = co_await io::write_all(writer, out);
             wrote          = true;
-            drained.notify();
             if (res.err)
             {
                 failed = res.err;
@@ -726,8 +695,6 @@ coro::task<> http2_connection_base::write_loop()
         }
     }
 
-    drained.close();
-
     // over TLS, after close_notify.
     (void)co_await shutdown(conn);
 }
@@ -751,7 +718,7 @@ bool http2_connection_base::take_output(std::vector<std::byte>&        out,
 
     // the control frames and heads (in the order they were submitted, as HPACK's encoding is), then DATA in the
     // streams' turns.
-    if (scheduling) fill();
+    fill();
     session.take_output(out);
     data_writing = std::exchange(data_queued, 0);
 
@@ -817,7 +784,6 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
 {
     // a stream waiting too long for what it's to receive, or to send, is reset alone.
     std::optional<io::clock::time_point> next;
-    bool                                 timed_out = false;
     for (auto& [id, s] : active)
     {
         const auto expired = [&](const std::optional<io::clock::time_point>& deadline)
@@ -846,11 +812,7 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
         fail_stream(*s, std::make_error_code(std::errc::timed_out));
         session.reset(id, http2::error_code::cancel);
         s->changed.notify();
-        timed_out = true;
     }
-
-    // a writer may be waiting for the connection's writer to catch up, rather than for the stream.
-    if (timed_out) drained.notify();
     return next;
 }
 
@@ -899,14 +861,14 @@ void http2_connection_base::fill()
             send_order.remove(s);
             s.changed.notify();
 
-            // its handler's next write keeps its turn, rather than the next stream taking it (a less urgent one, or
-            // the next of a non-incremental one's urgency; but not an incremental one sharing its urgency, which would
-            // anyway): its handler usually writes again within microseconds, but the writer, if the socket takes what
-            // it's framed at once, would be back sooner. So the round ends here, and the turn's held, for hold_turn
-            // at most, so a handler that's slower (e.g. reading what it sends from elsewhere) doesn't hold the
-            // connection up for long. (Without it, a handler writing a frame at a time got about half the connection
-            // when it was more urgent than all the others: learned in stage 5's tenth part.) A stream whose last DATA
-            // this was has nothing more to write.
+            // its writer's next write (a handler's, or a request body's) keeps its turn, rather than the next stream
+            // taking it (a less urgent one, or the next of a non-incremental one's urgency; but not an incremental one
+            // sharing its urgency, which would anyway): its writer usually writes again within microseconds, but the
+            // connection's, if the socket takes what it's framed at once, would be back sooner. So the round ends
+            // here, and the turn's held, for hold_turn at most, so a writer that's slower (e.g. reading what it sends
+            // from elsewhere) doesn't hold the connection up for long. (Without it, a handler writing a frame at a time
+            // got about half the connection when it was more urgent than all the others: learned in stage 5's tenth
+            // part.) A stream whose last DATA this was has nothing more to write.
             if (!s.ended && hold_turn_of(s)) break;
         }
         else
@@ -939,6 +901,12 @@ bool http2_connection_base::turn_still_held()
     return false;
 }
 
+void http2_connection_base::unqueue(http2_stream_base& s)
+{
+    std::scoped_lock lock{mu};
+    send_order.remove(s);
+}
+
 coro::task<bool> http2_connection_base::wait_queued(std::size_t n)
 {
     while (true)
@@ -965,7 +933,6 @@ void http2_connection_base::end(std::error_code why)
         fail_stream(*s, why);
         s->changed.notify();
     }
-    drained.notify();
 
     // the reader stops receiving, and lingers, as long as the timer lets it; the writer writes what's left, and
     // finishes (see run()).

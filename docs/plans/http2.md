@@ -33,7 +33,8 @@ connections (`server_config::http2_notsent_lowat`, the writer waiting for the so
 (`client_options::expect_continue_timeout`, the encoder's head apart from the body, `response_decode()`'s
 `stop_at_interim`, and 417 sent again without the expectation), done (2026-10-21); and its sixth, `Expect: 100-continue`
 in the client over HTTP/2 (the stream's wait, `continue_deadline` checked by the connection's timer, and 417 sent again
-on the same connection), done (2026-10-21).
+on the same connection), done (2026-10-21); and its seventh, the client's request bodies through the connection's
+scheduler (one write path for both sides, every client stream u=3 incremental), done (2026-10-21).
 
 ## Goal
 
@@ -1614,6 +1615,76 @@ idle stream would be a connection error for the peer.
   (the client's and the server's together, varying with the connection's setup). So nothing the noise shows, as
   expected: the stream's no larger, and a connection without requests waiting has its timer look at one count.
 
+### Part 7: the client's request bodies through the scheduler (done 2026-10-21)
+
+- As proposed (see "Scheduling the client's request bodies", its first bullet; Decided question 33's part 7, round-robin
+  until part 8). `http2_connection_base::step_write()` has one path for both roles: a write goes to the session at once,
+  a frame at a time, while less than `max_ahead` of DATA waits for the writer (or is being written), no stream waits in
+  the scheduler, and the output's under `max_output`; otherwise the rest waits in `send_order`, framed in its turn by
+  the writer's `fill()`, and a write that doesn't wait returns a ready task. The `scheduling` flag is gone (`fill()`
+  runs every round), and so are `submit_windowed()` (the client's old path, now dead) and the `drained` notifier (with
+  `output_drained()`): only the client's old path waited on it, past `max_output`, where a write now queues as the
+  server's do; the notifies of it (a reset, a timeout, `end()`, `cancel()`, the client's oversized interim heads) went
+  with it. `hold_turn` and `waiting_turn()` come along unchanged; the client's write timeout is `io_timeout`, as
+  before. Every client stream is u=3 incremental (`body_priority`, set by `open()` through `send_order.update()` before
+  the stream's added), so contended bodies take turns a frame at a time; an incremental stream sharing its urgency
+  never holds its turn, so the client never holds one yet.
+- Not in the plan: the client makes its stream before its id is known (its head's fields view the stream's strings, and
+  an opened stream must be sent), so the scheduler node's id, which the constructor takes, stayed 0:
+  `scheduler_node::set_stream()` (new) sets it in `open()`. With it 0, `fill()`'s `ready` asked the session for stream
+  0's window, the connection's, so a stream whose own window was used up was picked, framed nothing, and ended the
+  round, holding up every other stream (a test shows it: a body without its stream's window, queued before another,
+  starved the other until it timed out); and non-incremental streams (part 8's) would all have sorted as id 0.
+- Not in the plan: `write_waiting()` takes its stream out of the scheduler (`unqueue()`, under the lock) if it's
+  destroyed while it waits (a `util::defer`, acting only when its step isn't done). A server's handler isn't destroyed
+  while it writes, but a client's `send()` may be (its `done()` already allows for that), and the queued span is in
+  `send_body()`'s frame, destroyed before `send()`'s `release` calls `done()`, which would have taken it out: so the
+  writer could frame from freed memory meanwhile. No test reaches it (nothing in the library destroys a task that's
+  waiting), so it's by reasoning only. And `abandon()` and `end_request()` fail their stream through `fail_stream()`,
+  rather than setting `failure`, so a failed stream is always out of the scheduler (neither is queued when they run,
+  but that's the rule now that the client's streams can be).
+- Departure from the tests the plan listed: "bodies of the same priority in rounds" is checked with the window given a
+  frame at a time, each once every body with frames left has queued again (so each frame's the scheduler's pick of all
+  of them): "ABCABCABC". With the whole window given at once, only the first round is fixed (each body's queued write
+  goes, in the order they queued); after it, `send_body()` reads 16 KiB at a time, so each write is a frame, and a body
+  whose task comes back first queues again first, and may go twice before another's back (an order such as
+  "ABCAABACBBCC" was seen). The server's handlers that write a frame at a time have the same gap, which part 10's hold
+  closes only for streams that would lose their turn, not for incremental ones sharing an urgency. A larger read in
+  `send_body()` (64 KiB, as the server's bench writes) would keep a body queued across rounds; left for part 8 to
+  weigh, with its memory per request.
+- Tests (no network). `test/http/client_scheduling.cpp` (`[http][http2][client][scheduler]`), against `test::h2_client`
+  as the server, unchanged (its `hold_windows` and `data_log`): a plug body of 65535 uses up the connection's window,
+  which the server gives back by exact amounts (`held::give()`: consuming the plug's stream, which has ended, so only
+  the connection's window grows, in one WINDOW_UPDATE), and the client's `wait_queued()` says when bodies have queued
+  (a watchdog closes the connection after 10 s, so a regression fails rather than hangs). Bodies of three frames in
+  rounds ("ABCABCABC", every frame whole, each body ending with its last DATA); the first round when the window opens
+  at once; a body alone in whole frames (its first from the scheduler, the rest at once), ending with its last DATA of
+  100 bytes; a body without its stream's window (65535 of five frames sent, never given back) not holding up one
+  queued behind it, which goes whole, then going on once its window grows; a queued body timing out at `io_timeout`
+  (300 ms: CANCEL, `timed_out`, nothing of it sent, the plug's request still answered); one canceled while queued with
+  10,000 bytes of its write framed (CANCEL, `operation_canceled`, the server having exactly those 10,000), the other
+  going on whole; and a 413 with RST_STREAM(NO_ERROR) before any body (the 413 returned, nothing of its body sent, the
+  other's going whole). With the client's old path (master's sources, these tests), all seven fail (the bodies never
+  queue); with the client's streams left non-incremental, the rounds ("AAABBBCCC") and the at-once tests fail; without
+  `set_stream()`, the stream window test fails; without `queue_rest()` arming the deadline, the timeout test fails;
+  without `cancel()` failing the stream, the cancel test fails; without `on_stream_reset()` failing it, the 413 test
+  fails. The existing client tests (`[http2][client]`: end-stream, trailers, 100-continue, cancellation, flow control)
+  pass unchanged. 30 runs of the new tests in a row passed.
+- Measured (`bench_request`, Release, seven alternating runs of master's binary and the branch's, the new case built
+  into both; one-minute load averages of 2.8 to 9.7, and one pair, whose "after" ran at a spike of 28, left out).
+  The new case, 8 request bodies at once over one connection from cppnet's client to cppnet's server (256 KiB each, with
+  their Content-Length, read 16 KiB at a time; the server's stream windows 64 KiB): 1655 to 2099 us a round before
+  (median 1780, about 1120 MiB/s), 1444 to 1756 after (median 1664, about 1200 MiB/s), and 116.4 to 117.7 allocations
+  a request before (median 116.8), 152.9 to 153.7 after (median 153.1). The 36 more are the writes that queue: with
+  eight bodies contending, nearly each of a body's sixteen writes now finds another queued and waits its turn, where
+  before most went at once as far as the windows allowed; each that waits costs its coroutine frame and its notifiers'
+  waits (`coro::notifier::notify()` swaps its waiters' vector out, so the next wait on it allocates one again: the
+  stream's, and the writer's, which the queued write wakes).
+  The HTTP/2 case, a stream at a time (a GET: no body): 97.8 to 108.9 us a request before (median 104.3), 83.6 to 115.9
+  after (median 101.8), 49.3 allocations a request both. The server's 8 responses at once: 1440 to 1560 us a round
+  before (median 1512), 1236 to 1630 after (median 1428), 98.4 allocations a response both. So no change the noise
+  shows but for the uploads, which are a little faster and allocate more.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2658,7 +2729,8 @@ certificate.
       `continue_deadline` (the timer's third deadline), `send()` waiting before `send_body()`, and HTTP/2's rule for a
       final response first; tests against cppnet's server and `test::h2_client` as the server. After 5, whose API and
       417 handling it shares.
-   7. **The client's request bodies through the scheduler.** The client's streams on the server's write path
+   7. **The client's request bodies through the scheduler.** Done (2026-10-21; see Learned in stage 6). The client's
+      streams on the server's write path
       (`scheduling` for both roles: at once when uncontended, otherwise in turns; writes that don't wait without a
       coroutine), every stream u=3 incremental, so contended bodies take turns a frame at a time; `bench_request` with 8
       bodies at once. Split from 8 so the move onto the shared path is measured and reviewed without priorities.
