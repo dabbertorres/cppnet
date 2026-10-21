@@ -208,8 +208,11 @@ namespace
             if (stream.failure)
                 return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(stream.failure));
 
-            // a response to HEAD has no body, whatever its head says.
-            const bool end = end_stream || (stream.head_request && !status_is_information(resp.status_code));
+            // a response to HEAD has no body (nor trailers), whatever its head says; one without a body is followed
+            // by its trailers, if it has any (or declares them), which end the stream instead.
+            const bool trailing = !resp.trailers.empty() || resp.headers.get_all("Trailer"sv).has_value();
+            const bool end =
+                (end_stream && !trailing) || (stream.head_request && !status_is_information(resp.status_code));
 
             stream.status_text = std::to_string(static_cast<int>(resp.status_code));
             stream.fields.clear();
@@ -237,9 +240,23 @@ namespace
 
             if (!stream.ended)
             {
+                // the trailers end the stream, if there are any it can send; an empty DATA frame does otherwise. If
+                // one can't be sent, nothing is, and the stream's left to be reset.
+                stream.fields.clear();
+                if (auto err =
+                        append_fields(stream.resp.trailers, stream.names, stream.fields, field_section::trailers))
+                    return coro::ready_task<io::result>(io::result{.err = err});
+
                 stream.ended = true;
-                if (auto sent = c.session.submit_data(stream.id, {}, true); !sent.has_value())
+                if (!stream.fields.empty())
+                {
+                    if (auto err = c.session.submit_headers(stream.id, stream.fields, true))
+                        return coro::ready_task<io::result>(io::result{.err = err});
+                }
+                else if (auto sent = c.session.submit_data(stream.id, {}, true); !sent.has_value())
+                {
                     return coro::ready_task<io::result>(io::result{.err = sent.error()});
+                }
             }
         }
 
@@ -389,12 +406,22 @@ namespace
     {
         if (kind != http2::block_kind::head)
         {
-            // trailers end the request's body (and aren't passed on).
+            // trailers end the request's body: kept (without those that can't be trailers) for the body's reader to
+            // move to req.trailers once it reaches the end, so the handler finds them once it's read the body to its
+            // end, and they don't change under it as it reads.
             if (const auto it = streams.find(id); it != streams.end() && end_stream)
             {
-                it->second->received_end = true;
-                it->second->read_deadline.reset();
-                it->second->changed.notify();
+                auto& s = *it->second;
+                for (const auto& f : fields)
+                {
+                    if (!trailer_allowed(f.name)) continue;
+                    if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<headers>();
+                    s.received_trailers->add(f.name, f.value);
+                }
+
+                s.received_end = true;
+                s.read_deadline.reset();
+                s.changed.notify();
             }
             return;
         }
@@ -486,6 +513,7 @@ namespace
         req.peer_certificates = peer_certs;
         auto body             = std::make_unique<stream_reader>(stream.get());
         stream->body          = body.get();
+        stream->trailers_to   = &req.trailers;
         req.body              = std::move(body);
 
         // its handler's token: stopped when the stream fails (see fail_stream()), or by abort (at once, after
@@ -629,8 +657,10 @@ namespace
                 // a response under way can't be finished: the client mustn't take what it has as all of it.
                 if (rw.sent() || stopped) co_return false;
 
-                // a 500 rather than the response the handler meant (perhaps after a 1xx), without its headers.
+                // a 500 rather than the response the handler meant (perhaps after a 1xx), without its headers or
+                // trailers.
                 rw.headers().clear();
+                rw.trailers().clear();
                 rw.headers().set("Date"sv, current_date());
                 co_await rw.send(status::INTERNAL_SERVER_ERROR, 0);
             }
@@ -643,7 +673,22 @@ namespace
             // less than its Content-Length (a response to HEAD has none, whatever its head says).
             if (!stream.head_request && rw.body_remaining() > 0) co_return false;
 
-            (void)co_await rw.finish();
+            // e.g. a trailer that can't be sent: then the stream's reset (not ended), so the client doesn't take the
+            // response for complete.
+            if (auto finished = co_await rw.finish(); finished.err)
+            {
+                if (finished.err == std::errc::invalid_argument)
+                {
+                    logger.warn("handler for {} {} set a trailer that can't be sent",
+                                method_string(req.method),
+                                req.target.path);
+                    co_return false;
+                }
+                logger.debug("failed to end the response to {} {}: {}",
+                             method_string(req.method),
+                             req.target.path,
+                             finished.err.message());
+            }
         }
         catch (const std::exception& ex)
         {

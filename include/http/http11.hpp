@@ -56,6 +56,12 @@ request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server
 // connection from then, e.g.
 void call_at_body_end(const server_request& req, io::end_callback callback) noexcept;
 
+// keep_body_trailers has the body of a request that request_decode() decoded keep its trailer section's fields in
+// req.trailers (see chunked_reader::keep_trailers()), before call_at_body_end()'s callback is called: only a chunked
+// body has any. req mustn't move while its body's read (as the server's, reused for each request on a connection,
+// doesn't); without it, they're checked and dropped.
+void keep_body_trailers(server_request& req) noexcept;
+
 // call_at_body_start sets what's awaited before the first read of the body of a request that request_decode() decoded
 // (see io::start_callback): e.g. for a server to send 100 Continue then. A body that's empty is never read, so there's
 // nothing to call.

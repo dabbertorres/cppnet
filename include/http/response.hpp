@@ -255,6 +255,9 @@ struct server_response
     status             status_code = status::NONE;
     net::http::headers headers{};
     io::writer*        body = nullptr;
+
+    // The response's trailer fields, sent after the body (see response_writer::trailers()).
+    net::http::headers trailers{};
 };
 
 using response_encoder_result = std::expected<io::writer*, std::error_code>;
@@ -302,6 +305,18 @@ public:
 
     net::http::headers& headers() noexcept;
 
+    // trailers are the response's trailer fields (e.g. Server-Timing, or gRPC's grpc-status), sent after the body when
+    // it ends (finish(), which the server calls once the handler returns, so middleware may add to them after the
+    // handler it wraps): over HTTP/2, as a final HEADERS frame, whatever the body's framing; over HTTP/1.1, in the last
+    // chunk, so only for a body sent without a Content-Length (send(status)) to an HTTP/1.1 client, and dropped
+    // otherwise (with a Content-Length, to an HTTP/1.0 client, and for HEAD). They're sent whatever the request's TE.
+    // Fields that can't be trailers are dropped (see trailer_allowed()); an invalid name or value (e.g. a line break)
+    // fails finish() with std::errc::invalid_argument, and the response is cut short (the connection closed, or the
+    // stream reset), so the client doesn't take it as complete. Over HTTP/2, a response without a body ends with its
+    // head, unless trailers (or a Trailer field, which declares them, as RFC 9110 says a sender should) are set by the
+    // time it's sent: then they follow the head.
+    net::http::headers& trailers() noexcept;
+
     // send sends the response's status and headers, with a Content-Length of content_length (except for statuses
     // that have no content: 1xx, 204 and 304), and returns the writer for its body. Writing more than content_length
     // fails with std::errc::value_too_large; writing less leaves the server to close the connection. It throws
@@ -330,7 +345,8 @@ public:
     coro::task<io::writer*> send(status status_code);
 
     // finish ends the body of a response sent without a Content-Length, if it's chunked (see send(status)), or an
-    // HTTP/2 response's stream. It does nothing otherwise, or if the body was ended already.
+    // HTTP/2 response's stream, sending the trailers (see trailers()). It does nothing otherwise, or if the body was
+    // ended already. It fails with std::errc::invalid_argument, having sent nothing, if a trailer can't be sent.
     coro::task<io::result> finish();
 
     // body_remaining is how much of the body the handler has yet to write.

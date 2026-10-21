@@ -28,12 +28,12 @@ namespace net::http
 // stop (its waits given req.stop end with std::errc::operation_canceled), and the timeout answers once it has returned:
 // if the deadline passed, no final response was sent, and the request's own token wasn't stopped (then its client is
 // gone, or the server aborted, and the server sends nothing for it), it sends 503 Service Unavailable with an empty
-// body (and whatever headers the rest of the chain had set). A response the rest of the chain sent stands. It never
-// writes while the rest of the chain might: unlike Go's, it doesn't buffer the response so as to answer at the
-// deadline. So a handler that ignores its token delays the 503 until it returns, as it would any response, and holds
-// its connection (or its HTTP/2 stream's place) meanwhile. If the rest of the chain throws once the deadline has
-// passed, the 503 is still sent (the deadline being the likelier cause, e.g. of a canceled wait turned into an
-// exception), and then the exception rethrown (so the server logs it, and closes an HTTP/1.1 connection).
+// body (and whatever headers the rest of the chain had set, but no trailers). A response the rest of the chain sent
+// stands. It never writes while the rest of the chain might: unlike Go's, it doesn't buffer the response so as to
+// answer at the deadline. So a handler that ignores its token delays the 503 until it returns, as it would any
+// response, and holds its connection (or its HTTP/2 stream's place) meanwhile. If the rest of the chain throws once the
+// deadline has passed, the 503 is still sent (the deadline being the likelier cause, e.g. of a canceled wait turned
+// into an exception), and then the exception rethrown (so the server logs it, and closes an HTTP/1.1 connection).
 //
 // Middleware that records what was sent (instrument::http_metrics, http_tracing) goes outside it, as above: it then
 // sees the request's own token, and the 503 that was sent (recorded as any 5xx, an error). Inside it, it would see the
@@ -83,7 +83,12 @@ public:
         req.stop = std::move(original);
         deadline.cancel();
 
-        if (expired && !resp.sent() && !req.stop.stop_requested()) co_await resp.send(status::SERVICE_UNAVAILABLE, 0);
+        // (the rest's trailers were for the response it meant, not for this one.)
+        if (expired && !resp.sent() && !req.stop.stop_requested())
+        {
+            resp.trailers().clear();
+            co_await resp.send(status::SERVICE_UNAVAILABLE, 0);
+        }
 
         if (failure != nullptr) std::rethrow_exception(failure);
     }

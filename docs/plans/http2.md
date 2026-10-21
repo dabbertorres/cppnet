@@ -9,7 +9,8 @@ end to end, trailers, the HPACK encoder's dynamic table, and RFC 9218's prioriti
 5"); its questions (at the end) all as recommended. Its first part, interim responses on the server (and 100 Continue),
 done (2026-10-20; see Learned in stage 5); its second, interim responses in the client (`on_informational`), done
 (2026-10-20); its third, trailers in the codecs (`chunked_reader`, `chunked_writer::finish(trailers)`,
-`trailer_allowed()`), done (2026-10-20).
+`trailer_allowed()`), done (2026-10-20); its fourth, trailers on the server (`server_request::trailers`,
+`response_writer::trailers()`), done (2026-10-20).
 
 ## Goal
 
@@ -569,6 +570,68 @@ idle stream would be a connection error for the peer.
   run's spread (1 to 4%). None of those requests or responses is chunked, so nothing they run changed; it's taken for
   noise, or code layout.
 
+### Part 4: trailers on the server (done 2026-10-20)
+
+- `server_request::trailers` and `server_response::trailers` (with `response_writer::trailers()`), as proposed:
+  `headers` members, inline. `server_request::clear()` empties the request's; the server's `start_response()` (and
+  `respond_and_close()`) empty the response's, as HTTP/1.1's response is the connection's, reused per request.
+- HTTP/1.1, receiving: `http11::keep_body_trailers(req)` (new, beside `call_at_body_end()` and
+  `call_at_body_start()`, told apart by `typeid` as they are) has a chunked body keep its trailer section in
+  `req.trailers`; the server calls it just before `call_at_body_end()`, so they're filled before the end callback and
+  the watch. Not in `set_request_body()`: the by-value `request_decode()` moves the request it decoded into, which
+  would leave the body pointing into the moved-from one.
+- HTTP/2, receiving, differs from the plan: `on_headers()` doesn't add to `req.trailers`, but keeps the allowed ones in
+  the stream (`http2_stream_base::received_trailers`, a `unique_ptr<headers>` made only when a message has some), and
+  the body's reader moves them to the stream's `trailers_to` (`&req.trailers`) as it returns the end
+  (`hand_over_trailers()`, under the lock). The handler runs on another thread than the connection's reader, so with
+  the plan's way a handler that looked at `req.trailers` before the body's end (or middleware after `next()`, the
+  body unread) would race with the reader adding to them, and they'd appear whenever they arrived, not only at the
+  end as the API says. In the base, as part 5's client needs the same for a response's body; on the heap, so streams
+  without trailers (the client's too) don't grow by a `headers` (680 bytes with libc++).
+- HTTP/1.1, sending: `finish()` passes `&resp->trailers` to `chunked_writer::finish()` when the body's chunked;
+  otherwise they're dropped without being looked at (a Content-Length, HTTP/1.0). For HEAD the server clears them
+  before `finish()`: the chunked writer writes into the HEAD's discard writer, but would still check them, so an
+  invalid one would close the connection for nothing; over HTTP/2 a HEAD's head ends the stream, so both versions
+  drop them unchecked alike.
+- HTTP/2, sending: `append_fields()`'s `bool request` became `field_section` (`response`, `request`, `trailers`); the
+  trailers' leaves out what `trailer_allowed()` refuses (besides the connection-specific fields), and checks every
+  field with `valid_fields()`, those it leaves out too, as `chunked_writer::finish()` does. `http2_finish()` appends
+  them before it marks the stream ended, so one that can't be sent leaves the stream to be reset; then HEADERS with
+  END_STREAM, or an empty DATA if none are left. `http2_send_head()` doesn't end a bodyless head if
+  `resp.trailers` isn't empty or `Trailer` is among the headers (a 1xx never ends it, and HEAD's always does).
+- An invalid trailer: `finish()` fails with `invalid_argument`, logged at warn ("handler for GET /x set a trailer that
+  can't be sent"; other failures to finish stay at debug). HTTP/1.1 then closes without the last chunk (what was
+  buffered of the body is flushed first); HTTP/2's `respond_after()` returns false, and the stream's reset with
+  INTERNAL_ERROR (CANCEL if the handler was stopped).
+- The 500 for a handler that throws clears the trailers with the headers (HTTP/2's in `respond_after()`, HTTP/1.1's
+  in `respond_and_close()`, whose 500 has a Content-Length and so would drop them anyway). `http::timeout`'s 503 clears
+  only the trailers: it keeps the rest of the chain's headers, as before.
+- `fuzz_http11` now decodes into one `server_request` reused for each request, as the server does (the in-place
+  `request_decode()`, then `keep_body_trailers()`), and reads `req.trailers`, instead of the `dynamic_cast`; it also
+  checks that a request starts without the last one's. Ran for 110 s from two seeds with trailers (106,706 runs);
+  `fuzz_http2` (unchanged) for 110 s (59,072 runs).
+- Tests (`test/http/server_trailers.cpp`, `[trailers]`): over HTTP/1.1 with raw requests, a handler reads a chunked
+  request's trailers after its body (a disallowed one dropped, a repeated name one field); trailers in the last chunk
+  (disallowed ones dropped), none after a Content-Length, without a body, to HTTP/1.0 or for HEAD; an invalid one
+  closes the connection without the last chunk; none with the 500; the connection reused after a response with
+  trailers, the next request having none; middleware adding one. Over HTTP/2 with `test::h2_client` (which now records
+  a response's trailers, its DATA frames and whether its head ended the stream, and sends trailers): a request's
+  trailers after its body, and straight after its head; trailers after a chunked body, after a Content-Length, straight
+  after a bodyless head (no DATA), a declared `Trailer` with none (an empty DATA ends it), none for HEAD, the reset for
+  an invalid one, none with the 500; middleware adding one. And `append_fields()`'s `trailers` section on its own.
+- Sizes (libc++): `headers` is 680 bytes, so `server_request` grew from 1096 to 1776, `server_response` from 704 to
+  1384, and the HTTP/2 server's stream by 1376 (those two, `received_trailers` and `trailers_to`); `http2_stream_base`
+  from 272 to 288. Each is still one allocation (per connection, or per stream), as the plan expected, if larger than
+  its "few hundred bytes".
+- Measured (`bench_request`, Release, five alternating runs of the binaries before and after, best of each):
+  allocations unchanged everywhere (1.4 per request pipelined, 4.2 one per read, 3.0 over a socket, 2.0 to a handler
+  that waits, 52.0 over HTTP/2, and the middleware runs' 2.4, 1.4, 2.4, 3.4, 2.4 and 4.0). Times: pipelined 1122 ns
+  before and 1147 after (the runs' spread 1122 to 1162 before, 1147 to 1175 after), one per read 1332 and 1324, over a
+  socket 27.6 and 28.8 us (27.6 to 29.8 before, 28.8 to 29.1 after), to a handler that waits 35.7 and 36.3, over HTTP/2
+  80.4 and 80.3, and the middleware runs within 1% either way. What a request without trailers now does more is two
+  `clear()`s of empty `headers`, a `typeid` check, and a test for HEAD; the pipelined run's 2% is at the edge of its
+  spread, and taken for noise or layout.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1105,9 +1168,10 @@ throughput isn't changed (by frame count and order).
    3. **Trailers in the codecs.** Done (2026-10-20; see Learned in stage 5). `chunked_reader` keeping a trailer
       section, `chunked_writer::finish(trailers)`, `trailer_allowed()`, and `fuzz_http11`'s transcript. Split out as
       it's the part without I/O, tested on strings, which both sides' parts build on.
-   4. **Trailers on the server.** `server_request::trailers`, `response_writer::trailers()`, over HTTP/1.1 and HTTP/2
-      (whose session already handles them); tests with raw requests and `test::h2_client`. One side, both versions: the
-      API is the same over either, and the server's tests don't need the client's part.
+   4. **Trailers on the server.** Done (2026-10-20; see Learned in stage 5). `server_request::trailers`,
+      `response_writer::trailers()`, over HTTP/1.1 and HTTP/2 (whose session already handles them); tests with raw
+      requests and `test::h2_client`. One side, both versions: the API is the same over either, and the server's tests
+      don't need the client's part.
    5. **Trailers in the client.** `client_response::trailers()` and `client_request::make_trailers`, over both
       versions; tested against 4's server, so after it.
    6. **HPACK's table, built.** `dynamic_table`'s storage (no allocation per entry: the decoder gains at once), the

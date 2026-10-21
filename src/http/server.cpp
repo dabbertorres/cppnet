@@ -858,6 +858,9 @@ coro::task<> server::serve_requests(detail::connection& conn)
             break;
         }
 
+        // (filled before the body's end is called, so before a watch begins.)
+        http11::keep_body_trailers(req);
+
         // (for a request without a body, at once.)
         state.watch_gate.store(0, std::memory_order::relaxed);
         http11::call_at_body_end(req, {.call = &connection_state::body_ended, .context = &state});
@@ -938,10 +941,24 @@ coro::task<> server::serve_requests(detail::connection& conn)
             break;
         }
 
-        // ends a body sent without a Content-Length, chunked.
+        // a response to HEAD has no body, so nothing after it either.
+        if (req.method == request_method::HEAD) resp.trailers.clear();
+
+        // ends a body sent without a Content-Length, chunked, with its trailers. If they can't be sent, the connection
+        // closes without the last chunk, so the client doesn't take the response for complete.
         if (auto finished = co_await rw.finish(); finished.err)
         {
-            logger->debug("failed to end the response's body: {}", finished.err.message());
+            if (finished.err == std::errc::invalid_argument)
+            {
+                logger->warn("handler for {} {} set a trailer that can't be sent",
+                             method_string(req.method),
+                             req.target.path);
+            }
+            else
+            {
+                logger->debug("failed to end the response's body: {}", finished.err.message());
+            }
+
             co_await state.abandon_watch();
             break;
         }
@@ -1067,6 +1084,7 @@ void server::start_response(connection_state& state, io::discard_writer& no_body
     resp.status_code = status::NONE;
     resp.body        = req.method == request_method::HEAD ? static_cast<io::writer*>(&no_body) : &state.writer;
     resp.headers.clear();
+    resp.trailers.clear();
     resp.headers.set("Date"sv, current_date());
 
     // HTTP/1.1 connections persist unless either end says they close, and HTTP/1.0's close unless the client says they
@@ -1163,6 +1181,7 @@ coro::task<> server::respond_and_close(detail::connection& conn, connection_stat
     resp.status_code = status::NONE;
     resp.body        = &state.writer;
     resp.headers.clear();
+    resp.trailers.clear();
     resp.headers.set("Connection"sv, "close"sv);
     resp.headers.set("Date"sv, current_date());
 

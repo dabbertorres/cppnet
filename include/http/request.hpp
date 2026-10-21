@@ -212,6 +212,12 @@ struct server_request
     // std::errc::connection_aborted, if the connection ends first).
     std::unique_ptr<io::reader> body = nullptr;
 
+    // The request's trailer fields, once the body has been read to its end (until then, and for a body without any,
+    // empty): over HTTP/1.1, a chunked body's trailer section; over HTTP/2, a HEADERS frame after the body. They're
+    // kept apart from headers (RFC 9110, section 6.5), and without the fields that can't be trailers (see
+    // trailer_allowed()), which are dropped. clear() empties them.
+    net::http::headers trailers{};
+
     // path_value is the value of the route's parameter name: e.g. "42" for "id", for the route "/users/:id" and the
     // path "/users/42". It's empty if the route has no such parameter (a parameter never matches an empty segment).
     [[nodiscard]] std::string_view path_value(std::string_view name) const noexcept
@@ -236,6 +242,7 @@ struct server_request
         target.host.clear();
         target.port.clear();
         headers.clear();
+        trailers.clear();
         host.clear();
         route = {};
         path_values.clear();

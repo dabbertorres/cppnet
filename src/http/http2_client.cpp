@@ -284,7 +284,8 @@ http2_client_connection::open(const client_request& request, bool end_stream)
     fields.push_back({.name = ":scheme", .value = is_tls(conn) ? "https" : "http"});
     fields.push_back({.name = ":authority", .value = stream->authority});
     fields.push_back({.name = ":path", .value = stream->path});
-    if (auto err = append_fields(request.headers, stream->names, fields, true)) return std::unexpected(err);
+    if (auto err = append_fields(request.headers, stream->names, fields, field_section::request))
+        return std::unexpected(err);
 
     const auto id = session.open_stream();
     if (!id.has_value()) return std::unexpected(id.error());

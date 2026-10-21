@@ -503,6 +503,30 @@ scheduler.spawn(server.serve());
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).
+- **Trailers** are fields that come after the body (RFC 9110, section 6.5), e.g. what's known only once the body's
+  done: a digest of it, `Server-Timing`, or gRPC's `grpc-status`. A request's are `req.trailers` (a `headers`, kept
+  apart from `req.headers`), there once the handler has read the body to its end, and empty until then: a chunked
+  body's trailer section over HTTP/1.1, the HEADERS frame after the body over HTTP/2. A response's are
+  `resp.trailers()`, sent when the response ends, once the handler has returned (so middleware may add to them after
+  `next()`):
+
+  ```cpp
+  auto* body = co_await resp.send(net::http::status::OK);   // no Content-Length: chunked, over HTTP/1.1
+  co_await net::io::write_all(*body, reply);
+  resp.trailers().set("Grpc-Status", "0");                  // sent after the body
+  ```
+
+  Over HTTP/1.1 only a chunked body has trailers (in its last chunk), so they're sent only for a body sent with
+  `send(status)` to an HTTP/1.1 client, and dropped otherwise: after a body with a Content-Length, to an HTTP/1.0
+  client, and for HEAD. A handler with trailers to send uses `send(status)`. Over HTTP/2 they're sent whatever the
+  body: a response without one is followed by them, if they're set (or a `Trailer` field declares them) by the time
+  its head is sent. Either way, they're sent whatever the request's `TE`. `net::http::trailer_allowed(name)` is
+  whether a field may be a trailer: not one for framing, routing, authentication, request modifiers, response
+  controls or the content's format (e.g. `Content-Length`, `Host`, `Authorization`, `Cache-Control`, `Content-Type`,
+  `If-*`, `Trailer`), which are dropped, received or sent. A trailer whose name or value can't be sent (e.g. a value
+  with a line break) cuts the response short, logged: the HTTP/1.1 connection closes without the last chunk, or the
+  HTTP/2 stream's reset, so the client doesn't take the response for complete. The 500 for a handler that throws, and
+  `http::timeout`'s 503, have none.
 - **Canceling:** `req.stop`, a `std::stop_token`, is stopped once the request is no longer wanted: over HTTP/2, when the
   client resets its stream, the stream times out, or its connection ends; over HTTP/1.1, when the client leaves (below),
   or the connection ends; and when the server is aborted (below). Canceling is cooperative: a handler checks

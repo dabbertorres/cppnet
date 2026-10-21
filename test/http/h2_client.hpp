@@ -50,8 +50,11 @@ struct h2_client final : http2::session_events
         std::string                                      status;
         std::vector<std::pair<std::string, std::string>> headers;
         std::vector<interim>                             interims; // before the final head, in order
+        std::vector<std::pair<std::string, std::string>> trailers; // after the body (a HEADERS that ends the stream)
         std::string                                      body;
-        bool                                             done = false;
+        int                                              data_frames = 0;     // DATA frames, empty ones too
+        bool                                             head_ended  = false; // the head ended the stream
+        bool                                             done        = false;
         std::error_code                                  reset;
         int                                              order = 0; // when it was done
     };
@@ -96,6 +99,7 @@ struct h2_client final : http2::session_events
                 if (f.name == ":status") r.status = f.value;
                 else r.headers.emplace_back(f.name, f.value);
             }
+            r.head_ended = end;
         }
         else if (kind == http2::block_kind::informational)
         {
@@ -106,12 +110,17 @@ struct h2_client final : http2::session_events
                 else head.headers.emplace_back(f.name, f.value);
             }
         }
+        else
+        {
+            for (const auto& f : fields) r.trailers.emplace_back(f.name, f.value);
+        }
         if (end) done(r);
     }
 
     void on_data(http2::stream_id id, std::span<const std::byte> data, bool end) override
     {
         auto& r = responses[id];
+        ++r.data_frames;
         r.body.append(reinterpret_cast<const char*>(data.data()), data.size());
         s.consume(id, data.size());
         if (end) done(r);
@@ -159,6 +168,13 @@ struct h2_client final : http2::session_events
         REQUIRE_FALSE(s.submit_headers(id, head, body.empty() && end));
         if (!body.empty()) send(id, body, end);
         return id;
+    }
+
+    // send_trailers ends a stream with trailers, once its body (if any) has all been sent.
+    void send_trailers(http2::stream_id id, std::span<const hpack::field> fields)
+    {
+        REQUIRE_FALSE(pending_body.contains(id));
+        REQUIRE_FALSE(s.submit_headers(id, fields, true));
     }
 
     // respond sends a response's head (as a server), and its body, if any (ending the stream, if end).
@@ -347,6 +363,16 @@ struct stop_probe
 inline std::string header(const h2_client::response& r, std::string_view name)
 {
     for (const auto& [n, v] : r.headers)
+    {
+        if (n == name) return v;
+    }
+    return "(none)";
+}
+
+// trailer is a response's trailer's value, or "(none)".
+inline std::string trailer(const h2_client::response& r, std::string_view name)
+{
+    for (const auto& [n, v] : r.trailers)
     {
         if (n == name) return v;
     }

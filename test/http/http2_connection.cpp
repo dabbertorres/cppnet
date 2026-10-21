@@ -155,6 +155,36 @@ TEST_CASE("HTTP/2 sends neither connection-specific fields, nor those Connection
     CHECK(got == std::vector<std::string>{"content-type: text/plain", "x-other: a", "x-other: b"});
 }
 
+TEST_CASE("HTTP/2 sends only the fields that may be trailers as trailers", "[http][http2][connection][trailers]")
+{
+    const net::http::headers from{
+        { "Server-Timing",   {"db;dur=53"}},
+        {"Content-Length",           {"0"}},
+        {      "If-Match",       {"\"a\""}},
+        {          "Host", {"example.com"}},
+        { "Authorization",      {"secret"}},
+        {    "Keep-Alive",   {"timeout=5"}},
+        {   "Grpc-Status",           {"0"}},
+    };
+
+    std::vector<std::string>  names;
+    std::vector<hpack::field> fields;
+    REQUIRE_FALSE(detail::append_fields(from, names, fields, detail::field_section::trailers));
+
+    std::vector<std::string> got;
+    got.reserve(fields.size());
+    for (const auto& f : fields) got.push_back(std::string{f.name} + ": " + std::string{f.value});
+    CHECK(got == std::vector<std::string>{"server-timing: db;dur=53", "grpc-status: 0"});
+
+    // one it would drop is still checked, as HTTP/1.1's chunked_writer checks it.
+    net::http::headers bad;
+    bad.add("Grpc-Status", "0");
+    bad.add("Content-Length", "1\r\n2");
+    fields.clear();
+    CHECK(detail::append_fields(bad, names, fields, detail::field_section::trailers) == std::errc::invalid_argument);
+    CHECK(fields.empty());
+}
+
 TEST_CASE("HTTP/2 sends values without the whitespace around them", "[http][http2][connection]")
 {
     net::http::headers from;
@@ -167,7 +197,7 @@ TEST_CASE("HTTP/2 sends values without the whitespace around them", "[http][http
 
     std::vector<std::string>  names;
     std::vector<hpack::field> fields;
-    REQUIRE_FALSE(detail::append_fields(from, names, fields, true));
+    REQUIRE_FALSE(detail::append_fields(from, names, fields, detail::field_section::request));
 
     std::vector<std::string> got;
     got.reserve(fields.size());

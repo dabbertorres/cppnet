@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -151,8 +152,19 @@ public:
     std::vector<std::byte> received; // DATA not read yet, from received_start (before it, what's read)
     std::size_t            received_start = 0;
     bool                   received_end   = false;
-    bool                   ended          = false; // this side has sent END_STREAM
-    std::error_code        failure;                // reset, timed out, or the connection ended (see fail_stream())
+
+    // The trailers received (those that may be: see trailer_allowed()), held until the reader reaches the end of what
+    // was received, which moves them to trailers_to, if it's set (e.g. a request's): so whoever looks at them does on
+    // the reader's task, once it's read to the end, never as the connection's reader adds them. Made only for a
+    // message that has them, so a stream without any isn't larger for them.
+    std::unique_ptr<headers> received_trailers;
+    headers*                 trailers_to = nullptr;
+
+    // hand_over_trailers moves the trailers received to trailers_to, if both are there (holding the lock).
+    void hand_over_trailers() noexcept;
+
+    bool            ended = false; // this side has sent END_STREAM
+    std::error_code failure;       // reset, timed out, or the connection ended (see fail_stream())
 
     // The stop source of the stream's handler's token (server_request::stop): the server's streams have one, the
     // client's none. It's stopped when the stream fails, once the lock's released (see fail_stream()).
@@ -178,15 +190,23 @@ public:
 // where HTTP/1.1 has them as optional whitespace (which its parsers strip, so they mean nothing).
 [[nodiscard]] std::string_view trim_value(std::string_view value) noexcept;
 
+// field_section is which section of a message append_fields() appends.
+enum class field_section : std::uint8_t
+{
+    response, // a response's head
+    request,  // a request's head: without Host, which :authority replaces, and TE unless it's "trailers"
+    trailers, // either's trailers: without the fields that can't be trailers (see trailer_allowed())
+};
+
 // append_fields appends from's fields to fields as HTTP/2 sends them: names lowercased (into names, which fields views,
 // so names mustn't be touched until fields are sent), values without the whitespace around them (see trim_value),
-// without connection-specific fields (nor those Connection names; and, for a request, Host, which :authority replaces,
-// and TE unless it's "trailers"), and with credentials never indexed. It fails with std::errc::invalid_argument,
-// appending nothing, if a field's name or value isn't valid (see valid_fields), as HTTP/1.1's encoder does.
+// without connection-specific fields (nor those Connection names; nor what section leaves out), and with credentials
+// never indexed. It fails with std::errc::invalid_argument, appending nothing, if a field's name or value isn't valid
+// (see valid_fields), as HTTP/1.1's encoder does: any field's, even one it would leave out.
 [[nodiscard]] std::error_code append_fields(const headers&             from,
                                             std::vector<std::string>&  names,
                                             std::vector<hpack::field>& fields,
-                                            bool                       request = false);
+                                            field_section              section = field_section::response);
 
 // http2_connection_base runs an HTTP/2 connection's session: a reader feeding it what's read, a writer writing its
 // output, and a timer for its streams' timeouts (and the connection's, which a derived class says).

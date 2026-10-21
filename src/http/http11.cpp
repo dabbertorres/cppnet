@@ -859,6 +859,16 @@ void call_at_body_end(const server_request& req, io::end_callback callback) noex
     // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
+void keep_body_trailers(server_request& req) noexcept
+{
+    // NOTE: as call_at_body_end().
+    auto* body = req.body.get();
+    if (body == nullptr || typeid(*body) != typeid(chunked_reader)) return;
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): the type is checked first.
+    static_cast<chunked_reader*>(body)->keep_trailers(&req.trailers);
+}
+
 void call_at_body_start(const server_request& req, io::start_callback callback) noexcept
 {
     // NOTE: as call_at_body_end().

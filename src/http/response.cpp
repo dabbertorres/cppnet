@@ -80,6 +80,8 @@ response_writer::response_writer(detail::http2_stream*           stream,
 
 headers& response_writer::headers() noexcept { return resp->headers; }
 
+headers& response_writer::trailers() noexcept { return resp->trailers; }
+
 coro::task<io::writer*> response_writer::send(status status_code, std::size_t content_length)
 {
     return start(status_code, framing::length, content_length);
@@ -273,7 +275,8 @@ coro::task<io::result> response_writer::finish()
     auto& h1 = std::get<http11_backend>(backend);
     if (!h1.chunked_open) return coro::ready_task<io::result>();
 
+    // NOTE: only a chunked body has a last chunk to carry trailers: a body framed otherwise drops them.
     h1.chunked_open = false;
-    return h1.chunked.finish();
+    return h1.chunked.finish(&resp->trailers);
 }
 }

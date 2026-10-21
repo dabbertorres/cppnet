@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <expected>
 #include <memory>
 #include <print>
 #include <span>
@@ -110,32 +109,32 @@ std::string transcript(net::io::reader* conn)
     net::io::buffered_reader reader{conn};
     std::string              out;
 
+    // reused for each request, as the server does.
+    net::http::server_request req;
+
     for (int i = 0; i < 8; ++i)
     {
-        auto req = test::sync_wait(net::http::http11::request_decode(&reader, 512));
-        if (!req.has_value())
+        if (auto err = test::sync_wait(net::http::http11::request_decode(&reader, 512, req)); err)
         {
-            out += "error: " + req.error().message() + "\n";
+            out += "error: " + err.message() + "\n";
             return out;
         }
 
-        out += std::string{net::http::method_string(req->method)} + " " + req->target.path + "?" + req->target.query
-             + " " + std::to_string(req->version.major) + "." + std::to_string(req->version.minor)
-             + " host=" + req->host + "\n";
+        // the previous request's are gone.
+        if (!req.trailers.empty()) fail("a request kept the last one's trailers", req.target.path);
 
-        check_fields(req->headers, "", out);
+        out += std::string{net::http::method_string(req.method)} + " " + req.target.path + "?" + req.target.query + " "
+             + std::to_string(req.version.major) + "." + std::to_string(req.version.minor) + " host=" + req.host + "\n";
 
-        // (as the server will, once it keeps them: http2.md's stage 5, part 4.)
-        net::http::headers trailers;
-        if (auto* chunked = dynamic_cast<net::http::http11::chunked_reader*>(req->body.get()); chunked != nullptr)
-            chunked->keep_trailers(&trailers);
+        check_fields(req.headers, "", out);
+        net::http::http11::keep_body_trailers(req);
 
         // reads of an odd size, so they straddle chunks.
         std::string body;
         std::string buf(13, '\0');
         while (true)
         {
-            auto res = test::sync_wait(req->body->read(buf));
+            auto res = test::sync_wait(req.body->read(buf));
             body.append(buf.data(), res.count);
 
             if (res.err)
@@ -143,13 +142,13 @@ std::string transcript(net::io::reader* conn)
                 out += "body: " + body + " (" + res.err.message() + ")\n";
                 if (res.err == net::io::errc::end_of_stream) break;
 
-                if (!trailers.empty()) fail("a body that failed kept trailers", res.err.message());
+                if (!req.trailers.empty()) fail("a body that failed kept trailers", res.err.message());
                 return out;
             }
         }
 
-        check_fields(trailers, "trailer ", out);
-        check_trailers(trailers);
+        check_fields(req.trailers, "trailer ", out);
+        check_trailers(req.trailers);
     }
 
     return out;

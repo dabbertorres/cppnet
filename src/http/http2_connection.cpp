@@ -78,8 +78,10 @@ std::string_view trim_value(std::string_view value) noexcept
     return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
 }
 
-std::error_code
-append_fields(const headers& from, std::vector<std::string>& names, std::vector<hpack::field>& fields, bool request)
+std::error_code append_fields(const headers&             from,
+                              std::vector<std::string>&  names,
+                              std::vector<hpack::field>& fields,
+                              field_section              section)
 {
     using namespace std::string_view_literals;
 
@@ -93,10 +95,12 @@ append_fields(const headers& from, std::vector<std::string>& names, std::vector<
     // the fields Connection names are this connection's too (RFC 9113, section 8.2.2).
     const bool has_connection = from.get_all("Connection"sv).has_value();
 
+    const bool request = section == field_section::request;
     for (const auto& [name, values] : from)
     {
         if (connection_specific(name) || (has_connection && from.has_token("Connection"sv, name))) continue;
         if (request && util::equal_ignore_case(std::string_view{name}, "host"sv)) continue;
+        if (section == field_section::trailers && !trailer_allowed(name)) continue;
 
         auto& lowered = names.emplace_back(name);
         std::ranges::transform(lowered, lowered.begin(), [](char c) { return util::to_lower_ascii(c); });
@@ -158,7 +162,11 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
             }
             else
             {
-                if (s.received_end) co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
+                if (s.received_end)
+                {
+                    s.hand_over_trailers();
+                    co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
+                }
                 if (s.failure) co_return io::result{.err = s.failure};
 
                 seen = s.changed.value();
@@ -177,6 +185,14 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
         c.wake_writer();
         (void)co_await stream->changed.wait(seen);
     }
+}
+
+void http2_stream_base::hand_over_trailers() noexcept
+{
+    if (trailers_to == nullptr || received_trailers == nullptr) return;
+
+    *trailers_to = std::move(*received_trailers);
+    received_trailers.reset();
 }
 
 io::handle stream_reader::native_handle() const noexcept { return stream->conn->native_handle(); }
