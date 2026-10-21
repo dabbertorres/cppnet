@@ -33,6 +33,7 @@
 #include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_connection.hpp"
 #include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
@@ -47,6 +48,7 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "tcp.hpp"
 #include "tls/certificate.hpp"
 
 namespace net::http::detail
@@ -148,12 +150,21 @@ namespace
     class http2_server_connection final : public http2_connection_base
     {
     public:
+        // marked is whether TCP_NOTSENT_LOWAT is set on the connection: its writer then waits for it to be writable
+        // before each round (with options.writable, if it's set).
         http2_server_connection(io::scheduler*         scheduler,
                                 connection&            conn,
                                 const http2_options&   options,
                                 const request_handler& handler,
-                                spdlog::logger&        logger)
-            : http2_connection_base{scheduler, conn, http2::role::server, options.session, logger}
+                                spdlog::logger&        logger,
+                                bool                   marked)
+            : http2_connection_base{scheduler,
+                                    conn,
+                                    http2::role::server,
+                                    options.session,
+                                    logger,
+                                    marked,
+                                    marked ? options.writable : writable_function{}}
             , options{options}
             , handler{handler}
             , peer_certs{peer_certificates(conn)}
@@ -908,7 +919,18 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
                          std::stop_token            stop,
                          std::stop_token            abort)
 {
-    http2_server_connection c{scheduler, conn, options, handler, logger};
+    // TCP_NOTSENT_LOWAT (docs/plans/http2.md, stage 6's fourth part), now that it's HTTP/2: the kernel then holds
+    // little more than what's in flight, and the writer waits for it to take more before framing more, so what's past
+    // the scheduler's reordering is the mark and a round. (Not on HTTP/1.x's connections, whose responses aren't
+    // reordered: it would only cost them wakeups.)
+    bool marked = false;
+    if (options.notsent_lowat > 0)
+    {
+        if (auto set = socket_of(conn).set_notsent_lowat(options.notsent_lowat); set.has_value()) marked = true;
+        else logger.debug("failed to set TCP_NOTSENT_LOWAT: {}", set.error().message());
+    }
+
+    http2_server_connection c{scheduler, conn, options, handler, logger, marked};
     co_await c.serve(already_read, std::move(stop), std::move(abort));
 }
 

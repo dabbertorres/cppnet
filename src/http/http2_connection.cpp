@@ -26,6 +26,7 @@
 #include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 #include "http/priority.hpp"
 #include "io/io.hpp"
@@ -394,13 +395,17 @@ http2_connection_base::http2_connection_base(io::scheduler*               schedu
                                              connection&                  conn,
                                              http2::role                  side,
                                              const http2::session_config& config,
-                                             spdlog::logger&              logger)
+                                             spdlog::logger&              logger,
+                                             bool                         waits_writable,
+                                             writable_function            writable)
     : session{side, config}
     , scheduler{scheduler}
     , pool{scheduler->pool()}
     , conn{conn}
     , logger{logger}
     , scheduling{side == http2::role::server}
+    , waits_writable{waits_writable}
+    , writable{std::move(writable)}
     , writer_wakeup{pool}
     , drained{pool}
 {}
@@ -651,9 +656,22 @@ coro::task<> http2_connection_base::write_loop()
     std::vector<std::byte>        out;
     std::vector<std::stop_source> stopping; // the streams fill() failed
     bool                          wrote = false;
+    std::error_code               failed; // the write (or wait) that failed, if one did
 
     while (true)
     {
+        // what the last round wrote has to go (but the mark) before more's framed. A round after one that didn't
+        // write needn't wait: the connection was writable after the last that did, and only the peer's changed it.
+        if (wrote && waits_writable)
+        {
+            const auto res = co_await wait_for_socket();
+            if (res.err)
+            {
+                failed = res.err;
+                break;
+            }
+        }
+
         const auto seen   = writer_wakeup.value();
         const bool ending = take_output(out, std::exchange(wrote, false), stopping);
         stop_all(stopping);
@@ -665,31 +683,7 @@ coro::task<> http2_connection_base::write_loop()
             drained.notify();
             if (res.err)
             {
-                logger.debug("HTTP/2 connection's write failed: {}", res.err.message());
-
-                // the connection was closed (e.g. reset): the reader finds that too, at once, and why, if the peer said
-                // (e.g. a TLS alert it sent before closing, which a write after it doesn't see), so it's left to end
-                // it. Otherwise (e.g. a write that timed out), it's ended here.
-                if (res.err == io::status_condition::closed)
-                {
-                    // NOTE: end() notifies it.
-                    while (true)
-                    {
-                        const auto ended = writer_wakeup.value();
-                        {
-                            std::scoped_lock lock{mu};
-                            if (is_ending) break;
-                        }
-                        (void)co_await writer_wakeup.wait(ended);
-                    }
-                    break;
-                }
-
-                {
-                    std::scoped_lock lock{mu};
-                    end();
-                }
-                stop_pending();
+                failed = res.err;
                 break;
             }
             continue;
@@ -702,10 +696,46 @@ coro::task<> http2_connection_base::write_loop()
         (void)co_await writer_wakeup.wait(seen);
     }
 
+    if (failed)
+    {
+        logger.debug("HTTP/2 connection's write failed: {}", failed.message());
+
+        // the connection was closed (e.g. reset): the reader finds that too, at once, and why, if the peer said (e.g. a
+        // TLS alert it sent before closing, which a write after it doesn't see), so it's left to end it. Otherwise
+        // (e.g. a write, or a wait for the socket, that timed out), it's ended here.
+        if (failed == io::status_condition::closed)
+        {
+            // NOTE: end() notifies it.
+            while (true)
+            {
+                const auto ended = writer_wakeup.value();
+                {
+                    std::scoped_lock lock{mu};
+                    if (is_ending) break;
+                }
+                (void)co_await writer_wakeup.wait(ended);
+            }
+        }
+        else
+        {
+            {
+                std::scoped_lock lock{mu};
+                end();
+            }
+            stop_pending();
+        }
+    }
+
     drained.close();
 
     // over TLS, after close_notify.
     (void)co_await shutdown(conn);
+}
+
+coro::task<io::result> http2_connection_base::wait_for_socket()
+{
+    if (writable) return writable();
+    return wait_writable(conn);
 }
 
 bool http2_connection_base::take_output(std::vector<std::byte>&        out,

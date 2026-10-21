@@ -125,6 +125,17 @@ inline bool tls_failure([[maybe_unused]] std::error_code err) noexcept
 #endif
 }
 
+// wait_writable waits until the connection can take more (see socket::wait_writable(): e.g. what's written but not yet
+// sent is under its TCP_NOTSENT_LOWAT): over TLS, the TCP socket's, as the stream's writes wait for it (see
+// tls::stream::wait_writable()), so never alongside them, nor a read's replies.
+inline coro::task<io::result> wait_writable(connection& conn)
+{
+#ifdef NET_HAS_TLS
+    if (auto* tls = std::get_if<tls::stream>(&conn)) return tls->wait_writable();
+#endif
+    return socket_of(conn).wait_writable();
+}
+
 // shutdown ends the outgoing side of the connection (over TLS, after close_notify), while reads still work.
 inline coro::task<std::error_code> shutdown(connection& conn)
 {

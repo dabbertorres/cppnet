@@ -70,6 +70,19 @@ struct server_config
     // every response shares it alike (Go's DisableClientPriority).
     bool http2_priorities = true;
 
+    // The TCP_NOTSENT_LOWAT set on each HTTP/2 connection's socket (over TLS, the TCP socket's; not on HTTP/1.x's,
+    // whose responses aren't reordered): the most the kernel holds written but not yet sent, before the connection's
+    // writer, which waits for the socket to take more before each round of frames, frames more. So responses are
+    // sent by their priorities (see http2_priorities) up to the last moment, where otherwise the kernel's send buffer
+    // (autotuned, up to megabytes) would hold what was framed before a more urgent response came. What's in flight
+    // isn't limited by it, so a path with a long round trip still fills its window. 16 KiB is Cloudflare's tuning
+    // (for nginx, through Linux's sysctl). 0 sets none, and the writer then writes as the socket takes it.
+    std::size_t http2_notsent_lowat = std::size_t{16} * 1'024;
+
+    // Internal (for tests): what an HTTP/2 connection's writer waits with for its socket to take more, instead of the
+    // socket (only with http2_notsent_lowat set), if set: e.g. to hold the connection "unwritable".
+    detail::writable_function http2_writable{};
+
     std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 
 #ifdef NET_HAS_TLS

@@ -1276,6 +1276,64 @@ struct connection
         }
     }
 
+    // wait_writable waits until the socket's writable (see socket::wait_writable()), as a flush: once no flush is in
+    // progress, taking the flush on while it waits, so it never waits alongside one of the socket's writes (whichever
+    // came second would fail with std::errc::device_or_resource_busy), nor does a read's reply (which leaves what it
+    // emitted to it, as to any flush in progress). What's queued by the time it's writable is written before it
+    // returns (the flush's, so its failure is the stream's).
+    coro::task<io::result> wait_writable()
+    {
+        while (true)
+        {
+            std::uint64_t seen = 0;
+            {
+                std::scoped_lock lock{mu};
+                if (write_failure) co_return io::result{.err = write_failure};
+                if (!flushing)
+                {
+                    flushing = true;
+                    break;
+                }
+
+                ++flush_waiters;
+                seen = flushed.value();
+            }
+
+            (void)co_await flushed.wait(seen);
+
+            std::scoped_lock lock{mu};
+            --flush_waiters;
+        }
+
+        // the flush is this one's until it's handed to write_queued(), or released (also if this is destroyed while it
+        // waits: having written nothing, it fails nothing).
+        bool        held = true;
+        util::defer release{[this, &held] noexcept
+                            {
+                                if (!held) return;
+                                {
+                                    std::scoped_lock lock{mu};
+                                    flushing = false;
+                                }
+                                flushed.notify();
+                            }};
+
+        const auto                res = co_await socket.wait_writable();
+        std::vector<std::uint8_t> pending;
+        std::uint64_t             target = 0;
+        if (!res.err)
+        {
+            std::scoped_lock lock{mu};
+            pending.swap(outgoing);
+            target = emitted;
+        }
+        if (pending.empty()) co_return res;
+
+        held = false;
+        if (auto err = co_await write_queued(std::move(pending), target); err) co_return io::result{.err = err};
+        co_return res;
+    }
+
     // receive reads from the socket once, and passes what it read to the channel, returning the read's error (if any).
     coro::task<std::error_code> receive()
     {
@@ -1768,6 +1826,8 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
         co_return io::result{.count = written};
     }(conn.get(), target, written);
 }
+
+coro::task<io::result> stream::wait_writable() { return conn->wait_writable(); }
 
 coro::task<std::error_code> stream::shutdown()
 {

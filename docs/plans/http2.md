@@ -27,7 +27,9 @@ reprioritizing the client's requests, and connection coalescing with the ORIGIN 
 DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6); its second,
 431 for a request's header list over the limit (`session_events::on_header_list_too_large()`, answered by the server's
 `refuse()`), done (2026-10-21); and its third, TCP_NOTSENT_LOWAT's part in the socket (`tcp_socket::set_notsent_lowat()`
-and `socket::wait_writable()`), done (2026-10-21).
+and `socket::wait_writable()`), done (2026-10-21); and its fourth, TCP_NOTSENT_LOWAT on the server's HTTP/2
+connections (`server_config::http2_notsent_lowat`, the writer waiting for the socket before each round, and
+`tls::stream::wait_writable()`), done (2026-10-21).
 
 ## Goal
 
@@ -1376,6 +1378,81 @@ idle stream would be a connection error for the peer.
   waiting tests fail every run (the wait ends at once); without the fast path, the ready-task test fails; with the
   option not set, the read-back and the under-half-the-buffer check fail.
 
+### Part 4: TCP_NOTSENT_LOWAT, the server's writer (done 2026-10-21)
+
+- As proposed (see "TCP_NOTSENT_LOWAT", Decided questions 28 (a) and 29 (a)). `server_config::http2_notsent_lowat`
+  (`std::size_t`, 16 KiB; 0 sets none), passed through `detail::http2_options::notsent_lowat`. `detail::serve_http2()`
+  sets it on the connection's TCP socket (`socket_of(conn)`: over TLS, the stream's), which is where both ways of
+  choosing HTTP/2 meet (ALPN in `serve_connection()`, the preface in `serve_requests()`), so never on HTTP/1.1's; a
+  failure (e.g. `not_supported`) is logged at debug, and the connection's writer then doesn't wait.
+- The writer (`http2_connection_base::write_loop()`; `waits_writable`, a constructor argument the server's connection
+  passes, so the client's connections are as they were until part 8): a round after one that wrote first awaits
+  `wait_for_socket()`, then takes the output (`fill()`, then the session's) as before. A round after one that didn't
+  write doesn't wait: the last wait found the socket writable, and nothing's been written since, so only the peer's
+  changed it (saving the `poll()` when the writer's woken from idle, e.g. once per request a stream at a time). Control
+  frames wait with the DATA, as the plan says. A wait that fails is handled as a failed write (both now set `failed`
+  and break out to one place): a `closed` condition leaves the end to the reader, anything else (e.g. `timed_out`, as
+  the socket's write timeout, the server's `write_timeout`, applies to the wait) ends the connection. GOAWAY on a
+  graceful drain, and the end, still go through the loop, so they wait as anything else does; the writer still shuts
+  the connection down after.
+- `max_ahead` is unchanged: `data_writing` (the DATA of the writer's last round) stays counted through the wait, so a
+  handler's write still goes at once, without the scheduler, while less than a round's DATA is in the writer's hands
+  and nothing's queued (the plan's "and meanwhile handlers' writes queue (past `max_ahead`)"). So what's past
+  reordering is the mark and at most `max_ahead`, as the plan says.
+- TLS (not in the plan, which only said a TLS stream's reads "then wait as a second writer would"): the socket's
+  `wait_writable()` claims its write operation, so called under a TLS stream it would collide with the stream's own
+  socket writes, a flush in progress (the HTTP/2 writer's last, or a read's replies: alerts, key updates, the answer to
+  close_notify), whichever came second failing with `device_or_resource_busy` and, for the stream's, failing every
+  later write (`write_failure`). So the wait goes through the stream's flush queue: `tls::stream::wait_writable()`
+  (public, beside `shutdown()`) takes the flush on as a flush does (waiting for one in progress, as a flush waiter), waits
+  for the socket, then writes what was queued meanwhile (a read's replies, which leave what they emit to a flush in
+  progress) through `write_queued()`, before it returns; a wait that fails writes nothing, and fails nothing but itself.
+  `detail::wait_writable(conn)` (`http/connection.hpp`) picks the stream's or the socket's. It's a coroutine (a frame
+  per round over TLS, where each round's write already has one); the socket's stays a ready task when writable.
+- The test hook (as planned): `detail::writable_function` (`std::function<coro::task<io::result>()>`, in
+  `http2_config.hpp`, which now includes `coro/task.hpp` and `io/io.hpp`), `http2_options::writable`, set from
+  `server_config::http2_writable` (internal, as `connect_options::system_connect` is), used instead of the socket only
+  while the mark's set.
+- Deadlines (reasoned against the plan, which wanted the test): `wrote_at`, which `waiting_turn()` reads, is set by
+  `take_output()`, so it's now when the writer's back from a round's write and its wait for the socket. A stream waiting
+  its turn is put off while the writer's rounds come within `write_timeout` of each other, which a slow peer that still
+  reads gives; a writer held longer by the socket fails anyway (its wait times out at the same `write_timeout`, ending
+  the connection), so there's nothing to put off for. Through the hook, which has no timeout of its own, a writer held
+  past `write_timeout` lets queued streams time out (reset, `timed_out`): the stand-in for the connection ending. Before,
+  a single `write_all()` that took longer than `write_timeout` (with progress) had the same gap; now a write and a wait
+  share it.
+- Tests (no network). `test/http/server_notsent_lowat.cpp` (`[http][http2][server][notsent-lowat]`): the mark read back
+  by a handler (`getsockopt()` on its body writer's `native_handle()`, the connection's fd) through `http::client`: 16384
+  by default and 4096 if set, over HTTP/2 with prior knowledge; 0 with the mark 0, and over HTTP/1.1. Through the hook
+  (`writer_gate`: `hold()`, `grant()` a wait at a time, `open()`), with the client's windows open (16 MiB), so only the
+  writer holds DATA back: a u=7 response of 256 KiB requested while the writer's held goes at once as far as
+  `max_ahead` (64 KiB) and queues the rest; then u=0 and u=3 ones queue behind it (probes, which count before
+  answering, as their answers wait too, through `detail::wait_queued_streams`); let go, the frames are "BBBBUUNN" then
+  the rest of B's 12. Paced (a wait granted every 20 ms, so a round each, and once none for 600 ms), a u=0 response of
+  4 MiB takes the connection about 2 seconds while a u=7 one waits its turn, past its `write_timeout` of 1 second: it
+  isn't reset, and goes after. `test/tls/server.cpp`: over TLS with ALPN, the mark is 16384 on HTTP/2's connections and
+  0 on HTTP/1.1's, and an 8 MiB response (written 64 KiB at a time) arrives whole and in order through the TLS writer's
+  waits. `test/tls/stream.cpp` (`[tls][wait-writable]`): `wait_writable()` while a 12 MiB write flushes to a peer that
+  reads returns, without error, once the write's gone; to one that doesn't, both time out (300 ms), never
+  `device_or_resource_busy`. The existing scheduling, end-stream and waiting-turn tests now run with the mark set (the
+  default) and pass unchanged. With the writer never waiting, the ordering test fails (the bulk response all goes before
+  the others are requested, so it never queues); with `wrote_at` not set after a wait, the paced test's bulk response
+  is reset; with the mark not set, the read-back fails; with the stream's wait going straight to the socket, the TLS
+  stream test fails (macOS's `poll()` said writable while the write waited, so the wait returned at once).
+- Measured (`bench_request`, Release, master's binary and the branch's alternating, on a machine busy with other work:
+  six pairs at a load average of 3 to 4.5 are counted; a seventh, at a spike to 53, and three more as it decayed, are
+  not). Over HTTP/2, a stream at a time: 98.4 to 122.6 us a request before (median 107.3), 105.6 to 120.4 after (median
+  107.9), and 49.2 to 49.5 allocations a request before, 49.2 to 49.4 after: the `poll()` a round that wrote costs (a
+  round after an idle one doesn't wait) is within the noise. 8 streams at once (256 KiB each, written 64 KiB at a time,
+  over loopback, the worst case for the mark): 1426 to 1640 us a round before (median 1518, about 1320 MiB/s), 1506 to
+  1682 after (median 1515, the same), and 96.3 to 97.2 allocations a response before (median 96.6), 98.6 to 99.1 after
+  (median 98.8): about two more, most likely as more of the handlers' writes find the writer waiting with a round's DATA counted, so
+  queue, each with its coroutine. HTTP/1.1 over a socket, untouched: 34.1 to 40.5 us before, 33.5 to 41.3 after. So
+  loopback's throughput doesn't drop, and Decided question 28 stays as decided.
+- Not done: part 10's relay by hand (its throwaway programs weren't kept, and the Go client and the relay would have
+  to be written again), so how much this gains on a slow path is unmeasured here; the hook test is the evidence that the
+  writer frames by priority while the socket's held.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2406,7 +2483,8 @@ certificate.
       `tcp_socket::set_notsent_lowat()` and `socket::wait_writable()` (a
       `poll()` for the level, then the scheduler's write wait), tested over loopback sockets. Split from 4 so the I/O
       layer's part, which differs between the kernels, is reviewed and tested on its own.
-   4. **TCP_NOTSENT_LOWAT, the server's writer.** `server_config::http2_notsent_lowat` (Decided question 28) set on each
+   4. **TCP_NOTSENT_LOWAT, the server's writer.** Done (2026-10-21; see Learned in stage 6).
+      `server_config::http2_notsent_lowat` (Decided question 28) set on each
       HTTP/2 connection, and the writer waiting for writability before each round (Decided question 29), through a test
       hook; `bench_request` with streams that contend, and part 10's relay by hand. It changes the writer every HTTP/2
       response goes through, so it's alone.

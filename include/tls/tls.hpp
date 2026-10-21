@@ -318,6 +318,14 @@ public:
     using io::reader::read;
     using io::writer::write;
 
+    // wait_writable waits until the socket is writable (see socket::wait_writable(): e.g. what's written but not yet
+    // sent is under its TCP_NOTSENT_LOWAT), as writes wait for it: after a write (or a read's replies) being written,
+    // never alongside it, which the socket would refuse. What's queued meanwhile (e.g. a read's replies, which leave
+    // what they have to a write in progress) is written once it's writable, before it returns. Its result's count is 0,
+    // and its err why it ended otherwise: the socket's write deadline, timeout and stop token apply, and a write that
+    // failed before fails it at once.
+    coro::task<io::result> wait_writable();
+
     // shutdown sends close_notify (telling the peer that nothing was cut short), and ends the socket's outgoing side,
     // without closing it: what the peer sent before its own close_notify can still be read, but nothing more written.
     coro::task<std::error_code> shutdown();

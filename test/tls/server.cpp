@@ -21,9 +21,13 @@
 #include <utility>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <spdlog/common.h>
 #include <spdlog/details/log_msg.h>
 #include <spdlog/logger.h>
@@ -799,6 +803,77 @@ TEST_CASE("without http2, an HTTPS server doesn't agree on h2", "[tls][http][ser
     };
 
     CHECK(sched.run_to_completion(test(&sched, server.port())).empty());
+}
+
+TEST_CASE("an HTTPS server sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP sockets, not on HTTP/1.1's",
+          "[tls][http][server][http2][notsent-lowat]")
+{
+    const bool use_http2 = GENERATE(true, false);
+    CAPTURE(use_http2);
+
+    // patterned is a body of size bytes, each its offset's, modulo a prime (so a part sent twice, or out of order,
+    // shows).
+    const auto patterned = [](std::size_t size)
+    {
+        std::string body(size, '\0');
+        for (std::size_t i = 0; i < size; ++i) body[i] = static_cast<char>(i % 251);
+        return body;
+    };
+
+    http::router r;
+    r.GET("/mark",
+          [](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              auto* body = co_await resp.send(http::status::OK);
+
+              int        value = -1;
+              socklen_t  size  = sizeof(value);
+              const bool got  = ::getsockopt(body->native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, &size) == 0;
+              const auto text = got ? std::to_string(value) : "(getsockopt failed)";
+              (void)co_await net::io::write_all(*body, text);
+          });
+    // more than the socket's buffers hold, written 64 KiB at a time: so (over HTTP/2) the writer waits for the TLS
+    // stream's socket to take more, and the client's reads (and the stream's replies to them, if any) go on meanwhile.
+    r.GET("/big",
+          [patterned](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
+          {
+              const auto data = patterned(std::size_t{8} << 20);
+              auto*      body = co_await resp.send(http::status::OK, data.size());
+              for (std::size_t at = 0; at < data.size(); at += std::size_t{64} * 1'024)
+              {
+                  const auto chunk = std::string_view{data}.substr(at, std::size_t{64} * 1'024);
+                  if ((co_await net::io::write_all(*body, chunk)).err) co_return;
+              }
+          });
+
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config(), std::move(r)};
+
+    // HTTP/2 agreed on with ALPN, or HTTP/1.1 (the client offering only it).
+    auto options  = trusting_options();
+    options.http2 = use_http2;
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string base) -> task<std::pair<std::string, std::string>>
+    {
+        auto mark = co_await client->get(base + "/mark");
+        if (!mark.has_value()) co_return std::pair{"error: " + mark.error().message(), std::string{}};
+        auto value = co_await net::io::read_all(*mark->body);
+        if (!value.has_value()) co_return std::pair{"error: " + value.error().message(), std::string{}};
+
+        auto big = co_await client->get(base + "/big");
+        if (!big.has_value()) co_return std::pair{"error: " + big.error().message(), std::string{}};
+        auto body = co_await net::io::read_all(*big->body);
+        if (!body.has_value()) co_return std::pair{"error: " + body.error().message(), std::string{}};
+
+        co_return std::pair{std::format("HTTP/{} {}", mark->version.major, *value), std::move(*body)};
+    };
+
+    const auto [mark, big] = sched.run_to_completion(test(&client, "https://localhost:" + server.port()));
+    CHECK(mark == (use_http2 ? "HTTP/2 16384" : "HTTP/1 0"));
+    CHECK(big.size() == std::size_t{8} << 20);
+    const bool intact = big == patterned(std::size_t{8} << 20);
+    CHECK(intact);
 }
 
 TEST_CASE("an HTTPS server's error responses end with close_notify", "[tls][http][server]")

@@ -271,6 +271,8 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
           .write_timeout       = cfg.write_timeout,
           .session             = http2_session_config(cfg),
           .priorities          = cfg.http2_priorities,
+          .notsent_lowat       = cfg.http2_notsent_lowat,
+          .writable            = cfg.http2_writable,
       }
 #ifdef NET_HAS_TLS
     , tls_ctx{cfg.tls}

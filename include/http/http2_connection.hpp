@@ -240,11 +240,15 @@ template<std::size_t N>
 class http2_connection_base : protected http2::session_events
 {
 public:
+    // waits_writable is whether the writer waits for the connection to be writable before each round (see
+    // write_loop()): with TCP_NOTSENT_LOWAT set on it. writable, if set, is what it waits with instead (for tests).
     http2_connection_base(io::scheduler*               scheduler,
                           connection&                  conn,
                           http2::role                  side,
                           const http2::session_config& config,
-                          spdlog::logger&              logger);
+                          spdlog::logger&              logger,
+                          bool                         waits_writable = false,
+                          writable_function            writable       = {});
 
     http2_connection_base(const http2_connection_base&)            = delete;
     http2_connection_base& operator=(const http2_connection_base&) = delete;
@@ -381,8 +385,24 @@ protected:
     std::vector<std::stop_source>                            to_stop; // for stop_pending()
 
 private:
-    bool                                 receive(std::vector<std::byte>& pending);
-    coro::task<>                         write_loop();
+    bool receive(std::vector<std::byte>& pending);
+
+    // write_loop is the writer: each round, it takes the session's output (see take_output()) and writes it, until the
+    // connection's ending and what's left is written; then it shuts the connection down. With waits_writable (the
+    // server's, with TCP_NOTSENT_LOWAT set: docs/plans/http2.md, stage 6's fourth part), a round after one that wrote
+    // first waits for the connection to be writable (wait_for_socket()): what's written but not yet sent under the
+    // mark. So fill() frames only when the socket can take more, and meanwhile handlers' writes queue (past
+    // max_ahead) for their turns: what's past reordering is the mark (in the kernel) and a round (in the writer's
+    // hands), not the send buffer. Control frames wait with the DATA: TCP would deliver them after what the kernel
+    // holds anyway. A wait that fails ends the connection as a write that fails does (the socket's write deadline,
+    // timeout and stop token apply to it as to a write). wrote_at is when the writer's back from a round's write (and
+    // its wait), so a stream waiting its turn is put off (see waiting_turn()) while the writer's rounds come within
+    // its write timeout of each other: one held up longer by the socket fails anyway, its wait timing out.
+    coro::task<> write_loop();
+
+    // wait_for_socket waits until the connection is writable: with the writable hook, if it's set.
+    coro::task<io::result> wait_for_socket();
+
     coro::task<>                         timer_loop();
     std::optional<io::clock::time_point> check_streams(io::clock::time_point now);
 
@@ -423,10 +443,14 @@ private:
     // Whether the connection schedules its streams' DATA (a server's: see step_write()).
     const bool scheduling;
 
+    // Whether the writer waits for the connection to be writable before each round, and with what (see write_loop()).
+    const bool        waits_writable;
+    writable_function writable;
+
     // Guarded by mu.
     std::size_t                          data_queued  = 0; // DATA submitted (by streams that schedule) not yet taken
     std::size_t                          data_writing = 0; // of the writer's output, DATA (as data_queued counts it)
-    std::optional<io::clock::time_point> wrote_at;         // when the writer last wrote, with streams scheduled
+    std::optional<io::clock::time_point> wrote_at;         // when the writer was back from writing, streams scheduled
     http2::stream_id                     turn_held = 0;    // the stream whose turn fill() holds, until...
     io::clock::time_point                turn_held_until;  // ...at most this
     bool                                 is_ending   = false;

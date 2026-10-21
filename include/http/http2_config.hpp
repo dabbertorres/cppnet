@@ -3,7 +3,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
+
+#include "coro/task.hpp"
+#include "io/io.hpp"
 
 // HTTP/2's settings and limits: what the server's and client's configurations hold, without HTTP/2's internals (its
 // framing, session and connections, see docs/plans/http2.md), which the public headers (http/server.hpp,
@@ -94,6 +98,10 @@ struct session_config
 namespace net::http::detail
 {
 
+// writable_function waits until an HTTP/2 connection's socket can take more (see socket::wait_writable()), as its
+// writer does before each round with TCP_NOTSENT_LOWAT set: for tests, which hold a connection "unwritable" with it.
+using writable_function = std::function<coro::task<io::result>()>;
+
 // http2_options are what an HTTP/2 connection is served with: server_config's.
 struct http2_options
 {
@@ -110,6 +118,14 @@ struct http2_options
     // and PRIORITY_UPDATE frames) and the handler's response (its Priority field): server_config::http2_priorities.
     // Off, every stream is u=3, incremental.
     bool priorities = true;
+
+    // The TCP_NOTSENT_LOWAT set on each connection's socket, after which its writer waits for the socket to be
+    // writable before each round: server_config::http2_notsent_lowat. 0 sets none, and the writer doesn't wait.
+    std::size_t notsent_lowat = 0;
+
+    // Internal (for tests): what the writer waits with instead of the socket, if set (only while notsent_lowat is set):
+    // server_config::http2_writable.
+    writable_function writable{};
 };
 
 // http2_client_options are what a client's HTTP/2 connections are made with: client_options'.

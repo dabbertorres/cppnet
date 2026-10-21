@@ -1250,6 +1250,120 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
     }
 }
 
+TEST_CASE("waiting for a stream to be writable waits for a write in progress, rather than alongside it",
+          "[tls][wait-writable]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // the server reads everything, until close_notify; or reads nothing (until the client's done), while the write and
+    // the wait are limited by a write timeout.
+    const bool reads = GENERATE(true, false);
+    CAPTURE(reads);
+
+    std::string    server_read;
+    server_outcome server_done{.sched = &sched, .err = {}};
+    server_outcome client_done{.sched = &sched, .err = {}};
+
+    const auto server = [reads](std::string* server_read, server_outcome* server_done, server_outcome* client_done)
+    {
+        return [reads, server_read, server_done, client_done](tls::stream& s) -> task<>
+        {
+            if (reads)
+            {
+                auto [read, err] = co_await read_to_end(s);
+                *server_read     = std::move(read);
+                server_done->finish(err);
+            }
+            else
+            {
+                co_await client_done->wait();
+                server_done->finish({});
+            }
+
+            co_await s.close();
+        };
+    };
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   server(&server_read, &server_done, &client_done))));
+
+    // more than both sides' socket buffers hold, so that writing it waits for the peer to read.
+    const std::string data(std::size_t{12} * 1'024 * 1'024, 'a');
+
+    struct outcome
+    {
+        net::io::result write;
+        net::io::result wait;
+        std::error_code shutdown;
+    };
+
+    // await_write awaits a write on a task of its own, saying when it's about to (so that it's most likely flushing,
+    // and waiting for the socket, by the time the client waits for it to be writable).
+    const auto await_write =
+        [](task<net::io::result> write, net::io::result* res, server_outcome* started, server_outcome* done) -> task<>
+    {
+        started->finish({});
+        *res = co_await std::move(write);
+        done->finish(res->err);
+    };
+
+    const auto client = [reads, await_write](net::io::scheduler* sched,
+                                             std::uint16_t       port,
+                                             const std::string*  data,
+                                             server_outcome*     server_done,
+                                             server_outcome*     client_done) -> task<outcome>
+    {
+        outcome out;
+
+        auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value())
+        {
+            out.shutdown = s.error();
+            co_return out;
+        }
+        if (!reads) s->socket().set_write_timeout(300ms);
+
+        server_outcome started{.sched = sched, .err = {}};
+        server_outcome written{.sched = sched, .err = {}};
+        const bool     spawned =
+            sched->spawn(await_write(s->write(std::as_bytes(std::span{*data})), &out.write, &started, &written));
+        REQUIRE(spawned);
+        co_await started.wait();
+
+        out.wait = co_await s->wait_writable();
+        co_await written.wait();
+
+        if (reads) out.shutdown = co_await s->shutdown();
+        client_done->finish({});
+        co_await server_done->wait();
+        co_await s->close();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(client(&sched, listener.local_port(), &data, &server_done, &client_done));
+
+    CAPTURE(out.write.err.message(), out.wait.err.message(), out.shutdown.message());
+    CHECK(out.wait.count == 0);
+    if (reads)
+    {
+        // the wait returned once the write had gone, and the socket could take more.
+        CHECK_FALSE(out.write.err);
+        CHECK(out.write.count == data.size());
+        CHECK_FALSE(out.wait.err);
+        CHECK_FALSE(out.shutdown);
+        CHECK(server_read.size() == data.size());
+    }
+    else
+    {
+        // neither was refused for the other (device_or_resource_busy): the write timed out, and so did the wait,
+        // with it.
+        CHECK(out.write.err == std::errc::timed_out);
+        CHECK(out.wait.err == std::errc::timed_out);
+    }
+}
+
 TEST_CASE("a read canceled by the stream's stop token leaves it to read again", "[tls][stop]")
 {
     std::stop_source   source;

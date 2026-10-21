@@ -760,7 +760,13 @@ scheduler.spawn(server.serve());
   does one sending `Via`, `Forwarded` or `X-Forwarded-For` (an intermediary, whose `Priority` fields are its clients',
   so ignored). Only what hasn't been handed to the connection's writer can be reordered: a response alone goes at once,
   and a handler's write returns once its data's been framed, in its turn (so it waits while more urgent ones are sent,
-  which doesn't count against its `write_timeout` while the server's writing to the client). A client sets a request's
+  which doesn't count against its `write_timeout` while the server's writing to the client). Nor can what the kernel
+  holds, written but not yet sent: so the server sets TCP_NOTSENT_LOWAT on each HTTP/2 connection's socket
+  (`server_config::http2_notsent_lowat`, 16 KiB; over TLS, the TCP socket's; not on HTTP/1.1's), and the connection's
+  writer waits for the kernel to hold less than that before it frames more (see `socket::wait_writable()`, above). So
+  what's past reordering is the mark and a round of frames (64 KiB), rather than the send buffer, which the kernel
+  grows up to megabytes; what's in flight isn't limited, so a path with a long round trip still fills its window. 0
+  sets none, and the writer writes as the socket takes it. A client sets a request's
   priority with the same field (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other
   signal, and sends its request bodies as they're written, whatever their priorities. A field sent as several lines is
   one value, its lines joined with commas: `req.headers.get()` gives only the first.
