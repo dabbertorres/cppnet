@@ -11,8 +11,9 @@ done (2026-10-20; see Learned in stage 5); its second, interim responses in the 
 (2026-10-20); its third, trailers in the codecs (`chunked_reader`, `chunked_writer::finish(trailers)`,
 `trailer_allowed()`), done (2026-10-20); its fourth, trailers on the server (`server_request::trailers`,
 `response_writer::trailers()`), done (2026-10-20); its fifth, trailers in the client (`client_response::trailers()`,
-`client_request::make_trailers`), done (2026-10-20); and then trailers held in `trailer_fields`, 2 fields inline
-rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)").
+`client_request::make_trailers`), done (2026-10-20); then trailers held in `trailer_fields`, 2 fields inline
+rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)"); and its sixth, HPACK's dynamic table built
+(its storage, the encoder's table and `hpack::indexing`, with the sessions still on `none`), done (2026-10-20).
 
 ## Goal
 
@@ -732,6 +733,85 @@ idle stream would be a connection error for the peer.
   runs), and this one nearly so with the bench's coroutine frame padded back to the old offsets (its `server_request`
   and `server_response` are locals of the frame; 1128 to 1181): it's where the frame's locals fall.
 
+### Part 6: HPACK's table, built (done 2026-10-20)
+
+- `dynamic_table`'s storage as Decided question 16 (a), with one change: its two buffers, the fields' text (appended
+  oldest first, and moved to the front when a field doesn't fit after the newest) and the ring of fixed-size entries
+  (24 bytes with libc++: the text's offset, the name's and value's lengths and hashes), aren't made at their full size
+  at once but grow by doubling as fields need them (from 512 bytes and 16 entries), up to twice the maximum size and a
+  32nd of it. So a table nothing's added to allocates nothing (an encoder with `indexing::none`, and the decoder of a
+  peer that never indexes, such as cppnet's own client), and a table whose maximum size a peer set high (until part 7's
+  cap, the encoder's is whatever SETTINGS_HEADER_TABLE_SIZE says, up to 4 GiB) holds only what's put in it. A table
+  filled to 4096 bytes grows five or six times, once, over its first few kilobytes of fields. A field's lengths are 32
+  bits, so the maximum size is held to 2^32 - 1 (all HPACK's integers and SETTINGS can say anyway).
+- What's moved to the front includes the fields the new one is about to evict: `insert()` copies a field that may be
+  a view of one of the table's own (the decoder's literal whose name is an index of the dynamic table, as in RFC 7541,
+  C.5.2's), so the text is moved (or copied to the larger buffer) first, the views re-pointed if they were into it, the
+  field copied after the newest, and only then the oldest evicted. What's kept is at most the maximum size, and the new
+  field's text at most the maximum size less 32, so in a buffer of twice the maximum size it always fits; when the
+  buffer's smaller, it's grown rather than moved within if what's kept and the new field would fill more than half of
+  it. The decoder's promise is unchanged (a field's views are valid during its callback: it's passed on before it's
+  inserted), and so is `at()`'s (valid until the table next changes). The hash is a multiply-and-fold over 8 bytes at a
+  time (only ever compared within the process); `find()` goes through the entries newest first comparing hashes and
+  lengths before text, and gives the newest exact match and the newest with the name.
+- The encoder: `encoder(hpack::indexing)`, `none` by default, with its own `dynamic_table` (`table()`, for the tests
+  and the fuzzer). `automatic` is Decided questions 13 and 14's policy, decided by the field's name: never indexed for
+  `field::never_indexed` and `sensitive()`'s names, which it sends as never-indexed literals whatever the field says
+  (rather than as literals without indexing, as `none` sends an unmarked one: so intermediaries don't index them
+  either, as nghttp2 does for authorization); literals without indexing for nghttp2's list and for a field over 3/4 of
+  the table (`size * 4 > max * 3`; a table of 0 indexes nothing); the rest indexed. Searched in Go's order: a static
+  exact match, a dynamic exact match (neither for a never-indexed field), then the name's index, the static table's or
+  else the newest dynamic one's. `none` is exactly what was built in stage 1: the same code, with the table never
+  searched nor added to, and `sensitive()` not looked at.
+- Size updates: the encoder tracks the smallest maximum size since the last block, and starts the next with it if
+  it's below both what the peer's decoder knows and the final size (it may have evicted fields there, which the
+  decoder must too), then the final size if it differs from what the decoder knows or the smallest was below it. So
+  shrinking then growing between blocks is two updates (min, then final), growing then shrinking back to what's known
+  is none, and a change that ends where it started without going below is none. `set_max_table_size()` takes each of
+  the peer's settings (growing too) with `automatic`; with `none` it keeps stage 1's rule, only ever shrinking (it's
+  min'ed with the current size), which is what keeps the sessions' bytes the same: growing would send a size update
+  to a peer that offers more than 4096 (as Firefox's 65536), for a table that's empty. Part 7 can drop that rule with
+  the cap.
+- HTTP/2's sessions still default-construct their encoder (`none`), so nothing on the wire changed. Checked with a
+  throwaway differential fuzzer (master's `hpack.cpp`, renamed into another namespace, against the branch's, in one
+  binary): random field lists (static-table names and values, sensitive names, never-indexed flags, random text) and
+  table size changes encoded by both encoders, byte for byte the same, and random blocks decoded by both decoders, the
+  same fields, errors and tables; 1.7 million runs in 300 s, no difference. And the suite's HTTP/2 tests (which check
+  some blocks' bytes), `fuzz_http2` and the rest pass unchanged.
+- `fuzz_hpack` (its records' control byte now changes the size to 128s of its low 6 bits, and with bit 6 set again to
+  4096, so it shrinks then grows, or grows then shrinks, between blocks): what's decoded is re-encoded by an
+  `automatic` encoder and by a `none` one, each to its own decoder: the fields must decode the same (with
+  `automatic`, never indexed if they were or are `sensitive()`); after each block the `automatic` encoder's table must
+  hold the same fields as its decoder's, in order, none of them `sensitive()`, and a field new to it in the block must
+  be in the block unmarked (so nothing was indexed from a never-indexed field); the `none` encoder's table stays empty.
+  600 s (about 430,000 runs, inputs up to 2 KiB) found nothing; nor did the 10 s ctest run.
+- Tests (`[http][hpack]`, with `[encoder][indexing]`, `[encoder][size]`, `[table]`): C.4's requests encoded with
+  `automatic` give C.4's bytes exactly (`:authority` and `cache-control` indexed, the rest static indexes) and its
+  tables; C.6's responses (a table of 256) decode to the same fields, `location` a literal without indexing and
+  `set-cookie` never indexed, the tables as the policy says (159, 201 and 224 bytes); size updates (shrinking, growing,
+  shrinking then growing back or past, growing then shrinking back or below, twice, the same, and `none`'s), each
+  accepted by a decoder that's had the same settings, and signalled once; a table shrunk to 0 and grown again emptied
+  on both sides; eviction oldest first, the encoder's table equal to its decoder's; never-indexed and per-message names
+  kept out of the table (the same block twice gives the same bytes), and an indexed field marked never indexed sent as
+  a never-indexed literal (with its dynamic name index); the 3/4 rule at its edges; 20,000 operations on a table
+  (inserts of new fields and of fields named or valued from the table's own, size changes) against a model, `find()`
+  included; a field named or valued from the one it evicts as the text moves over where it was, and named from one as
+  the buffer grows (each found by breaking the re-pointing: the moving case wasn't caught by the model test alone, as
+  the old bytes were usually still there, nor the growing case, which ASan catches only when it's hit); and a decoder
+  given literals named by index 62 for 1000 blocks, its callbacks seeing the right fields as the text moves. A second
+  request on a connection encoding to fewer bytes, and a SETTINGS above the cap, are part 7's (the sessions).
+- Sizes (libc++): `encoder` 24 to 112 bytes (its table); `decoder` 136 to 160; `http2::session` 672 to 784.
+- Measured (`bench_request`, Release, five alternating runs of the binaries before and after): over HTTP/2 (cppnet's
+  client and server) 51.8 to 52.0 allocations a request before, 51.7 to 51.9 after, and 81.2 to 86.0 us before, 81.2
+  to 85.8 after: unchanged, as cppnet's client doesn't index yet (until part 7), so the server's decoder never inserted
+  anything, before or after. Pipelined 1162 to 1202 ns before, 1168 to 1204 after; over a socket 27.8 to 28.9 us
+  before, 28.0 to 30.3 after (one run of 30.3; the rest within master's spread). What a client that indexes saves was
+  measured apart (a throwaway benchmark, -O2, master's decoder against the branch's in one binary): blocks as Go's
+  encoder makes them (a new `:path` of about 40 bytes each request, with incremental indexing, and `:authority`,
+  `user-agent` and `accept-encoding` indexes while they last, re-added when the `:path`s push them out): 1.04
+  allocations a block before, 0 after, and 106 to 110 ns a block before, 79 to 95 after.
+
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1274,10 +1354,11 @@ throughput isn't changed (by frame count and order).
       don't need the client's part.
    5. **Trailers in the client.** Done (2026-10-20; see Learned in stage 5). `client_response::trailers()` and
       `client_request::make_trailers`, over both versions; tested against 4's server, so after it.
-   6. **HPACK's table, built.** `dynamic_table`'s storage (no allocation per entry: the decoder gains at once), the
-      encoder's table, search, eviction and size updates, and `hpack::indexing`, with HTTP/2's sessions on `none`, so
-      nothing changes on the wire; `fuzz_hpack`'s new properties (with `automatic`). Split from 7 so the mechanics are
-      proved on their own, by the fuzzer, before anything depends on them.
+   6. **HPACK's table, built.** Done (2026-10-20; see Learned in stage 5). `dynamic_table`'s storage (no allocation per
+      entry: the decoder gains at once), the encoder's table, search, eviction and size updates, and `hpack::indexing`,
+      with HTTP/2's sessions on `none`, so nothing changes on the wire; `fuzz_hpack`'s new properties (with
+      `automatic`). Split from 7 so the mechanics are proved on their own, by the fuzzer, before anything depends on
+      them.
    7. **HPACK's indexing, on.** The policy (Decided questions 13 and 14), the encoder's cap (`encoder_table_size`), the
       sessions indexing; `bench_request`'s bytes per request; curl and h2load by hand. A wire change, so its own pull
       request, to measure and to revert alone.

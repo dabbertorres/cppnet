@@ -1,8 +1,12 @@
 #include "http/hpack.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -316,6 +320,50 @@ std::optional<std::string_view> decode_string(std::span<const std::byte>& in, st
     return buffer;
 }
 
+// hash is a dynamic table's hash of a name or value: only ever compared within the process, so the bytes' order in a
+// word doesn't matter. 8 bytes at a time, as fields are tens of bytes.
+std::uint32_t hash_of(std::string_view s) noexcept
+{
+    constexpr std::uint64_t multiplier = 0x9e37'79b9'7f4a'7c15; // 2^64 over the golden ratio
+
+    std::uint64_t h = s.size();
+    while (s.size() >= 8)
+    {
+        std::uint64_t word = 0;
+        std::memcpy(&word, s.data(), 8);
+        h = (h ^ word) * multiplier;
+        h ^= h >> 32U;
+        s.remove_prefix(8);
+    }
+
+    std::uint64_t word = 0;
+    if (!s.empty()) std::memcpy(&word, s.data(), s.size());
+    h = (h ^ word) * multiplier;
+    return static_cast<std::uint32_t>(h ^ (h >> 32U));
+}
+
+// rebase points s, if it's a view of [from, from_end), at the same place in a copy of it at to. (std::less, as built-in
+// comparisons of unrelated pointers aren't specified.)
+void rebase(std::string_view& s, const char* from, const char* from_end, const char* to) noexcept
+{
+    const auto* at = s.data();
+    if (s.empty() || std::less<>{}(at, from) || !std::less<>{}(at, from_end)) return;
+    s = {to + (at - from), s.size()};
+}
+
+// indexed_by_default is whether indexing::automatic indexes a field named name, unless it's never indexed or too large:
+// not those that change from one message to the next, nghttp2's list (docs/plans/http2.md, Decided question 13 of
+// stage 5).
+bool indexed_by_default(std::string_view name) noexcept
+{
+    return name != ":path" && name != "age" && name != "content-length" && name != "etag" && name != "if-modified-since"
+        && name != "if-none-match" && name != "location";
+}
+
+// The smallest buffers a dynamic table makes, before doubling: room for a request's or response's usual fields.
+constexpr std::size_t min_text    = 512;
+constexpr std::size_t min_entries = 16;
+
 }
 
 namespace net::http::hpack
@@ -328,11 +376,39 @@ bool sensitive(std::string_view name) noexcept
 
 field dynamic_table::at(std::size_t index) const noexcept
 {
-    const auto& e = entries[index];
+    const auto& e    = nth(index);
+    const auto* name = text.data() + e.offset;
     return {
-        .name  = std::string_view{              e.text.data(),                 e.name_size},
-        .value = std::string_view{e.text.data() + e.name_size, e.text.size() - e.name_size}
+        .name  = std::string_view{              name,  e.name_size},
+        .value = std::string_view{name + e.name_size, e.value_size}
     };
+}
+
+dynamic_table::match dynamic_table::find(std::string_view name, std::string_view value) const noexcept
+{
+    match found;
+    if (entries == 0) return found;
+
+    const auto name_hash  = hash_of(name);
+    const auto value_hash = hash_of(value);
+    for (std::size_t i = 0; i < entries; ++i)
+    {
+        const auto& e = nth(i);
+        if (e.name_hash != name_hash || e.name_size != name.size()) continue;
+
+        const auto* text_of = text.data() + e.offset;
+        if (std::string_view{text_of, e.name_size} != name) continue;
+
+        if (found.name_index == npos) found.name_index = i;
+        if (e.value_hash == value_hash && e.value_size == value.size()
+            && std::string_view{text_of + e.name_size, e.value_size} == value)
+        {
+            found.index = i;
+            break;
+        }
+    }
+
+    return found;
 }
 
 void dynamic_table::insert(std::string_view name, std::string_view value)
@@ -340,25 +416,86 @@ void dynamic_table::insert(std::string_view name, std::string_view value)
     const auto size = field_size(name, value);
     if (size > max)
     {
-        entries.clear();
+        first   = 0;
+        entries = 0;
+        end     = 0;
         current = 0;
         return;
     }
 
-    // NOTE: copied before evicting, as name or value may be one of the fields evicted.
-    entry e;
-    e.text.reserve(name.size() + value.size());
-    e.text.append(name).append(value);
-    e.name_size = name.size();
+    const auto length = name.size() + value.size();
+    make_room(length, name, value);
+
+    // NOTE: copied before evicting, as name or value may be one of the fields evicted (whose text stays where it is
+    //       until room is next made).
+    auto* out = text.data() + end;
+    std::ranges::copy(name, out);
+    std::ranges::copy(value, out + name.size());
 
     evict_to(max - size);
-    entries.push_front(std::move(e));
+    push({.offset     = end,
+          .name_size  = static_cast<std::uint32_t>(name.size()),
+          .value_size = static_cast<std::uint32_t>(value.size()),
+          .name_hash  = hash_of({out, name.size()}),
+          .value_hash = hash_of({out + name.size(), value.size()})});
+    end += length;
     current += size;
+}
+
+void dynamic_table::make_room(std::size_t length, std::string_view& name, std::string_view& value)
+{
+    // with nothing to keep, the next field's text starts at the front.
+    if (entries == 0) end = 0;
+    if (end + length <= text.size()) return;
+
+    // NOTE: what's kept includes the fields this one will evict (they're evicted once it's copied, as it may be one of
+    //       them), which is at most the maximum size: with this field's text (at most the maximum size, less 32), it
+    //       fits in a buffer twice the maximum size.
+    const auto  start = entries == 0 ? 0 : nth(entries - 1).offset;
+    const auto  kept  = end - start;
+    const auto* from  = text.data() + start;
+    const auto* until = text.data() + end;
+
+    if (const auto largest = 2 * max; text.size() < largest && kept + length > text.size() / 2)
+    {
+        // a larger buffer, doubling (unless there's room enough at the front already, which halves the moves).
+        std::vector<char> larger(std::min(largest, std::max(min_text, std::bit_ceil(2 * (kept + length)))));
+        std::copy(from, until, larger.data());
+        rebase(name, from, until, larger.data());
+        rebase(value, from, until, larger.data());
+        text.swap(larger);
+    }
+    else
+    {
+        // NOTE: start isn't 0, or there would be room (kept + length is less than twice the maximum size, and at most
+        //       half the buffer if it's smaller), so this moves towards the front, as std::copy may.
+        std::copy(from, until, text.data());
+        rebase(name, from, until, text.data());
+        rebase(value, from, until, text.data());
+    }
+
+    for (std::size_t i = 0; i < entries; ++i) ring[(first + i) & (ring.size() - 1)].offset -= start;
+    end = kept;
+}
+
+void dynamic_table::push(const entry& e)
+{
+    if (entries == ring.size())
+    {
+        // the oldest first, at the front of the larger ring.
+        std::vector<entry> larger(std::max(min_entries, 2 * ring.size()));
+        for (std::size_t i = 0; i < entries; ++i) larger[i] = ring[(first + i) & (ring.size() - 1)];
+        ring.swap(larger);
+        first = 0;
+    }
+
+    ring[(first + entries) & (ring.size() - 1)] = e;
+    ++entries;
 }
 
 void dynamic_table::set_max_size(std::size_t max_size) noexcept
 {
-    max = max_size;
+    max = limited(max_size);
     evict_to(max);
 }
 
@@ -366,9 +503,10 @@ void dynamic_table::evict_to(std::size_t size) noexcept
 {
     while (current > size)
     {
-        const auto& oldest = entries.back();
-        current -= oldest.text.size() + 32;
-        entries.pop_back();
+        const auto& oldest = ring[first];
+        current -= std::size_t{oldest.name_size} + oldest.value_size + 32;
+        first = (first + 1) & (ring.size() - 1);
+        --entries;
     }
 }
 
@@ -473,37 +611,68 @@ void decoder::emit(const field& f, block_state& state) const
 
 void encoder::set_max_table_size(std::size_t max_table_size) noexcept
 {
-    // NOTE: as nothing is added to the table, it only ever needs to shrink.
-    if (max_table_size >= table_max) return;
+    // NOTE: as indexing::none adds nothing to the table, it only ever needs to shrink.
+    if (mode == indexing::none) max_table_size = std::min(max_table_size, dynamic.max_size());
 
-    table_max      = max_table_size;
-    pending_update = max_table_size;
+    dynamic.set_max_size(max_table_size);
+    smallest = std::min(smallest, dynamic.max_size());
 }
 
 void encoder::encode(std::span<const field> fields, std::vector<std::byte>& out)
 {
-    if (pending_update.has_value())
+    if (smallest != unchanged)
     {
-        encode_integer(static_cast<std::uint32_t>(*pending_update), 5, 0x20, out);
-        pending_update.reset();
+        // RFC 7541, section 4.2: the smallest size since the last block, if the peer's decoder must evict to it too,
+        // then the final size.
+        const auto final_size = dynamic.max_size();
+        if (smallest < std::min(known, final_size)) encode_integer(static_cast<std::uint32_t>(smallest), 5, 0x20, out);
+        if (final_size != known || smallest < known)
+            encode_integer(static_cast<std::uint32_t>(final_size), 5, 0x20, out);
+
+        known    = final_size;
+        smallest = unchanged;
     }
 
-    for (const auto& f : fields)
-    {
-        // NOTE: a never-indexed field keeps its representation even if the static table has it, so that whoever
-        //       decodes it knows not to index it either (RFC 7541, section 6.2.3).
-        const auto match = find_static(f.name, f.value);
-        if (match.index != 0 && !f.never_indexed)
-        {
-            encode_integer(match.index, 7, 0x80, out);
-            continue;
-        }
+    for (const auto& f : fields) encode_field(f, out);
+}
 
-        // a literal without indexing (0000), or never indexed (0001), with its name's index (or 0, and its name).
-        encode_integer(match.name_index, 4, f.never_indexed ? 0x10 : 0x00, out);
-        if (match.name_index == 0) encode_string(f.name, out);
-        encode_string(f.value, out);
+void encoder::encode_field(const field& f, std::vector<std::byte>& out)
+{
+    const bool automatic = mode == indexing::automatic;
+    const bool never     = f.never_indexed || (automatic && sensitive(f.name));
+
+    // NOTE: a never-indexed field keeps its representation even if a table has it, so that whoever decodes it knows
+    //       not to index it either (RFC 7541, section 6.2.3).
+    const auto match = find_static(f.name, f.value);
+    if (match.index != 0 && !never)
+    {
+        encode_integer(match.index, 7, 0x80, out);
+        return;
     }
+
+    const auto dynamic_match = automatic ? dynamic.find(f.name, f.value) : dynamic_table::match{};
+    if (dynamic_match.index != dynamic_table::npos && !never)
+    {
+        encode_integer(static_cast<std::uint32_t>(static_table.size() + 1 + dynamic_match.index), 7, 0x80, out);
+        return;
+    }
+
+    auto name_index = match.name_index;
+    if (name_index == 0 && dynamic_match.name_index != dynamic_table::npos)
+        name_index = static_cast<std::uint32_t>(static_table.size() + 1 + dynamic_match.name_index);
+
+    // NOTE: a field of more than 3/4 of the table would push out most of what's there, for one field (nghttp2's rule).
+    const bool index =
+        automatic && !never && indexed_by_default(f.name) && field_size(f.name, f.value) * 4 <= dynamic.max_size() * 3;
+
+    // a literal with incremental indexing (01), without indexing (0000), or never indexed (0001), with its name's
+    // index (or 0, and its name).
+    if (index) encode_integer(name_index, 6, 0x40, out);
+    else encode_integer(name_index, 4, never ? 0x10 : 0x00, out);
+    if (name_index == 0) encode_string(f.name, out);
+    encode_string(f.value, out);
+
+    if (index) dynamic.insert(f.name, f.value);
 }
 
 void encode_integer(std::uint32_t value, int prefix_bits, std::uint8_t first_bits, std::vector<std::byte>& out)

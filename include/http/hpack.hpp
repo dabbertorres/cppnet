@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -48,21 +48,46 @@ inline constexpr std::size_t default_max_list_size = std::size_t{64} * 1'024;
 
 // dynamic_table holds the fields an encoder or decoder has indexed, newest first, evicting the oldest to stay within
 // its maximum size (RFC 7541, section 4).
+//
+// Its storage is made once rather than per field (docs/plans/http2.md, Decided question 16 of stage 5): the fields'
+// text is appended to one buffer, oldest first, and moved to the buffer's front when it reaches the end (the buffer
+// being up to twice the maximum size, what's moved is at most the maximum size, for as much appended); and each field
+// is a fixed-size entry in a ring (its text's offset, its name's and value's lengths and hashes), of which there are
+// at most a 32nd of the maximum size. Both grow, by doubling, only as the fields need them, up to those bounds: a
+// table nothing's added to allocates nothing, and one whose maximum size is large (a peer's SETTINGS) holds only what
+// it's given.
 class dynamic_table
 {
 public:
+    // npos is no index: what find() gives when there's no such field.
+    static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+
+    // match is what find() found: the index of a field with the name and value (or npos), and of the newest with the
+    // name (or npos).
+    struct match
+    {
+        std::size_t index      = npos;
+        std::size_t name_index = npos;
+    };
+
+    // max_size is limited to what HPACK's integers can say (SETTINGS_HEADER_TABLE_SIZE is 32 bits), as are a field's
+    // lengths.
     explicit dynamic_table(std::size_t max_size = default_table_size) noexcept
-        : max{max_size}
+        : max{limited(max_size)}
     {}
 
     // size is what the fields come to (by field_size).
     [[nodiscard]] std::size_t size() const noexcept { return current; }
     [[nodiscard]] std::size_t max_size() const noexcept { return max; }
-    [[nodiscard]] std::size_t count() const noexcept { return entries.size(); }
+    [[nodiscard]] std::size_t count() const noexcept { return entries; }
 
     // at is the field at index (0 being the newest), which must be less than count(). Its views are valid until the
     // table next changes.
     [[nodiscard]] field at(std::size_t index) const noexcept;
+
+    // find goes through the fields, newest first, for one with name and value, comparing their hashes and lengths
+    // before their text.
+    [[nodiscard]] match find(std::string_view name, std::string_view value) const noexcept;
 
     // insert adds a field (copying it, so it may be one of the table's own), evicting the oldest until it fits. A field
     // larger than the maximum size empties the table, and isn't added.
@@ -72,17 +97,41 @@ public:
     void set_max_size(std::size_t max_size) noexcept;
 
 private:
+    // entry is where a field is: its text (the name, then the value) at offset in text.
     struct entry
     {
-        std::string text; // the name, then the value
-        std::size_t name_size = 0;
+        std::size_t   offset     = 0;
+        std::uint32_t name_size  = 0;
+        std::uint32_t value_size = 0;
+        std::uint32_t name_hash  = 0;
+        std::uint32_t value_hash = 0;
     };
 
+    static constexpr std::size_t limited(std::size_t size) noexcept
+    {
+        return size < std::numeric_limits<std::uint32_t>::max() ? size : std::numeric_limits<std::uint32_t>::max();
+    }
+
+    // nth is the entry at index (0 being the newest).
+    [[nodiscard]] const entry& nth(std::size_t index) const noexcept
+    {
+        return ring[(first + entries - 1 - index) & (ring.size() - 1)];
+    }
+
+    // make_room makes room for length more bytes of text after the newest field's: moving the fields' text to the front
+    // of the buffer, or into a larger one, and name and value with it if they're views of a field's.
+    void make_room(std::size_t length, std::string_view& name, std::string_view& value);
+
+    void push(const entry& e);
     void evict_to(std::size_t size) noexcept;
 
-    std::deque<entry> entries;
-    std::size_t       current = 0;
-    std::size_t       max;
+    std::vector<char>  text; // the fields' text, the oldest's from its offset, the newest's ending at end
+    std::vector<entry> ring; // the fields, the oldest at first; its size a power of two (or 0)
+    std::size_t        first   = 0;
+    std::size_t        entries = 0;
+    std::size_t        end     = 0;
+    std::size_t        current = 0;
+    std::size_t        max;
 };
 
 // decoder decodes header blocks: one per connection, as the dynamic table is the connection's.
@@ -157,27 +206,59 @@ private:
     std::string value_buffer;
 };
 
-// encoder encodes header blocks: one per connection, as the dynamic table is the connection's.
-//
-// Fields are never added to the dynamic table (simpler, and compression oracles live there; see docs/plans/http2.md):
-// a field the static table has is encoded as its index (unless it's never indexed, whose representation must say so),
-// and others as literals (with the static table's index for the name, if it has the name), Huffman coded when that's
-// shorter.
+// indexing is what an encoder adds to its dynamic table (docs/plans/http2.md, "HPACK's dynamic table, for the
+// encoder", and Decided questions 13 and 14 of stage 5).
+enum class indexing : std::uint8_t
+{
+    // none adds nothing: a field the static table has is encoded as its index (unless it's never indexed, whose
+    // representation must say so), and others as literals without indexing (or never indexed), with the static table's
+    // index for the name, if it has the name. The table only ever shrinks (it's empty, so growing it would gain
+    // nothing), and only what field::never_indexed says is never indexed.
+    none,
+
+    // automatic adds what's likely to repeat, nghttp2's way: everything but
+    // - never-indexed fields: field::never_indexed, and what sensitive() names (sent as never indexed, whatever the
+    //   field says, so that intermediaries don't index them either);
+    // - fields that change from one message to the next (:path, age, content-length, etag, if-modified-since,
+    //   if-none-match, location), whose entries would only push out others: literals without indexing;
+    // - and a field that would take more than 3/4 of the table, likewise.
+    // A field is encoded as the first of: an index of the static table's, or the dynamic table's (unless it's never
+    // indexed), then a literal with the static table's index for the name, or the dynamic table's (Go's order).
+    automatic,
+};
+
+// encoder encodes header blocks: one per connection, as the dynamic table is the connection's, kept in step with the
+// peer's decoder's.
 class encoder
 {
 public:
-    // set_max_table_size takes the peer's SETTINGS_HEADER_TABLE_SIZE. If it's less than the table's maximum size, the
-    // next block starts with a size update (as RFC 9113, section 4.3.1, requires).
+    explicit encoder(indexing indexing_mode = indexing::none) noexcept
+        : mode{indexing_mode}
+    {}
+
+    // set_max_table_size takes the peer's SETTINGS_HEADER_TABLE_SIZE, each time it changes (with indexing::none, only
+    // if it shrinks the table). The next block starts with the smallest size the table has had since the last one, if
+    // that's below both what the peer's decoder knows and the size it has now (it may have evicted fields there), then
+    // the size it has now, if that, or the smallest, differs from what the decoder knows (RFC 7541, section 4.2); as
+    // RFC 9113, section 4.3.1, requires when the peer lowers its setting.
     void set_max_table_size(std::size_t max_table_size) noexcept;
 
     // encode appends a block of fields to out.
     void encode(std::span<const field> fields, std::vector<std::byte>& out);
 
-    [[nodiscard]] std::size_t max_table_size() const noexcept { return table_max; }
+    [[nodiscard]] std::size_t          max_table_size() const noexcept { return dynamic.max_size(); }
+    [[nodiscard]] const dynamic_table& table() const noexcept { return dynamic; }
 
 private:
-    std::size_t                table_max = default_table_size;
-    std::optional<std::size_t> pending_update;
+    // unchanged is smallest's value when the table's size hasn't changed since the last block.
+    static constexpr std::size_t unchanged = std::numeric_limits<std::size_t>::max();
+
+    void encode_field(const field& f, std::vector<std::byte>& out);
+
+    dynamic_table dynamic;
+    std::size_t   known    = default_table_size; // the table's size as the peer's decoder knows it
+    std::size_t   smallest = unchanged;          // since the last block
+    indexing      mode;
 };
 
 // The building blocks, for HTTP/2's code and its tests.
