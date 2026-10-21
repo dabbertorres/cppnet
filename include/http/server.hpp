@@ -61,6 +61,14 @@ struct server_config
     // The most streams (requests) an HTTP/2 client may have open on a connection at once (nginx's default).
     std::uint32_t http2_max_concurrent_streams = 100;
 
+    // Whether an HTTP/2 connection takes each response's priority (RFC 9218) from what the client asks (a request's
+    // Priority field, and PRIORITY_UPDATE frames) and what the handler says (a Priority field in the response, which
+    // is also sent to the client, e.g. "u=7" for a bulk download; see http/priority.hpp). A client that hasn't sent
+    // any has its responses share the connection alike, and so do those of an intermediary (one sending Via,
+    // Forwarded or X-Forwarded-For), whose Priority fields are its clients'. Off, every response shares it alike
+    // (Go's DisableClientPriority). The connection doesn't schedule by it yet (docs/plans/http2.md, Priorities).
+    bool http2_priorities = true;
+
     std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 
 #ifdef NET_HAS_TLS

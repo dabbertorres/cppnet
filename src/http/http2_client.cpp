@@ -27,6 +27,7 @@
 #include "http/http2.hpp"
 #include "http/http2_connection.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/io.hpp"
@@ -652,6 +653,9 @@ void http2_client_connection::on_goaway(http2::stream_id /*last*/, std::error_co
 }
 
 void http2_client_connection::on_ping_ack(std::span<const std::byte, 8> /*opaque*/) {}
+
+// (a client's session never reports it: a PRIORITY_UPDATE from the server ends the connection.)
+void http2_client_connection::on_priority_update(http2::stream_id /*stream*/, priority /*p*/) {}
 
 void http2_client_connection::after_receive()
 {

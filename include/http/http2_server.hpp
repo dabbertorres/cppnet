@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <span>
 #include <stop_token>
 
@@ -9,6 +10,8 @@
 #include "coro/task.hpp"
 #include "http/connection.hpp"
 #include "http/http2_config.hpp"
+#include "http/priority.hpp"
+#include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
 #include "io/scheduler.hpp"
@@ -32,4 +35,10 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
 
 // http2_ops are what response_writer does with the server's HTTP/2 streams.
 extern const http2_stream_ops http2_ops;
+
+// stream_priority is the priority of the HTTP/2 stream a request (its handler's) came on, as the server has it now
+// (see docs/plans/http2.md, Priorities), or nullopt if it didn't come over HTTP/2 (or its body was replaced). For
+// tests, as nothing acts on it yet.
+[[nodiscard]] std::optional<priority> stream_priority(const server_request& req);
+
 }

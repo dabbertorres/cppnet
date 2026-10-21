@@ -20,6 +20,8 @@
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
 #include "http/http2_config.hpp"
+#include "http/priority.hpp"
+#include "http/structured_fields.hpp"
 #include "util/string_util.hpp"
 
 namespace net::http::http2
@@ -35,6 +37,10 @@ namespace
 
     // Until the server's SETTINGS arrive, a client assumes it may open this many streams (as Go and Chromium do).
     constexpr std::uint32_t assumed_max_concurrent_streams = 100;
+
+    // The most PRIORITY_UPDATEs a server keeps for streams not yet open, whatever its MAX_CONCURRENT_STREAMS (which
+    // bounds them first, as RFC 9218 has it, unless it's larger): past it, they're ignored, as glitches.
+    constexpr std::size_t max_idle_priorities = 128;
 
     std::uint32_t read32(std::span<const std::byte> in) noexcept
     {
@@ -241,10 +247,11 @@ session::session(role r, const session_config& config)
     , next_local_stream{r == role::client ? 1U : 2U}
 {
     // NOTE: this->config, not the parameter of the same name.
-    auto& local               = this->config.local;
-    local.enable_push         = false;
-    local.initial_window_size = std::clamp<std::uint32_t>(local.initial_window_size, 65'535, max_window);
-    local.max_frame_size      = std::clamp(local.max_frame_size, min_max_frame_size, max_max_frame_size);
+    auto& local                 = this->config.local;
+    local.enable_push           = false;
+    local.no_rfc7540_priorities = true;
+    local.initial_window_size   = std::clamp<std::uint32_t>(local.initial_window_size, 65'535, max_window);
+    local.max_frame_size        = std::clamp(local.max_frame_size, min_max_frame_size, max_max_frame_size);
 
     // as many CONTINUATIONs as the largest header block this side takes needs, if that's more (a block's encoded size
     // is limited by max_header_list_size too), in frames of the least MAX_FRAME_SIZE: the peer may send frames that
@@ -337,11 +344,12 @@ session::receive_frame(std::span<const std::byte> in, session_events& events, ti
     case frame_type::goaway: err = on_goaway(h, payload, events); break;
     case frame_type::window_update: err = on_window_update(h, payload, events, now); break;
     case frame_type::continuation: err = on_continuation(h, payload, events, now); break;
+    case frame_type::priority_update: err = on_priority_update(h, payload, events, now); break;
 
     // a client sends ENABLE_PUSH 0, and a client can't push.
     case frame_type::push_promise: err = connection_error(error_code::protocol_error, "PUSH_PROMISE"); break;
 
-    // unknown frame types are ignored (RFC 9113, section 4.1): e.g. RFC 9218's PRIORITY_UPDATE.
+    // unknown frame types are ignored (RFC 9113, section 4.1): e.g. RFC 8336's ORIGIN.
     default: break;
     }
 
@@ -473,6 +481,11 @@ std::error_code session::end_header_block(const header_block& block, session_eve
 
     const auto id     = block.stream;
     const auto stream = stream_for_block(id, now);
+
+    // a PRIORITY_UPDATE that came before the stream opened (a server's): reported after its head, if it's well-formed,
+    // or dropped with it.
+    const auto update = idle_priorities.empty() ? std::nullopt : take_idle_priority(id);
+
     if (!stream.has_value()) return stream.error();
     if (*stream == nullptr) return {}; // ignored, or refused
 
@@ -507,6 +520,10 @@ std::error_code session::end_header_block(const header_block& block, session_eve
     }
 
     events.on_headers(id, checked->kind, block_fields, block.end_stream);
+
+    // (the most recent signal, so it overrides the request's Priority field: RFC 9218, section 7.1.)
+    if (update.has_value() && checked->kind == block_kind::head) events.on_priority_update(id, *update);
+
     if (block.end_stream) close_remote(id);
     return {};
 }
@@ -683,12 +700,13 @@ std::error_code session::on_settings(const frame_header& h, std::span<const std:
     if (payload.size() / 6 > config.max_settings)
         return connection_error(error_code::enhance_your_calm, "too many settings");
 
+    const bool first  = !settings_received;
     settings_received = true;
 
     const auto previous_window = static_cast<std::int64_t>(peer.initial_window_size);
     for (auto rest = payload; !rest.empty(); rest = rest.subspan(6))
     {
-        if (auto err = apply_setting(read16(rest), read32(rest.subspan(2)))) return err;
+        if (auto err = apply_setting(read16(rest), read32(rest.subspan(2)), first)) return err;
     }
 
     // a change of INITIAL_WINDOW_SIZE moves every stream's window by as much (RFC 9113, section 6.9.2).
@@ -707,7 +725,7 @@ std::error_code session::on_settings(const frame_header& h, std::span<const std:
     return {};
 }
 
-std::error_code session::apply_setting(std::uint16_t id, std::uint32_t value)
+std::error_code session::apply_setting(std::uint16_t id, std::uint32_t value, bool first)
 {
     switch (static_cast<setting_id>(id))
     {
@@ -738,6 +756,16 @@ std::error_code session::apply_setting(std::uint16_t id, std::uint32_t value)
         break;
 
     case setting_id::max_header_list_size: peer.max_header_list_size = value; break;
+
+    case setting_id::no_rfc7540_priorities:
+        // 0 or 1, in the first SETTINGS, and never changed after (RFC 9218, section 2.1, whose "MAY" treat a change as
+        // a connection error this takes: Go's checks only the value). A later SETTINGS that leaves it out changes
+        // nothing; one that sends 1 when the first didn't send it changes it from its initial 0. Nothing else depends
+        // on it: neither side sends RFC 7540's signals, and a server ignores them whatever the client says.
+        if (value > 1 || (!first && (value == 1) != peer.no_rfc7540_priorities))
+            return connection_error(error_code::protocol_error, "NO_RFC7540_PRIORITIES");
+        peer.no_rfc7540_priorities = value == 1;
+        break;
 
     // unknown settings are ignored.
     default: break;
@@ -825,6 +853,78 @@ std::error_code session::on_window_update(const frame_header&        h,
     it->second.send_window += increment;
     events.on_window_update(h.stream);
     return {};
+}
+
+std::error_code session::on_priority_update(const frame_header&        h,
+                                            std::span<const std::byte> payload,
+                                            session_events&            events,
+                                            time_point                 now)
+{
+    // only a client sends it (RFC 9218, section 7.1), on stream 0, with a stream id (31 bits) and a Priority field's
+    // value, which may be empty.
+    if (side == role::client) return connection_error(error_code::protocol_error, "PRIORITY_UPDATE");
+    if (h.stream != 0) return connection_error(error_code::protocol_error);
+    if (payload.size() < 4) return connection_error(error_code::frame_size_error);
+
+    // a stream id of 0 is an error, and so is an even one: a push stream, which this side never opens, so it's idle
+    // (for which RFC 9218 makes it an error) and always will be.
+    const auto id = read32(payload) & max_stream_id;
+    if (id == 0 || !peer_initiated(id)) return connection_error(error_code::protocol_error, "PRIORITY_UPDATE stream");
+
+    const auto it   = streams.find(id);
+    const bool idle = it == streams.end() && !closed(id);
+
+    // after this side's GOAWAY, the peer's new streams won't be processed, and its frames for them are ignored, as
+    // ever (not counted: the peer may not have seen the GOAWAY yet).
+    if (local_goaway.has_value() && id > *local_goaway && it == streams.end()) return {};
+
+    // a closed stream's is ignored (e.g. a client reprioritizing a response that ended meanwhile), but counted, so
+    // a flood of them can't go on for free (Decided question 22 of stage 5).
+    if (it == streams.end() && !idle) return glitch(now);
+
+    // a value that doesn't parse is ignored too, rather than the stream's error (Go's) or the connection's (RFC 9218
+    // allows either), and counted. It's parsed to a priority now, so what's kept is two bytes, not the frame's value.
+    // NOTE: parsed twice (once to tell whether it parses, as parse_priority() doesn't say), only for this frame.
+    const auto value = std::string_view{reinterpret_cast<const char*>(payload.data()) + 4, payload.size() - 4};
+    if (!sf::parse_dictionary(value, [](std::string_view, const sf::member&) {})) return glitch(now);
+
+    // a complete set: what it leaves out is the default, not what the stream had.
+    const auto p = parse_priority(value);
+
+    if (!idle)
+    {
+        if (it->second.known) events.on_priority_update(id, p);
+        return {};
+    }
+
+    // a stream not yet open: the latest is kept, until its head arrives. RFC 9218 bounds them, with the streams that
+    // are open, by MAX_CONCURRENT_STREAMS, as a connection error; and this side by max_idle_priorities, past which
+    // they're ignored (and counted).
+    const auto kept = std::ranges::find(idle_priorities, id, &std::pair<stream_id, priority>::first);
+    if (kept != idle_priorities.end())
+    {
+        kept->second = p;
+        return {};
+    }
+
+    if (open_peer_streams + idle_priorities.size() >= config.local.max_concurrent_streams)
+        return connection_error(error_code::protocol_error, "PRIORITY_UPDATE for too many streams");
+    if (idle_priorities.size() >= max_idle_priorities) return glitch(now);
+
+    idle_priorities.emplace_back(id, p);
+    return {};
+}
+
+std::optional<priority> session::take_idle_priority(stream_id stream)
+{
+    std::optional<priority> taken;
+    std::erase_if(idle_priorities,
+                  [&](const std::pair<stream_id, priority>& kept)
+                  {
+                      if (kept.first == stream) taken = kept.second;
+                      return kept.first <= highest_peer_stream;
+                  });
+    return taken;
 }
 
 bool session::can_open_stream(std::size_t reserved) const noexcept

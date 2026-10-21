@@ -121,6 +121,9 @@ void encode_settings(const settings& values, const settings& defaults, std::vect
     add(setting_id::initial_window_size, values.initial_window_size, defaults.initial_window_size);
     add(setting_id::max_frame_size, values.max_frame_size, defaults.max_frame_size);
     add(setting_id::max_header_list_size, values.max_header_list_size, defaults.max_header_list_size);
+    add(setting_id::no_rfc7540_priorities,
+        values.no_rfc7540_priorities ? 1 : 0,
+        defaults.no_rfc7540_priorities ? 1 : 0);
 
     put_header(static_cast<std::uint32_t>(changed.size() * 6), frame_type::settings, 0, 0, out);
     for (const auto& [id, value] : changed)

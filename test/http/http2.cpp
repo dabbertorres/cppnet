@@ -24,6 +24,7 @@
 #include "http/hpack.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 
 namespace http2 = net::http::http2;
 namespace hpack = net::http::hpack;
@@ -85,6 +86,11 @@ struct recorder final : http2::session_events
     void on_ping_ack(std::span<const std::byte, 8> opaque) override
     {
         log.push_back(std::format("ping ack {}", to_hex(opaque)));
+    }
+
+    void on_priority_update(http2::stream_id stream, net::http::priority p) override
+    {
+        log.push_back(std::format("priority {} u={}{}", stream, p.urgency, p.incremental ? " i" : ""));
     }
 
     // take returns the lines recorded since it was last called, without window updates (which are noise unless a
@@ -1286,4 +1292,439 @@ TEST_CASE("the session's encoder indexes within the smaller of the peer's table 
     CHECK(first.starts_with(tc.indexes ? "885f" : "880f10"));
     if (tc.indexes) CHECK(blocks[1] == "88bfbe");
     else CHECK(blocks[1] == first);
+}
+
+namespace
+{
+
+// settings_in is the first SETTINGS frame's parameters in out, as "id=value".
+std::vector<std::string> settings_in(std::span<const std::byte> out)
+{
+    // a server's output starts with frames; a client's with the preface.
+    if (as_string(out).starts_with(http2::preface)) out = out.subspan(http2::preface.size());
+
+    while (out.size() >= 9)
+    {
+        const auto h       = http2::decode_frame_header(out.first<9>());
+        const auto payload = out.subspan(9, h.length);
+        out                = out.subspan(9 + h.length);
+        if (h.type != static_cast<std::uint8_t>(http2::frame_type::settings)) continue;
+
+        std::vector<std::string> found;
+        for (auto rest = payload; rest.size() >= 6; rest = rest.subspan(6))
+        {
+            const auto id = (std::to_integer<unsigned>(rest[0]) << 8U) | std::to_integer<unsigned>(rest[1]);
+            found.push_back(std::format("{}={}", id, read_u32(rest.subspan(2))));
+        }
+        return found;
+    }
+    return {};
+}
+
+// setting is a SETTINGS frame's payload with one parameter.
+std::vector<std::byte> setting(http2::setting_id id, std::uint32_t value)
+{
+    std::vector<std::byte> payload{static_cast<std::byte>(static_cast<unsigned>(id) >> 8U), static_cast<std::byte>(id)};
+    const auto             v = u32(value);
+    payload.insert(payload.end(), v.begin(), v.end());
+    return payload;
+}
+
+// priority_update is a PRIORITY_UPDATE frame's payload: the prioritized stream, and a Priority field's value.
+std::vector<std::byte> priority_update(http2::stream_id stream, std::string_view value)
+{
+    auto       payload = u32(stream);
+    const auto bytes   = bytes_of(value);
+    payload.insert(payload.end(), bytes.begin(), bytes.end());
+    return payload;
+}
+
+}
+
+TEST_CASE("both sides send SETTINGS_NO_RFC7540_PRIORITIES as 1, in their first SETTINGS",
+          "[http][http2][session][priority]")
+{
+    endpoint client{http2::role::client};
+    endpoint server{http2::role::server};
+
+    std::vector<std::byte> out;
+    client.s.take_output(out);
+    CHECK(std::ranges::contains(settings_in(out), "9=1"));
+    server.deliver(out);
+
+    server.s.take_output(out);
+    CHECK(std::ranges::contains(settings_in(out), "9=1"));
+    client.deliver(out);
+
+    pump(client, server);
+    CHECK(client.s.peer_settings().no_rfc7540_priorities);
+    CHECK(server.s.peer_settings().no_rfc7540_priorities);
+    CHECK_FALSE(client.failure);
+    CHECK_FALSE(server.failure);
+}
+
+TEST_CASE("SETTINGS_NO_RFC7540_PRIORITIES is 0 or 1, and never changes after the first SETTINGS",
+          "[http][http2][session][priority]")
+{
+    struct test_case
+    {
+        std::string_view                        what;
+        std::vector<std::vector<std::uint32_t>> frames; // each SETTINGS' values of the setting, after the first
+        std::optional<std::uint32_t>            first;  // the first SETTINGS' (none: it's left out)
+        bool                                    fails;
+        bool                                    value = false;
+    };
+
+    const auto tc = GENERATE(
+        test_case{.what = "1", .frames = {}, .first = 1, .fails = false, .value = true},
+        test_case{.what = "0", .frames = {}, .first = 0, .fails = false},
+        test_case{.what = "2", .frames = {}, .first = 2, .fails = true},
+        test_case{.what = "2^32-1", .frames = {}, .first = 0xffff'ffff, .fails = true},
+        test_case{.what = "1, then 1 again", .frames = {{1}}, .first = 1, .fails = false, .value = true},
+        test_case{.what = "1, then left out", .frames = {{}}, .first = 1, .fails = false, .value = true},
+        test_case{.what = "1, then 0", .frames = {{0}}, .first = 1, .fails = true},
+        test_case{.what = "left out, then 0 (its initial value)", .frames = {{0}}, .first = {}, .fails = false},
+        test_case{.what = "left out, then 1", .frames = {{1}}, .first = {}, .fails = true},
+        test_case{.what = "0 then 1 in the first SETTINGS: the last", .frames = {}, .first = {}, .fails = false},
+        test_case{.what = "a later SETTINGS with 1 then 0, after 1", .frames = {{1, 0}}, .first = 1, .fails = true});
+    CAPTURE(tc.what);
+
+    const auto role = GENERATE(http2::role::server, http2::role::client);
+    CAPTURE(role == http2::role::server ? "server" : "client");
+
+    // the peer's frames: a client's preface first, for a server.
+    raw r;
+    if (role == http2::role::server)
+    {
+        const auto p = bytes_of(http2::preface);
+        r.bytes.insert(r.bytes.end(), p.begin(), p.end());
+    }
+
+    std::vector<std::byte> first;
+    if (tc.first.has_value()) first = setting(http2::setting_id::no_rfc7540_priorities, *tc.first);
+    if (tc.what.starts_with("0 then 1"))
+    {
+        first          = setting(http2::setting_id::no_rfc7540_priorities, 0);
+        const auto one = setting(http2::setting_id::no_rfc7540_priorities, 1);
+        first.insert(first.end(), one.begin(), one.end());
+    }
+    r.frame(http2::frame_type::settings, 0, 0, first);
+
+    for (const auto& values : tc.frames)
+    {
+        std::vector<std::byte> payload;
+        for (const auto v : values)
+        {
+            const auto one = setting(http2::setting_id::no_rfc7540_priorities, v);
+            payload.insert(payload.end(), one.begin(), one.end());
+        }
+        r.frame(http2::frame_type::settings, 0, 0, payload);
+    }
+
+    endpoint e{role};
+    e.deliver(r.bytes);
+    if (tc.fails)
+    {
+        CHECK(e.failure == http2::error_code::protocol_error);
+        return;
+    }
+
+    REQUIRE_FALSE(e.failure);
+    CHECK(e.s.peer_settings().no_rfc7540_priorities == (tc.value || tc.what.starts_with("0 then 1")));
+}
+
+TEST_CASE("PRIORITY_UPDATE's connection errors", "[http][http2][session][priority][malformed]")
+{
+    struct test_case
+    {
+        std::string_view  what;
+        raw               frames;
+        http2::error_code want;
+    };
+
+    raw on_stream;
+    on_stream.client_start()
+        .headers(1, request(), http2::flags::end_headers)
+        .frame(http2::frame_type::priority_update, 0, 1, priority_update(1, "u=1"));
+
+    raw short_payload;
+    short_payload.client_start().frame(http2::frame_type::priority_update, 0, 0, std::vector<std::byte>(3));
+
+    raw stream_zero;
+    stream_zero.client_start().frame(http2::frame_type::priority_update, 0, 0, priority_update(0, "u=1"));
+
+    raw push_stream;
+    push_stream.client_start().frame(http2::frame_type::priority_update, 0, 0, priority_update(2, "u=1"));
+
+    raw in_block;
+    in_block.client_start()
+        .headers(1, request(), 0)
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=1"));
+
+    const auto tc = GENERATE_REF(
+        test_case{.what = "on a stream, not 0", .frames = on_stream, .want = http2::error_code::protocol_error},
+        test_case{.what   = "shorter than a stream id",
+                  .frames = short_payload,
+                  .want   = http2::error_code::frame_size_error},
+        test_case{.what = "for stream 0", .frames = stream_zero, .want = http2::error_code::protocol_error},
+        test_case{.what   = "for an even (push) stream",
+                  .frames = push_stream,
+                  .want   = http2::error_code::protocol_error},
+        test_case{.what = "inside a header block", .frames = in_block, .want = http2::error_code::protocol_error});
+    CAPTURE(tc.what);
+
+    endpoint server{http2::role::server};
+    server.deliver(tc.frames.bytes);
+    CHECK(server.failure == tc.want);
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(goaway_code(out) == static_cast<std::uint32_t>(tc.want));
+}
+
+TEST_CASE("a client takes PRIORITY_UPDATE as a connection error", "[http][http2][session][priority][malformed]")
+{
+    endpoint client{http2::role::client};
+    REQUIRE(client.s.open_stream() == 1U);
+
+    raw r;
+    http2::encode_settings({}, {}, r.bytes);
+    r.frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=1"));
+    client.deliver(r.bytes);
+    CHECK(client.failure == http2::error_code::protocol_error);
+}
+
+TEST_CASE("PRIORITY_UPDATE for an open stream is reported, as a complete set", "[http][http2][session][priority]")
+{
+    endpoint server{http2::role::server};
+
+    raw r;
+    r.client_start()
+        .headers(1, request("POST"), http2::flags::end_headers)
+        .headers(3, request(), end_both)
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=5, i"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "i"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=0, x=?1;y, i=?0"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, ""))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(3, "u=9, i=1, u=6"));
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    // what each leaves out is the default (u=3, not incremental), not what the stream had; stream 3 has ended its
+    // request, but not been answered, so it's open.
+    CHECK(server.events.take()
+          == std::vector<std::string>{
+              "settings",
+              "headers 1 head :method=POST :scheme=https :authority=example.com :path=/",
+              "headers 3 head end :method=GET :scheme=https :authority=example.com :path=/",
+              "priority 1 u=5 i",
+              "priority 1 u=3 i",
+              "priority 1 u=0",
+              "priority 1 u=3",
+              "priority 3 u=6",
+          });
+}
+
+TEST_CASE("PRIORITY_UPDATE for a stream not yet open is kept, and reported just after its head",
+          "[http][http2][session][priority]")
+{
+    endpoint server{http2::role::server};
+
+    auto with_priority = request();
+    with_priority.push_back({.name = "priority", .value = "u=2"});
+
+    raw r;
+    r.client_start()
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=1"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=6, i"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(5, "u=4"))
+        .headers(1, with_priority, end_both)
+        .headers(3, request(), end_both)
+        .headers(5, request(), end_both);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    // the latest of stream 1's, after its head (whose field it overrides, being the most recent signal); none for 3.
+    CHECK(server.events.take()
+          == std::vector<std::string>{
+              "settings",
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/ priority=u=2",
+              "priority 1 u=6 i",
+              "headers 3 head end :method=GET :scheme=https :authority=example.com :path=/",
+              "headers 5 head end :method=GET :scheme=https :authority=example.com :path=/",
+              "priority 5 u=4",
+          });
+}
+
+TEST_CASE("a kept PRIORITY_UPDATE goes with its stream's head, if that's malformed or refused",
+          "[http][http2][session][priority]")
+{
+    http2::session_config config;
+    config.local.max_concurrent_streams = 2;
+    endpoint server{http2::role::server, config};
+
+    auto malformed = request();
+    malformed.push_back({.name = "connection", .value = "close"});
+
+    // stream 1's head is malformed (reset); stream 7's is refused, as 3 and 5 are open by then.
+    raw r;
+    r.client_start()
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=1"))
+        .headers(1, malformed, end_both)
+        .headers(3, request(), http2::flags::end_headers)
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(7, "u=2"))
+        .headers(5, request(), http2::flags::end_headers)
+        .headers(7, request(), end_both);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    CHECK(server.events.take()
+          == std::vector<std::string>{
+              "settings",
+              "headers 3 head :method=GET :scheme=https :authority=example.com :path=/",
+              "headers 5 head :method=GET :scheme=https :authority=example.com :path=/",
+          });
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream) == std::vector<std::string>{"1 1", "7 7"});
+}
+
+TEST_CASE("PRIORITY_UPDATEs kept for streams not yet open are bounded, with the open ones, by MAX_CONCURRENT_STREAMS",
+          "[http][http2][session][priority][limits]")
+{
+    http2::session_config config;
+    config.local.max_concurrent_streams = 2;
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start()
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(3, "u=1"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(5, "u=1"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(5, "u=2")); // replaces, so doesn't count
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+    server.events.take();
+
+    SECTION("a third stream's is past the bound")
+    {
+        raw more;
+        more.frame(http2::frame_type::priority_update, 0, 0, priority_update(7, "u=1"));
+        server.deliver(more.bytes);
+        CHECK(server.failure == http2::error_code::protocol_error);
+    }
+
+    SECTION("a stream opened past them closes theirs, so they're dropped; then it counts, with one more")
+    {
+        raw more;
+        more.headers(7, request(), http2::flags::end_headers)
+            .frame(http2::frame_type::priority_update, 0, 0, priority_update(9, "u=1"));
+        server.deliver(more.bytes);
+        REQUIRE_FALSE(server.failure);
+        CHECK(server.events.take()
+              == std::vector<std::string>{"headers 7 head :method=GET :scheme=https :authority=example.com :path=/"});
+
+        raw past;
+        past.frame(http2::frame_type::priority_update, 0, 0, priority_update(11, "u=1"));
+        server.deliver(past.bytes);
+        CHECK(server.failure == http2::error_code::protocol_error);
+    }
+}
+
+TEST_CASE("PRIORITY_UPDATEs kept for streams not yet open are at most 128, whatever MAX_CONCURRENT_STREAMS",
+          "[http][http2][session][priority][limits]")
+{
+    // past 128, they're ignored as glitches, of which one is allowed.
+    http2::session_config config;
+    config.local.max_concurrent_streams = http2::unlimited;
+    config.glitches                     = {.burst = 1, .rate = 0};
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start();
+    for (http2::stream_id id = 1; id <= 2 * 129; id += 2)
+        r.frame(http2::frame_type::priority_update, 0, 0, priority_update(id, "u=1"));
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    // the first 128 are kept (stream 1's among them), the 129th ignored.
+    raw more;
+    more.headers(1, request(), end_both).headers((2 * 129) - 1, request(), end_both);
+    server.deliver(more.bytes);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take()
+          == std::vector<std::string>{
+              "settings",
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/",
+              "priority 1 u=1",
+              "headers 257 head end :method=GET :scheme=https :authority=example.com :path=/",
+          });
+
+    // the next ignored one is one glitch too many.
+    raw past;
+    past.frame(http2::frame_type::priority_update, 0, 0, priority_update(3, "u=1"));
+    server.deliver(past.bytes);
+    CHECK(server.failure == http2::error_code::enhance_your_calm);
+}
+
+TEST_CASE("PRIORITY_UPDATE for a closed stream, or whose value doesn't parse, is ignored as a glitch",
+          "[http][http2][session][priority][limits]")
+{
+    // one glitch allowed.
+    http2::session_config config;
+    config.glitches = {.burst = 1, .rate = 0};
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start().headers(1, request(), end_both).headers(3, request(), http2::flags::end_headers);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.s.submit_headers(1, response(), true)); // stream 1 is closed
+    server.events.take();
+
+    const auto first  = GENERATE(as<std::string_view>{}, "closed", "unparsable", "unparsable, idle");
+    const auto second = GENERATE(as<std::string_view>{}, "closed", "unparsable", "unparsable, idle");
+    CAPTURE(first, second);
+
+    const auto frame = [](std::string_view what)
+    {
+        if (what == "closed") return priority_update(1, "u=1");
+        if (what == "unparsable") return priority_update(3, "u=1, U=2");
+        return priority_update(5, "u=");
+    };
+
+    raw once;
+    once.frame(http2::frame_type::priority_update, 0, 0, frame(first));
+    server.deliver(once.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    raw twice;
+    twice.frame(http2::frame_type::priority_update, 0, 0, frame(second));
+    server.deliver(twice.bytes);
+    CHECK(server.failure == http2::error_code::enhance_your_calm);
+
+    // none reported, nor kept: stream 5's head has none after it.
+    CHECK(server.events.take().empty());
+}
+
+TEST_CASE("PRIORITY_UPDATE for a stream after this side's GOAWAY is ignored, not counted",
+          "[http][http2][session][priority][goaway]")
+{
+    http2::session_config config;
+    config.glitches = {.burst = 0, .rate = 0};
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start().headers(1, request(), http2::flags::end_headers);
+    server.deliver(r.bytes);
+    server.s.goaway(1, http2::error_code::no_error);
+    server.events.take();
+
+    raw more;
+    more.frame(http2::frame_type::priority_update, 0, 0, priority_update(3, "u=1"))
+        .headers(3, request(), end_both)
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(3, "u=2"))
+        .frame(http2::frame_type::priority_update, 0, 0, priority_update(1, "u=5"));
+    server.deliver(more.bytes);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take() == std::vector<std::string>{"priority 1 u=5"});
 }

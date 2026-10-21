@@ -16,8 +16,9 @@ rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)"); its 
 (its storage, the encoder's table and `hpack::indexing`, with the sessions still on `none`), done (2026-10-20); and its
 seventh, HPACK's indexing on in both sides' sessions (`indexing::automatic`, the encoder held to 4096 by
 `session_config::encoder_table_size`), done (2026-10-21); and its eighth, Structured Fields and `http::priority`
-(`http/structured_fields.hpp`, `http/priority.hpp`, `fuzz_structured_fields`; nothing uses them yet), done
-(2026-10-21).
+(`http/structured_fields.hpp`, `http/priority.hpp`, `fuzz_structured_fields`), done (2026-10-21); and its ninth,
+priority signals (PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES in the session, each server stream's priority,
+`server_config::http2_priorities`; recorded, not yet acted on), done (2026-10-21).
 
 ## Goal
 
@@ -982,6 +983,126 @@ idle stream would be a connection error for the peer.
   for the response's, section 8's merging; over the default again for a PRIORITY_UPDATE, which carries a complete
   set), and `join_lines()` for the lines; nothing else.
 
+### Part 9: priority signals (done 2026-10-21)
+
+- The session (`http2.hpp`, `http2_session.hpp`): `frame_type::priority_update` (0x10) and
+  `settings::no_rfc7540_priorities` (`setting_id` 0x9 was there; `encode_settings()` writes it when it differs, after
+  MAX_HEADER_LIST_SIZE, by id). Both sides' sessions send it as 1 in their first SETTINGS, set in the constructor as
+  ENABLE_PUSH's 0 is, so the server's and the client's connections send it without a change of their own (and
+  `server_config::http2_priorities = false` still sends it: what it says is that RFC 7540's signals are ignored, which
+  they are either way, as Go's server sends it with either scheduler). `settings` stays 24 bytes (libc++), the bool in
+  the padding after `enable_push`. Received: a value over 1 is PROTOCOL_ERROR, and so is a later SETTINGS whose value
+  differs from what the first said (left out of the first is its initial 0: so a first without it and a later 1 is a
+  change, a later 0 isn't; a later SETTINGS without it changes nothing). Within the first frame, the last value wins, as
+  for any setting. `apply_setting()` takes whether it's the first frame's. RFC 9218 only says a change MAY be an error;
+  Go checks only the value (and only its server), so this is stricter than Go, as the plan said. Both roles are checked
+  alike.
+- PRIORITY_UPDATE (`session::on_priority_update()`), in the order the RFC's errors come: a client's session takes any
+  as PROTOCOL_ERROR; a server's, one on a stream other than 0 is PROTOCOL_ERROR, one under 4 bytes FRAME_SIZE_ERROR, a
+  prioritized id of 0, or an even one (a push stream: this side never pushes, so it's idle for good), PROTOCOL_ERROR.
+  Frames past MAX_FRAME_SIZE and one inside a header block are connection errors before it's looked at, as any frame's.
+  Then by the stream's state: after this side's GOAWAY, one for a stream past its last that isn't open is ignored
+  without counting (as the frames of streams the peer may not know are refused, Learned in stage 2); a closed stream's
+  is ignored and counted as a glitch (Decided question 22), whatever its value; then the value, which must parse as a
+  Dictionary (`sf::parse_dictionary()` with a callback that does nothing, then `parse_priority()`: parsed twice, as
+  `parse_priority()` doesn't say whether it parsed, only for this frame, rather than a new internal function), else
+  it's ignored and counted. A parsed one is `parse_priority(value)` over the default: a complete set (RFC 9218, section
+  7.1), so "i" alone is u=3 incremental, and "" is u=3. For an open stream (one the application knows, as every open
+  stream of a server's does) it's `session_events::on_priority_update(stream, priority)`, a new pure virtual (the
+  client's connection's is a no-op, as its session never calls it; the tests' recorders log it). For an idle one it's
+  kept, the latest per stream, in `idle_priorities` (a vector of stream id and priority, 8 bytes each), searched
+  through: the RFC's bound, the open streams (`open_peer_streams`) plus those kept, is at most MAX_CONCURRENT_STREAMS,
+  PROTOCOL_ERROR past it (a replacement doesn't count); and, should MAX_CONCURRENT_STREAMS be larger (or unlimited, as a
+  `session_config` may say), at most 128 (`max_idle_priorities`), past which they're ignored as glitches, so neither the
+  memory nor the search grows with a client that sends them for ever higher ids. Each kept one is past
+  `highest_peer_stream`: `end_header_block()` takes the block's stream's, if any, right after `stream_for_block()`,
+  whatever becomes of the block (`take_idle_priority()`, which also drops those of lower ids, closed now that a higher
+  stream has opened), so a refused or malformed head drops it too; and it's reported right after the head's
+  `on_headers()`, so the connection, having made the stream from the head (and its field), replaces that with the
+  update: the most recent signal, as the RFC has it. The check costs a request nothing when none are kept (`empty()`
+  first).
+- The server (`http2_server.cpp`): each `http2_stream` has `priority` (2 bytes) and `prioritized` (1), guarded by the
+  connection's lock, in what was padding (between `expects_continue` and the `body` pointer), so the stream's no larger.
+  `start_stream()` notes, as it adds each regular field to the request, whether it's `priority` or an intermediary's
+  (`via`, `forwarded`, `x-forwarded-for`): `priority_signal_of(name)`, a switch on the name's length, comparing only
+  names of 3, 8, 9 or 15 characters, so a request without them costs a switch a field; then, before anything that may
+  refuse the request (a 501, a 400, a 417, whose fields still tell of the client, as Go's `processHeaders` reads them
+  before its handler could refuse), `request_priority(req, signals)`: with `http2_priorities` off, u=3 incremental; a
+  request with one of the intermediary's fields makes the connection `behind_intermediary` (sticky), whose requests are
+  then u=3 incremental, their fields ignored; else one with `priority` makes the connection `priority_aware` (sticky:
+  the field present, even malformed, as Go's), and is `parse_priority(sf::join_lines(lines, priority_lines))` over RFC
+  9218's default (the field's lines from `get_all()`, joined into the connection's `priority_lines` only when there are
+  several); and one without is u=3, incremental unless the connection is aware. `on_priority_update()` (the session's
+  event) replaces the stream's priority, and makes the connection aware. `http2_send_head()` merges the final
+  response's `priority` field over the stream's (`parse_priority(value, stream.priority)`, section 8: the response's
+  parameters replace the client's, the others kept), if the stream's prioritized, and not for 1xx (whose headers the
+  final response sends again anyway); a field of several lines is joined in a local string, as that's rare. With
+  `http2_priorities` off, `prioritized` is false and the session's PRIORITY_UPDATEs are still checked (its errors are
+  the protocol's) but the connection ignores them, so every stream stays u=3 incremental, as the plan says.
+- Departures from Go (Decided question 19 is Go's rule, and these are where following the plan's wording differs from
+  Go's code, `processHeaders` and `rfc9218Priority` in `src/net/http/internal/http2`, Go 1.27.1, read for this part):
+  Go parses the field of the request that first shows an intermediary (over u=3 incremental) and ignores only later
+  ones; here that request's is ignored too, as "request fields ignored" says. Go takes a request's last `priority`
+  line; here the lines are joined (RFC 9651's rule, part 8). Go makes the connection aware on any PRIORITY_UPDATE, even
+  one it then refuses as a stream error, or one for a closed stream; here only one the session reports does, and one
+  kept for an idle stream only once that stream's head arrives (so a request in between, without a field, is still
+  u=3 incremental). And Go resets the stream for a PRIORITY_UPDATE that doesn't parse; here it's ignored (Decided
+  question 22).
+- `server_config::http2_priorities` (public, on) came with this part rather than with part 10, as what it turns off
+  is recorded here: `http2_options::priorities` carries it to the connection. Nothing schedules by priorities yet, so
+  there's no public way to see a stream's: `detail::stream_priority(const server_request&)` (`http/http2_server.hpp`,
+  internal, for tests) finds the request's stream through its body (a `stream_reader`, whose new `owner()` is the
+  stream) and reads its priority under the lock; it's nullopt over HTTP/1.1. Part 10's scheduler will read
+  `http2_stream::priority` directly.
+- Tests. On bytes (`test/http/http2.cpp`, `[http][http2][session][priority]`): both sides' first SETTINGS have 9=1, and
+  each records the other's; NO_RFC7540_PRIORITIES of 0, 1, 2 and 2^32-1, then 1 again, left out, 0 after 1, 0 and 1
+  after it was left out, 0 then 1 in the first frame, and 1 then 0 in a later one, as a server and as a client; each of
+  PRIORITY_UPDATE's connection errors (on a stream, short, stream 0, an even stream, inside a header block) with its
+  GOAWAY; a client receiving one; reports for open streams, complete sets ("u=5, i", "i", "u=0, x=?1;y, i=?0", "", and
+  "u=9, i=1, u=6": the last u, and i=1 an Integer, ignored), a half-closed stream's too; kept ones reported after their
+  heads (the latest of two, over the request's field), a stream between without one; one dropped with a malformed head,
+  and one with a refused head (RST_STREAMs checked); the bound by MAX_CONCURRENT_STREAMS (two kept, a third an error;
+  or a higher stream opening, dropping them, then one kept and one an error); the 128 with MAX_CONCURRENT_STREAMS
+  unlimited (the 129th a glitch, the next past the budget); a closed stream's, an open one's that doesn't parse, and an
+  idle one's that doesn't parse, each a glitch (one allowed, every pair of them failing the connection, and none
+  reported nor kept); and one after GOAWAY ignored and not counted (no glitches allowed), an open stream's still
+  reported. Over a socket (`test/http/server_priority.cpp`, `[http][http2][server][priority]`, `test::h2_client`, which
+  gained `priority_update(id, value)`: the session's output, then the frame, written at once), a handler reporting its
+  stream's priority as it starts, after waiting at a gate (for an update sent meanwhile), and once its head is sent:
+  the defaults before and after the client's first field, a field's parameters over the default, two lines joined, a
+  malformed field ignored but still a signal; each intermediary field ignoring that request's field and the
+  connection's later ones, but not its PRIORITY_UPDATE nor the response's field; an update before the head as the first
+  signal (then a request without a field is u=3), an update before a head that has a field (the update wins), one while
+  the handler waits, and one for a stream that's ended (ignored, the connection going on); the response's field merged
+  (u replaced and i kept, i replaced and u kept, invalid members ignored, a malformed field ignored, over the
+  unprioritized default) and sent to the client; `http2_priorities = false` (field, response field and update all
+  ignored, the connection going on); and an HTTP/1.1 request, with no stream priority. Each server rule was checked to
+  fail a test when broken (the update not making the connection aware failed the update test once its first request had
+  no field: with one, the field made it aware anyway, so the test was changed to start without one; and kept updates
+  not dropped as higher streams open failed the bound test).
+- `fuzz_http2`: op 7's bits 3-4 choose among four frames random bytes rarely make: the SETTINGS changing
+  HEADER_TABLE_SIZE (part 7's, now 0), SETTINGS with NO_RFC7540_PRIORITIES of the next byte, a PRIORITY_UPDATE (for a
+  stream the application knows, an idle one, an even one or 0; with "u=1", "u=6, i", "u=" or bytes from the script), and
+  a malformed one (on a stream, or short); its recorder logs `on_priority_update`, and the property (the same at once or
+  a byte at a time, and the blocks decoding) is unchanged. The scripts' prefix SETTINGS now have NO_RFC7540_PRIORITIES =
+  1, as a real peer's do (with an empty one, any 1 later would be a change). Seeded by hand with each kind (the events
+  of each seed checked once, by a temporary print: a kept update reported after its head, an open stream's, the setting
+  and the errors), 360 s (118,000 runs) and then 600 s with `-len_control=0` (113,000 runs, scripts up to 512 bytes)
+  found nothing; the 10 s ctest run passes. (No deliberate break was tried for this part: the property is the same as
+  before, and what's new reaches it through the events the recorder logs.)
+- Measured (`bench_request`, Release, five alternating runs of master's binary and the branch's; its HTTP/2 requests
+  have no `priority` field, as most clients' don't). Over HTTP/2, a stream at a time: 79.3 to 82.2 us a request before,
+  79.8 to 86.2 after (medians 81.3 and 82.1: within the spread, which one run's 86.2 widens), and 51.8 to 52.0
+  allocations a request both (nothing allocates for a request without the field: the signals are noted as its fields
+  are added, and the response's `get_all("priority")` is a look through its few fields). Bytes: the first request's 106
+  up and 135 down became 112 and 141, the SETTINGS_NO_RFC7540_PRIORITIES each side now sends (6 bytes), and from the
+  second on 21 and 49, unchanged. HTTP/1.1, untouched: pipelined 1137 to 1153 ns before, 1145 to 1173 after (part 7
+  saw 1128 to 1178 on one binary), over a socket 27.6 to 29.8 us before, 27.7 to 29.1 after.
+- For part 10: the scheduler reads `http2_stream::priority` (under the lock, as everything it touches); a change of it
+  (an update, or the response's field, which `http2_send_head()` merges before the head's submitted) is where a stream
+  would move between levels (`update(stream, priority)` in the plan). The default for clients that never signal is
+  incremental, so with the scheduler they share the connection round-robin, as now.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -1535,11 +1656,13 @@ throughput isn't changed (by frame count and order).
    8. **Structured Fields and `http::priority`.** Done (2026-10-21; see Learned in stage 5). RFC 9651's Dictionary
       parsing, `parse_priority()`, `to_string()`, `fuzz_structured_fields`. Without I/O, and nothing uses it yet: split
       out so the parser is reviewed (and fuzzed) on its own.
-   9. **Priority signals.** The session's PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES, `on_priority_update`, and
-      each server stream's priority (the request's field, updates, the response's field), recorded but not yet acted
-      on; tests on bytes. Split from 10 as the protocol's rules are tested on bytes, apart from the writer.
-   10. **Scheduling by priority.** The scheduler, the connection's contended path, `server_config::http2_priorities`;
-      tests over a socket, and `bench_request` with streams that contend. Last: it changes the writer every HTTP/2
+   9. **Priority signals.** Done (2026-10-21; see Learned in stage 5). The session's PRIORITY_UPDATE and
+      SETTINGS_NO_RFC7540_PRIORITIES, `on_priority_update`, and each server stream's priority (the request's field,
+      updates, the response's field), recorded but not yet acted on; tests on bytes. Split from 10 as the protocol's
+      rules are tested on bytes, apart from the writer. (`server_config::http2_priorities` came with it, rather than
+      with 10: what it turns off is recorded here.)
+   10. **Scheduling by priority.** The scheduler, the connection's contended path; tests over a socket, and
+      `bench_request` with streams that contend. Last: it changes the writer every HTTP/2
       response goes through, so it comes once the rest is in, and alone.
 
    Trailers come before HPACK and priorities as they're what a user needs (gRPC); HPACK's two parts, internal, before

@@ -17,6 +17,7 @@
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
 #include "http/http2_config.hpp"
+#include "http/priority.hpp"
 
 // HTTP/2's protocol, without I/O: a session is fed what's read from the connection (receive()), told what the
 // application sends (submit_headers(), submit_data(), ...), and gives what's to be written (take_output()). It's
@@ -74,6 +75,12 @@ public:
     virtual void on_goaway(stream_id last_stream, std::error_code err, std::string_view debug) = 0;
 
     virtual void on_ping_ack(std::span<const std::byte, 8> opaque) = 0;
+
+    // on_priority_update is a PRIORITY_UPDATE (RFC 9218, section 7.1) for one of the client's streams the application
+    // knows (a server's only: a client's session takes one as a connection error): the stream's new priority, a
+    // complete set (what the frame leaves out is the default). One that came before the stream opened is reported
+    // just after its head, so it overrides the request's Priority field.
+    virtual void on_priority_update(stream_id stream, priority p) = 0;
 };
 
 // session_config's default max_header_list_size is HPACK's (see http2_config.hpp, which doesn't include hpack.hpp).
@@ -205,6 +212,15 @@ private:
                                      std::span<const std::byte>            payload,
                                      session_events&                       events,
                                      std::chrono::steady_clock::time_point now);
+    std::error_code on_priority_update(const frame_header&                   h,
+                                       std::span<const std::byte>            payload,
+                                       session_events&                       events,
+                                       std::chrono::steady_clock::time_point now);
+
+    // take_idle_priority takes the PRIORITY_UPDATE kept for a stream that was idle, once a header block on it has
+    // arrived (whatever becomes of the block), and drops those of streams that can no longer open (lower ids than the
+    // highest the peer has opened, which are closed).
+    std::optional<priority> take_idle_priority(stream_id stream);
 
     // end_header_block decodes a complete header block, and reports it (or resets its stream, if it's malformed).
     // decode_block decodes it into block_fields; stream_for_block finds its stream, or opens a peer's, returning
@@ -215,8 +231,8 @@ private:
     std::expected<stream_state*, std::error_code> stream_for_block(stream_id                             id,
                                                                    std::chrono::steady_clock::time_point now);
 
-    // apply_setting applies one of the peer's settings.
-    std::error_code apply_setting(std::uint16_t id, std::uint32_t value);
+    // apply_setting applies one of the peer's settings, from its first SETTINGS frame or a later one.
+    std::error_code apply_setting(std::uint16_t id, std::uint32_t value, bool first);
 
     // validated is what validate() found in a header block.
     struct validated
@@ -295,6 +311,11 @@ private:
 
     // streams this side has reset recently, whose frames in flight are ignored (RFC 9113, section 5.1).
     std::deque<stream_id> recently_reset;
+
+    // the latest PRIORITY_UPDATE for each of the client's streams that are still idle (a server's): reported after the
+    // stream's head (see take_idle_priority()). Each is past highest_peer_stream; at most max_concurrent_streams with
+    // the open streams (RFC 9218, section 7.1), so a few, and looked through.
+    std::vector<std::pair<stream_id, priority>> idle_priorities;
 
     std::int64_t  connection_send_window = 65'535;
     std::int64_t  connection_recv_window = 65'535;

@@ -64,6 +64,9 @@ enum class frame_type : std::uint8_t
     goaway        = 0x7,
     window_update = 0x8,
     continuation  = 0x9,
+
+    // RFC 9218's (section 7.1): a client's new priority for a stream, on stream 0.
+    priority_update = 0x10,
 };
 
 // Frames' flags (each meaningful only on some types).

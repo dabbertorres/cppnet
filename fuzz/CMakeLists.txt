@@ -27,9 +27,14 @@ add_fuzzer(fuzz_url url.cpp "${PROJECT_SOURCE_DIR}/src/url.cpp")
 add_fuzzer(fuzz_base64 base64.cpp "${PROJECT_SOURCE_DIR}/src/encoding/base64.cpp")
 add_fuzzer(fuzz_hpack hpack.cpp "${PROJECT_SOURCE_DIR}/src/http/hpack.cpp")
 add_fuzzer(
-  fuzz_http2 http2.cpp "${PROJECT_SOURCE_DIR}/src/http/headers.cpp"
-  "${PROJECT_SOURCE_DIR}/src/http/hpack.cpp" "${PROJECT_SOURCE_DIR}/src/http/http2.cpp"
+  fuzz_http2
+  http2.cpp
+  "${PROJECT_SOURCE_DIR}/src/http/headers.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/hpack.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/http2.cpp"
   "${PROJECT_SOURCE_DIR}/src/http/http2_session.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/priority.cpp"
+  "${PROJECT_SOURCE_DIR}/src/http/structured_fields.cpp"
 )
 add_fuzzer(
   fuzz_structured_fields structured_fields.cpp "${PROJECT_SOURCE_DIR}/src/http/priority.cpp"

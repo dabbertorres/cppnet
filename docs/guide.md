@@ -717,9 +717,14 @@ scheduler.spawn(server.serve());
   resp.headers().set("Priority", net::http::to_string({.urgency = 7}));   // "u=7"
   ```
 
-  The server doesn't act on priorities yet: a later version sends HTTP/2 responses by them (the client's field, and
-  the handler's). A field sent as several lines is one value, its lines joined with commas: `req.headers.get()` gives
-  only the first.
+  The HTTP/2 server records each response's priority (unless `server_config::http2_priorities` is off): the request's
+  field, or the client's `PRIORITY_UPDATE` frames (which replace it, even one sent before the request), then the
+  response's field, merged over it when its head is sent (what it leaves out keeps the client's). A client that has
+  never sent a priority gets its responses shared alike (as `u=3, i`), rather than one at a time; so does one sending
+  `Via`, `Forwarded` or `X-Forwarded-For` (an intermediary, whose `Priority` fields are its clients', so ignored). It
+  doesn't act on them yet: a later version sends HTTP/2 responses by them. A client sets a request's priority with the
+  same field (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other signal. A field
+  sent as several lines is one value, its lines joined with commas: `req.headers.get()` gives only the first.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <expected>
@@ -34,10 +35,12 @@
 #include "http/http2.hpp"
 #include "http/http2_connection.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "http/structured_fields.hpp"
 #include "io/discard_writer.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -81,6 +84,29 @@ namespace
         return formatted;
     }
 
+    // The request's fields that bear on its priority (docs/plans/http2.md, Decided question 19 of stage 5), as bits:
+    // Priority (the client signals priorities), and Via, Forwarded or X-Forwarded-For (the client is an intermediary).
+    constexpr std::uint8_t priority_field = 1;
+    constexpr std::uint8_t via_proxy      = 2;
+
+    // priority_signal_of is which of those a field's name (lowercase, as HTTP/2's are) is, if any: by its length
+    // first, so a request without them costs a switch a field.
+    std::uint8_t priority_signal_of(std::string_view name) noexcept
+    {
+        switch (name.size())
+        {
+        case 3: return name == "via"sv ? via_proxy : 0;
+        case 8: return name == "priority"sv ? priority_field : 0;
+        case 9: return name == "forwarded"sv ? via_proxy : 0;
+        case 15: return name == "x-forwarded-for"sv ? via_proxy : 0;
+        default: return 0;
+        }
+    }
+
+    // unprioritized is a stream's priority when the client hasn't said: RFC 9218's urgency, but incremental, so that
+    // such streams share the connection (round-robin, as they did before priorities) rather than go one at a time.
+    constexpr priority unprioritized{.urgency = 3, .incremental = true};
+
 }
 
 // http2_stream is a request a connection serves: the request, the response its handler makes, and its stream.
@@ -96,6 +122,13 @@ public:
 
     // the request expects 100 Continue before its client sends the body, which is to come (see run_stream()).
     bool expects_continue = false;
+
+    // The response's priority (RFC 9218): the request's Priority field's, or the connection's default (see
+    // request_priority()), then each PRIORITY_UPDATE's, then merged with the response's Priority field once its final
+    // head is sent, if prioritized (server_config::http2_priorities). Guarded by the connection's lock. Nothing acts
+    // on it yet (docs/plans/http2.md, stage 5's tenth part: the scheduler).
+    http::priority priority    = unprioritized;
+    bool           prioritized = false;
 
     // req.body, as start_stream() made it.
     stream_reader* body = nullptr;
@@ -136,6 +169,7 @@ namespace
                         bool                          end_stream) override;
         void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
         void on_ping_ack(std::span<const std::byte, 8> opaque) override;
+        void on_priority_update(http2::stream_id id, priority p) override;
 
         void                                 after_receive() override;
         coro::task<>                         finish_streams() override;
@@ -150,6 +184,10 @@ namespace
 
         // refuse answers a request with just a status, ending the stream.
         void refuse(http2::stream_id id, status code, bool request_ended);
+
+        // request_priority is a request's priority, from its fields (holding the lock): signals is what
+        // priority_signal_of() found in them.
+        priority request_priority(const server_request& req, std::uint8_t signals);
 
         // schedule starts a stream's handler, or queues it if max_concurrent_streams handlers are running (holding
         // the lock), or ends the connection if too many are queued (removing the stream); promote starts queued
@@ -192,9 +230,21 @@ namespace
         bool                                                                final_sent   = false; // the final GOAWAY
         bool                                                                peer_goaway  = false;
         bool                                                                aborted      = false; // stop_handlers()
-        std::optional<io::clock::time_point>                                drain_deadline;
-        std::optional<io::clock::time_point>                                idle_since;
-        io::clock::time_point                                               started_at = io::clock::now();
+
+        // What the client has shown of priorities (Decided question 19 of stage 5, Go's): whether it's signalled one
+        // (a request's Priority field, or a PRIORITY_UPDATE), so a request without one is RFC 9218's default (u=3,
+        // not incremental) rather than unprioritized; and whether it's an intermediary (a request with Via, Forwarded
+        // or X-Forwarded-For), whose requests' Priority fields are ignored (they're its clients', which shouldn't
+        // order each other's: RFC 9218, section 13.1), though its PRIORITY_UPDATEs aren't. Both stick.
+        bool priority_aware      = false;
+        bool behind_intermediary = false;
+
+        // for joining a request's Priority field's lines, when there are several (sf::join_lines()).
+        std::string priority_lines;
+
+        std::optional<io::clock::time_point> drain_deadline;
+        std::optional<io::clock::time_point> idle_since;
+        io::clock::time_point                started_at = io::clock::now();
 
         coro::async_scope handlers; // the streams' handlers
     };
@@ -207,6 +257,19 @@ namespace
             std::scoped_lock lock{c.mu};
             if (stream.failure)
                 return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(stream.failure));
+
+            // the final response's Priority field is merged into the stream's: its parameters replace the request's,
+            // and those it doesn't have are left as they were (RFC 9218, section 8, as nghttpx and h2o do: Decided
+            // question 23 of stage 5). A field of several lines is joined in a string of its own, as that's rare.
+            if (stream.prioritized && !status_is_information(resp.status_code))
+            {
+                if (const auto lines = resp.headers.get_all("priority"sv))
+                {
+                    std::string joined;
+                    stream.priority =
+                        parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined), stream.priority);
+                }
+            }
 
             // a response to HEAD has no body (nor trailers), whatever its head says; one without a body is followed
             // by its trailers, if it has any (or declares them), which end the stream instead.
@@ -267,6 +330,17 @@ namespace
 }
 
 const http2_stream_ops http2_ops{.send_head = http2_send_head, .finish = http2_finish};
+
+std::optional<priority> stream_priority(const server_request& req)
+{
+    const auto* body = dynamic_cast<const stream_reader*>(req.body.get());
+    if (body == nullptr) return std::nullopt;
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): a server_request's body is a server's stream's.
+    auto&            stream = static_cast<http2_stream&>(*body->owner());
+    std::scoped_lock lock{stream.conn->mu};
+    return stream.priority;
+}
 
 namespace
 {
@@ -447,6 +521,7 @@ namespace
         std::string_view path;
         std::string_view authority;
         std::string      cookie;
+        std::uint8_t     signals = 0;
 
         for (const auto& f : fields)
         {
@@ -461,6 +536,7 @@ namespace
             if (f.name != "cookie")
             {
                 req.headers.add(f.name, f.value);
+                signals |= priority_signal_of(f.name);
                 continue;
             }
 
@@ -469,6 +545,10 @@ namespace
             cookie += f.value;
         }
         if (!cookie.empty()) req.headers.set("cookie"sv, std::move(cookie));
+
+        // (before the request may be refused below: what its fields show of the client counts all the same.)
+        stream->priority    = request_priority(req, signals);
+        stream->prioritized = options.priorities;
 
         req.method = parse_method(method);
         if (req.method == request_method::NONE)
@@ -535,6 +615,32 @@ namespace
         resp.headers.set("Date"sv, current_date());
 
         return stream;
+    }
+
+    priority http2_server_connection::request_priority(const server_request& req, std::uint8_t signals)
+    {
+        if (!options.priorities) return unprioritized;
+
+        if ((signals & via_proxy) != 0) behind_intermediary = true;
+        if (behind_intermediary) return unprioritized;
+
+        // RFC 9218's default (u=3, not incremental) once the client has shown it knows priorities: with this request's
+        // field too, whose missing parameters are then the default's.
+        const auto lines = (signals & priority_field) != 0 ? req.headers.get_all("priority"sv) : std::nullopt;
+        if (!lines.has_value()) return {.urgency = 3, .incremental = !priority_aware};
+
+        priority_aware = true;
+        return parse_priority(sf::join_lines({lines->begin(), lines->end()}, priority_lines));
+    }
+
+    void http2_server_connection::on_priority_update(http2::stream_id id, priority p)
+    {
+        if (!options.priorities) return;
+
+        // (the session reports it only for a stream whose head it has, and the stream may have been answered without
+        // a handler, e.g. a 501.)
+        priority_aware = true;
+        if (const auto it = streams.find(id); it != streams.end()) it->second->priority = p;
     }
 
     void http2_server_connection::refuse(http2::stream_id id, status code, bool request_ended)

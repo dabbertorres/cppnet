@@ -17,11 +17,13 @@ inline constexpr std::uint32_t unlimited = std::numeric_limits<std::uint32_t>::m
 inline constexpr std::uint32_t min_max_frame_size = 16'384;
 inline constexpr std::uint32_t max_max_frame_size = 16'777'215;
 
-// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2).
+// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2; and RFC 9218's
+// NO_RFC7540_PRIORITIES, section 2.1, 0 until it's sent).
 struct settings
 {
     std::uint32_t header_table_size      = 4'096;
     bool          enable_push            = true;
+    bool          no_rfc7540_priorities  = false;
     std::uint32_t max_concurrent_streams = unlimited;
     std::uint32_t initial_window_size    = 65'535;
     std::uint32_t max_frame_size         = min_max_frame_size;
@@ -45,7 +47,9 @@ struct token_bucket
 // session_config configures a session: what it advertises, and the limits that defend it.
 struct session_config
 {
-    // This side's settings, sent first. ENABLE_PUSH is always sent as 0 (this side never pushes, nor accepts pushes).
+    // This side's settings, sent first. ENABLE_PUSH is always sent as 0 (this side never pushes, nor accepts pushes),
+    // and NO_RFC7540_PRIORITIES as 1 (this side sends none of RFC 7540's priority signals, and a server ignores them:
+    // RFC 9218, section 2.1).
     // initial_window_size must be at least its default (65535), as the peer may send that much before it has seen it.
     // max_header_list_size is HPACK's default list size (hpack::default_max_list_size, which http2_session.hpp checks).
     settings local{
@@ -101,6 +105,11 @@ struct http2_options
     std::chrono::seconds write_timeout{};
 
     http2::session_config session{};
+
+    // Whether each stream's priority (RFC 9218) is taken from what the client signals (the request's Priority field,
+    // and PRIORITY_UPDATE frames) and the handler's response (its Priority field): server_config::http2_priorities.
+    // Off, every stream is u=3, incremental.
+    bool priorities = true;
 };
 
 // http2_client_options are what a client's HTTP/2 connections are made with: client_options'.

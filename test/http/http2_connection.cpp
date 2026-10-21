@@ -27,6 +27,7 @@
 #include "http/http2.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "listen.hpp"
@@ -61,6 +62,7 @@ protected:
     {}
     void on_goaway(http2::stream_id /*last*/, std::error_code /*err*/, std::string_view /*debug*/) override {}
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override {}
+    void on_priority_update(http2::stream_id /*id*/, net::http::priority /*p*/) override {}
 
     std::optional<net::io::clock::time_point> check_connection(net::io::clock::time_point /*now*/) override
     {

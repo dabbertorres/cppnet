@@ -16,13 +16,20 @@
 // - 5: consume (the next byte chooses a stream; the one after, how much, in 256s).
 // - 6: PING, or GOAWAY (the next byte: bit 0 which, 1 whether the last stream is the peer's last or the most, 4-7 the
 //      code).
-// - 7: receive a SETTINGS frame changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the
-//      session's encoder to follow (frames that say so are rare among random bytes).
+// - 7: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
+//      - 0: SETTINGS changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the session's
+//        encoder to follow;
+//      - 1: SETTINGS with NO_RFC7540_PRIORITIES of the next byte (0, 1, or a value that's invalid);
+//      - 2: PRIORITY_UPDATE (the next byte: bits 0-3 choose a stream, 4-5 how: one the application knows, an idle one
+//        (that many past the peer's highest), an even one, or 0; 6-7 its value: "u=1", "u=6, i", one that doesn't
+//        parse, or the next n bytes, n being the byte after);
+//      - 3: a malformed PRIORITY_UPDATE: on stream 1 (the next byte's bit 0), or shorter than its stream id (bits 1-2:
+//        its length).
 // A stream is chosen from those the application knows (a server's requests, a client's own), in order.
 //
-// The server's script follows the client's preface and empty SETTINGS, and the client's the server's empty SETTINGS,
-// so that the fuzzer starts past them. The client opens streams before it receives: a GET (1), a POST with a
-// Content-Length of 3 and no body yet (3), and a HEAD (5).
+// The server's script follows the client's preface and SETTINGS, and the client's the server's SETTINGS, each with
+// only NO_RFC7540_PRIORITIES (1, as both sides send it), so that the fuzzer starts past them. The client opens streams
+// before it receives: a GET (1), a POST with a Content-Length of 3 and no body yet (3), and a HEAD (5).
 #include "http/http2.hpp"
 
 #include <algorithm>
@@ -47,6 +54,7 @@
 #include "http/hpack.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 
 namespace
 {
@@ -98,6 +106,11 @@ struct recorder final : http2::session_events
     }
 
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override { log += "ping ack\n"; }
+
+    void on_priority_update(http2::stream_id stream, net::http::priority p) override
+    {
+        log += std::format("priority {} {} {}\n", stream, p.urgency, p.incremental);
+    }
 };
 
 // outcome is what a session made of a script.
@@ -317,9 +330,93 @@ private:
                                        : std::format("submit data {} error {}\n", id, sent.error().value());
     }
 
+    // rare_frame receives one of the frames random bytes rarely make (op 7's).
+    void rare_frame(std::uint8_t which, script& sc)
+    {
+        std::vector<std::byte> frame;
+        switch (which & 3U)
+        {
+        case 0:
+        {
+            const auto size = sc.next();
+            http2::encode_settings({.header_table_size = size == 255 ? 65'536U : 64U * size}, {}, frame);
+            break;
+        }
+
+        case 1:
+        {
+            const std::array<std::byte, 6> setting{std::byte{0},
+                                                   std::byte{9},
+                                                   std::byte{0},
+                                                   std::byte{0},
+                                                   std::byte{0},
+                                                   std::byte{sc.next()}};
+            http2::encode_frame_header(
+                {.length = 6, .type = static_cast<std::uint8_t>(http2::frame_type::settings), .stream = 0},
+                frame);
+            frame.insert(frame.end(), setting.begin(), setting.end());
+            break;
+        }
+
+        case 2:
+        {
+            const auto       arg      = sc.next();
+            const auto       selector = arg & 0xfU;
+            http2::stream_id id       = 0;
+            switch ((arg >> 4U) & 3U)
+            {
+            case 0: id = stream(selector); break;
+            case 1: id = (s.last_peer_stream() == 0 ? 1U : s.last_peer_stream() + 2U) + (2U * selector); break;
+            case 2: id = 2U * (selector + 1U); break;
+            default: break;
+            }
+
+            constexpr std::array<std::string_view, 3> values{"u=1", "u=6, i", "u="};
+            std::string_view                          value;
+            std::span<const std::byte>                raw;
+            if (const auto v = (arg >> 6U) & 3U; v < values.size()) value = values.at(v);
+            else raw = sc.take(sc.next());
+
+            const auto length = static_cast<std::uint32_t>(4 + value.size() + raw.size());
+            http2::encode_frame_header(
+                {.length = length, .type = static_cast<std::uint8_t>(http2::frame_type::priority_update), .stream = 0},
+                frame);
+            for (int shift = 24; shift >= 0; shift -= 8) frame.push_back(static_cast<std::byte>(id >> shift));
+            const auto bytes = std::as_bytes(std::span{value});
+            frame.insert(frame.end(), bytes.begin(), bytes.end());
+            frame.insert(frame.end(), raw.begin(), raw.end());
+            break;
+        }
+
+        default:
+        {
+            const auto arg       = sc.next();
+            const bool on_stream = (arg & 1U) != 0;
+            const auto length    = on_stream ? 7U : (arg >> 1U) & 3U;
+            const auto stream_id = on_stream ? 1U : 0U;
+            http2::encode_frame_header({.length = length,
+                                        .type   = static_cast<std::uint8_t>(http2::frame_type::priority_update),
+                                        .stream = stream_id},
+                                       frame);
+            frame.insert(frame.end(),
+                         {std::byte{0},
+                          std::byte{0},
+                          std::byte{0},
+                          std::byte{1},
+                          std::byte{'u'},
+                          std::byte{'='},
+                          std::byte{'1'}});
+            frame.resize(http2::frame_header_size + length);
+            break;
+        }
+        }
+        receive(frame);
+    }
+
     void step(script& sc)
     {
-        switch (sc.next() & 7U)
+        const auto op = sc.next();
+        switch (op & 7U)
         {
         case 0: receive(sc.take(sc.next())); break;
 
@@ -363,14 +460,7 @@ private:
             break;
         }
 
-        case 7:
-        {
-            const auto             size = sc.next();
-            std::vector<std::byte> frame;
-            http2::encode_settings({.header_table_size = size == 255 ? 65'536U : 64U * size}, {}, frame);
-            receive(frame);
-            break;
-        }
+        case 7: rare_frame(op >> 3U, sc); break;
 
         default: break;
         }
@@ -453,7 +543,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     std::vector<std::byte> prefix;
     const auto             preface = std::as_bytes(std::span{http2::preface});
     prefix.assign(preface.begin(), preface.end());
-    http2::encode_settings({}, {}, prefix);
+    http2::encode_settings({.no_rfc7540_priorities = true}, {}, prefix);
     check(http2::role::server, prefix, input);
 
     // a client, receiving a server's SETTINGS first.

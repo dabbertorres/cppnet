@@ -106,6 +106,9 @@ public:
     // io::start_callback): e.g. the server's 100 Continue. It's awaited without the connection's lock.
     void call_at_start(io::start_callback callback) noexcept { at_start = callback; }
 
+    // owner is the stream it reads (e.g. for the server to find a request's stream from its body).
+    [[nodiscard]] http2_stream_base* owner() const noexcept { return stream; }
+
 private:
     http2_stream_base* stream;
     io::start_callback at_start;
