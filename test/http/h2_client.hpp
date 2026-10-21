@@ -163,6 +163,9 @@ struct h2_client final : http2::session_events
         done(r);
     }
 
+    // (as a server, for the client's tests: cppnet's client never sends a header list over the limit.)
+    void on_header_list_too_large(http2::stream_id /*stream*/, bool /*end_stream*/) override {}
+
     void on_window_update(http2::stream_id /*stream*/) override {}
     void on_settings(const http2::settings& /*peer*/) override {}
     void on_goaway(http2::stream_id last, std::error_code err, std::string_view /*debug*/) override

@@ -767,6 +767,93 @@ TEST_CASE("HTTP/2's header list limit doesn't wrap with max_header_bytes near SI
                                         }));
 }
 
+TEST_CASE("an HTTP/2 request over the header list limit gets 431, with no handler, and the connection goes on",
+          "[http][http2][server][limits]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // /fields answers with its x-long's length and its x-marker, counting the handlers that ran.
+    std::atomic<int> handled{0};
+    http::router     router;
+    router.GET("/fields",
+               [&handled](const http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   ++handled;
+                   const auto msg  = std::format("{} {}",
+                                                 req.headers.get("x-long").value_or("").size(),
+                                                 req.headers.get("x-marker").value_or("(none)"));
+                   auto*      body = co_await resp.send(http::status::OK, msg.size());
+                   co_await net::io::write_all(*body, msg);
+               });
+
+    // a list of at most 1 KiB, and 32 bytes more a field for up to 100 fields: 4,224 bytes.
+    test_server server{&sched, std::move(router), {.max_header_bytes = 1'024}};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [&handled](h2_client& c) -> task<>
+                                        {
+                                            // x-long is 2,038 bytes of a list, so three take it past the limit; but the
+                                            // client's HPACK table indexes the first, so the others are an index each,
+                                            // and the block's small (and its value's Huffman coded).
+                                            const std::string                 value(2'000, 'a');
+                                            const std::array<hpack::field, 4> too_many{
+                                                hpack::field{.name = "x-marker", .value = "hello"},
+                                                hpack::field{  .name = "x-long",   .value = value},
+                                                hpack::field{  .name = "x-long",   .value = value},
+                                                hpack::field{  .name = "x-long",   .value = value},
+                                            };
+
+                                            // one that ends its stream, and one whose body was to follow (it never
+                                            // comes).
+                                            const auto ended    = c.request("GET", "/fields", {}, true, too_many);
+                                            const auto unended  = c.request("POST", "/fields", {}, false, too_many);
+                                            const bool answered = co_await c.pump(
+                                                [&] { return c.responses[ended].done && c.responses[unended].done; });
+                                            REQUIRE(answered);
+
+                                            // by the PING's answer, what the server sent before it (the RST_STREAM
+                                            // after the 431) has arrived.
+                                            const bool synced = co_await c.sync();
+                                            REQUIRE(synced);
+
+                                            for (const auto id : {ended, unended})
+                                            {
+                                                CAPTURE(id);
+                                                const auto& r = c.responses[id];
+                                                CHECK(r.status == "431");
+                                                CHECK(r.head_ended);
+                                                CHECK(r.body.empty());
+
+                                                // just its status and Date.
+                                                REQUIRE(r.headers.size() == 1);
+                                                CHECK(r.headers[0].first == "date");
+                                            }
+                                            CHECK_FALSE(c.responses[ended].reset);
+                                            CHECK(c.responses[unended].reset == http2::error_code::no_error);
+
+                                            // the connection goes on: a request indexing the fields the long blocks
+                                            // added to HPACK's table is answered as they were sent, so the server's
+                                            // table is in step with the client's.
+                                            const std::array<hpack::field, 2> fields{
+                                                hpack::field{  .name = "x-long",   .value = value},
+                                                hpack::field{.name = "x-marker", .value = "hello"},
+                                            };
+                                            const auto id   = c.request("GET", "/fields", {}, true, fields);
+                                            const bool done = co_await c.wait_for(id);
+                                            REQUIRE(done);
+
+                                            const auto& r = c.responses[id];
+                                            CAPTURE(r.reset.message());
+                                            CHECK(r.status == "200");
+                                            CHECK(r.body == "2000 hello");
+                                            CHECK_FALSE(c.goaway);
+
+                                            // no handler ran for the requests over the limit.
+                                            CHECK(handled == 1);
+                                        }));
+}
+
 TEST_CASE("an HTTP/2 response's field with a line break throws, as over HTTP/1.1", "[http][http2][server]")
 {
     net::io::scheduler sched{make_pool()};

@@ -65,6 +65,11 @@ struct recorder final : http2::session_events
         log.push_back(std::move(line));
     }
 
+    void on_header_list_too_large(http2::stream_id stream, bool end) override
+    {
+        log.push_back(std::format("too large {}{}", stream, end ? " end" : ""));
+    }
+
     void on_data(http2::stream_id stream, std::span<const std::byte> data, bool end) override
     {
         log.push_back(std::format("data {} [{}]{}", stream, as_string(data), end ? " end" : ""));
@@ -1198,6 +1203,193 @@ TEST_CASE("a header block may have as many CONTINUATIONs as the largest one this
 
     CHECK_FALSE(server.failure);
     CHECK(server.events.take().back().starts_with("headers 1 head end"));
+}
+
+namespace
+{
+
+// small_list is a session's config whose header lists are limited to 200 bytes (HPACK's sizes: a field's name and
+// value, and 32), and its glitches to burst (so the one after the burst fails the connection).
+http2::session_config small_list(double burst = 10)
+{
+    http2::session_config config;
+    config.local.max_header_list_size = 200;
+    config.glitches                   = {.burst = burst, .rate = 0};
+    return config;
+}
+
+// long_field is a field that takes any list over 200 bytes, though its block (Huffman coded) is under.
+hpack::field long_field()
+{
+    static const std::string value(200, 'a');
+    return {.name = "x-long", .value = value};
+}
+
+std::vector<hpack::field> long_request(std::string_view method = "GET")
+{
+    auto fields = request(method);
+    fields.push_back(long_field());
+    return fields;
+}
+
+}
+
+TEST_CASE("a request's head over the header list limit is reported without its fields, for the server to answer",
+          "[http][http2][session][limits]")
+{
+    endpoint server{http2::role::server, small_list()};
+
+    raw r;
+    r.client_start();
+
+    SECTION("ending the stream: the answer ends it")
+    {
+        r.headers(1, long_request(), end_both);
+        server.deliver(r.bytes);
+
+        CHECK_FALSE(server.failure);
+        CHECK(server.events.take() == std::vector<std::string>{"settings", "too large 1 end"});
+
+        // its stream is open for the answer, which ends it.
+        REQUIRE(server.s.open_streams() == 1);
+        CHECK_FALSE(server.s.submit_headers(1, response("431"), true));
+        CHECK(server.s.open_streams() == 0);
+    }
+
+    SECTION("with a body to follow")
+    {
+        r.headers(1, long_request("POST"), http2::flags::end_headers);
+        server.deliver(r.bytes);
+
+        CHECK_FALSE(server.failure);
+        CHECK(server.events.take() == std::vector<std::string>{"settings", "too large 1"});
+
+        raw body;
+        body.frame(http2::frame_type::data, http2::flags::end_stream, 1, bytes_of("body"));
+
+        SECTION("the body's reported, as the request's")
+        {
+            server.deliver(body.bytes);
+            CHECK(server.events.take() == std::vector<std::string>{"data 1 [body] end"});
+        }
+
+        SECTION("once answered and reset, its DATA is ignored")
+        {
+            REQUIRE_FALSE(server.s.submit_headers(1, response("431"), true));
+            server.s.reset(1, http2::error_code::no_error);
+            server.deliver(body.bytes);
+
+            CHECK_FALSE(server.failure);
+            CHECK(server.events.take().empty());
+
+            std::vector<std::byte> out;
+            server.s.take_output(out);
+            CHECK(frames_of(out, http2::frame_type::rst_stream)
+                  == std::vector<std::string>{std::format("1 {}", static_cast<int>(http2::error_code::no_error))});
+        }
+
+        SECTION("what follows its head is trailers")
+        {
+            const std::vector<hpack::field> trailers{
+                {.name = "checksum", .value = "abc"}
+            };
+            raw more;
+            more.headers(1, trailers, end_both);
+            server.deliver(more.bytes);
+
+            CHECK_FALSE(server.failure);
+            CHECK(server.events.take() == std::vector<std::string>{"headers 1 trailers end checksum=abc"});
+        }
+    }
+
+    // the block was decoded all the same: HPACK's table is in step, and nothing was sent for it.
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::goaway).empty());
+}
+
+TEST_CASE("trailers over the header list limit reset the stream, as before", "[http][http2][session][limits]")
+{
+    connected  c{small_list()};
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, request("POST"), false));
+    const std::vector<hpack::field> trailers{long_field()};
+    REQUIRE_FALSE(c.client.s.submit_headers(id, trailers, true));
+    pump(c.client, c.server);
+
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{"headers 1 head :method=POST :scheme=https :authority=example.com :path=/",
+                                      "reset 1 protocol error"});
+    CHECK(c.client.events.take() == std::vector<std::string>{"reset 1 protocol error"});
+    CHECK_FALSE(c.server.failure);
+}
+
+TEST_CASE("a client resets a response's head over its header list limit, as before", "[http][http2][session][limits]")
+{
+    connected  c{{}, small_list()};
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, request(), true));
+    pump(c.client, c.server);
+    c.server.events.take();
+
+    auto fields = response();
+    fields.push_back(long_field());
+    REQUIRE_FALSE(c.server.s.submit_headers(id, fields, true));
+    pump(c.client, c.server);
+
+    CHECK(c.client.events.take() == std::vector<std::string>{"reset 1 protocol error"});
+    CHECK_FALSE(c.client.failure);
+
+    // (the server's done with the stream, both sides having ended it, so the reset's nothing to it.)
+    CHECK(c.server.events.take().empty());
+}
+
+TEST_CASE("a header list over the limit is a glitch, whatever its block", "[http][http2][session][limits]")
+{
+    // one glitch allowed: the second list over the limit fails the connection.
+    SECTION("requests' heads")
+    {
+        endpoint server{http2::role::server, small_list(1)};
+
+        raw r;
+        r.client_start().headers(1, long_request(), end_both).headers(3, long_request(), end_both);
+        server.deliver(r.bytes);
+
+        CHECK(server.events.take() == std::vector<std::string>{"settings", "too large 1 end"});
+        CHECK(server.failure == http2::error_code::enhance_your_calm);
+    }
+
+    SECTION("trailers")
+    {
+        endpoint server{http2::role::server, small_list(1)};
+
+        const std::vector<hpack::field> trailers{long_field()};
+        raw                             r;
+        r.client_start()
+            .headers(1, request("POST"), http2::flags::end_headers)
+            .headers(1, trailers, end_both)
+            .headers(3, request("POST"), http2::flags::end_headers)
+            .headers(3, trailers, end_both);
+        server.deliver(r.bytes);
+
+        CHECK(server.failure == http2::error_code::enhance_your_calm);
+    }
+
+    SECTION("responses' heads")
+    {
+        connected c{{}, small_list(1)};
+        for (int i = 0; i < 2; ++i)
+            REQUIRE_FALSE(c.client.s.submit_headers(c.client.s.open_stream().value(), request(), true));
+        pump(c.client, c.server);
+
+        auto fields = response();
+        fields.push_back(long_field());
+        REQUIRE_FALSE(c.server.s.submit_headers(1, fields, true));
+        REQUIRE_FALSE(c.server.s.submit_headers(3, fields, true));
+        pump(c.client, c.server);
+
+        CHECK(c.client.failure == http2::error_code::enhance_your_calm);
+    }
 }
 
 TEST_CASE("the session's encoder indexes within the smaller of the peer's table size and its cap, signalling changes",

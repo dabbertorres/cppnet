@@ -654,6 +654,9 @@ void http2_client_connection::on_headers(http2::stream_id              id,
     s.changed.notify();
 }
 
+// (a client's session never reports it: a response's head over the limit resets its stream.)
+void http2_client_connection::on_header_list_too_large(http2::stream_id /*stream*/, bool /*end_stream*/) {}
+
 void http2_client_connection::on_goaway(http2::stream_id /*last*/, std::error_code err, std::string_view /*debug*/)
 {
     // no more streams: once those it has are done, so is the connection.

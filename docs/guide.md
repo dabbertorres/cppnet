@@ -691,7 +691,9 @@ scheduler.spawn(server.serve());
   added and removed under a lock).
 - **`server_config`** sets the host and port, and limits: header and body read timeouts, the write timeout, the size
   of a request's head, and how many connections are served at once. To handle a failure to listen, give the server a
-  listener from `listener::make()` instead of a host and port.
+  listener from `listener::make()` instead of a host and port. A head over `max_header_bytes` is answered 431 (Request
+  Header Fields Too Large) without a handler: over HTTP/1.1 the connection then closes; over HTTP/2 (whose limit counts
+  32 bytes more a field, as HTTP/2 counts a header list) only the stream ends, and the connection goes on.
 - **Stopping:** `server.close()` stops accepting and ends the connections gracefully: a connection waiting for a
   request (its first, or the next on a kept-alive one) closes at once, and one in the middle of a request finishes it
   (the handler reads the body and sends its response as usual, which says `Connection: close` if it wasn't sent yet),

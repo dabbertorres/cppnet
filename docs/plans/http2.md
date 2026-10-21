@@ -24,7 +24,9 @@ done. Stage 6 decided (2026-10-21): finishing HTTP/2 (TCP_NOTSENT_LOWAT on the s
 with their last DATA, 431 for a header list over the limit, `Expect: 100-continue` in the client, scheduling and
 reprioritizing the client's requests, and connection coalescing with the ORIGIN frame), in twelve pull requests (see
 "Stage 6"); its questions (at the end) all as recommended. Its first part, ending a body of known length with its last
-DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6).
+DATA frame on both sides (`http2_stream_base::data_left`), done (2026-10-21; see Learned in stage 6); and its second,
+431 for a request's header list over the limit (`session_events::on_header_list_too_large()`, answered by the server's
+`refuse()`), done (2026-10-21).
 
 ## Goal
 
@@ -1284,6 +1286,45 @@ idle stream would be a connection error for the peer.
   (median 1524), and 96.2 to 98.8 allocations a response before (median 97.3), 95.9 to 98.5 after (median 96.6). So no
   difference in time that the noise shows, and slightly fewer allocations, as a frame less goes through the writer.
 
+### Part 2: 431 for a header list over the limit (done 2026-10-21)
+
+- As proposed (see "431 for a header list over the limit", Decided question 27 (a)). The session's `end_header_block()`:
+  a block whose decoded list is over MAX_HEADER_LIST_SIZE (`value_too_large` from the decoder, which decoded it to its
+  end without calling back, so HPACK's table is in step) is, for a server's session on a stream without its head yet,
+  counted as a glitch (`glitch()`, so the budget still stops a client sending nothing else), then the stream marked
+  `head_received` and `known`, and reported with `session_events::on_header_list_too_large(stream, end_stream)` (new,
+  pure virtual; no fields, as the decoder kept none); a block that ends the stream closes its remote side after, as a
+  head's does. Anything else over the limit, trailers (`head_received`) and a client's session's response heads
+  (informational ones too), is `stream_error()`'s PROTOCOL_ERROR, as before. The checks before it are unchanged: a
+  closed stream and a self-dependent priority are reset first. A PRIORITY_UPDATE kept for the stream is taken
+  (`take_idle_priority()` runs before) and not reported, so it's dropped, as for a malformed head.
+- The server's `on_header_list_too_large()` answers with `refuse(id, status::REQUEST_HEADER_FIELDS_TOO_LARGE,
+  end_stream)` (unless the connection's `ending()`, as `on_headers()` does nothing then), logged at debug: `:status`
+  and `date`, END_STREAM, and RST_STREAM(NO_ERROR) if the request goes on, so the session forgets the stream and
+  ignores its DATA (the reset's remembered). No `http2_stream` is made: no handler, nothing counted against
+  `http2_max_concurrent_streams` nor the queue, and the stream never reaches the scheduler. The client's connection's
+  override is a no-op (its session never calls it), and so are `test::h2_client`'s and `test/http/http2_connection.cpp`'s
+  `test_connection`'s; `test/http/http2.cpp`'s recorder logs "too large <id>[ end]", `fuzz_http2`'s too (and counts
+  the stream as one the application knows, so the script's ops may answer or reset it).
+- Nothing departed from the plan. One thing the session test showed: the client's RST_STREAM for a response head over
+  its limit means nothing to a server whose response and request have both ended (the session has forgotten the
+  stream), as before.
+- Tests (no network). `test/http/http2.cpp` (`[http][http2][session][limits]`, a list limit of 200 bytes and a field of
+  238): a request's head over the limit reported (not reset) with END_STREAM, its stream then open for the answer,
+  which ends it; and without, its DATA then reported as the request's body, or ignored once the application has
+  answered and reset it (RST_STREAM(NO_ERROR) in the output), and a HEADERS after it taken as trailers; no GOAWAY
+  either way. Trailers over the limit reset the stream (PROTOCOL_ERROR, both sides told), and a client's session resets
+  a response's head over its limit, as before. Each is a glitch: with a budget of one, the second request head, the
+  second trailers or the second response head over the limit fails the connection (ENHANCE_YOUR_CALM).
+  `test/http/http2_server.cpp` (`[http][http2][server][limits]`, `max_header_bytes` 1024, so a list of 4,224): two
+  requests whose lists are past it (a field of 2,038 three times: the first indexed by the client's HPACK table, the
+  others indexes) get 431 with only `date`, ending their streams, one that ended its own and one whose body was to
+  follow, which also gets RST_STREAM(NO_ERROR) (checked after a PING's answer); then a request repeating the fields as
+  indexes of the table the long blocks filled is answered with them, so the tables are in step; no handler ran but
+  that one, and no GOAWAY. With the session resetting such heads as before, the new tests fail.
+- `fuzz_http2`'s properties are unchanged; its recorder implements the new event. Its 10-second run, and a 90-second
+  one, pass.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2307,7 +2348,7 @@ certificate.
       (`http2_stream_ops::send_head` takes it) and the request's; trailers set after the head of such a response
       dropped unless declared (Decided question 26). First: small, on the wire alone (9 bytes a response), and
       independent of the rest.
-   2. **431 for a header list over the limit.** The session reports a request's head over MAX_HEADER_LIST_SIZE
+   2. **431 for a header list over the limit.** Done (2026-10-21; see Learned in stage 6). The session reports a request's head over MAX_HEADER_LIST_SIZE
       (`on_header_list_too_large()`) rather than resetting it, and the server answers it with `refuse()`; tests on bytes
       and with `test::h2_client`. Small, the server's only, and apart from the writer.
    3. **TCP_NOTSENT_LOWAT, the socket's part.** `tcp_socket::set_notsent_lowat()` and `socket::wait_writable()` (a

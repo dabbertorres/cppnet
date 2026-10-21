@@ -57,6 +57,12 @@ public:
     virtual void
     on_headers(stream_id stream, block_kind kind, std::span<const hpack::field> fields, bool end_stream) = 0;
 
+    // on_header_list_too_large is a request's head (a server's only) whose decoded header list was over this side's
+    // MAX_HEADER_LIST_SIZE: the stream is open, without its fields, for the application to answer (e.g. with 431) or
+    // reset; what follows on it is its body, and trailers. (A block over the limit is decoded all the same, to keep
+    // HPACK in step, and counted as a glitch. Trailers over it, and a client's response heads, reset the stream.)
+    virtual void on_header_list_too_large(stream_id stream, bool end_stream) = 0;
+
     // on_data is a DATA frame's data (without padding), which counts against the stream's window until consume()d.
     virtual void on_data(stream_id stream, std::span<const std::byte> data, bool end_stream) = 0;
 
@@ -222,7 +228,8 @@ private:
     // highest the peer has opened, which are closed).
     std::optional<priority> take_idle_priority(stream_id stream);
 
-    // end_header_block decodes a complete header block, and reports it (or resets its stream, if it's malformed).
+    // end_header_block decodes a complete header block, and reports it (or resets its stream, if it's malformed; a
+    // request's head whose list is over the limit is reported without its fields, on_header_list_too_large()).
     // decode_block decodes it into block_fields; stream_for_block finds its stream, or opens a peer's, returning
     // nullptr if the block is to be ignored (or the stream was refused).
     std::error_code

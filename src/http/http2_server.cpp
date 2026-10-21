@@ -167,6 +167,7 @@ namespace
                         http2::block_kind             kind,
                         std::span<const hpack::field> fields,
                         bool                          end_stream) override;
+        void on_header_list_too_large(http2::stream_id id, bool end_stream) override;
         void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
         void on_ping_ack(std::span<const std::byte, 8> opaque) override;
         void on_priority_update(http2::stream_id id, priority p) override;
@@ -526,6 +527,16 @@ namespace
         add_stream(*stream);
         auto& s = *streams.emplace(id, std::move(stream)).first->second;
         schedule(s);
+    }
+
+    void http2_server_connection::on_header_list_too_large(http2::stream_id id, bool end_stream)
+    {
+        if (ending()) return;
+
+        // answered as a head over max_header_bytes is over HTTP/1.1 (RFC 9113, section 10.5.1, suggests it), without a
+        // handler, as a malformed request is.
+        logger.debug("HTTP/2 stream {}: its header list is too large", id);
+        refuse(id, status::REQUEST_HEADER_FIELDS_TOO_LARGE, end_stream);
     }
 
     std::unique_ptr<http2_stream>

@@ -60,6 +60,7 @@ protected:
                     std::span<const net::http::hpack::field> /*fields*/,
                     bool /*end_stream*/) override
     {}
+    void on_header_list_too_large(http2::stream_id /*id*/, bool /*end_stream*/) override {}
     void on_goaway(http2::stream_id /*last*/, std::error_code /*err*/, std::string_view /*debug*/) override {}
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override {}
     void on_priority_update(http2::stream_id /*id*/, net::http::priority /*p*/) override {}

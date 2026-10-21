@@ -83,6 +83,12 @@ struct recorder final : http2::session_events
         if (std::ranges::find(known, stream) == known.end()) known.push_back(stream);
     }
 
+    void on_header_list_too_large(http2::stream_id stream, bool end) override
+    {
+        log += std::format("too large {} {}\n", stream, end);
+        if (std::ranges::find(known, stream) == known.end()) known.push_back(stream);
+    }
+
     void on_data(http2::stream_id stream, std::span<const std::byte> data, bool end) override
     {
         log += std::format("data {} {} {}\n", stream, data.size(), end);

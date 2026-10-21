@@ -495,8 +495,22 @@ std::error_code session::end_header_block(const header_block& block, session_eve
     // (only once it's decoded, and its stream found or opened, so HPACK and the streams stay in step.)
     if (block.self_dependent) return stream_error(id, error_code::protocol_error, &events, now);
 
-    // a header list over the limit (or malformed) is refused, as the stream's error.
-    if (decoded == std::errc::value_too_large) return stream_error(id, error_code::protocol_error, &events, now);
+    // a header list over the limit: a request's head is reported without its fields, for the server to answer (431,
+    // RFC 9113 section 10.5.1, rather than a reset), its stream open and having its head (so what follows is its body,
+    // and trailers); trailers, which may come with a response under way, and a response's head are refused, as the
+    // stream's error. Either way it's a glitch, so a peer that sends nothing else is stopped as one that's reset is.
+    if (decoded == std::errc::value_too_large)
+    {
+        if (side == role::client || s.head_received) return stream_error(id, error_code::protocol_error, &events, now);
+        if (auto err = glitch(now)) return err;
+
+        // (a PRIORITY_UPDATE kept for it is dropped, as for a malformed head.)
+        s.head_received = true;
+        s.known         = true;
+        events.on_header_list_too_large(id, block.end_stream);
+        if (block.end_stream) close_remote(id);
+        return {};
+    }
 
     const auto checked = validate(s, block.end_stream);
     if (!checked.has_value()) return stream_error(id, error_code::protocol_error, &events, now);
