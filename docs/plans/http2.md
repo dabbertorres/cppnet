@@ -20,10 +20,10 @@ seventh, HPACK's indexing on in both sides' sessions (`indexing::automatic`, the
 priority signals (PRIORITY_UPDATE and SETTINGS_NO_RFC7540_PRIORITIES in the session, each server stream's priority,
 `server_config::http2_priorities`), done (2026-10-21); and its tenth, scheduling the server's responses by priority
 (`http/http2_scheduler.hpp`, the connection's contended path, `fuzz_http2_scheduler`), done (2026-10-21): stage 5 is
-done. Stage 6 proposed (2026-10-21): finishing HTTP/2 (TCP_NOTSENT_LOWAT on the server's connections, ending streams
+done. Stage 6 decided (2026-10-21): finishing HTTP/2 (TCP_NOTSENT_LOWAT on the server's connections, ending streams
 with their last DATA, 431 for a header list over the limit, `Expect: 100-continue` in the client, scheduling and
 reprioritizing the client's requests, and connection coalescing with the ORIGIN frame), in twelve pull requests (see
-"Stage 6"); its questions (at the end) are open.
+"Stage 6"); its questions (at the end) all as recommended.
 
 ## Goal
 
@@ -1734,7 +1734,7 @@ throughput isn't changed (by frame count and order).
 
 ## Stage 6
 
-Proposed (2026-10-21). Seven things, chosen for stage 6, to finish HTTP/2. On the server: TCP_NOTSENT_LOWAT, so that
+Decided (2026-10-21). Seven things, chosen for stage 6, to finish HTTP/2. On the server: TCP_NOTSENT_LOWAT, so that
 little of what's past part 10's scheduler sits in the socket's send buffer; ending a response with a Content-Length on
 its last DATA frame, rather than with an empty one; and 431 for a header list over the limit, rather than a reset. On
 both sides: connection coalescing and the ORIGIN frame (RFC 8336). On the client: `Expect: 100-continue` (waiting for
@@ -1816,7 +1816,7 @@ consistent connection state". RFC 6585 defines 431.
 handler of its own, `handleHeaderListTooLong`, which writes 431 with a short HTML body (`processHeaders`, read for this
 plan). nghttpx and h2o answer 431 too (from memory).
 
-**Proposed** (Open question 27).
+**Proposed** (Decided question 27).
 
 - The session (`http2_session.cpp`): a server's request head over the limit is reported, rather than reset: the stream's
   marked as having its head (so what follows on it is trailers, and refused as a stream's), `known`, and
@@ -1876,7 +1876,7 @@ connections with a long round trip and a small window (its documentation; how ex
 slides, writing about a CWND and an MSS at a time). Apple's networking sessions recommended setting it (16 KiB, from
 memory).
 
-**Proposed** (Open questions 28 and 29).
+**Proposed** (Decided questions 28 and 29).
 
 - `tcp_socket::set_notsent_lowat(std::size_t bytes)` (beside `set_nodelay()`, `std::expected<void, std::error_code>`, 0
   turning it off), and `socket::wait_writable()`: a task that returns once the socket is writable, by the kernel's
@@ -1945,7 +1945,7 @@ content says whether it closes the connection or goes on reading it.
   `CURLOPT_EXPECT_100_TIMEOUT_MS` (1 s by default, from memory); and on 417 sends the request again without it.
 - hyper's client doesn't wait for a 100 (from memory).
 
-**Proposed API** (Open questions 30 to 32).
+**Proposed API** (Decided questions 30 to 32).
 
 ```cpp
 struct client_options
@@ -1970,7 +1970,7 @@ struct client_options
   response is decoded as now; some decodes heads with `http11::response_decode()`'s new `stop_at_continue`, which
   returns a 100 (passed to `on_informational` as now) rather than looping past it. A 100 sends the body and decodes
   again; other 1xx are passed on and the wait goes on (the same deadline); a final response first doesn't send the body
-  unless the connection's kept (Open question 31, Go's rule: then it's sent, for the framing), and a connection whose
+  unless the connection's kept (Decided question 31, Go's rule: then it's sent, for the framing), and a connection whose
   body wasn't sent isn't reused. `response_header_timeout` starts once
   the body's sent, as now.
 - HTTP/2 (`http2_client_connection::send()`): the head goes without END_STREAM, then the client waits on the stream's
@@ -1980,9 +1980,9 @@ struct client_options
   first: above 299, the body isn't sent and the stream's left for the server to reset (cppnet's resets with NO_ERROR
   once its handler returns without reading), or reset with CANCEL once the response is done with (`done()`, as now); a
   2xx goes on waiting for the timeout, then sends the body (Go's, for full-duplex streams).
-- 417 in answer to a request that expected, whose body wasn't sent (Open question 32): sent again at once, once, without
-  the expectation (its `Expect` removed), on whatever connection `send()`'s retry loop takes: the body's reader is
-  untouched, so no `get_body` is needed. A 417 after the body was sent (the timeout passed first) is returned.
+- 417 in answer to a request that expected, whose body wasn't sent (Decided question 32): sent again at once, once,
+  without the expectation (its `Expect` removed), on whatever connection `send()`'s retry loop takes: the body's reader
+  is untouched, so no `get_body` is needed. A 417 after the body was sent (the timeout passed first) is returned.
 
 **Costs.** None for requests without the expectation (a lookup of `Expect` among their fields, done once). One that
 expects costs a flush of its head on its own over HTTP/1.1 (two writes where there was one), and a round trip (or the
@@ -2010,7 +2010,7 @@ each body write that has to wait is a coroutine.
 none of the clients looked at for stage 5 (hyper, curl, Chrome, Firefox) orders uploads by RFC 9218, which describes the
 response's priority (from memory for the browsers). So this is cppnet's own.
 
-**Proposed** (Open question 33).
+**Proposed** (Decided question 33).
 
 - The client's streams take the server's path (`scheduling` for both roles): a write goes to the session at once while
   less than `max_ahead` waits for the writer and no stream waits its turn, and otherwise waits in the scheduler, framed
@@ -2049,7 +2049,7 @@ glitch; Go's server, one that doesn't parse as a stream error: stage 5's How oth
 **How others do it.** Firefox sends PRIORITY_UPDATE when it reprioritizes (from memory, as in stage 5), Chrome only over
 HTTP/3 (from memory); Go's, curl's and hyper's clients send none.
 
-**Proposed API** (Open question 34).
+**Proposed API** (Decided question 34).
 
 ```cpp
 struct client_response
@@ -2129,7 +2129,7 @@ while the request's body is still queued moving it (after part 8).
 - nghttp2's library sends and receives ORIGIN (`nghttp2_submit_origin()`, `NGHTTP2_ORIGIN`); Cloudflare sent it for that
   paper's experiment; nginx and Go's server don't.
 
-**Proposed** (Open questions 35 to 40).
+**Proposed** (Decided questions 35 to 40).
 
 - The session (`http2.hpp`, `http2_session.hpp`): `frame_type::origin` (0xc). A server's session sends one
   (`submit_origin(origins)`, split into frames of at most the peer's MAX_FRAME_SIZE), and ignores any it receives; a
@@ -2144,22 +2144,22 @@ while the request's body is still queued moving it (after part 8).
   doesn't serve is the application's (`rw.send(status::MISDIRECTED_REQUEST, 0)`): the guide says so.
 - The client's connections: an `http2_client_connection` over TLS keeps its Origin Set (uninitialized until the first
   ORIGIN; then the initial origin, the key's host and port, and the entries, at most 256, the rest ignored), and
-  remembers, per host, whether its certificate is valid for it (Open question 37: the whole verification again, as
+  remembers, per host, whether its certificate is valid for it (Decided question 37: the whole verification again, as
   `tls_verify_cert_chain` with that host, through `tls::detail::verify_for(stream, host)`, internal, which the
   handshake's verification shares), so it's checked once per host and connection. Never with
   `insecure_skip_verification` (nothing establishes authority then), nor over cleartext.
-- The pool (`client_options::http2_coalescing`, off by default: Open question 36): a request whose own key has no
+- The pool (`client_options::http2_coalescing`, off by default: Decided question 36): a request whose own key has no
   connection with a stream free looks, before connecting, through the pool's list of HTTP/2 connections whose Origin Set
   is initialized (`coalescing`, kept as the connections' callbacks report ORIGIN and their end) for one whose set has
   the request's origin, whose certificate is valid for its host, and which has a stream free (reserved as
-  `available_http2()` does). Connections stay under their own keys (Open question 38): per-host limits, idle timeouts,
-  eviction and `http2_hosts` count them as now, and the lease says it's `coalesced`.
-- 421 (Open question 40): a coalesced request's 421 removes its origin from that connection's set (RFC 8336's MUST), the
-  response is discarded (as a redirect's, `discard()`), and the request is sent again, once, on a connection of its own
-  key, not coalesced, if it can be (no body, or `get_body` to read it again, as for a 307); otherwise the 421 is
+  `available_http2()` does). Connections stay under their own keys (Decided question 38): per-host limits, idle
+  timeouts, eviction and `http2_hosts` count them as now, and the lease says it's `coalesced`.
+- 421 (Decided question 40): a coalesced request's 421 removes its origin from that connection's set (RFC 8336's MUST),
+  the response is discarded (as a redirect's, `discard()`), and the request is sent again, once, on a connection of its
+  own key, not coalesced, if it can be (no body, or `get_body` to read it again, as for a 307); otherwise the 421 is
   returned. A 421 on a connection of the request's own key is returned as it is.
-- Coalescing by address (RFC 9113's rule for a connection without ORIGIN, Chrome's) is Open question 35's (b): a part of
-  its own if it's chosen (below, in Stages): the pool resolves a new host's name first when a connection whose
+- Coalescing by address (RFC 9113's rule for a connection without ORIGIN, Chrome's) is Decided question 35's (b), not
+  chosen; it would be a part of its own: the pool resolves a new host's name first when a connection whose
   certificate covers it exists, compares the addresses with the connection's peer's, and otherwise connects to the
   addresses it resolved (`tcp_socket::connect()` with the addresses, so the name isn't resolved twice, giving up the
   start on the first family's addresses that stage 7 of the resolver's plan made, for those hosts only).
@@ -2192,9 +2192,9 @@ certificate.
 2. **Frames and the connection's state machine**, without I/O: the codec, settings, streams' states, flow control,
    errors, GOAWAY. Tests on bytes, and a fuzz target. The stub (and `util/packed.hpp`) is removed.
 3. **The server.** The new primitive in `coro/` (`coro::notifier`), with its tests and the benchmark against `wait_on`
-   (see Decided and Learned in stage 3), first; then `response_writer`'s back ends; the connection coroutine, its writer and the
-   handlers' tasks; ALPN and prior knowledge; per-stream timeouts; the limits; graceful `close()`. Loopback tests
-   (with a minimal test client), h2spec, curl, h2load.
+   (see Decided and Learned in stage 3), first; then `response_writer`'s back ends; the connection coroutine, its writer
+   and the handlers' tasks; ALPN and prior knowledge; per-stream timeouts; the limits; graceful `close()`. Loopback
+   tests (with a minimal test client), h2spec, curl, h2load.
 4. **The client.** The pool's shared connections, ALPN, stream limits (and the second connection), retries, PING
    checks. Loopback tests, and public servers (needs the network).
 5. **Decided (2026-10-20), in ten pull requests, in this order** (see "Stage 5"; each mergeable and tested alone):
@@ -2237,11 +2237,10 @@ certificate.
    Trailers come before HPACK and priorities as they're what a user needs (gRPC); HPACK's two parts, internal, before
    priorities' three, the largest change.
 
-6. **Proposed (2026-10-21), in twelve pull requests, in this order** (see "Stage 6"; each mergeable and tested alone; a
-   thirteenth if Open question 35 chooses coalescing by address):
+6. **Decided (2026-10-21), in twelve pull requests, in this order** (see "Stage 6"; each mergeable and tested alone):
    1. **Ending streams with their last DATA.** A body of known length ends with its last DATA frame, on both sides:
       `http2_stream_base::data_left`, set from the response's Content-Length (`http2_stream_ops::send_head` takes it)
-      and the request's; trailers set after the head of such a response dropped unless declared (Open question 26).
+      and the request's; trailers set after the head of such a response dropped unless declared (Decided question 26).
       First: small, on the wire alone (9 bytes a response), and independent of the rest.
    2. **431 for a header list over the limit.** The session reports a request's head over MAX_HEADER_LIST_SIZE
       (`on_header_list_too_large()`) rather than resetting it, and the server answers it with `refuse()`; tests on bytes
@@ -2249,14 +2248,14 @@ certificate.
    3. **TCP_NOTSENT_LOWAT, the socket's part.** `tcp_socket::set_notsent_lowat()` and `socket::wait_writable()` (a
       `poll()` for the level, then the scheduler's write wait), tested over loopback sockets. Split from 4 so the I/O
       layer's part, which differs between the kernels, is reviewed and tested on its own.
-   4. **TCP_NOTSENT_LOWAT, the server's writer.** `server_config::http2_notsent_lowat` (Open question 28) set on each
-      HTTP/2 connection, and the writer waiting for writability before each round (Open question 29), through a test
+   4. **TCP_NOTSENT_LOWAT, the server's writer.** `server_config::http2_notsent_lowat` (Decided question 28) set on each
+      HTTP/2 connection, and the writer waiting for writability before each round (Decided question 29), through a test
       hook; `bench_request` with streams that contend, and part 10's relay by hand. It changes the writer every HTTP/2
       response goes through, so it's alone.
-   5. **Expect: 100-continue, HTTP/1.1.** `client_options::expect_continue_timeout` (Open question 30), the head flushed
-      apart from the body, `response_decode()`'s `stop_at_continue`, a final response first (Open question 31), and 417
-      sent again without the expectation (Open question 32); tests against cppnet's server and raw ones. The API comes
-      with this part, over the version that's simpler to get right.
+   5. **Expect: 100-continue, HTTP/1.1.** `client_options::expect_continue_timeout` (Decided question 30), the head
+      flushed apart from the body, `response_decode()`'s `stop_at_continue`, a final response first (Decided question
+      31), and 417 sent again without the expectation (Decided question 32); tests against cppnet's server and raw ones.
+      The API comes with this part, over the version that's simpler to get right.
    6. **Expect: 100-continue, HTTP/2.** The stream's `continued` and `continue_deadline` (the timer's third deadline),
       `send()` waiting before `send_body()`, and HTTP/2's rule for a final response first; tests against cppnet's server
       and `test::h2_client` as the server. After 5, whose API and 417 handling it shares.
@@ -2268,23 +2267,21 @@ certificate.
       question 33), and `client_options::http2_notsent_lowat` for the client's connections (part 4's writer); tests with
       bodies of several urgencies. Small, once 7 is in.
    9. **Reprioritizing a request in flight.** The session's `submit_priority_update()` (a client's: only what changes,
-      at most one pending a stream), `client_response::set_priority()` (Open question 34) through `detail::body_source`,
-      moving the stream's own body in the client's scheduler too; tests on bytes and against cppnet's server. After 8,
-      whose scheduler it updates.
+      at most one pending a stream), `client_response::set_priority()` (Decided question 34) through
+      `detail::body_source`, moving the stream's own body in the client's scheduler too; tests on bytes and against
+      cppnet's server. After 8, whose scheduler it updates.
    10. **ORIGIN, the session and the server.** `frame_type::origin`, `submit_origin()`, `on_origin()` (a client's
-       session), and `server_config::http2_origins` checked against the certificate and sent over TLS (Open question
+       session), and `server_config::http2_origins` checked against the certificate and sent over TLS (Decided question
        39); tests on bytes and with `test::h2_client`. First of coalescing's three, as the server's side stands alone
        (other clients, Firefox's, use it).
    11. **The client's origin sets.** Each TLS connection's Origin Set from ORIGIN frames, and the certificate checked
-       for another host (`tls::detail::verify_for()`, Open question 37), recorded but not yet used by the pool; tests of
-       the sets (from `test::h2_client` as the server) and the check alone. Split from 12 as part 9 of stage 5 was from
-       10: the protocol's and TLS's rules tested apart from the pool.
-   12. **Coalescing in the pool, and 421.** `client_options::http2_coalescing` (Open questions 35 and 36), the pool's
-       list of connections with origin sets, searched before connecting (Open question 38), and a coalesced request's
-       421 (Open question 40); tests with two names on loopback servers. Last: it changes how the pool picks
+       for another host (`tls::detail::verify_for()`, Decided question 37), recorded but not yet used by the pool; tests
+       of the sets (from `test::h2_client` as the server) and the check alone. Split from 12 as part 9 of stage 5 was
+       from 10: the protocol's and TLS's rules tested apart from the pool.
+   12. **Coalescing in the pool, and 421.** `client_options::http2_coalescing` (Decided questions 35 and 36), the pool's
+       list of connections with origin sets, searched before connecting (Decided question 38), and a coalesced request's
+       421 (Decided question 40); tests with two names on loopback servers. Last: it changes how the pool picks
        connections, which every request goes through.
-   13. **Coalescing by address** (only if Open question 35 chooses (b)): a new host's name resolved before connecting
-       when a connection whose certificate covers it exists, its addresses compared with that connection's peer's.
 
    Server-side fixes first (small, independent), then the client's 100-continue (an API users ask for), its bodies and
    priorities (building on part 10's scheduler), and coalescing last (the largest, and the pool's).
@@ -2423,7 +2420,9 @@ All decided as recommended (2026-10-20); the options are kept for the reasoning.
     (trailers, for gRPC), then the internal gain, and the riskiest change to the writer last; HPACK and priorities don't
     depend on each other, so (c) is fine too if browsers matter sooner.
 
-## Open questions (stage 6)
+## Decided questions (stage 6)
+
+All decided as recommended (2026-10-21); the options are kept for the reasoning.
 
 26. **Trailers on a response with a Content-Length, over HTTP/2.** (a) The stream ends with its last DATA unless
     trailers or a `Trailer` field are set when its head is sent (the rule a bodyless response follows now); trailers set
