@@ -53,6 +53,12 @@ struct session_config
         .max_header_list_size   = std::uint32_t{64} * 1'024,
     };
 
+    // The most this side's HPACK encoder's dynamic table may hold: it uses the smaller of this and the peer's
+    // SETTINGS_HEADER_TABLE_SIZE (docs/plans/http2.md, Decided question 15 of stage 5). 4096 is the setting's initial
+    // value, and Go's, nghttp2's and h2's cap: a larger table would cost memory per connection, and a longer search
+    // per field, for fields few connections repeat. 0 indexes nothing (the first block then says so).
+    std::uint32_t encoder_table_size = 4'096;
+
     // The connection's receive window, raised from its initial 65535 with a WINDOW_UPDATE: how much the peer may send
     // on all streams before this side consumes some. It's to hold every stream's window (local.initial_window_size
     // times the streams that may be open), or streams read one at a time may wait for each other's data to be read:

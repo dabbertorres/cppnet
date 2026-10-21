@@ -212,11 +212,12 @@ enum class indexing : std::uint8_t
 {
     // none adds nothing: a field the static table has is encoded as its index (unless it's never indexed, whose
     // representation must say so), and others as literals without indexing (or never indexed), with the static table's
-    // index for the name, if it has the name. The table only ever shrinks (it's empty, so growing it would gain
-    // nothing), and only what field::never_indexed says is never indexed.
+    // index for the name, if it has the name. Only what field::never_indexed says is never indexed. What HTTP/2's
+    // sessions did until they indexed (docs/plans/http2.md, part 7 of stage 5): kept for the tests and fuzz_hpack,
+    // which check representations and decoding without the table.
     none,
 
-    // automatic adds what's likely to repeat, nghttp2's way: everything but
+    // automatic adds what's likely to repeat, nghttp2's way (what HTTP/2's sessions do): everything but
     // - never-indexed fields: field::never_indexed, and what sensitive() names (sent as never indexed, whatever the
     //   field says, so that intermediaries don't index them either);
     // - fields that change from one message to the next (:path, age, content-length, etag, if-modified-since,
@@ -236,11 +237,11 @@ public:
         : mode{indexing_mode}
     {}
 
-    // set_max_table_size takes the peer's SETTINGS_HEADER_TABLE_SIZE, each time it changes (with indexing::none, only
-    // if it shrinks the table). The next block starts with the smallest size the table has had since the last one, if
-    // that's below both what the peer's decoder knows and the size it has now (it may have evicted fields there), then
-    // the size it has now, if that, or the smallest, differs from what the decoder knows (RFC 7541, section 4.2); as
-    // RFC 9113, section 4.3.1, requires when the peer lowers its setting.
+    // set_max_table_size takes the table's size each time it changes: the peer's SETTINGS_HEADER_TABLE_SIZE, or less
+    // (HTTP/2's sessions hold it to session_config::encoder_table_size). The next block starts with the smallest size
+    // the table has had since the last one, if that's below both what the peer's decoder knows and the size it has now
+    // (it may have evicted fields there), then the size it has now, if that, or the smallest, differs from what the
+    // decoder knows (RFC 7541, section 4.2); as RFC 9113, section 4.3.1, requires when the peer lowers its setting.
     void set_max_table_size(std::size_t max_table_size) noexcept;
 
     // encode appends a block of fields to out.

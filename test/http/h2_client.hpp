@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <format>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -21,10 +24,11 @@
 #include "coro/task.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
+#include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
-#include "io/util.hpp"
 #include "io/writer.hpp"
 #include "socket.hpp"
 
@@ -57,6 +61,8 @@ struct h2_client final : http2::session_events
         bool                                             done        = false;
         std::error_code                                  reset;
         int                                              order = 0; // when it was done
+
+        std::vector<std::string> never_indexed; // fields that came as never-indexed literals
     };
 
     // How long pump() waits by default, so a server that stops answering fails a test rather than hanging it.
@@ -73,6 +79,7 @@ struct h2_client final : http2::session_events
         , in{in}
         , out{out}
         , sock{sock}
+        , preface_left{side == http2::role::server ? http2::preface.size() : 0}
     {}
 
     http2::session                       s;
@@ -88,10 +95,19 @@ struct h2_client final : http2::session_events
     int                                  finished    = 0;
     int                                  pings       = 0; // acknowledged
 
+    // blocks are the header blocks received on each stream, as they were encoded (HPACK's representations, from
+    // HEADERS and its CONTINUATIONs), in order.
+    std::map<http2::stream_id, std::vector<std::vector<std::byte>>> blocks;
+
     void
     on_headers(http2::stream_id id, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
     {
         auto& r = responses[id];
+        for (const auto& f : fields)
+        {
+            if (f.never_indexed) r.never_indexed.emplace_back(f.name);
+        }
+
         if (kind == http2::block_kind::head)
         {
             for (const auto& f : fields)
@@ -251,6 +267,7 @@ struct h2_client final : http2::session_events
                 closed = true;
                 co_return done();
             }
+            record_blocks(std::span{pending}.first(*used));
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(*used));
             if (timed_out) co_return done();
         }
@@ -277,8 +294,39 @@ struct h2_client final : http2::session_events
         return pump([this, want = pings + 1] { return pings >= want; });
     }
 
+    // record_blocks keeps the header blocks of the frames the session has received (which it takes whole), as they
+    // were encoded: HEADERS' without its padding and priority, and CONTINUATIONs' added to the stream's last.
+    void record_blocks(std::span<const std::byte> received)
+    {
+        const auto skipped = std::min(preface_left, received.size());
+        received           = received.subspan(skipped);
+        preface_left -= skipped;
+
+        while (received.size() >= http2::frame_header_size)
+        {
+            const auto h     = http2::decode_frame_header(received.first<http2::frame_header_size>());
+            auto       block = received.subspan(http2::frame_header_size, h.length);
+            received         = received.subspan(http2::frame_header_size + h.length);
+
+            if (h.type == static_cast<std::uint8_t>(http2::frame_type::headers))
+            {
+                if ((h.flags & http2::flags::padded) != 0)
+                    block = block.subspan(1, block.size() - 1 - std::to_integer<std::size_t>(block[0]));
+                if ((h.flags & http2::flags::priority) != 0) block = block.subspan(5);
+                blocks[h.stream].emplace_back(block.begin(), block.end());
+            }
+            else if (h.type == static_cast<std::uint8_t>(http2::frame_type::continuation))
+            {
+                auto& last = blocks[h.stream].back();
+                last.insert(last.end(), block.begin(), block.end());
+            }
+        }
+    }
+
     std::map<http2::stream_id, std::string> pending_body;
     std::map<http2::stream_id, bool>        pending_end;
+
+    std::size_t preface_left; // of the client's preface, which a server's session receives first
 
     // what's been read but not received (part of a frame): kept from one pump() to the next.
     std::vector<std::byte> pending;
@@ -358,6 +406,26 @@ struct stop_probe
         sched->notify_all(word);
     }
 };
+
+// size_updates is the dynamic table size updates a header block starts with (RFC 7541, section 6.3), as hex.
+inline std::string size_updates(std::span<const std::byte> block)
+{
+    std::string out;
+    std::size_t i = 0;
+    while (i < block.size() && (std::to_integer<unsigned>(block[i]) & 0xe0U) == 0x20U)
+    {
+        // an integer with a 5-bit prefix: its continuation octets have their top bit set, but the last.
+        const bool more = (std::to_integer<unsigned>(block[i]) & 0x1fU) == 0x1fU;
+        out += std::format("{:02x}", std::to_integer<unsigned>(block[i++]));
+        while (more && i < block.size())
+        {
+            const auto b = std::to_integer<unsigned>(block[i++]);
+            out += std::format("{:02x}", b);
+            if ((b & 0x80U) == 0) break;
+        }
+    }
+    return out;
+}
 
 // header is a response's field's value, or "(none)".
 inline std::string header(const h2_client::response& r, std::string_view name)

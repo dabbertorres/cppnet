@@ -1193,3 +1193,97 @@ TEST_CASE("a header block may have as many CONTINUATIONs as the largest one this
     CHECK_FALSE(server.failure);
     CHECK(server.events.take().back().starts_with("headers 1 head end"));
 }
+
+TEST_CASE("the session's encoder indexes within the smaller of the peer's table size and its cap, signalling changes",
+          "[http][http2][session][hpack]")
+{
+    struct test_case
+    {
+        std::string_view           what;
+        std::uint32_t              cap;
+        std::vector<std::uint32_t> sizes; // the client's SETTINGS_HEADER_TABLE_SIZE, a SETTINGS frame each
+        std::string_view           updates;
+        bool                       indexes;
+    };
+
+    // NOTE: 0x20 is a size update of 0; 0x3f, then an integer's continuation octets, one of 31 or more.
+    const auto tc = GENERATE(
+        test_case{
+            .what    = "the peer's initial size",
+            .cap     = 4'096,
+            .sizes   = {},
+            .updates = "",
+            .indexes = true
+    },
+        test_case{.what    = "the peer's larger: still 4096",
+                  .cap     = 4'096,
+                  .sizes   = {65'536},
+                  .updates = "",
+                  .indexes = true},
+        test_case{.what = "the peer's smaller", .cap = 4'096, .sizes = {2'048}, .updates = "3fe10f", .indexes = true},
+        test_case{.what    = "the peer's lowered, then raised past the cap",
+                  .cap     = 4'096,
+                  .sizes   = {100, 8'192},
+                  .updates = "3f453fe11f",
+                  .indexes = true},
+        test_case{.what    = "the peer's raised, then lowered back",
+                  .cap     = 4'096,
+                  .sizes   = {8'192, 4'096},
+                  .updates = "",
+                  .indexes = true},
+        test_case{.what = "the peer's 0", .cap = 4'096, .sizes = {0}, .updates = "20", .indexes = false},
+        test_case{.what = "a cap of 0", .cap = 0, .sizes = {}, .updates = "20", .indexes = false},
+        test_case{.what    = "a cap above 4096, and the peer's larger",
+                  .cap     = 8'192,
+                  .sizes   = {65'536},
+                  .updates = "3fe13f",
+                  .indexes = true},
+        test_case{.what    = "a cap above 4096, and the peer's initial size",
+                  .cap     = 8'192,
+                  .sizes   = {},
+                  .updates = "",
+                  .indexes = true});
+    CAPTURE(tc.what);
+
+    http2::session_config config;
+    config.encoder_table_size = tc.cap;
+    endpoint server{http2::role::server, config};
+
+    raw r;
+    r.client_start();
+    for (const auto size : tc.sizes) http2::encode_settings({.header_table_size = size}, {}, r.bytes);
+    r.headers(1, request(), end_both).headers(3, request(), end_both);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    const std::vector<hpack::field> fields{
+        {     .name = ":status",        .value = "200"},
+        {.name = "content-type", .value = "text/plain"},
+        {      .name = "server",     .value = "cppnet"}
+    };
+    std::vector<std::string> blocks;
+    for (const http2::stream_id id : {1U, 3U})
+    {
+        REQUIRE_FALSE(server.s.submit_headers(id, fields, true));
+
+        std::vector<std::byte> out;
+        server.s.take_output(out);
+        while (out.size() >= 9)
+        {
+            const auto h = http2::decode_frame_header(std::span{out}.first<9>());
+            if (h.type == static_cast<std::uint8_t>(http2::frame_type::headers))
+                blocks.push_back(to_hex(std::span{out}.subspan(9, h.length)));
+            out.erase(out.begin(), out.begin() + 9 + h.length);
+        }
+    }
+    REQUIRE(blocks.size() == 2);
+
+    // the first block starts with the size updates; content-type and server are literals with incremental indexing
+    // (5f and 76: their static names), unless the table's 0 (0f10 and 0f27: without indexing); the second has them as
+    // dynamic indexes (63 and 62, the newest), or as the first had them, without the updates.
+    CHECK(blocks[0].starts_with(tc.updates));
+    const auto first = std::string_view{blocks[0]}.substr(tc.updates.size());
+    CHECK(first.starts_with(tc.indexes ? "885f" : "880f10"));
+    if (tc.indexes) CHECK(blocks[1] == "88bfbe");
+    else CHECK(blocks[1] == first);
+}

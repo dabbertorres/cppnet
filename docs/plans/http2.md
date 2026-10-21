@@ -12,8 +12,10 @@ done (2026-10-20; see Learned in stage 5); its second, interim responses in the 
 `trailer_allowed()`), done (2026-10-20); its fourth, trailers on the server (`server_request::trailers`,
 `response_writer::trailers()`), done (2026-10-20); its fifth, trailers in the client (`client_response::trailers()`,
 `client_request::make_trailers`), done (2026-10-20); then trailers held in `trailer_fields`, 2 fields inline
-rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)"); and its sixth, HPACK's dynamic table built
-(its storage, the encoder's table and `hpack::indexing`, with the sessions still on `none`), done (2026-10-20).
+rather than `headers`' 8 (2026-10-20; see "Trailers' size (after part 5)"); its sixth, HPACK's dynamic table built
+(its storage, the encoder's table and `hpack::indexing`, with the sessions still on `none`), done (2026-10-20); and its
+seventh, HPACK's indexing on in both sides' sessions (`indexing::automatic`, the encoder held to 4096 by
+`session_config::encoder_table_size`), done (2026-10-21).
 
 ## Goal
 
@@ -811,6 +813,87 @@ idle stream would be a connection error for the peer.
   `user-agent` and `accept-encoding` indexes while they last, re-added when the `:path`s push them out): 1.04
   allocations a block before, 0 after, and 106 to 110 ns a block before, 79 to 95 after.
 
+### Part 7: HPACK's indexing, on (done 2026-10-21)
+
+- Both sides' sessions encode with `indexing::automatic` (`http2_session.cpp`: the encoder's constructed so), held to
+  `session_config::encoder_table_size` (internal, 4096, Decided question 15 (a)): the session gives the encoder the
+  smaller of the cap and the peer's SETTINGS_HEADER_TABLE_SIZE, at construction (the peer's initial 4096) and with
+  each SETTINGS. So a peer offering more (Firefox's 65536, or Go's with `MaxDecoderHeaderTableSize` raised) gets no
+  size update (the table's still the 4096 its decoder assumes); one lowering it below 4096 gets the smallest since the
+  last block, then the final size, at the start of the next block (part 6's mechanics); and a lowering then raising
+  past the cap between two blocks gets the lowered size, then 4096. A cap of 0 indexes nothing (the first block then
+  starts with a size update of 0): the switch to turn indexing off, should it be needed, rather than an option for
+  `none`. `session_config` stays 120 bytes (libc++; the cap takes what was padding after `connection_window`).
+- `indexing::none` stays in `hpack.hpp`, but no session uses it: the encoder's default constructor still makes one, as
+  HPACK's tests check its representations byte for byte (stage 1's encoder tests), and `fuzz_hpack` re-encodes with both
+  modes (with `none` the table must stay empty). Its rule that the table only shrinks, which kept the sessions' bytes
+  the same in part 6 when a peer offered more than 4096, is gone: the cap does that now, so both modes follow the size
+  they're given the same way (two tests' expected bytes changed: `none` growing to 8192 now signals it, `3fe13f82`
+  rather than `82`, and shrinking to 0 then growing back signals both, `203fe11f82` rather than `2082`; and "the encoder
+  signals a smaller table, once" became "the encoder signals the table's size, once, without indexing too", 8192, 100
+  then 200 giving `3f453fa90182`, 100 then 200, rather than `3f4582`).
+- No existing HTTP/2 test compared a session's header blocks byte for byte, so none of their expected bytes changed:
+  `test/http/http2.cpp`'s byte-level tests encode frames (and SETTINGS, PING, GOAWAY) without HPACK, and the blocks
+  they send the session come from a `hpack::encoder` of their own (`none`), which the session's decoder takes as it
+  did. Every HTTP/2 test (and the suite) passed unchanged with the sessions indexing.
+- Tests. `test::h2_client` keeps the header blocks it receives as they were encoded (`blocks`, per stream: HEADERS'
+  payload without padding or priority, with its CONTINUATIONs), and which fields came as never-indexed literals
+  (`response::never_indexed`), and `test::size_updates()` reads the size updates a block starts with. Over a socket
+  (cleartext, prior knowledge), the server's (`[http2][server][hpack]`): three requests whose responses repeat
+  `content-type`, `x-served-by` and two fields echoing the request's (`x-token`, and `cookie`, which the h2_client's
+  session, indexing now too, sends never indexed and the server decodes), each block after the first more than 20
+  bytes smaller, `set-cookie` a never-indexed literal every time, and no size updates; a client offering 65536, then
+  `x-a` (3000 bytes, under 3/4 of 4096), `x-b`, `x-a` again: no size updates, and the third block over 1000 bytes (`x-b`
+  pushed `x-a` out, so it's a literal again: in a table of 65536 it would have been an index); and SETTINGS of 100
+  then 8192 written by hand between two requests (the session can't change its own; a PING makes sure they've
+  arrived), the next block starting with `3f453fe11f` (100, then 4096), the one after with none and smaller again (the
+  table cut to 100 kept only its newest field). The client's (`[http2][client][hpack]`, against `test::h2_client` as the
+  server): the same three, its requests repeating `:authority`, `user-agent` and `accept` (each block after the first
+  more than 20 bytes smaller, the second and third the same bytes), `authorization` and `cookie` never-indexed
+  literals every time, `:path` a literal (without indexing). And the session's bytes (`[session][hpack]`, with
+  `raw`'s SETTINGS): a response of `:status`, `content-type` and `server` twice, whose second block is `88bfbe` (the
+  two fields as dynamic indexes 63 and 62) unless the table is 0, for the peer's initial size, larger (65536: no
+  update), smaller (2048: `3fe10f`), lowered then raised past the cap (`3f453fe11f`), raised then lowered back
+  (none), 0 (`20`, and nothing indexed), a cap of 0 (`20`), and a cap of 8192 with the peer's 65536 (`3fe13f`) or its
+  initial 4096 (none). Each was checked to fail without the cap where it should (the session's encoder given the
+  peer's setting as it was).
+- `fuzz_http2` gained a property and an op: after a script, the session's output is read as its peer would read it,
+  with a decoder whose limit is the HEADER_TABLE_SIZE of each SETTINGS the session acknowledged, from the
+  acknowledgement on (the session's `on_settings()` gives it, in the order of its ACKs), and each header block must
+  decode to the fields the application submitted, in order; and op 7 (which received bytes, as 0 does) now receives a
+  SETTINGS frame changing HEADER_TABLE_SIZE (to its byte's 64s, 255 being 65536), as random bytes rarely make one. With
+  the session's encoder ignoring SETTINGS (a deliberate break), it failed within two minutes; with the code as it is,
+  700 s (two runs, the second with `-len_control=0` for longer scripts) found nothing, nor did `fuzz_hpack` in 300 s.
+- Measured (`bench_request`, Release, five alternating runs of master's binary and the branch's, both with the bytes
+  count, which this part adds: a blocking relay between a second client and the server, counting each way, in a run
+  of its own after the timed one). Bytes over HTTP/2, a request (`:method`, `:scheme`, `:authority`, `:path`) and its
+  response (`:status`, `server`, `content-type`, `content-length`, `date`; a 13-byte body): from the second request on,
+  33 bytes up and 89 down before, 21 up and 49 down after (every run the same): the request's block 24 bytes to 12
+  (`:authority`, 12 bytes as a literal, now one), the response's 49 to 9 (`server`, `content-type` and `date` now one
+  byte each; `content-length` stays a 5-byte literal, and `date` is a literal again once a second). The first request,
+  with the connection's preface and SETTINGS, 106 up and 138 down before, 106 and 135 after: a literal with
+  incremental indexing has a 6-bit prefix for its name's index where one without has 4, so `server` (54),
+  `content-type` (31) and `date` (33) take a byte less each even the first time. Allocations a request (client and
+  server together) 51.8 to 51.9 before and after: the decoders now insert the peer's fields, into part 6's storage,
+  which allocated only while the tables first grew (in the warm-up). Time 80.6 to 84.6 us a request before, 80.0 to
+  81.8 after (within the spread; loopback's bytes cost little). The rest of `bench_request` unchanged (pipelined 1139
+  to 1178 ns before, 1128 to 1144 after; over a socket 27.7 to 29.1 us before, 27.7 to 29.0 after).
+- Noticed while counting: a response with a Content-Length ends with an empty DATA frame (END_STREAM), 9 bytes, after
+  the body's last DATA, as `finish()` ends the stream after the handler; ending it with the write that reaches the
+  length would save them. Not done here (it's the response writer's, not HPACK's).
+- Interop, by hand (cleartext, prior knowledge, through a throwaway Python relay printing each HEADERS block's size and
+  first bytes; h2load and nghttp aren't installed, so not those). curl 8.7.1 (nghttp2 1.64.0, macOS's) with five URLs
+  in one invocation against `example/http-server` (with `Authorization`, `Cookie` and a repeated custom field): one
+  connection ("Re-using existing connection" each time), every response right (`hello world`, `hello, alice`,
+  `hello, bob`, and a 404), the server's blocks 39 bytes then 8 (`88bfbe` and `content-length`) and 6 for the 404;
+  curl's own blocks, which index, decoded by the server. Go 1.27.1's net/http (h2c through `Protocols`'
+  `SetUnencryptedHTTP2`, `HTTP2Config.MaxDecoderHeaderTableSize` 4096, 65536 and 512) as the client of
+  `example/http-server`, four requests each: one connection, every response right, the server's blocks 39 bytes then
+  8, and with 512 the first block starting with `3fe103` (512); and as the server for a throwaway cppnet client making
+  six requests on one connection (`User-Agent`, `Accept`, `Authorization`, `Cookie`, `X-N`): Go saw every field right
+  on each (its handler echoing them), the client's blocks 74 bytes then 39, and with Go's 512 the second block (the
+  first after Go's SETTINGS) starting with `3fe103`; with 65536, no size update.
+
 
 ## Stage 5
 
@@ -1359,9 +1442,9 @@ throughput isn't changed (by frame count and order).
       with HTTP/2's sessions on `none`, so nothing changes on the wire; `fuzz_hpack`'s new properties (with
       `automatic`). Split from 7 so the mechanics are proved on their own, by the fuzzer, before anything depends on
       them.
-   7. **HPACK's indexing, on.** The policy (Decided questions 13 and 14), the encoder's cap (`encoder_table_size`), the
-      sessions indexing; `bench_request`'s bytes per request; curl and h2load by hand. A wire change, so its own pull
-      request, to measure and to revert alone.
+   7. **HPACK's indexing, on.** Done (2026-10-21; see Learned in stage 5). The policy (Decided questions 13 and 14),
+      the encoder's cap (`encoder_table_size`), the sessions indexing; `bench_request`'s bytes per request; curl and
+      h2load by hand. A wire change, so its own pull request, to measure and to revert alone.
    8. **Structured Fields and `http::priority`.** RFC 9651's Dictionary parsing, `parse_priority()`, `to_string()`,
       `fuzz_structured_fields`. Without I/O, and nothing uses it yet: split out so the parser is reviewed (and fuzzed)
       on its own.

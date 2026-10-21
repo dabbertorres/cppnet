@@ -1353,3 +1353,190 @@ TEST_CASE("an HTTP/2 request that expects 100 Continue gets one when its handler
                                             }));
     }
 }
+
+namespace
+{
+
+// indexing_router answers with fields HPACK's table can hold: some that repeat, the request's own sent back, and a
+// cookie (never indexed); and at /big/:name, a field of 3000 bytes named for name, near 3/4 of a table of 4096.
+http::router indexing_router()
+{
+    http::router r;
+    r.GET("/fields",
+          [](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              resp.headers()
+                  .set("Content-Type", "text/plain")
+                  .set("X-Served-By", "cppnet's tests")
+                  .set("X-Token-Seen", req.headers.get("x-token").value_or("(none)"))
+                  .set("X-Cookie-Seen", req.headers.get("cookie").value_or("(none)"))
+                  .set("Set-Cookie", "session=secret");
+              auto* body = co_await resp.send(http::status::OK, 2);
+              co_await net::io::write_all(*body, "ok"sv);
+          });
+    r.GET("/big/:name",
+          [](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const auto name = req.path_value("name");
+              resp.headers().set(std::format("X-{}", name), std::string(3'000, name.front()));
+              co_await resp.send(http::status::NO_CONTENT);
+          });
+    return r;
+}
+
+// with_client_config runs test with an h2_client of config's, as with_client does.
+template<typename Test>
+task<> with_client_config(net::io::scheduler* sched, std::string port, http2::session_config config, Test test)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+    REQUIRE(conn.has_value());
+
+    h2_client client{&*conn, &*conn, &*conn, http2::role::client, config};
+    co_await test(client);
+}
+
+}
+
+TEST_CASE("the server's HTTP/2 responses repeat fields as indexes of HPACK's table, but never cookies",
+          "[http][http2][server][hpack]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, indexing_router()};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            // the client's own session indexes too: x-token, and the server's table
+                                            // copes; the cookie it doesn't.
+                                            const std::array fields{
+                                                hpack::field{.name = "x-token",   .value = "abc"},
+                                                hpack::field{ .name = "cookie", .value = "id=42"}
+                                            };
+
+                                            std::vector<http2::stream_id> ids;
+                                            for (int i = 0; i < 3; ++i)
+                                            {
+                                                ids.push_back(c.request("GET", "/fields", {}, true, fields));
+                                                const bool finished = co_await c.wait_for(ids.back());
+                                                REQUIRE(finished);
+                                            }
+
+                                            for (const auto id : ids)
+                                            {
+                                                CAPTURE(id);
+                                                const auto& r = c.responses[id];
+                                                CHECK(r.status == "200");
+                                                CHECK(r.body == "ok");
+                                                CHECK(header(r, "content-type") == "text/plain");
+                                                CHECK(header(r, "x-served-by") == "cppnet's tests");
+                                                CHECK(header(r, "x-token-seen") == "abc");
+                                                CHECK(header(r, "x-cookie-seen") == "id=42");
+                                                CHECK(header(r, "set-cookie") == "session=secret");
+                                                CHECK(r.never_indexed == std::vector<std::string>{"set-cookie"});
+                                                REQUIRE(c.blocks[id].size() == 1);
+                                                CHECK(test::size_updates(c.blocks[id][0]).empty());
+                                            }
+
+                                            // the fields the first response put in the table are indexes in the next:
+                                            // the second's block is smaller (by more than the cookie, which is a
+                                            // literal each time), and so is the third's (the date may have changed for
+                                            // the second, and been added again).
+                                            const auto first  = c.blocks[ids[0]][0].size();
+                                            const auto second = c.blocks[ids[1]][0].size();
+                                            const auto third  = c.blocks[ids[2]][0].size();
+                                            CAPTURE(first, second, third);
+                                            CHECK(second + 20 < first);
+                                            CHECK(third + 20 < first);
+                                        }));
+}
+
+TEST_CASE("a client's SETTINGS_HEADER_TABLE_SIZE above 4096 leaves the server's HPACK table at 4096",
+          "[http][http2][server][hpack]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, indexing_router()};
+
+    http2::session_config config;
+    config.local.header_table_size = 65'536;
+
+    sched.run_to_completion(with_client_config(
+        &sched,
+        server.port(),
+        config,
+        [](h2_client& c) -> task<>
+        {
+            // x-a, then x-b, then x-a again: in a table of 4096, x-b pushes x-a out, so it's sent again as a literal
+            // (of about 1900 bytes, Huffman coded); in one of 65536, it would be an index.
+            std::vector<http2::stream_id> ids;
+            for (const auto* path : {"/big/a", "/big/b", "/big/a"})
+            {
+                ids.push_back(c.request("GET", path));
+                const bool finished = co_await c.wait_for(ids.back());
+                REQUIRE(finished);
+            }
+
+            for (const auto id : ids)
+            {
+                CAPTURE(id);
+                CHECK(c.responses[id].status == "204");
+                REQUIRE(c.blocks[id].size() == 1);
+                CHECK(
+                    test::size_updates(c.blocks[id][0]).empty()); // the table's size is still the 4096 the client knows
+            }
+            CHECK(header(c.responses[ids[2]], "x-a") == std::string(3'000, 'a'));
+            CHECK(c.blocks[ids[2]][0].size() > 1'000);
+        }));
+}
+
+TEST_CASE("a client's SETTINGS_HEADER_TABLE_SIZE lowered then raised: the server's next block signals both",
+          "[http][http2][server][hpack]")
+{
+    net::io::scheduler sched{make_pool()};
+    test_server        server{&sched, indexing_router()};
+
+    sched.run_to_completion(with_client(&sched,
+                                        server.port(),
+                                        [](h2_client& c) -> task<>
+                                        {
+                                            const auto first = c.request("GET", "/fields");
+                                            const bool done  = co_await c.wait_for(first);
+                                            REQUIRE(done);
+
+                                            // SETTINGS lowering the table to 100, then raising it past the cap, written
+                                            // by hand (the session can't change its settings): the server's next block
+                                            // must start with 100, then its cap, 4096 (RFC 7541, section 4.2), whose
+                                            // decoder (this client's, at 4096 still) accepts them. The PING makes sure
+                                            // they've arrived first.
+                                            std::vector<std::byte> frames;
+                                            http2::encode_settings({.header_table_size = 100}, {}, frames);
+                                            http2::encode_settings({.header_table_size = 8'192}, {}, frames);
+                                            const auto written = co_await net::io::write_all(*c.out, frames);
+                                            REQUIRE_FALSE(written.err);
+                                            const bool synced = co_await c.sync();
+                                            REQUIRE(synced);
+
+                                            const auto second = c.request("GET", "/fields");
+                                            const bool done2  = co_await c.wait_for(second);
+                                            REQUIRE(done2);
+                                            const auto third = c.request("GET", "/fields");
+                                            const bool done3 = co_await c.wait_for(third);
+                                            REQUIRE(done3);
+
+                                            for (const auto id : {first, second, third})
+                                            {
+                                                CAPTURE(id);
+                                                CHECK(c.responses[id].status == "200");
+                                                CHECK(header(c.responses[id], "x-served-by") == "cppnet's tests");
+                                            }
+
+                                            CHECK(test::size_updates(c.blocks[first][0]).empty());
+                                            CHECK(test::size_updates(c.blocks[second][0])
+                                                  == "3f453fe11f"); // 100, then 4096
+                                            CHECK(test::size_updates(c.blocks[third][0]).empty());
+
+                                            // the table was cut to 100, keeping at most its newest field, so the second
+                                            // response indexed the others again, and the third has them as indexes.
+                                            CHECK(c.blocks[third][0].size() + 20 < c.blocks[second][0].size());
+                                        }));
+}

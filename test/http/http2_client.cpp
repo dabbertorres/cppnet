@@ -1919,3 +1919,193 @@ TEST_CASE("a handler's outgoing requests given its token are canceled with it", 
     if (http2_upstream) expected.emplace_back("upstream stopped");
     CHECK(sched.run_to_completion(test(&sched, &client, &front, &probe, &proxy, http2_upstream)) == expected);
 }
+
+namespace
+{
+
+// exchange sends req on fake's connection (recording what happens in out, which must outlive the scheduler, in case
+// a test fails before the request's done), and answers it (stream id) as server with a 204, returning whether the
+// response came back as a 204.
+task<bool> exchange(net::io::scheduler*  sched,
+                    const fake_server&   fake,
+                    test::h2_client&     server,
+                    http::client_request req,
+                    http2::stream_id     id,
+                    outcome*             out)
+{
+    const bool spawned = sched->spawn(send_request(sched, fake.conn, std::move(req), out));
+    REQUIRE(spawned);
+    const bool received = co_await server.pump([&] { return server.responses[id].done; });
+    REQUIRE(received);
+
+    server.respond(id, "204");
+    const bool written = co_await server.pump([] { return true; }); // (just written)
+    REQUIRE(written);
+
+    const bool answered = co_await out->wait(sched);
+    REQUIRE(answered);
+    co_return out->status == 204;
+}
+
+}
+
+TEST_CASE("the client's HTTP/2 requests repeat fields as indexes of HPACK's table, but never credentials",
+          "[http][http2][client][hpack]")
+{
+    std::array<outcome, 3> outcomes; // (before the scheduler, which waits for the requests)
+    net::io::scheduler     sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, std::array<outcome, 3>* outcomes) -> task<>
+    {
+        auto            fake = co_await connect_fake(sched, {.io_timeout = 3s});
+        test::h2_client server{&fake.socket, &fake.socket, &fake.socket, http2::role::server};
+
+        const auto make = []
+        {
+            http::client_request req{.method = http::request_method::GET,
+                                     .uri    = net::url::parse("http://example.com/some/path").value()};
+            req.headers.set("User-Agent", "cppnet's tests")
+                .set("Accept", "text/plain")
+                .set("Authorization", "Bearer a-token-of-some-length")
+                .set("Cookie", "id=42");
+            return req;
+        };
+
+        const std::array<http2::stream_id, 3> ids{1, 3, 5};
+        for (const auto id : ids)
+        {
+            const bool exchanged = co_await exchange(sched, fake, server, make(), id, &outcomes->at(id / 2));
+            REQUIRE(exchanged);
+        }
+
+        for (const auto id : ids)
+        {
+            CAPTURE(id);
+            const auto& r = server.responses[id];
+            CHECK(test::header(r, ":authority") == "example.com");
+            CHECK(test::header(r, ":path") == "/some/path");
+            CHECK(test::header(r, "user-agent") == "cppnet's tests");
+            CHECK(test::header(r, "accept") == "text/plain");
+            CHECK(test::header(r, "authorization") == "Bearer a-token-of-some-length");
+            CHECK(test::header(r, "cookie") == "id=42");
+            CHECK(r.never_indexed == std::vector<std::string>{"authorization", "cookie"});
+            REQUIRE(server.blocks[id].size() == 1);
+            CHECK(test::size_updates(server.blocks[id][0]).empty());
+        }
+
+        // :authority, user-agent and accept are indexes after the first request (:path stays a literal, as it changes
+        // from one request to the next, and so do the credentials, each time), so the others' blocks are smaller,
+        // and the same.
+        const auto first = server.blocks[1][0].size();
+        CAPTURE(first, server.blocks[3][0].size());
+        CHECK(server.blocks[3][0].size() + 20 < first);
+        CHECK(server.blocks[3][0] == server.blocks[5][0]);
+        fake.conn->close();
+    };
+
+    sched.run_to_completion(test(&sched, &outcomes));
+}
+
+TEST_CASE("a server's SETTINGS_HEADER_TABLE_SIZE above 4096 leaves the client's HPACK table at 4096",
+          "[http][http2][client][hpack]")
+{
+    std::array<outcome, 3> outcomes; // (before the scheduler, which waits for the requests)
+    net::io::scheduler     sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, std::array<outcome, 3>* outcomes) -> task<>
+    {
+        http2::session_config config;
+        config.local.header_table_size = 65'536;
+
+        auto            fake = co_await connect_fake(sched, {.io_timeout = 3s});
+        test::h2_client server{&fake.socket, &fake.socket, &fake.socket, http2::role::server, config};
+
+        // x-a, then x-b, then x-a again: in a table of 4096, x-b pushes x-a out, so it's sent again as a literal (of
+        // about 1900 bytes, Huffman coded); in one of 65536, it would be an index.
+        const auto with = [](char name)
+        {
+            http::client_request req{.method = http::request_method::GET,
+                                     .uri    = net::url::parse("http://example.com/").value()};
+            req.headers.set(std::format("X-{}", name), std::string(3'000, name));
+            return req;
+        };
+
+        const std::array<std::pair<http2::stream_id, char>, 3> sent{
+            {{1, 'a'}, {3, 'b'}, {5, 'a'}}
+        };
+        for (const auto& [id, name] : sent)
+        {
+            const bool exchanged = co_await exchange(sched, fake, server, with(name), id, &outcomes->at(id / 2));
+            REQUIRE(exchanged);
+        }
+
+        for (const auto& [id, name] : sent)
+        {
+            CAPTURE(id);
+            CHECK(test::header(server.responses[id], std::format("x-{}", name)) == std::string(3'000, name));
+            REQUIRE(server.blocks[id].size() == 1);
+            CHECK(test::size_updates(server.blocks[id][0]).empty()); // still the 4096 the server knows
+        }
+        CHECK(server.blocks[5][0].size() > 1'000);
+        fake.conn->close();
+    };
+
+    sched.run_to_completion(test(&sched, &outcomes));
+}
+
+TEST_CASE("a server's SETTINGS_HEADER_TABLE_SIZE lowered then raised: the client's next block signals both",
+          "[http][http2][client][hpack]")
+{
+    std::array<outcome, 3> outcomes; // (before the scheduler, which waits for the requests)
+    net::io::scheduler     sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, std::array<outcome, 3>* outcomes) -> task<>
+    {
+        auto            fake = co_await connect_fake(sched, {.io_timeout = 3s});
+        test::h2_client server{&fake.socket, &fake.socket, &fake.socket, http2::role::server};
+
+        const auto make = []
+        {
+            http::client_request req{.method = http::request_method::GET,
+                                     .uri    = net::url::parse("http://example.com/").value()};
+            req.headers.set("User-Agent", "cppnet's tests").set("Accept", "text/plain");
+            return req;
+        };
+
+        const bool first = co_await exchange(sched, fake, server, make(), 1, &outcomes->at(0));
+        REQUIRE(first);
+
+        // SETTINGS lowering the table to 100, then raising it past the cap, written by hand (the session can't change
+        // its settings): the client's next block must start with 100, then its cap, 4096 (RFC 7541, section 4.2). The
+        // PING's acknowledgement says the client has taken them, before the request's sent.
+        std::vector<std::byte> frames;
+        http2::encode_settings({.header_table_size = 100}, {}, frames);
+        http2::encode_settings({.header_table_size = 8'192}, {}, frames);
+        const auto written = co_await net::io::write_all(fake.socket, frames);
+        REQUIRE_FALSE(written.err);
+        const bool synced = co_await server.sync();
+        REQUIRE(synced);
+
+        const bool second = co_await exchange(sched, fake, server, make(), 3, &outcomes->at(1));
+        REQUIRE(second);
+        const bool third = co_await exchange(sched, fake, server, make(), 5, &outcomes->at(2));
+        REQUIRE(third);
+
+        for (const http2::stream_id id : {1U, 3U, 5U})
+        {
+            CAPTURE(id);
+            CHECK(test::header(server.responses[id], "user-agent") == "cppnet's tests");
+            REQUIRE(server.blocks[id].size() == 1);
+        }
+        CHECK(test::size_updates(server.blocks[1][0]).empty());
+        CHECK(test::size_updates(server.blocks[3][0]) == "3f453fe11f"); // 100, then 4096
+        CHECK(test::size_updates(server.blocks[5][0]).empty());
+
+        // the table was cut to 100, keeping at most one field, so the second request indexed the others again, and
+        // the third has them as indexes.
+        CHECK(server.blocks[5][0].size() + 10 < server.blocks[3][0].size());
+        fake.conn->close();
+    };
+
+    sched.run_to_completion(test(&sched, &outcomes));
+}

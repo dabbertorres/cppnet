@@ -237,6 +237,7 @@ session::session(role r, const session_config& config)
     , decoder{hpack::default_table_size,
               config.local.max_header_list_size == unlimited ? std::numeric_limits<std::size_t>::max()
                                                              : config.local.max_header_list_size}
+    , encoder{hpack::indexing::automatic}
     , next_local_stream{r == role::client ? 1U : 2U}
 {
     // NOTE: this->config, not the parameter of the same name.
@@ -256,6 +257,10 @@ session::session(role r, const session_config& config)
         const auto bytes = std::as_bytes(std::span{preface});
         output.insert(output.end(), bytes.begin(), bytes.end());
     }
+
+    // the encoder's table starts at the peer's initial SETTINGS_HEADER_TABLE_SIZE, unless the cap is smaller: then the
+    // first block says so.
+    encoder.set_max_table_size(std::min(this->config.encoder_table_size, peer.header_table_size));
 
     encode_settings(local, settings{}, output);
 
@@ -707,8 +712,10 @@ std::error_code session::apply_setting(std::uint16_t id, std::uint32_t value)
     switch (static_cast<setting_id>(id))
     {
     case setting_id::header_table_size:
+        // NOTE: the encoder may use less than the peer offers (RFC 7541, section 4.2): it's held to its cap, and so
+        //       only has to signal a change when the peer's setting goes below that (the smallest, then the final).
         peer.header_table_size = value;
-        encoder.set_max_table_size(value);
+        encoder.set_max_table_size(std::min(config.encoder_table_size, value));
         break;
 
     case setting_id::enable_push:

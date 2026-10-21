@@ -1,9 +1,12 @@
 // fuzz_http2 checks that an HTTP/2 session (as a server, and as a client) doesn't crash on any frames, nor on what its
 // application does between them, and that it receives frames the same whether they arrive at once or a byte at a
-// time: the same events, the same output (frames to send), and the same outcome.
+// time: the same events, the same output (frames to send), and the same outcome. And that the header blocks it sends
+// decode, by a decoder that takes the SETTINGS_HEADER_TABLE_SIZE of each SETTINGS the session has acknowledged (from
+// the acknowledgement on, as the peer's would), to the fields the application submitted, in order: so its encoder's
+// dynamic table (indexing::automatic) and size updates stay in step with what the peer allows.
 //
 // The input is a script, of records that each start with an op byte (its low 3 bits):
-// - 0 and 7: receive the next n bytes (n is the next byte; 0, or more than there are: the rest), as frames.
+// - 0: receive the next n bytes (n is the next byte; 0, or more than there are: the rest), as frames.
 // - 1: time passes: the next byte's tens of milliseconds (for the token buckets).
 // - 2: headers (the next byte: bits 0-3 choose a stream, 4-5 what, 6 ends the stream): a server responds (a 200, one
 //      with a Content-Length of 3, a 103, or trailers), a client opens a stream for a request (GET, POST with a
@@ -13,6 +16,8 @@
 // - 5: consume (the next byte chooses a stream; the one after, how much, in 256s).
 // - 6: PING, or GOAWAY (the next byte: bit 0 which, 1 whether the last stream is the peer's last or the most, 4-7 the
 //      code).
+// - 7: receive a SETTINGS frame changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the
+//      session's encoder to follow (frames that say so are rare among random bytes).
 // A stream is chosen from those the application knows (a server's requests, a client's own), in order.
 //
 // The server's script follows the client's preface and empty SETTINGS, and the client's the server's empty SETTINGS,
@@ -29,6 +34,7 @@
 #include <cstdlib>
 #include <expected>
 #include <format>
+#include <limits>
 #include <print>
 #include <ratio>
 #include <span>
@@ -39,6 +45,7 @@
 #include <vector>
 
 #include "http/hpack.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
 
 namespace
@@ -56,6 +63,7 @@ struct recorder final : http2::session_events
 {
     std::string                   log;
     std::vector<http2::stream_id> known;
+    std::vector<std::uint32_t>    table_sizes; // the peer's SETTINGS_HEADER_TABLE_SIZE after each of its SETTINGS
 
     void
     on_headers(http2::stream_id stream, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
@@ -78,7 +86,11 @@ struct recorder final : http2::session_events
     }
 
     void on_window_update(http2::stream_id stream) override { log += std::format("window {}\n", stream); }
-    void on_settings(const http2::settings& /*peer*/) override { log += "settings\n"; }
+    void on_settings(const http2::settings& peer) override
+    {
+        log += "settings\n";
+        table_sizes.push_back(peer.header_table_size);
+    }
 
     void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override
     {
@@ -98,6 +110,58 @@ struct outcome
 
     bool operator==(const outcome&) const = default;
 };
+
+// blocks_decode is whether the header blocks in a session's output decode, as the peer would decode them, to the fields
+// submitted, in order: the peer's decoder's limit is the SETTINGS_HEADER_TABLE_SIZE of each SETTINGS the session
+// acknowledged (table_sizes, in order), from its acknowledgement on.
+bool blocks_decode(http2::role                                    role,
+                   std::span<const std::byte>                     output,
+                   std::span<const std::uint32_t>                 table_sizes,
+                   std::span<const std::span<const hpack::field>> submitted)
+{
+    if (role == http2::role::client) output = output.subspan(http2::preface.size());
+
+    hpack::decoder         dec{hpack::default_table_size, std::numeric_limits<std::size_t>::max()};
+    std::size_t            acks    = 0;
+    std::size_t            decoded = 0;
+    std::vector<std::byte> block;
+
+    while (output.size() >= http2::frame_header_size)
+    {
+        const auto h       = http2::decode_frame_header(output.first<http2::frame_header_size>());
+        const auto payload = output.subspan(http2::frame_header_size, h.length);
+        output             = output.subspan(http2::frame_header_size + h.length);
+
+        const auto type = static_cast<http2::frame_type>(h.type);
+        if (type == http2::frame_type::settings && (h.flags & http2::flags::ack) != 0)
+        {
+            if (acks < table_sizes.size()) dec.set_max_table_size(table_sizes[acks]);
+            ++acks;
+            continue;
+        }
+        if (type != http2::frame_type::headers && type != http2::frame_type::continuation) continue;
+
+        // NOTE: the session never pads, nor sends a priority.
+        if (type == http2::frame_type::headers) block.clear();
+        block.insert(block.end(), payload.begin(), payload.end());
+        if ((h.flags & http2::flags::end_headers) == 0) continue;
+
+        if (decoded == submitted.size()) return false;
+        const auto            expected = submitted[decoded++];
+        std::size_t           at       = 0;
+        bool                  same     = true;
+        const std::error_code err      = dec.decode(block,
+                                                    [&](const hpack::field& f)
+                                                    {
+                                                   same = same && at < expected.size() && f.name == expected[at].name
+                                                       && f.value == expected[at].value;
+                                                   ++at;
+                                                    });
+        if (err || !same || at != expected.size()) return false;
+    }
+
+    return decoded == submitted.size();
+}
 
 // script is the fuzzer's input, read a byte at a time.
 struct script
@@ -154,6 +218,15 @@ public:
         out.unused = pending.size();
         out.events = std::move(events.log);
         collect();
+
+        if (!blocks_decode(role, out.output, events.table_sizes, submitted))
+        {
+            std::println(stderr,
+                         "PROPERTY FAILED: the {}'s header blocks don't decode to what it submitted\n{}",
+                         role == http2::role::server ? "server" : "client",
+                         out.events);
+            std::abort();
+        }
         return std::move(out);
     }
 
@@ -202,6 +275,7 @@ private:
 
         events.known.push_back(*id);
         const auto err = s.submit_headers(*id, fields, end_stream);
+        if (!err) submitted.push_back(fields);
         events.log += std::format("open {} {}\n", *id, err.value());
     }
 
@@ -227,8 +301,10 @@ private:
         }
 
         const std::array<fields, 4> blocks{ok, ok_with_length, early_hints, trailers};
-        const auto                  id = stream(arg & 0xfU);
-        events.log += std::format("submit headers {} {}\n", id, s.submit_headers(id, blocks.at(what), end).value());
+        const auto                  id  = stream(arg & 0xfU);
+        const auto                  err = s.submit_headers(id, blocks.at(what), end);
+        if (!err) submitted.push_back(blocks.at(what));
+        events.log += std::format("submit headers {} {}\n", id, err.value());
     }
 
     void submit_data(std::uint8_t arg, std::uint8_t size)
@@ -245,8 +321,7 @@ private:
     {
         switch (sc.next() & 7U)
         {
-        case 0:
-        case 7: receive(sc.take(sc.next())); break;
+        case 0: receive(sc.take(sc.next())); break;
 
         case 1: now += std::chrono::milliseconds{10} * sc.next(); break;
 
@@ -285,6 +360,15 @@ private:
 
             const auto last = (arg & 2U) != 0 ? s.last_peer_stream() : http2::max_stream_id;
             s.goaway(last, static_cast<http2::error_code>(arg >> 4U));
+            break;
+        }
+
+        case 7:
+        {
+            const auto             size = sc.next();
+            std::vector<std::byte> frame;
+            http2::encode_settings({.header_table_size = size == 255 ? 65'536U : 64U * size}, {}, frame);
+            receive(frame);
             break;
         }
 
@@ -341,6 +425,8 @@ private:
     std::vector<std::byte> pending;
     std::vector<std::byte> buffer;
     std::vector<std::byte> data;
+
+    std::vector<std::span<const hpack::field>> submitted; // the blocks submitted, in order (static arrays' fields)
 };
 
 void check(http2::role role, std::span<const std::byte> prefix, std::span<const std::byte> input)

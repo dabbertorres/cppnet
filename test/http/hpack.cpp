@@ -728,21 +728,23 @@ TEST_CASE("the encoder chooses the shortest representation it has", "[http][hpac
     }
 }
 
-TEST_CASE("the encoder signals a smaller table, once", "[http][hpack][encoder]")
+TEST_CASE("the encoder signals the table's size, once, without indexing too", "[http][hpack][encoder]")
 {
     hpack::encoder enc;
 
-    enc.set_max_table_size(8'192); // larger: nothing to signal
+    // NOTE: without indexing the table stays empty, but its size follows the peer's all the same, growing too: the
+    //       smallest since the last block, then the final size.
+    enc.set_max_table_size(8'192);
     enc.set_max_table_size(100);
-    enc.set_max_table_size(200); // larger again: the table stays at 100
-    CHECK(enc.max_table_size() == 100);
+    enc.set_max_table_size(200);
+    CHECK(enc.max_table_size() == 200);
 
     const std::vector<hpack::field> fields{
         {.name = ":method", .value = "GET"}
     };
     std::vector<std::byte> first;
     enc.encode(fields, first);
-    CHECK(to_hex(first) == "3f4582");
+    CHECK(to_hex(first) == "3f453fa90182");
 
     std::vector<std::byte> second;
     enc.encode(fields, second);
@@ -752,7 +754,8 @@ TEST_CASE("the encoder signals a smaller table, once", "[http][hpack][encoder]")
     hpack::decoder dec;
     dec.set_max_table_size(200);
     CHECK_FALSE(decode(dec, first).err);
-    CHECK(dec.table().max_size() == 100);
+    CHECK(dec.table().max_size() == 200);
+    CHECK(enc.table().count() == 0);
 }
 
 TEST_CASE("credentials and cookies are sensitive", "[http][hpack]")
@@ -916,11 +919,14 @@ TEST_CASE("the encoder signals the smallest size since the last block, then the 
         test_case{.what = "growing, then shrinking below", .sizes = {8'192, 100}, .hex = "3f4582"},
         test_case{.what = "shrinking twice", .sizes = {200, 100}, .hex = "3f4582"},
         test_case{.what = "the same", .sizes = {4'096}, .hex = "82"},
-        test_case{.what = "without indexing, growing", .mode = hpack::indexing::none, .sizes = {8'192}, .hex = "82"},
+        test_case{.what  = "without indexing, growing",
+                  .mode  = hpack::indexing::none,
+                  .sizes = {8'192},
+                  .hex   = "3fe13f82"},
         test_case{.what  = "without indexing, shrinking, then growing",
                   .mode  = hpack::indexing::none,
                   .sizes = {0, 4'096},
-                  .hex   = "2082"});
+                  .hex   = "203fe11f82"});
     CAPTURE(tc.what);
 
     hpack::encoder enc{tc.mode};

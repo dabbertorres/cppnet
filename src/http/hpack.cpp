@@ -611,9 +611,6 @@ void decoder::emit(const field& f, block_state& state) const
 
 void encoder::set_max_table_size(std::size_t max_table_size) noexcept
 {
-    // NOTE: as indexing::none adds nothing to the table, it only ever needs to shrink.
-    if (mode == indexing::none) max_table_size = std::min(max_table_size, dynamic.max_size());
-
     dynamic.set_max_size(max_table_size);
     smallest = std::min(smallest, dynamic.max_size());
 }

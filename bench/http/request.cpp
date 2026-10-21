@@ -9,7 +9,9 @@
 //   once (for another pool, as for a database's driver), whose connection the server watches meanwhile, to notice the
 //   client leaving.
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
-//   allocations are counted with the server's (as they share the process): for what a stream costs.
+//   allocations are counted with the server's (as they share the process): for what a stream costs. And the bytes a
+//   request and its response come to each way (frames, HPACK's blocks and all), counted by a relay between another
+//   client and the server, in a run of their own: for what HPACK's dynamic table saves.
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
 // costs (see docs/plans/middleware.md), with the metrics' own work; and with the metrics on the route instead (use()),
 // with each router: for what middleware on routes costs. And through http::timeout on the route, pipelined and over a
@@ -26,6 +28,7 @@
 #include <cstdlib>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <print>
 #include <ratio>
@@ -33,14 +36,17 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
 
@@ -122,6 +128,7 @@ constexpr std::size_t date_bytes      = 29; // e.g. "Sun, 06 Nov 1994 08:49:37 G
 constexpr std::size_t buffer_size     = std::size_t{16} * 1'024;
 constexpr int         socket_requests = 50'000;
 constexpr int         http2_requests  = 20'000;
+constexpr int         counted_bytes   = 1'000; // requests
 
 task<void> plaintext(const http::server_request& /*req*/, http::response_writer& resp)
 {
@@ -395,6 +402,143 @@ void measure_socket(std::string_view name, MakeRouter make_router, std::string_v
     runner.join();
 }
 
+// loopback is 127.0.0.1's port.
+sockaddr_in loopback(std::uint16_t port) noexcept
+{
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return addr;
+}
+
+// NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
+sockaddr* as_sockaddr(sockaddr_in& addr) noexcept { return reinterpret_cast<sockaddr*>(&addr); }
+
+// NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+
+// relay forwards the connections made to it to a port of 127.0.0.1's, counting the bytes each way: for what a request
+// and its response come to on the wire. Blocking, with a thread each way per connection, so it's only used for the run
+// that counts bytes, not the timed one.
+class relay
+{
+public:
+    explicit relay(std::uint16_t to)
+        : to{to}
+        , listener{::socket(AF_INET, SOCK_STREAM, 0)}
+    {
+        auto      addr   = loopback(0);
+        socklen_t length = sizeof(addr);
+        if (listener < 0 || ::bind(listener, as_sockaddr(addr), sizeof(addr)) != 0 || ::listen(listener, 8) != 0
+            || ::getsockname(listener, as_sockaddr(addr), &length) != 0)
+        {
+            std::println(stderr, "failed to make the relay's listener");
+            return;
+        }
+
+        listening = ntohs(addr.sin_port);
+        acceptor  = std::thread{[this] { accept_connections(); }};
+    }
+
+    relay(const relay&)            = delete;
+    relay& operator=(const relay&) = delete;
+    relay(relay&&)                 = delete;
+    relay& operator=(relay&&)      = delete;
+
+    ~relay()
+    {
+        stopping = true;
+        if (acceptor.joinable()) acceptor.join();
+
+        // ends the forwarders' reads, whether or not the ends have closed.
+        for (const auto fd : fds) ::shutdown(fd, SHUT_RDWR);
+        for (auto& t : forwarders) t.join();
+        for (const auto fd : fds) ::close(fd);
+        if (listener >= 0) ::close(listener);
+    }
+
+    [[nodiscard]] std::uint16_t port() const noexcept { return listening; }
+
+    // up is what the clients have sent, and down what the server has.
+    [[nodiscard]] std::size_t up() const noexcept { return sent_up.load(); }
+    [[nodiscard]] std::size_t down() const noexcept { return sent_down.load(); }
+
+private:
+    void accept_connections()
+    {
+        while (!stopping)
+        {
+            pollfd p{.fd = listener, .events = POLLIN, .revents = 0};
+            if (::poll(&p, 1, 50) <= 0) continue;
+
+            const int from = ::accept(listener, nullptr, nullptr);
+            if (from < 0) continue;
+
+            auto      addr = loopback(to);
+            const int dest = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (dest < 0 || ::connect(dest, as_sockaddr(addr), sizeof(addr)) != 0)
+            {
+                std::println(stderr, "the relay failed to connect to the server");
+                ::close(from);
+                if (dest >= 0) ::close(dest);
+                continue;
+            }
+
+            // NOTE: what's read is written at once, as the ends wrote it: Nagle's algorithm would hold small frames
+            //       back for the peer's delayed ACK.
+            const int on = 1;
+            ::setsockopt(from, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+            ::setsockopt(dest, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+
+            std::scoped_lock lock{mu};
+            fds.push_back(from);
+            fds.push_back(dest);
+            forwarders.emplace_back([this, from, dest] { forward(from, dest, sent_up); });
+            forwarders.emplace_back([this, from, dest] { forward(dest, from, sent_down); });
+        }
+    }
+
+    // write_all writes all of data to fd, returning whether it could.
+    static bool write_all(int fd, std::span<const char> data)
+    {
+        while (!data.empty())
+        {
+            const auto n = ::write(fd, data.data(), data.size());
+            if (n <= 0) return false;
+            data = data.subspan(static_cast<std::size_t>(n));
+        }
+        return true;
+    }
+
+    // forward copies what's read from in to out, until in ends (then ending out's writing side) or out fails.
+    static void forward(int in, int out, std::atomic<std::size_t>& count)
+    {
+        std::array<char, 16'384> buf{};
+        while (true)
+        {
+            const auto n = ::read(in, buf.data(), buf.size());
+            if (n <= 0) break;
+
+            count += static_cast<std::size_t>(n);
+            if (!write_all(out, std::span{buf.data(), static_cast<std::size_t>(n)})) break;
+        }
+
+        ::shutdown(out, SHUT_WR);
+    }
+
+    std::uint16_t            to;
+    int                      listener;
+    std::uint16_t            listening = 0;
+    std::atomic<bool>        stopping  = false;
+    std::atomic<std::size_t> sent_up   = 0;
+    std::atomic<std::size_t> sent_down = 0;
+    std::thread              acceptor;
+
+    std::mutex               mu; // for fds and forwarders, until acceptor has been joined
+    std::vector<int>         fds;
+    std::vector<std::thread> forwarders;
+};
+
 // http2_outcome is what measure_http2's client measured.
 struct http2_outcome
 {
@@ -444,8 +588,61 @@ task<http2_outcome> send_http2_requests(http::client* client, std::string url)
     co_return out;
 }
 
+// http2_bytes is what count_http2_bytes counted: the bytes each way (up from the client, down from the server).
+struct http2_bytes
+{
+    std::size_t first_up    = 0; // the first request's, with the connection's preface and SETTINGS
+    std::size_t first_down  = 0;
+    std::size_t second_up   = 0;
+    std::size_t second_down = 0;
+    std::size_t up          = 0; // counted_bytes requests' after those
+    std::size_t down        = 0;
+    int         failed      = -1;
+};
+
+// settle waits a moment: after a response, for what the client sends after it (e.g. a WINDOW_UPDATE).
+task<void> settle(net::io::scheduler* scheduler)
+{
+    const auto err = co_await scheduler->sleep_until(net::io::clock::now() + 20ms);
+    if (err) std::println(stderr, "failed to wait: {}", err.message());
+}
+
+// count_http2_bytes sends requests to url one at a time, through via, counting the bytes each way: of the first
+// request, of the second, and of counted_bytes more.
+task<http2_bytes> count_http2_bytes(net::io::scheduler* scheduler, http::client* client, std::string url, relay* via)
+{
+    http2_bytes out;
+
+    if (!co_await get_all(*client, url)) co_return http2_bytes{.failed = 0};
+    co_await settle(scheduler);
+    out.first_up   = via->up();
+    out.first_down = via->down();
+
+    if (!co_await get_all(*client, url)) co_return http2_bytes{.failed = 1};
+    co_await settle(scheduler);
+    out.second_up   = via->up() - out.first_up;
+    out.second_down = via->down() - out.first_down;
+
+    const auto up_at   = via->up();
+    const auto down_at = via->down();
+    for (int i = 0; i < counted_bytes; ++i)
+    {
+        if (!co_await get_all(*client, url))
+        {
+            out.failed = i + 2;
+            co_return out;
+        }
+    }
+
+    co_await settle(scheduler);
+    out.up   = via->up() - up_at;
+    out.down = via->down() - down_at;
+    co_return out;
+}
+
 // measure_http2 serves requests over cleartext HTTP/2, a stream at a time from cppnet's client, and prints the time and
-// allocations per request (the client's and the server's together).
+// allocations per request (the client's and the server's together); then the bytes a request and its response come
+// to each way, through a relay (with another client, so on a connection of its own).
 template<typename Router>
 void measure_http2(const Router& router)
 {
@@ -463,15 +660,40 @@ void measure_http2(const Router& router)
     options.http2_prior_knowledge = true;
     http::client client{&scheduler, options};
 
-    const auto url = std::format("http://127.0.0.1:{}/plaintext", server.local_port());
-    const auto out = scheduler.run_to_completion(send_http2_requests(&client, url));
+    // NOTE: the relay's client is another, so it makes a connection of its own, through the relay.
+    relay        via{server.local_port()};
+    http::client counting{&scheduler, options};
+
+    const auto url          = std::format("http://127.0.0.1:{}/plaintext", server.local_port());
+    const auto relayed      = std::format("http://127.0.0.1:{}/plaintext", via.port());
+    const auto [out, bytes] = scheduler.run_to_completion(
+        [](net::io::scheduler* scheduler,
+           http::client*       client,
+           std::string         url,
+           http::client*       counting,
+           std::string         relayed,
+           relay*              via) -> task<std::pair<http2_outcome, http2_bytes>>
+        {
+            auto timed = co_await send_http2_requests(client, std::move(url));
+            auto bytes = co_await count_http2_bytes(scheduler, counting, std::move(relayed), via);
+            co_return std::pair{timed, bytes};
+        }(&scheduler, &client, url, &counting, relayed, &via));
     if (out.failed >= 0) std::println(stderr, "HTTP/2 request {} failed", out.failed);
+    if (bytes.failed >= 0) std::println(stderr, "HTTP/2 request {} through the relay failed", bytes.failed);
 
     std::println("over HTTP/2 (a stream at a time, {} workers; the client's allocations too):", workers->concurrency());
     std::println("{:>10.1f} us per request",
                  std::chrono::duration<double, std::micro>(out.took).count() / http2_requests);
     std::println("{:>10.1f} allocations per request",
                  static_cast<double>(out.allocations) / static_cast<double>(http2_requests));
+    std::println("{:>10} bytes up, {} down: the first request (with the connection's preface and SETTINGS)",
+                 bytes.first_up,
+                 bytes.first_down);
+    std::println("{:>10} bytes up, {} down: the second", bytes.second_up, bytes.second_down);
+    std::println("{:>10.1f} bytes up, {:.1f} down per request, over {} more",
+                 static_cast<double>(bytes.up) / counted_bytes,
+                 static_cast<double>(bytes.down) / counted_bytes,
+                 counted_bytes);
 
     server.close();
     scheduler.shutdown();
