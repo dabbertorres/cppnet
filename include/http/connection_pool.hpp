@@ -230,8 +230,9 @@ namespace detail
         [[nodiscard]] bool wants_http2(const connection& conn) const noexcept;
 
         // start_http2 makes a connection an HTTP/2 connection the host's requests share, returning nullptr if the
-        // scheduler's stopping.
-        std::shared_ptr<http2_client_connection> start_http2(const std::string& key, std::unique_ptr<connection> conn);
+        // scheduler's stopping. origin is its own (see origin_text()), over TLS: none in cleartext.
+        std::shared_ptr<http2_client_connection>
+        start_http2(const std::string& key, std::unique_ptr<connection> conn, std::string origin);
 
         // available_http2 is one of the host's HTTP/2 connections (other than skip) with a stream free, which it
         // reserves for the request, if there is one (holding mu).

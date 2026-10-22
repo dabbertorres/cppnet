@@ -11,6 +11,7 @@
 #include <string_view>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <spdlog/logger.h>
@@ -22,6 +23,7 @@
 #include "http/http2.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_connection.hpp"
+#include "http/origin.hpp"
 #include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -76,6 +78,33 @@ public:
     std::string               path;
 };
 
+// origin_set is an HTTP/2 connection's Origin Set (RFC 8336, section 2.3; docs/plans/http2.md, stage 6's eleventh
+// part), once the server's first ORIGIN frame has initialized it, and what's known of its certificate for each of its
+// hosts. It's guarded by the connection's lock.
+struct origin_set
+{
+    // How many origins it keeps: those past it are ignored (RFC 8336 sets no limit).
+    static constexpr std::size_t max_origins = 256;
+
+    // The origins, normalized (see parse_origin()), each once, in the order they came: the connection's own first.
+    std::vector<https_origin> origins;
+
+    // The hosts whose certificate has been checked (see tls::detail::verify_for()), and whether it was valid for each:
+    // so each is checked once per connection. And how many checks have been made (for tests: two at once may both
+    // check a host).
+    std::vector<std::pair<std::string, bool>> checked;
+    std::size_t                               checks = 0;
+
+    // find is the origin with serialized as its serialization (normalized), if it has it.
+    [[nodiscard]] const https_origin* find(std::string_view serialized) const noexcept;
+
+    // add adds o, unless it has it, or is full.
+    void add(https_origin o);
+
+    // checked_for is whether the certificate is valid for host, if that's been checked.
+    [[nodiscard]] std::optional<bool> checked_for(std::string_view host) const noexcept;
+};
+
 // owned_connection holds what an http2_client_connection owns, before its base (which refers to the connection) is
 // made.
 struct owned_connection
@@ -92,19 +121,27 @@ class http2_client_connection final
 {
 public:
     // closed is called (with the connection) once it has ended; freed whenever a stream is done (so another may be
-    // sent).
+    // sent); origins_known (with the connection) once its Origin Set's been initialized (see origins()), by the
+    // server's first ORIGIN frame, not holding the connection's lock: for the pool's coalescing (docs/plans/http2.md,
+    // stage 6's twelfth part), which finds the connections with origin sets through it.
     struct callbacks
     {
         std::function<void(http2_client_connection&)> closed;
         std::function<void()>                         freed;
+        std::function<void(http2_client_connection&)> origins_known;
     };
 
     // With options.notsent_lowat, it sets TCP_NOTSENT_LOWAT on the connection's socket, and if that works, its writer
     // waits for the socket to take more before each round (see http2_connection_base::write_loop()).
+    //
+    // origin is the connection's own (see origin_text(): https, the host it connected to, its port), the first of its
+    // Origin Set, once ORIGIN initializes it; none, or one that doesn't parse (see parse_origin()), leaves it out. It's
+    // only kept over TLS, with the server's certificate verified (see origins()).
     http2_client_connection(io::scheduler*              scheduler,
                             std::unique_ptr<connection> conn,
                             const http2_client_options& options,
-                            callbacks                   on);
+                            callbacks                   on,
+                            std::string                 origin = {});
 
     // send_state is how far send() got with a request that failed, for deciding whether it may be sent again (on
     // another connection).
@@ -179,6 +216,32 @@ public:
     // nothing, once the response has ended (or failed), or the stream's done with. It takes the lock.
     bool reprioritize(http2::stream_id id, priority p);
 
+    // The connection's Origin Set (RFC 8336; docs/plans/http2.md, stage 6's eleventh part): what the server's ORIGIN
+    // frames say it's authoritative for, for the pool's coalescing (its twelfth part). Over TLS only, with the server's
+    // certificate verified (not with insecure_skip_verification, as nothing then says the server is anyone's), it's
+    // initialized by the server's first ORIGIN frame, with the connection's own origin and the frame's entries; later
+    // frames add to it. Each entry is parsed as an https origin, normalized (see parse_origin()), and ignored if it
+    // doesn't parse (RFC 8336: "If parsing fails, the field MUST be ignored"; an origin of another scheme too, as http
+    // requests never go over TLS). It keeps at most origin_set::max_origins, ignoring the rest.
+
+    // origins is the Origin Set's origins, in the order they came (the connection's own first), if it's initialized.
+    [[nodiscard]] std::optional<std::vector<std::string>> origins();
+
+    // authoritative_for is whether the connection may take requests for origin (an https origin, as parse_origin()
+    // reads it) by its Origin Set: it's initialized and has the origin, and the server's certificate is valid for its
+    // host, as a new connection's handshake would check it (tls::detail::verify_for(), Decided question 37): checked
+    // the first time a host's asked for, without the lock (it costs what a handshake's verification does), then
+    // remembered. False without an initialized set: coalescing is by ORIGIN only (Decided question 35).
+    [[nodiscard]] bool authoritative_for(std::string_view origin);
+
+    // remove_origin removes origin from the Origin Set (RFC 8336's MUST, when a request for it gets 421 (Misdirected
+    // Request): see Decided question 40), returning whether it was there. The connection's own may be removed too.
+    bool remove_origin(std::string_view origin);
+
+    // certificate_checks is how many times the server's certificate has been checked for a host (see
+    // authoritative_for()), for tests.
+    [[nodiscard]] std::size_t certificate_checks();
+
     // cancel fails a request's stream with std::errc::operation_canceled (unless it's failed already), and resets it
     // (CANCEL), if it's still there: a request's stop callback (see canceler), so it takes the lock, and must not be
     // called holding it. The stream stays the request's until done().
@@ -211,7 +274,7 @@ protected:
     void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
     void on_ping_ack(std::span<const std::byte, 8> opaque) override;
     void on_priority_update(http2::stream_id stream, priority p) override;
-    void on_origin(std::span<const std::string_view> origins) override;
+    void on_origin(std::span<const std::string_view> entries) override;
 
     void                                 after_receive() override;
     std::optional<io::clock::time_point> check_connection(io::clock::time_point now) override;
@@ -287,10 +350,24 @@ private:
     std::size_t                                                                reserved    = 0;
     bool                                                                       peer_goaway = false;
     bool                                                                       draining    = false; // drain()ed
+    // on.origins_known is to be called (after the receive whose ORIGIN initialized the Origin Set, without the lock).
+    bool                                 tell_origins = false;
     std::optional<io::clock::time_point> idle_from = io::clock::now(); // when it was last idle (none: not yet looked)
     std::size_t open_seen   = 0; // the session's open streams, when last looked at: fewer now means one's been freed
-    bool        goaway_told = false;   // the pool's been told of the server's GOAWAY (as a stream freed)
+    bool        goaway_told = false; // the pool's been told of the server's GOAWAY (as a stream freed)
+
+    // Set when it's made (so not guarded): whether it keeps an Origin Set at all: over TLS (RFC 8336 has ORIGIN ignored
+    // over cleartext), verifying the server's certificate (without, nothing says the server is anyone's, its own
+    // origin's included). NOTE: here, in what was padding, and before own_origin, which is made from it.
+    bool keeps_origins = false;
+
     std::size_t awaiting_continue = 0; // streams waiting for 100 (Continue): none, and the timer doesn't look for them
+
+    // The Origin Set, once ORIGIN has initialized it: on the heap, as few connections get one.
+    std::unique_ptr<origin_set> known_origins;
+
+    // Set when it's made: the connection's own origin, the Origin Set's first (only if it keeps one).
+    std::string own_origin;
 };
 
 }

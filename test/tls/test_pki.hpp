@@ -35,6 +35,11 @@ struct test_pki
     std::filesystem::path other_name_chain;
     std::filesystem::path other_name_key;
 
+    // one for several names (for an HTTP/2 connection's Origin Set): a.test, b.test, *.w.test and 127.0.0.1, from the
+    // ECDSA CA.
+    std::filesystem::path names_chain;
+    std::filesystem::path names_key;
+
     // one for localhost, from a CA nothing trusts.
     std::filesystem::path untrusted_chain;
     std::filesystem::path untrusted_key;

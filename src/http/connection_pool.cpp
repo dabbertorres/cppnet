@@ -26,6 +26,7 @@
 #include "coro/task.hpp"
 #include "http/http2_client.hpp"
 #include "http/http2_config.hpp"
+#include "http/origin.hpp"
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
 #include "util/defer.hpp"
@@ -172,14 +173,15 @@ connection_pool::acquire(std::string                    scheme,
                               freed();
                           }};
 
-    auto conn = co_await connect(tls, std::move(host), std::move(port), deadline, std::move(stop));
+    auto conn = co_await connect(tls, host, port, deadline, std::move(stop));
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
-    // a connection that speaks HTTP/2 is shared by the host's requests, from now on.
+    // a connection that speaks HTTP/2 is shared by the host's requests, from now on: over TLS, with its own origin, the
+    // first of the Origin Set the server's ORIGIN frames may make it.
     settled = true;
     if (wants_http2(**conn))
     {
-        auto shared = start_http2(key, std::move(*conn));
+        auto shared = start_http2(key, std::move(*conn), tls ? origin_text(host, port) : std::string{});
         if (shared == nullptr) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
         co_return lease{.conn = nullptr, .http2 = std::move(shared), .key = key, .reused = false};
     }
@@ -267,8 +269,8 @@ bool connection_pool::speaks_http2(const std::string& key, bool tls) const
 
 void connection_pool::host_gone(const std::string& key) { http2_hosts.erase(key); }
 
-std::shared_ptr<http2_client_connection> connection_pool::start_http2(const std::string&          key,
-                                                                      std::unique_ptr<connection> conn)
+std::shared_ptr<http2_client_connection>
+connection_pool::start_http2(const std::string& key, std::unique_ptr<connection> conn, std::string origin)
 {
     std::weak_ptr<connection_pool> weak = weak_from_this();
 
@@ -296,6 +298,8 @@ std::shared_ptr<http2_client_connection> connection_pool::start_http2(const std:
         {
             if (auto pool = weak.lock()) pool->freed();
         },
+        // NOTE: not used yet: the pool's coalescing is the HTTP/2 plan's stage 6's twelfth part.
+        .origins_known = nullptr,
     };
 
     // a writer stuck (the server not reading) fails the connection, and so its streams, as the server's
@@ -303,7 +307,11 @@ std::shared_ptr<http2_client_connection> connection_pool::start_http2(const std:
     // response_header_timeout.
     if (config.io_timeout > std::chrono::milliseconds::zero()) socket_of(*conn).set_write_timeout(config.io_timeout);
 
-    auto shared = std::make_shared<http2_client_connection>(scheduler, std::move(conn), http2_config, std::move(on));
+    auto shared = std::make_shared<http2_client_connection>(scheduler,
+                                                            std::move(conn),
+                                                            http2_config,
+                                                            std::move(on),
+                                                            std::move(origin));
 
     // a stream for the request that made it, before others can take them.
     (void)shared->reserve();

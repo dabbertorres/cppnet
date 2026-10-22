@@ -38,6 +38,7 @@
 #include <botan/ipv6_address.h>
 #include <botan/mac.h>
 #include <botan/mem_ops.h>
+#include <botan/ocsp.h>
 #include <botan/pk_keys.h>
 #include <botan/pkcs8.h>
 #include <botan/pkix_enums.h>
@@ -963,6 +964,39 @@ struct server_state
     Botan::X509_Certificate                       leaf;  // the server's certificate (its chain's first), for covers()
 };
 
+namespace
+{
+
+    // verify_chain verifies a peer's certificate chain as Botan's Callbacks::tls_verify_cert_chain does (with
+    // x509_path_validate() and the policy's restrictions), at now, and for a server's certificate, for hostname: for
+    // the handshake, and for verify_for() (another host, as a handshake would verify it, so they share this). The chain
+    // mustn't be empty.
+    Botan::Path_Validation_Result verify_chain(const std::vector<Botan::X509_Certificate>&              chain,
+                                               const std::vector<std::optional<Botan::OCSP::Response>>& ocsp_responses,
+                                               const std::vector<Botan::Certificate_Store*>&            trusted_roots,
+                                               Botan::Usage_Type                                        usage,
+                                               std::string_view                                         hostname,
+                                               const Botan::TLS::Policy&                                policy,
+                                               std::chrono::system_clock::time_point                    now,
+                                               std::chrono::milliseconds                                ocsp_timeout)
+    {
+        const Botan::Path_Validation_Restrictions restrictions{policy.require_cert_revocation_info(),
+                                                               policy.minimum_signature_strength()};
+
+        // the host name is only matched against a server's certificate.
+        const auto name = usage == Botan::Usage_Type::TLS_CLIENT_AUTH ? std::string_view{} : hostname;
+        return Botan::x509_path_validate(chain,
+                                         restrictions,
+                                         trusted_roots,
+                                         name,
+                                         usage,
+                                         now,
+                                         ocsp_timeout,
+                                         ocsp_responses);
+    }
+
+}
+
 // callbacks are Botan's calls back into a connection. They're only made while the connection's mutex is held (from
 // inside the channel's methods, which are only called holding it), and only touch what it guards.
 // NOTE: a member of connection, which the header declares, so it mustn't be internal.
@@ -1014,19 +1048,14 @@ public:
         // text).
         if (cert_chain.empty()) throw Botan::Invalid_Argument("Certificate chain was empty");
 
-        const Botan::Path_Validation_Restrictions restrictions{policy.require_cert_revocation_info(),
-                                                               policy.minimum_signature_strength()};
-
-        // the host name is only matched against a server's certificate.
-        const auto name   = usage == Botan::Usage_Type::TLS_CLIENT_AUTH ? std::string_view{} : hostname;
-        const auto result = Botan::x509_path_validate(cert_chain,
-                                                      restrictions,
-                                                      trusted_roots,
-                                                      name,
-                                                      usage,
-                                                      tls_current_timestamp(),
-                                                      tls_verify_cert_chain_ocsp_timeout(),
-                                                      ocsp_responses);
+        const auto result = verify_chain(cert_chain,
+                                         ocsp_responses,
+                                         trusted_roots,
+                                         usage,
+                                         hostname,
+                                         policy,
+                                         tls_current_timestamp(),
+                                         tls_verify_cert_chain_ocsp_timeout());
         if (!result.successful_validation())
         {
             record_verification_failure(result.result());
@@ -1484,6 +1513,10 @@ struct connection
 
     std::shared_ptr<callbacks>           cb;
     std::unique_ptr<Botan::TLS::Channel> channel;
+
+    // a client's context (null for a server's stream), for verify_for(): its trust store and policy. NOTE: set before
+    //       the stream is made, and never after, so it's read without mu.
+    std::shared_ptr<client_state> client;
 };
 
 void callbacks::tls_emit_data(std::span<const std::uint8_t> data)
@@ -1726,7 +1759,8 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
     if (host.empty() && !ctx.state->skip_verification)
         co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
-    auto c = std::make_unique<detail::connection>(std::move(conn));
+    auto c    = std::make_unique<detail::connection>(std::move(conn));
+    c->client = ctx.state;
 
     try
     {
@@ -1924,6 +1958,53 @@ bool detail::covers(const server_context& ctx, std::string_view host)
     catch (const std::exception&)
     {
         return false;
+    }
+}
+
+bool detail::verifies(const stream& s) noexcept
+{
+    const auto& client = s.conn->client;
+    return client != nullptr && !client->skip_verification;
+}
+
+std::error_code
+detail::verify_for(const stream& s, std::string_view host, std::optional<std::chrono::system_clock::time_point> at)
+{
+    if (!verifies(s) || host.empty()) return std::make_error_code(std::errc::invalid_argument);
+
+    auto& c = *s.conn;
+
+    // NOTE: copies of Botan's certificates share their data. The chain's set by the handshake, but read under mu as
+    //       peer_certificates() reads it.
+    std::vector<Botan::X509_Certificate> chain;
+    {
+        std::scoped_lock lock{c.mu};
+        chain = c.peer_chain;
+    }
+    if (chain.empty()) return std::make_error_code(std::errc::invalid_argument);
+
+    try
+    {
+        // what the handshake's verification has (see Botan's TLS client: its trust store for the host, the server's
+        // usage, and its clock), but for host; and no stapled OCSP responses, which aren't kept (the policy doesn't
+        // require revocation information, and a handshake with host would have fresh ones).
+        const std::string name{host};
+        const auto        roots  = c.client->credentials->trusted_certificate_authorities("tls-client", name);
+        const auto        result = verify_chain(chain,
+                                                {},
+                                                roots,
+                                                Botan::Usage_Type::TLS_SERVER_AUTH,
+                                                name,
+                                                *c.client->policy,
+                                                at.value_or(c.cb->tls_current_timestamp()),
+                                                c.cb->tls_verify_cert_chain_ocsp_timeout());
+        if (result.successful_validation()) return {};
+        return {static_cast<int>(result.result()), verification_category()};
+    }
+    catch (const std::exception&)
+    {
+        // (as the handshake's feed() takes an exception its verification throws.)
+        return make_error_code(errc::protocol_error);
     }
 }
 

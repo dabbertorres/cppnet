@@ -889,6 +889,140 @@ TEST_CASE("a client needs the server's name to verify its certificate", "[tls][v
     else CHECK(err == std::errc::invalid_argument);
 }
 
+TEST_CASE("a client's stream verifies the server's certificate for another host, as a handshake for it would",
+          "[tls][verification][verify-for]")
+{
+    struct test_case
+    {
+        std::string_view                      name;
+        std::string                           host;
+        std::chrono::system_clock::duration   later; // verified this long from now
+        std::string_view                      reason = {};
+        std::chrono::system_clock::time_point at     = {};
+        std::error_code                       err    = {};
+    };
+
+    // Botan's reasons (the certificate is valid from an hour ago for a day).
+    constexpr auto name_mismatch = "Certificate does not match provided name"sv;
+    constexpr auto expired       = "Certificate has expired"sv;
+    constexpr auto not_yet_valid = "Certificate is not yet valid"sv;
+
+    std::vector<test_case> cases{
+        {.name = "its first name", .host = "a.test", .later = {}},
+        {.name = "another of its names", .host = "b.test", .later = {}},
+        {.name = "its names in any case", .host = "B.Test", .later = {}},
+        {.name = "a wildcard's", .host = "x.w.test", .later = {}},
+        {.name = "below a wildcard's", .host = "y.x.w.test", .later = {}, .reason = name_mismatch},
+        {.name = "the wildcard's parent", .host = "w.test", .later = {}, .reason = name_mismatch},
+        {.name = "a name it doesn't have", .host = "c.test", .later = {}, .reason = name_mismatch},
+        {.name = "its IP address", .host = "127.0.0.1", .later = {}},
+        {.name = "an IP address it doesn't have", .host = "127.0.0.2", .later = {}, .reason = name_mismatch},
+        {.name = "expired since the handshake", .host = "b.test", .later = 48h, .reason = expired},
+        {.name = "its own, expired since the handshake", .host = "a.test", .later = 48h, .reason = expired},
+        {.name = "before it's valid", .host = "b.test", .later = -2h, .reason = not_yet_valid},
+    };
+
+    // the server's stream verifies nothing of the sort. NOTE: before the scheduler, whose tasks use them.
+    bool           server_verifies = true;
+    server_outcome server{.sched = nullptr, .err = {}};
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+    server.sched = &sched;
+
+    const auto serve = [&server, &server_verifies](tls::stream& s) -> task<>
+    {
+        server_verifies = tls::detail::verifies(s);
+        server.finish(tls::detail::verify_for(s, "a.test"));
+        co_await echo(s);
+    };
+    REQUIRE(sched.spawn(serve_once(&listener, server_with(pki().names_chain, pki().names_key), serve)));
+
+    struct client_side
+    {
+        std::error_code connected{};
+        bool            verifies = false;
+        std::error_code empty_host{};
+    };
+    const auto client = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::uint16_t port, std::vector<test_case>* cases, server_outcome* server)
+            -> task<client_side>
+        {
+            auto s = co_await connect_to(sched, port, trusting_client(), "a.test");
+            co_await server->wait();
+            if (!s.has_value()) co_return client_side{.connected = s.error()};
+
+            client_side out{.verifies = tls::detail::verifies(*s), .empty_host = tls::detail::verify_for(*s, "")};
+            for (auto& tc : *cases)
+            {
+                const auto now = std::chrono::system_clock::now();
+                tc.at          = now + tc.later;
+                tc.err         = tc.later == decltype(tc.later){} ? tls::detail::verify_for(*s, tc.host)
+                                                                  : tls::detail::verify_for(*s, tc.host, tc.at);
+            }
+
+            co_await s->close();
+            co_return out;
+        }(&sched, listener.local_port(), &cases, &server));
+
+    CAPTURE(client.connected.message());
+    REQUIRE_FALSE(client.connected);
+    CHECK(client.verifies);
+    CHECK(client.empty_host == std::errc::invalid_argument);
+    REQUIRE(server.done.load() == 1);
+    CHECK_FALSE(server_verifies);
+    CHECK(server.err == std::errc::invalid_argument);
+
+    for (const auto& tc : cases)
+    {
+        CAPTURE(tc.name, tc.host, tc.err.message());
+        if (tc.reason.empty())
+        {
+            CHECK_FALSE(tc.err);
+            continue;
+        }
+
+        // as the handshake says it: why, and bad_certificate.
+        CHECK(tc.err.category() == tls::verification_category());
+        CHECK(tc.err == tls::alert::bad_certificate);
+        CHECK(tc.err.message().contains(tc.reason));
+    }
+}
+
+TEST_CASE("a client's stream that doesn't verify the server's certificate can't verify it for another host",
+          "[tls][verification][verify-for]")
+{
+    // with insecure_skip_verification, nothing says the server is anyone's: here, one an untrusted CA's certificate is
+    // for, which a client that verifies refuses.
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+    REQUIRE(sched.spawn(serve_once(&listener, server_with(pki().untrusted_chain, pki().untrusted_key), echo)));
+
+    auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .insecure_skip_verification = true});
+    REQUIRE(ctx.has_value());
+
+    const auto [connected, verifies, err] = sched.run_to_completion(
+        [](net::io::scheduler* sched,
+           std::uint16_t       port,
+           tls::client_context ctx) -> task<std::tuple<std::error_code, bool, std::error_code>>
+        {
+            auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+            if (!s.has_value()) co_return std::tuple{s.error(), false, std::error_code{}};
+
+            const auto out =
+                std::tuple{std::error_code{}, tls::detail::verifies(*s), tls::detail::verify_for(*s, "localhost")};
+            co_await s->close();
+            co_return out;
+        }(&sched, listener.local_port(), *ctx));
+
+    CAPTURE(connected.message());
+    REQUIRE_FALSE(connected);
+    CHECK_FALSE(verifies);
+    CHECK(err == std::errc::invalid_argument);
+}
+
 TEST_CASE("a read into an empty span returns at once", "[tls]")
 {
     net::io::scheduler sched{make_pool()};

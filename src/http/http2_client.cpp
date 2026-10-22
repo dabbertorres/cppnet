@@ -32,6 +32,7 @@
 #include "http/http2_connection.hpp"
 #include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
+#include "http/origin.hpp"
 #include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -219,10 +220,30 @@ namespace
 
 }
 
+const https_origin* origin_set::find(std::string_view serialized) const noexcept
+{
+    const auto it = std::ranges::find(origins, serialized, &https_origin::serialized);
+    return it != origins.end() ? &*it : nullptr;
+}
+
+void origin_set::add(https_origin o)
+{
+    if (origins.size() >= max_origins || find(o.serialized) != nullptr) return;
+    origins.push_back(std::move(o));
+}
+
+std::optional<bool> origin_set::checked_for(std::string_view host) const noexcept
+{
+    const auto it = std::ranges::find(checked, host, &std::pair<std::string, bool>::first);
+    if (it == checked.end()) return std::nullopt;
+    return it->second;
+}
+
 http2_client_connection::http2_client_connection(io::scheduler*              scheduler,
                                                  std::unique_ptr<connection> conn,
                                                  const http2_client_options& options,
-                                                 callbacks                   on)
+                                                 callbacks                   on,
+                                                 std::string                 origin)
     : owned_connection{.owned = std::move(conn), .log = spdlog::default_logger()}
     // TCP_NOTSENT_LOWAT (docs/plans/http2.md, stage 6's eighth part), as the server sets it, now that it's HTTP/2: the
     // kernel then holds little more than what's in flight, and the writer waits for it to take more before framing
@@ -237,6 +258,8 @@ http2_client_connection::http2_client_connection(io::scheduler*              sch
                             options.writable}
     , options{options}
     , on{std::move(on)}
+    , keeps_origins{verifies_peer(*owned)}
+    , own_origin{keeps_origins ? std::move(origin) : std::string{}}
 {}
 
 bool http2_client_connection::start() { return scheduler->spawn(run_owned(shared_from_this())); }
@@ -871,10 +894,77 @@ void http2_client_connection::on_ping_ack(std::span<const std::byte, 8> /*opaque
 // (a client's session never reports it: a PRIORITY_UPDATE from the server ends the connection.)
 void http2_client_connection::on_priority_update(http2::stream_id /*stream*/, priority /*p*/) {}
 
-// NOTE: not yet kept: the connection's Origin Set, for coalescing, is the HTTP/2 plan's stage 6's eleventh part.
-void http2_client_connection::on_origin(std::span<const std::string_view> origins)
+void http2_client_connection::on_origin(std::span<const std::string_view> entries)
 {
-    logger.debug("HTTP/2 server sent ORIGIN, with {} entries", origins.size());
+    logger.debug("HTTP/2 server sent ORIGIN, with {} entries", entries.size());
+    if (!keeps_origins) return;
+
+    // the first initializes the set, with the connection's own origin (RFC 8336, section 2.3).
+    if (known_origins == nullptr)
+    {
+        known_origins = std::make_unique<origin_set>();
+        if (auto own = parse_origin(own_origin); own.has_value()) known_origins->add(std::move(*own));
+        tell_origins = true;
+    }
+
+    // an entry that isn't an https origin is ignored.
+    for (const auto entry : entries)
+    {
+        if (known_origins->origins.size() >= origin_set::max_origins) break;
+        if (auto o = parse_origin(entry); o.has_value()) known_origins->add(std::move(*o));
+    }
+}
+
+std::optional<std::vector<std::string>> http2_client_connection::origins()
+{
+    std::scoped_lock lock{mu};
+    if (known_origins == nullptr) return std::nullopt;
+
+    std::vector<std::string> out;
+    out.reserve(known_origins->origins.size());
+    for (const auto& o : known_origins->origins) out.push_back(o.serialized);
+    return out;
+}
+
+bool http2_client_connection::authoritative_for(std::string_view origin)
+{
+    auto wanted = parse_origin(origin);
+    if (!wanted.has_value()) return false;
+
+    {
+        std::scoped_lock lock{mu};
+        if (known_origins == nullptr || known_origins->find(wanted->serialized) == nullptr) return false;
+        if (const auto known = known_origins->checked_for(wanted->host); known.has_value()) return *known;
+    }
+
+    // NOTE: without the lock, as the connection goes on: its reads and writes don't wait for the signatures. Two
+    //       callers at once may both check a host, and find the same.
+    const bool valid = !verify_for(*owned, wanted->host);
+
+    std::scoped_lock lock{mu};
+    ++known_origins->checks;
+    if (!known_origins->checked_for(wanted->host).has_value()) known_origins->checked.emplace_back(wanted->host, valid);
+
+    // (it may have been removed meanwhile.)
+    return valid && known_origins->find(wanted->serialized) != nullptr;
+}
+
+bool http2_client_connection::remove_origin(std::string_view origin)
+{
+    const auto unwanted = parse_origin(origin);
+    if (!unwanted.has_value()) return false;
+
+    std::scoped_lock lock{mu};
+    if (known_origins == nullptr) return false;
+    return std::erase_if(known_origins->origins,
+                         [&](const https_origin& o) { return o.serialized == unwanted->serialized; })
+         > 0;
+}
+
+std::size_t http2_client_connection::certificate_checks()
+{
+    std::scoped_lock lock{mu};
+    return known_origins != nullptr ? known_origins->checks : 0;
 }
 
 void http2_client_connection::after_receive()
@@ -882,6 +972,7 @@ void http2_client_connection::after_receive()
     // a stream the session's done with (its response ended, or it was reset) is free for another request, though its
     // response may not have been read yet: a request waiting for one (strict_max_concurrent_streams) is told now.
     bool freed = false;
+    bool known = false;
     {
         std::scoped_lock lock{mu};
         const auto       open_now = session.open_streams();
@@ -894,9 +985,13 @@ void http2_client_connection::after_receive()
             goaway_told = true;
             freed       = true;
         }
+
+        // the server's first ORIGIN has initialized the Origin Set.
+        known = std::exchange(tell_origins, false);
     }
 
     if (freed && on.freed) on.freed();
+    if (known && on.origins_known) on.origins_known(*this);
 }
 
 std::optional<io::clock::time_point> http2_client_connection::check_connection(io::clock::time_point now)

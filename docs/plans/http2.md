@@ -40,7 +40,9 @@ client's request bodies by their requests' `Priority` fields, and TCP_NOTSENT_LO
 (`client_response::set_priority()`, through `detail::body_source`, and the session's `submit_priority_update()`), done
 (2026-10-22); and its tenth, ORIGIN in the session and the server (`frame_type::origin`, a server's `submit_origin()`, a
 client's `on_origin()`, and `server_config::http2_origins`, checked against the certificate and sent over TLS), done
-(2026-10-22).
+(2026-10-22); and its eleventh, the client's origin sets (each HTTP/2 connection's over TLS, from ORIGIN frames, and
+`tls::detail::verify_for()`, the server's certificate checked for another host), recorded but not yet used by the pool,
+done (2026-10-22).
 
 ## Goal
 
@@ -1928,6 +1930,107 @@ idle stream would be a connection error for the peer.
   by reference, has the vector), nothing's allocated, and the per-request path is untouched; a session's
   `session_events` has one more virtual function.
 
+### Part 11: the client's origin sets (done 2026-10-22)
+
+- As proposed (see "Connection coalescing and the ORIGIN frame"; Decided question 37 (a)). TLS:
+  `tls::detail::verify_for(stream, host, at = none)` (internal, new) verifies the server's chain, as the stream's
+  handshake received it, for another host, as a handshake connecting to that host would: `verify_chain()` (Botan's
+  `x509_path_validate()` with the policy's restrictions), which the handshake's `tls_verify_cert_chain` now calls too,
+  with the context's trust store (`trusted_certificate_authorities("tls-client", host)`, as Botan's client asks), its
+  policy, the server's usage, the stream's clock (`tls_current_timestamp()`; `at` instead, for tests) and its OCSP
+  timeout. It fails as the handshake does (`verification_category()`, which compares equal to `bad_certificate`), and
+  with `invalid_argument` for an empty host, or a stream that doesn't verify: `tls::detail::verifies(stream)` (new) is
+  whether it's a client's stream whose context doesn't skip verification. The stream's state keeps its client context
+  (`client`, null for a server's), set before the stream's made, so it's read without the stream's lock; the chain is
+  copied under it (copies of Botan's certificates share their data), and the verification runs without it, from any
+  thread, as the stream's reads and writes go on. `http::detail::verifies_peer(conn)` and `verify_for(conn, host)`
+  (`http/connection.hpp`) pass a connection's on (cleartext: false, and `invalid_argument`).
+- The origins: the server's parsing of `server_config::http2_origins` moved to `http/origin.hpp` (internal, new):
+  `https_origin` (the normalized serialization and the host, as a certificate's checked for it) and `parse_origin()`,
+  now returning `std::expected` (`invalid_argument`), which the server's `http2_origins_of()` and the client's
+  connections share, so an origin's normalized the same on both sides; and `origin_text(host, port)`, a URL's host
+  (an IPv6 address bracketed) and port as an origin's text, for the pool.
+- The client's connections: `http2_client_connection` keeps its Origin Set (`origin_set`, in `http2_client.hpp`: the
+  origins, each once, in the order they came, at most `origin_set::max_origins`, 256; and per host, whether the
+  certificate was valid for it) behind a `unique_ptr` (`known_origins`) made by the first ORIGIN, under the connection's
+  lock (`on_origin()`, which the session calls holding it). It's kept only if the connection verifies its peer
+  (`keeps_origins`, set when it's made: over TLS, without `insecure_skip_verification`); otherwise ORIGIN is logged and
+  ignored. The first frame adds the connection's own origin, then the frame's entries; later frames add theirs. Each
+  entry goes through `parse_origin()`, and is ignored if it doesn't parse (RFC 8336's "MUST be ignored"), or is there
+  already, or the set's full. The connection's own origin is a constructor argument (`origin`, the set's first), which
+  the pool gives a TLS connection (`origin_text(host, port)`, as it connected to them; none in cleartext); it's kept
+  (`own_origin`) only by a connection that keeps a set. Queries, for part 12's pool: `origins()` (a copy, none while
+  uninitialized), `authoritative_for(origin)` (the origin, parsed, in an initialized set, and the certificate valid for
+  its host: checked the first time a host's asked for, with `verify_for()` and without the connection's lock, then
+  remembered, so once per host and connection; false while uninitialized, as coalescing is by ORIGIN only, Decided
+  question 35), `remove_origin(origin)` (for part 12's 421, RFC 8336's MUST, returning whether it was there), and
+  `certificate_checks()` (how many verifications there have been, for tests). `callbacks::origins_known` is called
+  once, with the connection, when the first ORIGIN has initialized the set: from `after_receive()`, without the lock
+  (`on_origin()` sets `tell_origins`), as `freed` is, for part 12's pool to keep its list of connections with sets
+  (`coalescing`) by. The pool sets it to nothing yet.
+- Not in the plan (where it's silent, or its wording didn't fit):
+  - An entry of another scheme (e.g. `http://`) is ignored, as one that doesn't parse: `parse_origin()` reads https
+    origins only (the server's rules: no wildcards, user info, paths, nor names that aren't letters, digits and
+    hyphens), and the client sends `http://` requests over cleartext only, whose connections keep no set.
+  - The initial origin is "the SNI host" in RFC 8336; Botan doesn't give a channel's back, so the pool passes the host
+    and port it connected to (the URL's, which is what it sent as SNI). One that doesn't parse (e.g. a host with an
+    underscore) leaves the set without it: part 12's pool reaches a connection by its own key, and never asks the set
+    for it (a request for such a host couldn't be normalized to look it up either).
+  - The cap counts the connection's own origin, and removing one makes room for a later frame's.
+  - The connection's own origin may be removed (RFC 8336 has a 421 remove the request's origin, whichever it is).
+  - The certificate's check is by host, not origin (ports share it), lazily (on the first `authoritative_for()` for the
+    host, not as ORIGIN arrives: a set of 256 needn't cost 256 verifications), and without the connection's lock, so
+    two callers at once may both verify a host (both counted, the first's result kept). An origin removed while its host
+    is being checked isn't answered for. The connection's own host isn't taken as verified by the handshake: it's
+    checked as any other, which catches a certificate that's expired since (part 12 won't ask for it anyway).
+  - `verify_for()` has no stapled OCSP responses: the handshake's aren't kept (the policy doesn't require revocation
+    information, and a handshake with the other host would have fresh ones). A resumed session's chain is the session's
+    (as `peer_certificates()`'), and is verified the same.
+  - `verify_for()`'s `at` is for tests (the client's context has no clock hook): verifying a day after the handshake is
+    the "expired since the handshake" case Decided question 37 gives as its reason.
+  - Nothing frees the set before the connection's gone, and ORIGIN frames aren't limited in number: each's entries
+    are parsed (each a few comparisons and, once taken, a string) until the set's full, and none after.
+- Tests (no network). The check alone (`test/tls/stream.cpp`, `[tls][verification][verify-for]`), on a client's
+  stream to a server whose certificate (`test_pki`'s new `names_chain`, from the ECDSA CA) is for a.test, b.test,
+  *.w.test and 127.0.0.1, connected as a.test: its own name, another of its names, one in another case, a wildcard's
+  (x.w.test), and its IP address are valid; below a wildcard's (y.x.w.test), the wildcard's parent (w.test), a name it
+  doesn't have, and an address it doesn't have are refused with Botan's name mismatch; b.test and a.test two days on as
+  expired, and b.test two hours back as not yet valid; each refusal in `verification_category()`, equal to
+  `bad_certificate`. An empty host is `invalid_argument`, and so is a server's stream (whose `verifies()` is false). An
+  untrusted CA's certificate can't reach `verify_for()` through a stream that verifies (its handshake fails), so that
+  case is a stream with `insecure_skip_verification` to one: `verifies()` false, and `verify_for()` refused. The sets
+  (`test/tls/client_origin.cpp`, `[tls][http][client][http2][origin]`), from `test::h2_client` in its server role over
+  a `tls::stream` with that certificate, which sends ORIGIN with `submit_origin()`, then a PING twice (the second's
+  acknowledgement comes after the client's done with the receive that had the ORIGIN, callbacks included): none before
+  ORIGIN, nor any `origins_known`; then the own origin (given as "A.Test", normalized) and the entries, normalized
+  ("https://C.TEST:443" as "https://c.test", "https://[0:0::1]" as "https://[::1]", "https://127.0.0.1:443" without the
+  port), each once, without what isn't an https origin (text, http, a wildcard, a path, user info, an empty entry);
+  `origins_known` once; a later frame's added, without repeats, and `origins_known` not called again.
+  `authoritative_for()`: the own origin, b.test (also as "https://B.TEST:443"), x.w.test:8443 and 127.0.0.1 are; c.test
+  and [::1] in the set but not the certificate aren't, nor b.test:8443 and e.test, not in the set, nor what isn't an
+  origin; nothing before ORIGIN; six hosts checked, once each, whether asked once or twice. 300 entries keep the own
+  origin and the first 255; another frame then adds nothing; once one's removed, a frame's first is added. Removal:
+  nothing before ORIGIN; normalized ("https://B.test:443"); false a second time and for what isn't an origin; the own
+  origin; and a removed origin isn't authoritative, its host's check kept. Over cleartext (prior knowledge) and with
+  `insecure_skip_verification`: no set, no `origins_known`, not authoritative, no check. And through the pool, against
+  cppnet's server over TLS (`http2_origins` b.test and x.w.test): its connection's set is "https://127.0.0.1:port"
+  (its own, as the pool gives it) and the server's two, and it's authoritative for b.test.
+- The checks bite (each piece broken alone, the affected tests run): `verify_for()` without the host (the name not
+  matched), its stream test; ignoring `at`, its expiry cases; `verifies()` true with `insecure_skip_verification`, the
+  stream test of that and the client's cleartext-and-insecure one; `verify_chain()` without the host, the handshake's
+  own `[tls][verification]` test (so they share it); the connection keeping a set over cleartext (no `keeps_origins`
+  check), or over TLS without verifying (`is_tls()` for `verifies_peer()`), the cleartext-and-insecure test; the own
+  origin left out, every set test and the pool's; entries that don't parse kept, or kept as they came (not normalized),
+  or repeats kept, the first test; no cap, the cap test; `origins_known` on every frame, the first test's count;
+  `authoritative_for()` without the certificate's check, or without remembering it (each call verifying), the
+  authoritative test (its count, for the latter, once `checks` counted every verification rather than each host
+  recorded, which hid it); `remove_origin()` without normalizing, the removal test; the pool giving no origin, the
+  pool's test.
+- Measured: nothing, as the plan asks for no benchmark. A connection that never gets ORIGIN pays 80 bytes (2256 rather
+  than 2176, with libc++ in a debug build): the callback (48), the set's pointer (8) and its own origin (24, no
+  allocation for a host and port within the string's own buffer, nor in cleartext); the two flags fit in padding. A TLS
+  connection the pool makes formats its own origin once. Nothing on a request's path changes.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2989,10 +3092,10 @@ certificate.
        `submit_origin()`, `on_origin()` (a client's session), and `server_config::http2_origins` checked against the
        certificate and sent over TLS (Decided question 39); tests on bytes and with `test::h2_client`. First of
        coalescing's three, as the server's side stands alone (other clients, Firefox's, use it).
-   11. **The client's origin sets.** Each TLS connection's Origin Set from ORIGIN frames, and the certificate checked
-       for another host (`tls::detail::verify_for()`, Decided question 37), recorded but not yet used by the pool; tests
-       of the sets (from `test::h2_client` as the server) and the check alone. Split from 12 as part 9 of stage 5 was
-       from 10: the protocol's and TLS's rules tested apart from the pool.
+   11. **The client's origin sets.** Done (2026-10-22; see Learned in stage 6). Each TLS connection's Origin Set from
+       ORIGIN frames, and the certificate checked for another host (`tls::detail::verify_for()`, Decided question 37),
+       recorded but not yet used by the pool; tests of the sets (from `test::h2_client` as the server) and the check
+       alone. Split from 12 as part 9 of stage 5 was from 10: the protocol's and TLS's rules tested apart from the pool.
    12. **Coalescing in the pool, and 421.** `client_options::http2_coalescing` (Decided questions 35 and 36), the pool's
        list of connections with origin sets, searched before connecting (Decided question 38), and a coalesced request's
        421 (Decided question 40); tests with two names on loopback servers. Last: it changes how the pool picks

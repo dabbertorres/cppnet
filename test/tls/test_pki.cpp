@@ -85,19 +85,21 @@ const test_pki& pki()
             return std::pair{cert, std::move(key)};
         };
 
-        // issue writes a certificate for dns (and ip, if any), from ca, and its key (an RSA key if rsa, or else
-        // ECDSA's).
-        const auto issue = [&](const auto&                  ca,
-                               const std::string&           dns,
-                               const std::string&           ip,
-                               const std::filesystem::path& chain,
-                               const std::filesystem::path& key_path,
-                               bool                         rsa = false)
+        // issue writes a certificate for dns (and more_dns, and ip, if any), from ca, and its key (an RSA key if rsa,
+        // or else ECDSA's).
+        const auto issue = [&](const auto&                     ca,
+                               const std::string&              dns,
+                               const std::string&              ip,
+                               const std::filesystem::path&    chain,
+                               const std::filesystem::path&    key_path,
+                               bool                            rsa      = false,
+                               const std::vector<std::string>& more_dns = {})
         {
             const auto               key = make_key(rsa);
             Botan::X509_Cert_Options opts;
             opts.common_name = dns;
             opts.dns         = dns;
+            opts.more_dns    = more_dns;
             opts.ip          = ip;
 
             const auto           request = Botan::X509::create_cert_req(opts, *key, "SHA-256", rng);
@@ -198,6 +200,10 @@ const test_pki& pki()
         issue(trusted_rsa, "localhost", "127.0.0.1", out.rsa_localhost_chain, out.rsa_localhost_key, true);
         issue(trusted, "other.example", "", out.other_name_chain, out.other_name_key);
         issue(untrusted, "localhost", "127.0.0.1", out.untrusted_chain, out.untrusted_key);
+
+        out.names_chain = out.dir / "names.pem";
+        out.names_key   = out.dir / "names.key";
+        issue(trusted, "a.test", "127.0.0.1", out.names_chain, out.names_key, false, {"b.test", "*.w.test"});
 
         const auto client_ca = make_ca("cppnet test client CA");
         const auto impostor  = make_ca("cppnet test client CA");

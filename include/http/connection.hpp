@@ -114,6 +114,27 @@ inline std::shared_ptr<const std::vector<tls::certificate>> peer_certificates([[
     return nullptr;
 }
 
+// verifies_peer is whether it's a client's TLS connection whose handshake verified the server's certificate (see
+// tls::detail::verifies()): false in cleartext, and with insecure_skip_verification.
+inline bool verifies_peer([[maybe_unused]] const connection& conn) noexcept
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls::detail::verifies(*tls);
+#endif
+    return false;
+}
+
+// verify_for verifies the server's certificate for another host than the connection's own, as a new connection to host
+// would (see tls::detail::verify_for()), failing with why; or with std::errc::invalid_argument if the connection
+// doesn't verify its peer (see verifies_peer()).
+inline std::error_code verify_for([[maybe_unused]] const connection& conn, [[maybe_unused]] std::string_view host)
+{
+#ifdef NET_HAS_TLS
+    if (const auto* tls = std::get_if<tls::stream>(&conn)) return tls::detail::verify_for(*tls, host);
+#endif
+    return std::make_error_code(std::errc::invalid_argument);
+}
+
 // tls_failure is whether err is a TLS connection's failure: an alert (either side's), or the peer breaking the
 // protocol, which says why the connection ended, rather than only that it did (e.g. the peer closing or resetting it).
 inline bool tls_failure([[maybe_unused]] std::error_code err) noexcept
