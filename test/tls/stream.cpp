@@ -36,6 +36,7 @@
 #include "listen.hpp"
 #include "tcp.hpp"
 #include "tls/certificate.hpp"
+#include "tls/no_ems_server.hpp"
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
@@ -2018,15 +2019,103 @@ TEST_CASE("client contexts refuse a certificate without its key, or a key withou
     if (!ctx.has_value()) CHECK(ctx.error() == tc.err);
 }
 
+TEST_CASE("a TLS 1.2 server without Extended Master Secret is accepted, unless the client requires it", "[tls][ems]")
+{
+    // NOTE: Botan's default policy requires the extension, which cppnet's doesn't (as browsers, Go and OpenSSL don't),
+    //       unless asked to. The server is Botan's, leaving it out (see test::serve_without_ems()).
+    const bool require_ems = GENERATE(false, true);
+    CAPTURE(require_ems);
+
+    test::no_ems_outcome server;
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    server_outcome ended{.sched = &sched, .err = {}};
+    const auto     serve = [](net::listener* listener, test::no_ems_outcome* out, server_outcome* ended) -> task<>
+    {
+        co_await test::serve_without_ems(listener, pki().localhost_chain, pki().localhost_key, out);
+        ended->finish({});
+    };
+    REQUIRE(sched.spawn(serve(&listener, &server, &ended)));
+
+    auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .require_extended_master_secret = require_ems});
+    REQUIRE(ctx.has_value());
+
+    // what the server echoed and the version agreed on, or what failed (the handshake's error as an error), once the
+    // server's done too.
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx,
+                           server_outcome*     ended) -> task<std::expected<std::string, std::error_code>>
+    {
+        auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value())
+        {
+            co_await ended->wait();
+            co_return std::unexpected(s.error());
+        }
+
+        if (auto res = co_await net::io::write_all(*s, "hello"sv); res.err) co_return "write: " + res.err.message();
+
+        std::string               echoed;
+        std::array<std::byte, 16> buf{};
+        while (echoed.size() < 5)
+        {
+            auto res = co_await s->read(buf);
+            echoed += as_string(std::span{buf}.first(res.count));
+            if (res.err) co_return "read: " + res.err.message();
+        }
+
+        // NOTE: the server answers close_notify with its own, which is read before closing, so it's never written to a
+        //       closed socket.
+        if (auto err = co_await s->shutdown(); err) co_return "shutdown: " + err.message();
+        auto [rest, err] = co_await read_to_end(*s);
+        if (err != net::io::errc::end_of_stream) co_return "read to the end: " + err.message();
+
+        echoed += s->version() == tls::version::tls12 ? " over TLS 1.2" : " over TLS 1.3";
+        co_await s->close();
+        co_await ended->wait();
+        co_return echoed + rest;
+    };
+
+    const auto res = sched.run_to_completion(client(&sched, listener.local_port(), *ctx, &ended));
+    CAPTURE(res.has_value() ? *res : res.error().message());
+    CAPTURE(server.failure);
+    REQUIRE(ended.done.load() == 1);
+
+    // the client offered the extension, and the server left it out: what it saw was a session without it.
+    CHECK(server.client_offered_ems);
+    CHECK_FALSE(server.used_ems);
+
+    if (!require_ems)
+    {
+        CHECK(res == "hello over TLS 1.2");
+        CHECK(server.handshake_done);
+        CHECK(server.version == 0x0303);
+        CHECK(server.echoed == "hello");
+        CHECK_FALSE(server.client_alert.has_value());
+        CHECK(server.failure.empty());
+        return;
+    }
+
+    // the client refuses the ServerHello without it, telling the server why.
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == tls::alert::handshake_failure);
+    CHECK_FALSE(tls::from_peer(res.error()));
+    CHECK(res.error().message() == "handshake_failure (sent to the peer)");
+    CHECK_FALSE(server.handshake_done);
+    CHECK(server.client_alert == static_cast<std::uint8_t>(tls::alert::handshake_failure));
+    CHECK(server.failure.empty());
+}
+
 TEST_CASE("the system's trust store verifies a public server", "[tls][.network]")
 {
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be
-    //       required. badssl.com speaks TLS 1.2 without the Extended Master Secret extension, which mustn't be either,
-    //       unless asked for.
-    // NOTE: badssl.com is left out for now: from CI's runners it reset the connection (or timed out) about every other
-    //       run, mostly the second handshake in a row. Its expected failure below stays, for when it's brought back (or
-    //       a local server that likewise lacks the extension takes its place).
-    const std::string host        = GENERATE("example.com", "letsencrypt.org" /*, "badssl.com" */);
+    //       required.
+    // Requiring Extended Master Secret refuses neither (see the local test above for a server without it).
+    const std::string host        = GENERATE("example.com", "letsencrypt.org");
     const bool        require_ems = GENERATE(false, true);
     CAPTURE(host, require_ems);
 
@@ -2047,9 +2136,7 @@ TEST_CASE("the system's trust store verifies a public server", "[tls][.network]"
         co_return "ok";
     };
 
-    const std::string_view expected =
-        require_ems && host == "badssl.com" ? "handshake: handshake_failure (sent to the peer)" : "ok";
-    CHECK(sched.run_to_completion(client(&sched, host, require_ems)) == expected);
+    CHECK(sched.run_to_completion(client(&sched, host, require_ems)) == "ok");
 }
 
 TEST_CASE("public servers agree on the hybrid post-quantum key exchange", "[tls][policy][.network]")

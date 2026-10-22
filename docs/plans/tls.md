@@ -173,7 +173,13 @@ const std::error_category& category() noexcept;
   OpenSSL don't.
 - Botan's default policy also requires TLS 1.2 peers to support Extended Master Secret, which rejects servers that
   don't (e.g. badssl.com) with only `handshake_failure`. cppnet's policy doesn't, unless `require_extended_master_secret`
-  is set, as browsers, Go and OpenSSL don't. (Found by a review that tried the library from its docs.)
+  is set, as browsers, Go and OpenSSL don't. (Found by a review that tried the library from its docs.) The test of
+  both (2026-10-22) is local: `test/tls/no_ems_server.hpp`, a TLS 1.2 server in the tests on Botan directly, whose
+  `tls_modify_extensions()` drops the extension from its ServerHello (Botan 3.12 derives the master secret, and records
+  the session's use of the extension, from the ServerHello as sent); the test asserts, from the server's session, that
+  it wasn't used. It replaced badssl.com, which from CI's runners reset the connection (or timed out) about every other run;
+  badssl's Docker image wasn't a fit either (no Docker on the macOS runners, and a modern OpenSSL would support the
+  extension anyway).
 - Botan reports a failure as an exception with an alert and text: cppnet's errors say which side sent the alert, and a
   certificate that failed verification is its own code (Botan's `Certificate_Status_Code`, whose text is its message),
   which our `tls_verify_cert_chain` records (doing what Botan's does) before throwing.
