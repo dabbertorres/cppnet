@@ -1967,8 +1967,7 @@ bool detail::verifies(const stream& s) noexcept
     return client != nullptr && !client->skip_verification;
 }
 
-std::error_code
-detail::verify_for(const stream& s, std::string_view host, std::optional<std::chrono::system_clock::time_point> at)
+std::error_code detail::verify_for(const stream& s, std::string_view host)
 {
     if (!verifies(s) || host.empty()) return std::make_error_code(std::errc::invalid_argument);
 
@@ -1996,7 +1995,7 @@ detail::verify_for(const stream& s, std::string_view host, std::optional<std::ch
                                                 Botan::Usage_Type::TLS_SERVER_AUTH,
                                                 name,
                                                 *c.client->policy,
-                                                at.value_or(c.cb->tls_current_timestamp()),
+                                                c.cb->tls_current_timestamp(),
                                                 c.cb->tls_verify_cert_chain_ocsp_timeout());
         if (result.successful_validation()) return {};
         return {static_cast<int>(result.result()), verification_category()};

@@ -538,7 +538,7 @@ send_http2(net::http::detail::connection_pool::lease leased, net::http::client_r
     // connection is returned: another to the same host would likely reach the same server.)
     if (leased.coalesced && resp.has_value() && resp->status_code == net::http::status::MISDIRECTED_REQUEST)
     {
-        (void)leased.http2->remove_origin(net::http::detail::origin_text(request.uri.host, port_of(request.uri)));
+        leased.http2->remove_origin(net::http::detail::origin_text(request.uri.host, port_of(request.uri)));
         if (!rewind_body(request)) co_return sent{.response = std::move(resp)};
 
         co_await discard(std::move(*resp));

@@ -228,7 +228,7 @@ const https_origin* origin_set::find(std::string_view serialized) const noexcept
 
 void origin_set::add(https_origin o)
 {
-    if (origins.size() >= max_origins || find(o.serialized) != nullptr) return;
+    if (find(o.serialized) != nullptr) return;
     origins.push_back(std::move(o));
 }
 
@@ -907,23 +907,13 @@ void http2_client_connection::on_origin(std::span<const std::string_view> entrie
         tell_origins = true;
     }
 
-    // an entry that isn't an https origin is ignored.
+    // an entry that isn't an https origin is ignored; once the set's full, so is the rest (not parsed). NOTE: the one
+    // place the limit's kept (the own origin, added first, always fits).
     for (const auto entry : entries)
     {
         if (known_origins->origins.size() >= origin_set::max_origins) break;
         if (auto o = parse_origin(entry); o.has_value()) known_origins->add(std::move(*o));
     }
-}
-
-std::optional<std::vector<std::string>> http2_client_connection::origins()
-{
-    std::scoped_lock lock{mu};
-    if (known_origins == nullptr) return std::nullopt;
-
-    std::vector<std::string> out;
-    out.reserve(known_origins->origins.size());
-    for (const auto& o : known_origins->origins) out.push_back(o.serialized);
-    return out;
 }
 
 bool http2_client_connection::authoritative_for(std::string_view origin)
@@ -942,29 +932,20 @@ bool http2_client_connection::authoritative_for(std::string_view origin)
     const bool valid = !verify_for(*owned, wanted->host);
 
     std::scoped_lock lock{mu};
-    ++known_origins->checks;
     if (!known_origins->checked_for(wanted->host).has_value()) known_origins->checked.emplace_back(wanted->host, valid);
 
     // (it may have been removed meanwhile.)
     return valid && known_origins->find(wanted->serialized) != nullptr;
 }
 
-bool http2_client_connection::remove_origin(std::string_view origin)
+void http2_client_connection::remove_origin(std::string_view origin)
 {
     const auto unwanted = parse_origin(origin);
-    if (!unwanted.has_value()) return false;
+    if (!unwanted.has_value()) return;
 
     std::scoped_lock lock{mu};
-    if (known_origins == nullptr) return false;
-    return std::erase_if(known_origins->origins,
-                         [&](const https_origin& o) { return o.serialized == unwanted->serialized; })
-         > 0;
-}
-
-std::size_t http2_client_connection::certificate_checks()
-{
-    std::scoped_lock lock{mu};
-    return known_origins != nullptr ? known_origins->checks : 0;
+    if (known_origins == nullptr) return;
+    std::erase_if(known_origins->origins, [&](const https_origin& o) { return o.serialized == unwanted->serialized; });
 }
 
 void http2_client_connection::after_receive()

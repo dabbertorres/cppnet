@@ -90,15 +90,13 @@ struct origin_set
     std::vector<https_origin> origins;
 
     // The hosts whose certificate has been checked (see tls::detail::verify_for()), and whether it was valid for each:
-    // so each is checked once per connection. And how many checks have been made (for tests: two at once may both
-    // check a host).
+    // so each is checked once per connection.
     std::vector<std::pair<std::string, bool>> checked;
-    std::size_t                               checks = 0;
 
     // find is the origin with serialized as its serialization (normalized), if it has it.
     [[nodiscard]] const https_origin* find(std::string_view serialized) const noexcept;
 
-    // add adds o, unless it has it, or is full.
+    // add adds o, unless it has it. (The caller keeps it to max_origins: see on_origin().)
     void add(https_origin o);
 
     // checked_for is whether the certificate is valid for host, if that's been checked.
@@ -121,7 +119,7 @@ class http2_client_connection final
 {
 public:
     // closed is called (with the connection) once it has ended; freed whenever a stream is done (so another may be
-    // sent); origins_known (with the connection) once its Origin Set's been initialized (see origins()), by the
+    // sent); origins_known (with the connection) once its Origin Set's been initialized (see below), by the
     // server's first ORIGIN frame, not holding the connection's lock: for the pool's coalescing (docs/plans/http2.md,
     // stage 6's twelfth part), which finds the connections with origin sets through it.
     struct callbacks
@@ -136,7 +134,7 @@ public:
     //
     // origin is the connection's own (see origin_text(): https, the host it connected to, its port), the first of its
     // Origin Set, once ORIGIN initializes it; none, or one that doesn't parse (see parse_origin()), leaves it out. It's
-    // only kept over TLS, with the server's certificate verified (see origins()).
+    // only kept over TLS, with the server's certificate verified (see authoritative_for()).
     http2_client_connection(io::scheduler*              scheduler,
                             std::unique_ptr<connection> conn,
                             const http2_client_options& options,
@@ -224,9 +222,6 @@ public:
     // doesn't parse (RFC 8336: "If parsing fails, the field MUST be ignored"; an origin of another scheme too, as http
     // requests never go over TLS). It keeps at most origin_set::max_origins, ignoring the rest.
 
-    // origins is the Origin Set's origins, in the order they came (the connection's own first), if it's initialized.
-    [[nodiscard]] std::optional<std::vector<std::string>> origins();
-
     // authoritative_for is whether the connection may take requests for origin (an https origin, as parse_origin()
     // reads it) by its Origin Set: it's initialized and has the origin, and the server's certificate is valid for its
     // host, as a new connection's handshake would check it (tls::detail::verify_for(), Decided question 37): checked
@@ -235,12 +230,8 @@ public:
     [[nodiscard]] bool authoritative_for(std::string_view origin);
 
     // remove_origin removes origin from the Origin Set (RFC 8336's MUST, when a request for it gets 421 (Misdirected
-    // Request): see Decided question 40), returning whether it was there. The connection's own may be removed too.
-    bool remove_origin(std::string_view origin);
-
-    // certificate_checks is how many times the server's certificate has been checked for a host (see
-    // authoritative_for()), for tests.
-    [[nodiscard]] std::size_t certificate_checks();
+    // Request): see Decided question 40), if it's there. The connection's own may be removed too.
+    void remove_origin(std::string_view origin);
 
     // cancel fails a request's stream with std::errc::operation_canceled (unless it's failed already), and resets it
     // (CANCEL), if it's still there: a request's stop callback (see canceler), so it takes the lock, and must not be

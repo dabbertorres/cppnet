@@ -2,6 +2,7 @@
 
 // NOTE: before Botan's headers, some of which use <algorithm> without including it (see ports/botan).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -20,6 +21,7 @@
 #include <botan/asn1_obj.h>
 #include <botan/ber_dec.h>
 #include <botan/bigint.h>
+#include <botan/data_src.h>
 #include <botan/der_enc.h>
 #include <botan/ec_group.h>
 #include <botan/ecdsa.h>
@@ -186,6 +188,10 @@ const test_pki& pki()
 
         out.ca = out.dir / "ca.pem";
         write_file(out.ca, trusted.first.PEM_encode() + trusted_rsa.first.PEM_encode());
+        out.ecdsa_ca     = out.dir / "ecdsa-ca.pem";
+        out.ecdsa_ca_key = out.dir / "ecdsa-ca.key";
+        write_file(out.ecdsa_ca, trusted.first.PEM_encode());
+        write_file(out.ecdsa_ca_key, Botan::PKCS8::PEM_encode(*trusted.second));
 
         out.localhost_chain     = out.dir / "localhost.pem";
         out.localhost_key       = out.dir / "localhost.key";
@@ -328,6 +334,39 @@ net::tls::server_context server_with(const std::filesystem::path& chain, const s
     auto ctx = net::tls::server_context::make({.certificate_chain = chain, .private_key = key});
     REQUIRE(ctx.has_value());
     return *ctx;
+}
+
+net::tls::server_context names_until(std::chrono::system_clock::time_point not_after)
+{
+    const auto& made = pki();
+
+    Botan::System_RNG             rng;
+    const Botan::X509_Certificate ca{made.ecdsa_ca.string()};
+    Botan::DataSource_Stream      ca_key_file{made.ecdsa_ca_key.string()};
+    const auto                    ca_key = Botan::PKCS8::load_key(ca_key_file);
+
+    const Botan::ECDSA_PrivateKey key{rng, Botan::EC_Group::from_name("secp256r1")};
+    Botan::X509_Cert_Options      opts;
+    opts.common_name = "a.test";
+    opts.dns         = "a.test";
+    opts.more_dns    = {"b.test", "*.w.test"};
+    opts.ip          = "127.0.0.1";
+
+    const auto           request = Botan::X509::create_cert_req(opts, key, "SHA-256", rng);
+    const Botan::X509_CA authority{ca, *ca_key, "SHA-256", rng};
+    const auto           cert = authority.sign_request(request,
+                                                       rng,
+                                                       Botan::X509_Time{std::chrono::system_clock::now() - 1h},
+                                                       Botan::X509_Time{not_after});
+
+    // each its own files, as tests may make them at once.
+    static std::atomic<int> made_count{0};
+    const auto              n     = std::to_string(made_count.fetch_add(1));
+    const auto              chain = made.dir / ("names-until-" + n + ".pem");
+    const auto              path  = made.dir / ("names-until-" + n + ".key");
+    write_file(chain, cert.PEM_encode());
+    write_file(path, Botan::PKCS8::PEM_encode(key));
+    return server_with(chain, path);
 }
 
 net::tls::server_context client_auth_server(net::tls::client_auth auth, net::tls::version max_version)

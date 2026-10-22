@@ -133,15 +133,13 @@ namespace detail
 
     // verify_for verifies the server's certificate chain, as s's handshake received it, for host (a DNS name, or an IP
     // address without brackets), as a handshake connecting to host would verify it (docs/plans/http2.md, Decided
-    // question 37): the chain against the context's trust store, under its policy, valid now (or at, for tests), and
-    // the certificate for host. For a connection taking requests for another host than its own (RFC 9113, section
+    // question 37): the chain against the context's trust store, under its policy, valid now (by the stream's clock),
+    // and the certificate for host. For a connection taking requests for another host than its own (RFC 9113, section
     // 9.1.1: "any checks that the client would perform when forming a new TLS connection for the host"). It fails with
     // why, as the handshake would (in verification_category()), or with std::errc::invalid_argument for a stream that
     // doesn't verify (see verifies()), or an empty host. It may be called from any thread, as the stream's reads and
     // writes go on: it costs what a handshake's verification does (signatures).
-    [[nodiscard]] std::error_code verify_for(const stream&                                        s,
-                                             std::string_view                                     host,
-                                             std::optional<std::chrono::system_clock::time_point> at = std::nullopt);
+    [[nodiscard]] std::error_code verify_for(const stream& s, std::string_view host);
 
     // idle_clean is whether s holds nothing that a read hasn't taken: no data decrypted and unread, nor part of a
     // record; and neither the peer's close_notify nor a failure. For a pool of idle connections (whose sockets it
@@ -389,10 +387,9 @@ public:
     [[nodiscard]] io::handle native_handle() const noexcept override;
 
 private:
-    friend bool detail::idle_clean(const stream& s) noexcept;
-    friend bool detail::verifies(const stream& s) noexcept;
-    friend std::error_code
-    detail::verify_for(const stream& s, std::string_view host, std::optional<std::chrono::system_clock::time_point> at);
+    friend bool            detail::idle_clean(const stream& s) noexcept;
+    friend bool            detail::verifies(const stream& s) noexcept;
+    friend std::error_code detail::verify_for(const stream& s, std::string_view host);
 
     explicit stream(std::unique_ptr<detail::connection> conn) noexcept;
 

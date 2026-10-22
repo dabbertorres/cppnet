@@ -1,7 +1,9 @@
 // The HTTP/2 client's Origin Sets (RFC 8336; docs/plans/http2.md, stage 6's eleventh part): each connection over TLS
 // keeps one, from the server's ORIGIN frames, which the server the tests play (test::h2_client, in its server role over
 // a TLS stream with a certificate for a.test, b.test, *.w.test and 127.0.0.1) sends; and the server's certificate
-// checked for each origin's host before the connection's taken to be authoritative for it.
+// checked for each origin's host before the connection's taken to be authoritative for it. What a set has is seen
+// through authoritative_for(), which the pool asks, for origins whose hosts the certificate has (an origin it doesn't
+// have is never authoritative, in the set or not).
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -103,10 +105,10 @@ struct handshake
     std::optional<std::expected<tls::stream, std::error_code>> result;
     std::atomic<std::uint64_t>                                 done{0};
 
-    static task<> run(handshake* self, net::tcp_socket accepted)
+    static task<> run(handshake* self, net::tcp_socket accepted, tls::server_context ctx)
     {
         self->result = co_await tls::stream::accept(std::move(accepted),
-                                                    server_with(pki().names_chain, pki().names_key),
+                                                    std::move(ctx),
                                                     net::io::clock::now() + 5s,
                                                     {.alpn = std::vector<std::string>{"h2"}});
         self->done.store(1);
@@ -123,9 +125,13 @@ struct handshake
     }
 };
 
-// connect connects a client's HTTP/2 connection to the server the test plays, as a.test (its own origin given as
-// own_host's, with the port), telling of its Origin Set to known.
-task<connected> connect(net::io::scheduler* sched, transport how, told* known, std::string own_host = "a.test")
+// connect connects a client's HTTP/2 connection to the server the test plays (with ctx, or names_chain's certificate),
+// as a.test (its own origin given as own_host's, with the port), telling of its Origin Set to known.
+task<connected> connect(net::io::scheduler*                sched,
+                        transport                          how,
+                        told*                              known,
+                        std::string                        own_host = "a.test",
+                        std::optional<tls::server_context> ctx      = std::nullopt)
 {
     auto       listener = net::listener::make(sched, "127.0.0.1", "0").value();
     const auto port     = listener.local_port();
@@ -144,7 +150,9 @@ task<connected> connect(net::io::scheduler* sched, transport how, told* known, s
     else
     {
         handshake server{sched};
-        REQUIRE(sched->spawn(handshake::run(&server, std::move(*accepted))));
+        REQUIRE(sched->spawn(handshake::run(&server,
+                                            std::move(*accepted),
+                                            ctx ? *ctx : server_with(pki().names_chain, pki().names_key))));
 
         auto ctx = tls::client_context::make({.trusted_ca_file            = pki().ca,
                                               .insecure_skip_verification = how == transport::insecure_tls,
@@ -199,8 +207,17 @@ task<bool> send(test::h2_client& server, std::vector<std::string> origins)
     co_return co_await server.sync();
 }
 
-// own is the client's own origin, as its Origin Set has it.
+// own is the client's own origin.
 std::string own(std::uint16_t port) { return "https://a.test:" + std::to_string(port); }
+
+// answers is whether the connection's authoritative for each of origins.
+std::vector<bool> answers(http::detail::http2_client_connection& conn, const std::vector<std::string>& origins)
+{
+    std::vector<bool> out;
+    out.reserve(origins.size());
+    for (const auto& o : origins) out.push_back(conn.authoritative_for(o));
+    return out;
+}
 
 }
 
@@ -214,17 +231,29 @@ TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the s
 
     struct seen
     {
-        std::optional<std::vector<std::string>> before{}; // before ORIGIN
-        bool                                    told_before = false;
-        std::optional<std::vector<std::string>> first{}; // after the first
-        bool                                    told_first = false;
-        std::optional<std::vector<std::string>> later{}; // after a later one
-        std::uint64_t                           told_count = 0;
-        std::uint16_t                           port       = 0;
+        std::vector<bool> before{}; // before ORIGIN
+        bool              told_before = false;
+        std::vector<bool> first{}; // after the first
+        bool              told_first = false;
+        std::vector<bool> later{}; // after a later one
+        std::uint64_t     told_count = 0;
+        std::uint16_t     port       = 0;
+    };
+
+    // origins whose hosts the certificate has, asked about: its own (as the set has it, normalized), ones the first
+    // frame lists (normalized differently), one a later frame lists, and one none lists.
+    const auto asked = [](std::uint16_t port)
+    {
+        return std::vector<std::string>{own(port),
+                                        "https://b.test",
+                                        "https://x.w.test:8443",
+                                        "https://127.0.0.1",
+                                        "https://y.w.test",
+                                        "https://z.w.test"};
     };
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<seen>
+        [](net::io::scheduler* sched, told* known, auto asked) -> task<seen>
         {
             // its own origin as the pool gives it: the host as the URL had it.
             auto c      = co_await connect(sched, transport::tls, known, "A.Test");
@@ -235,57 +264,42 @@ TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the s
             // uninitialized until the server sends ORIGIN.
             const bool synced = co_await server.sync();
             REQUIRE(synced);
-            out.before      = c.conn->origins();
+            out.before      = answers(*c.conn, asked(c.port));
             out.told_before = known->count.load() != 0;
 
-            // initialized with its own origin and the entries: normalized (lowercase, without 443, an address as
-            // ip_addr writes it), each once; what isn't an https origin ignored.
+            // initialized with its own origin and the entries, normalized (lowercase, without 443); what isn't an
+            // https origin ignored.
             const bool first = co_await send(server,
-                                             {"https://b.test",
-                                              "https://C.TEST:443",
-                                              "https://x.w.test:8443",
+                                             {"https://B.TEST:443",
                                               "not an origin",
-                                              "http://d.test",
-                                              "https://b.test",
+                                              "http://y.w.test",
                                               "https://*.w.test",
-                                              "https://b.test/",
-                                              "https://user@b.test",
-                                              "https://[0:0::1]",
-                                              "https://127.0.0.1:443",
+                                              "https://y.w.test/",
+                                              "https://user@y.w.test",
+                                              "https://x.w.test:8443",
                                               "",
-                                              "https://B.test:443"});
+                                              "https://127.0.0.1:443"});
             REQUIRE(first);
-            out.first      = c.conn->origins();
+            out.first      = answers(*c.conn, asked(c.port));
             out.told_first = co_await known->wait();
 
             // later ones add to it; told once only.
-            const bool later = co_await send(server, {"https://d.test", "https://c.test", "https://e.test:8443"});
+            const bool later = co_await send(server, {"https://Y.w.test"});
             REQUIRE(later);
-            out.later      = c.conn->origins();
+            out.later      = answers(*c.conn, asked(c.port));
             out.told_count = known->count.load();
 
             c.conn->close();
             co_return out;
-        }(&sched, &known));
+        }(&sched, &known, asked));
 
-    CHECK_FALSE(out.before.has_value());
+    CHECK(out.before == std::vector<bool>(6, false));
     CHECK_FALSE(out.told_before);
 
-    const std::vector<std::string> first{own(out.port),
-                                         "https://b.test",
-                                         "https://c.test",
-                                         "https://x.w.test:8443",
-                                         "https://[::1]",
-                                         "https://127.0.0.1"};
-    REQUIRE(out.first.has_value());
-    CHECK(*out.first == first);
+    CHECK(out.first == std::vector<bool>{true, true, true, true, false, false});
     CHECK(out.told_first);
 
-    auto later = first;
-    later.emplace_back("https://d.test");
-    later.emplace_back("https://e.test:8443");
-    REQUIRE(out.later.has_value());
-    CHECK(*out.later == later);
+    CHECK(out.later == std::vector<bool>{true, true, true, true, true, false});
     CHECK(out.told_count == 1);
 }
 
@@ -307,9 +321,7 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
     {
         bool                before = true; // asked before ORIGIN
         std::vector<answer> answers{};
-        std::size_t         checks       = 0; // certificate checks, after the first round
-        std::size_t         checks_again = 0; // and after asking again
-        std::uint16_t       port         = 0;
+        std::vector<answer> again{}; // asked again
     };
 
     const auto out = sched.run_to_completion(
@@ -318,11 +330,11 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
             auto c      = co_await connect(sched, transport::tls, known);
             auto server = played(*c.server);
 
-            seen out{.port = c.port};
+            seen out;
 
             const bool synced = co_await server.sync();
             REQUIRE(synced);
-            out.before = c.conn->authoritative_for("https://a.test:" + std::to_string(c.port));
+            out.before = c.conn->authoritative_for(own(c.port));
 
             const bool sent = co_await send(
                 server,
@@ -330,24 +342,21 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
             REQUIRE(sent);
 
             const std::vector<std::string> asked{
-                "https://a.test:" + std::to_string(c.port), // its own
-                "https://b.test",                           // the certificate has it
-                "https://B.TEST:443",                       // the same, normalized
-                "https://b.test:8443",                      // not in the set (though the certificate has its host)
-                "https://c.test",                           // in the set, but the certificate doesn't have it
-                "https://x.w.test:8443",                    // the certificate's wildcard has it
-                "https://127.0.0.1",                        // the certificate has the address
-                "https://[::1]",                            // in the set, but the certificate hasn't the address
-                "https://e.test",                           // not in the set, nor the certificate
+                own(c.port),             // its own
+                "https://b.test",        // the certificate has it
+                "https://B.TEST:443",    // the same, normalized
+                "https://b.test:8443",   // not in the set (though the certificate has its host)
+                "https://c.test",        // in the set, but the certificate doesn't have it
+                "https://x.w.test:8443", // the certificate's wildcard has it
+                "https://127.0.0.1",     // the certificate has the address
+                "https://[::1]",         // in the set, but the certificate hasn't the address
+                "https://e.test",        // not in the set, nor the certificate
                 "not an origin",
             };
             for (const auto& origin : asked)
                 out.answers.push_back({.origin = origin, .authoritative = c.conn->authoritative_for(origin)});
-            out.checks = c.conn->certificate_checks();
-
-            // each host's checked once.
-            for (const auto& origin : asked) (void)c.conn->authoritative_for(origin);
-            out.checks_again = c.conn->certificate_checks();
+            for (const auto& origin : asked)
+                out.again.push_back({.origin = origin, .authoritative = c.conn->authoritative_for(origin)});
 
             c.conn->close();
             co_return out;
@@ -357,15 +366,63 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
 
     const std::vector<bool> want{true, true, true, false, false, true, true, false, false, false};
     REQUIRE(out.answers.size() == want.size());
+    REQUIRE(out.again.size() == want.size());
     for (std::size_t i = 0; i < want.size(); ++i)
     {
         CAPTURE(out.answers[i].origin);
         CHECK(out.answers[i].authoritative == want[i]);
+        CHECK(out.again[i].authoritative == want[i]);
     }
+}
 
-    // a.test, b.test, c.test, x.w.test, 127.0.0.1 and ::1: once each.
-    CHECK(out.checks == 6);
-    CHECK(out.checks_again == 6);
+TEST_CASE("an HTTP/2 client's connection checks the server's certificate for a host once, when it's first asked",
+          "[tls][http][client][http2][origin]")
+{
+    // the certificate's valid for five or six seconds more (seconds to spare, even for a slow handshake under TSan on a
+    // loaded machine): long enough to connect, and ask for b.test, then waited
+    // out. b.test's answer is remembered; x.w.test's and a.test's, first asked then, find it expired.
+    const auto not_after = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()) + 6s;
+
+    told known;
+
+    net::io::scheduler sched{make_pool()};
+    known.sched = &sched;
+
+    struct seen
+    {
+        bool before      = false; // b.test, while it's valid
+        bool after       = false; // b.test, once it's expired
+        bool wildcard    = true;  // x.w.test, first asked once it's expired
+        bool own_expired = true;  // its own, likewise
+    };
+
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, told* known, std::chrono::system_clock::time_point not_after) -> task<seen>
+        {
+            auto c      = co_await connect(sched, transport::tls, known, "a.test", test::names_until(not_after));
+            auto server = played(*c.server);
+
+            const bool sent = co_await send(server, {"https://b.test", "https://x.w.test"});
+            REQUIRE(sent);
+
+            seen out{.before = c.conn->authoritative_for("https://b.test")};
+
+            const auto left =
+                std::chrono::duration_cast<net::io::clock::duration>(not_after - std::chrono::system_clock::now() + 1s);
+            (void)co_await sched->sleep_until(net::io::clock::now() + left);
+
+            out.after       = c.conn->authoritative_for("https://b.test");
+            out.wildcard    = c.conn->authoritative_for("https://x.w.test");
+            out.own_expired = c.conn->authoritative_for(own(c.port));
+
+            c.conn->close();
+            co_return out;
+        }(&sched, &known, not_after));
+
+    CHECK(out.before);
+    CHECK(out.after);
+    CHECK_FALSE(out.wildcard);
+    CHECK_FALSE(out.own_expired);
 }
 
 TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http][client][http2][origin]")
@@ -377,10 +434,9 @@ TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http
 
     struct seen
     {
-        std::optional<std::vector<std::string>> first; // after 300 entries
-        std::optional<std::vector<std::string>> full;  // after another, while it's full
-        bool                                    removed = false;
-        std::optional<std::vector<std::string>> room; // after another, once there's room
+        std::vector<bool> first;       // after 300 entries
+        bool              full = true; // another, while it's full
+        std::vector<bool> room;        // after two more, once there's room for one
     };
 
     const auto out = sched.run_to_completion(
@@ -389,41 +445,71 @@ TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http
             auto c      = co_await connect(sched, transport::tls, known);
             auto server = played(*c.server);
 
+            const auto host = [](int i) { return "https://h" + std::to_string(i) + ".w.test"; };
+
             std::vector<std::string> many;
             many.reserve(300);
-            for (int i = 0; i < 300; ++i) many.push_back("https://h" + std::to_string(i) + ".test");
+            for (int i = 0; i < 300; ++i) many.push_back(host(i));
 
             seen       out;
             const bool first = co_await send(server, many);
             REQUIRE(first);
-            out.first = c.conn->origins();
 
-            const bool full = co_await send(server, {"https://more.test"});
+            // its own, and the first 255 entries.
+            out.first = answers(*c.conn, {own(c.port), host(0), host(254), host(255), host(299)});
+
+            const bool full = co_await send(server, {"https://more.w.test"});
             REQUIRE(full);
-            out.full = c.conn->origins();
+            out.full = c.conn->authoritative_for("https://more.w.test");
 
-            out.removed     = c.conn->remove_origin("https://h0.test");
-            const bool room = co_await send(server, {"https://more.test", "https://most.test"});
+            c.conn->remove_origin(host(0));
+            const bool room = co_await send(server, {"https://most.w.test", "https://more.w.test"});
             REQUIRE(room);
-            out.room = c.conn->origins();
+            out.room = answers(*c.conn, {"https://most.w.test", "https://more.w.test", host(0)});
 
             c.conn->close();
             co_return out;
         }(&sched, &known));
 
-    // its own, and the first 255 entries.
-    REQUIRE(out.first.has_value());
-    CHECK(out.first->size() == 256);
-    CHECK(out.first->back() == "https://h254.test");
+    CHECK(out.first == std::vector<bool>{true, true, true, false, false});
+    CHECK_FALSE(out.full);
+    CHECK(out.room == std::vector<bool>{true, false, false});
+}
 
-    REQUIRE(out.full.has_value());
-    CHECK(*out.full == *out.first);
+TEST_CASE("an HTTP/2 client's Origin Set doesn't count entries it ignores, nor repeats, against its limit",
+          "[tls][http][client][http2][origin]")
+{
+    told known;
 
-    // room for one more.
-    CHECK(out.removed);
-    REQUIRE(out.room.has_value());
-    CHECK(out.room->size() == 256);
-    CHECK(out.room->back() == "https://more.test");
+    net::io::scheduler sched{make_pool()};
+    known.sched = &sched;
+
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, told* known) -> task<std::vector<bool>>
+        {
+            auto c      = co_await connect(sched, transport::tls, known);
+            auto server = played(*c.server);
+
+            // 300 that aren't https origins, 300 repeats (as written, and normalized), then one more.
+            std::vector<std::string> entries;
+            entries.reserve(601);
+            for (int i = 0; i < 300; ++i) entries.push_back("http://h" + std::to_string(i) + ".w.test");
+            for (int i = 0; i < 150; ++i)
+            {
+                entries.emplace_back("https://b.test");
+                entries.emplace_back("https://B.test:443");
+            }
+            entries.emplace_back("https://x.w.test");
+
+            const bool sent = co_await send(server, entries);
+            REQUIRE(sent);
+
+            auto out = answers(*c.conn, {"https://b.test", "https://x.w.test"});
+            c.conn->close();
+            co_return out;
+        }(&sched, &known));
+
+    CHECK(out == std::vector<bool>{true, true});
 }
 
 TEST_CASE("an HTTP/2 client's connection removes origins from its Origin Set", "[tls][http][client][http2][origin]")
@@ -433,48 +519,34 @@ TEST_CASE("an HTTP/2 client's connection removes origins from its Origin Set", "
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
 
-    struct seen
-    {
-        bool                                    authoritative = false; // for b.test, before it's removed
-        std::vector<bool>                       removed;
-        std::optional<std::vector<std::string>> left;
-        bool                                    still  = true; // for b.test, after
-        std::size_t                             checks = 0;
-    };
-
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<seen>
+        [](net::io::scheduler* sched, told* known) -> task<std::vector<bool>>
         {
             auto c      = co_await connect(sched, transport::tls, known);
             auto server = played(*c.server);
 
-            seen       out;
-            const bool before = c.conn->remove_origin("https://b.test"); // uninitialized: nothing to remove
-            const bool sent   = co_await send(server, {"https://b.test", "https://c.test"});
+            // uninitialized: nothing to remove, and nothing's kept from trying.
+            c.conn->remove_origin("https://b.test");
+
+            const bool sent = co_await send(server, {"https://b.test", "https://x.w.test"});
             REQUIRE(sent);
 
-            out.authoritative = c.conn->authoritative_for("https://b.test");
-            out.removed       = {before,
-                                 c.conn->remove_origin("https://B.test:443"), // normalized as the entries are
-                                 c.conn->remove_origin("https://b.test"),     // gone already
-                                 c.conn->remove_origin("not an origin"),
-                                 c.conn->remove_origin("https://a.test:" + std::to_string(c.port))};
-            out.left          = c.conn->origins();
+            std::vector<bool> out{c.conn->authoritative_for("https://b.test")};
 
-            // the certificate's still valid for it (and not checked again), but the origin's gone.
-            out.still  = c.conn->authoritative_for("https://b.test");
-            out.checks = c.conn->certificate_checks();
+            // normalized as the entries are; what isn't an origin, nothing.
+            c.conn->remove_origin("https://B.test:443");
+            c.conn->remove_origin("not an origin");
+            c.conn->remove_origin(own(c.port));
+
+            // b.test's certificate check is remembered, but the origin's gone; and its own.
+            const auto after = answers(*c.conn, {"https://b.test", "https://x.w.test", own(c.port)});
+            out.insert(out.end(), after.begin(), after.end());
 
             c.conn->close();
             co_return out;
         }(&sched, &known));
 
-    CHECK(out.authoritative);
-    CHECK(out.removed == std::vector<bool>{false, true, false, false, true});
-    REQUIRE(out.left.has_value());
-    CHECK(*out.left == std::vector<std::string>{"https://c.test"});
-    CHECK_FALSE(out.still);
-    CHECK(out.checks == 1);
+    CHECK(out == std::vector<bool>{true, false, true, false});
 }
 
 TEST_CASE("an HTTP/2 client's connection keeps no Origin Set over cleartext, nor without verifying the server's "
@@ -489,15 +561,8 @@ TEST_CASE("an HTTP/2 client's connection keeps no Origin Set over cleartext, nor
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
 
-    struct seen
-    {
-        std::optional<std::vector<std::string>> origins;
-        bool                                    authoritative = true;
-        std::size_t                             checks        = 1;
-    };
-
-    const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known, transport how) -> task<seen>
+    const auto authoritative = sched.run_to_completion(
+        [](net::io::scheduler* sched, told* known, transport how) -> task<bool>
         {
             auto c      = co_await connect(sched, how, known);
             auto server = played(*c.server);
@@ -505,16 +570,12 @@ TEST_CASE("an HTTP/2 client's connection keeps no Origin Set over cleartext, nor
             const bool sent = co_await send(server, {"https://b.test"});
             REQUIRE(sent);
 
-            seen out{.origins       = c.conn->origins(),
-                     .authoritative = c.conn->authoritative_for("https://b.test"),
-                     .checks        = c.conn->certificate_checks()};
+            const bool out = c.conn->authoritative_for("https://b.test");
             c.conn->close();
             co_return out;
         }(&sched, &known, how));
 
-    CHECK_FALSE(out.origins.has_value());
-    CHECK_FALSE(out.authoritative);
-    CHECK(out.checks == 0);
+    CHECK_FALSE(authoritative);
     CHECK(known.count.load() == 0);
 }
 
@@ -538,15 +599,9 @@ TEST_CASE("the HTTP/2 client's pool gives a connection over TLS its own origin, 
     options.tls.trusted_ca_file = pki().ca;
     auto pool                   = std::make_shared<http::detail::connection_pool>(&sched, std::move(options));
 
-    struct seen
-    {
-        std::optional<std::vector<std::string>> origins{};
-        bool                                    authoritative = false;
-    };
-
     const auto port = std::to_string(server.local_port());
     const auto out  = sched.run_to_completion(
-        [](http::detail::connection_pool* pool, std::string port) -> task<seen>
+        [](http::detail::connection_pool* pool, std::string port) -> task<std::vector<bool>>
         {
             auto leased = co_await pool->acquire("https", "127.0.0.1", port, true);
             REQUIRE(leased.has_value());
@@ -561,10 +616,10 @@ TEST_CASE("the HTTP/2 client's pool gives a connection over TLS its own origin, 
             CHECK(resp->status_code == http::status::NO_CONTENT);
             resp->body.reset();
 
-            co_return seen{.origins = conn->origins(), .authoritative = conn->authoritative_for("https://b.test")};
+            // its own (as the pool gave it), the server's two, and one the server didn't list.
+            co_return answers(*conn,
+                              {"https://127.0.0.1:" + port, "https://b.test", "https://x.w.test", "https://a.test"});
         }(pool.get(), port));
 
-    REQUIRE(out.origins.has_value());
-    CHECK(*out.origins == std::vector<std::string>{"https://127.0.0.1:" + port, "https://b.test", "https://x.w.test"});
-    CHECK(out.authoritative);
+    CHECK(out == std::vector<bool>{true, true, true, false});
 }
