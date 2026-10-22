@@ -20,7 +20,15 @@
 //      too; the op's bit 6, incremental): a client's, which is sent only if it changes what the stream last said, and
 //      replaces one not yet taken (a server's fails). The output's taken after every record but these, so several may
 //      wait in it, to be replaced, or taken back (e.g. as the next record receives the end of a stream).
-// - 7, without: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
+// - 7, without, with the op's bit 6: ORIGIN (RFC 8336), as the op's bit 7 says:
+//      - 0: receive one (the next byte: bit 0 on stream 1 rather than 0, bit 1 with a flag RFC 8336 reserves (bits 2-3:
+//        which), bit 4 with one it doesn't (0x80), bits 5-6 how many of "https://a.example", "https://b.example:8443"
+//        and "" as its entries, bit 7 then the next n bytes, n being the byte after, as more of its payload: random
+//        entries, whose lengths may run past it);
+//      - 1: submit one (the next byte: bits 0-1 how many of "https://a.example", "https://b.example:8443" and
+//        "https://[::1]", bits 2-3 how many origins of 6000 bytes after them, so that they're split into frames): a
+//        server's, as many frames as they need (a client's fails).
+// - 7, without either: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
 //      - 0: SETTINGS changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the session's
 //        encoder to follow;
 //      - 1: SETTINGS with NO_RFC7540_PRIORITIES of the next byte (0, 1, or a value that's invalid);
@@ -32,7 +40,8 @@
 // A stream is chosen from those the application knows (a server's requests, a client's own), in order.
 //
 // Each output is checked to be whole frames, its PRIORITY_UPDATEs on stream 0 with values in to_string()'s form (so
-// one replaced or taken back in place has left the frames around it whole).
+// one replaced or taken back in place has left the frames around it whole), and its ORIGINs (only a server's) on stream
+// 0, without flags, their entries filling them exactly.
 //
 // The server's script follows the client's preface and SETTINGS, and the client's the server's SETTINGS, each with
 // only NO_RFC7540_PRIORITIES (1, as both sides send it), so that the fuzzer starts past them. The client opens streams
@@ -125,6 +134,13 @@ struct recorder final : http2::session_events
     {
         log += std::format("priority {} {} {}\n", stream, p.urgency, p.incremental);
     }
+
+    void on_origin(std::span<const std::string_view> origins) override
+    {
+        log += "origin";
+        for (const auto o : origins) log += std::format(" [{}]", o);
+        log += '\n';
+    }
 };
 
 // outcome is what a session made of a script.
@@ -190,8 +206,22 @@ bool blocks_decode(http2::role                                    role,
     return decoded == submitted.size();
 }
 
+// whole_entries is whether an ORIGIN frame's payload is whole entries (a 16-bit length and that many bytes), nothing
+// left over.
+bool whole_entries(std::span<const std::byte> payload)
+{
+    while (payload.size() >= 2)
+    {
+        const auto length = (std::to_integer<std::size_t>(payload[0]) << 8U) | std::to_integer<std::size_t>(payload[1]);
+        if (length > payload.size() - 2) return false;
+        payload = payload.subspan(2 + length);
+    }
+    return payload.empty();
+}
+
 // whole_frames is whether a session's output is whole frames, nothing left over, its PRIORITY_UPDATEs on stream 0 with
-// values in to_string()'s form (so one replaced or taken back in place has left the frames around it whole).
+// values in to_string()'s form (so one replaced or taken back in place has left the frames around it whole), and its
+// ORIGINs a server's, on stream 0, without flags, their entries filling them exactly.
 bool whole_frames(http2::role role, std::span<const std::byte> output)
 {
     if (role == http2::role::client) output = output.subspan(http2::preface.size());
@@ -202,6 +232,11 @@ bool whole_frames(http2::role role, std::span<const std::byte> output)
         if (output.size() < http2::frame_header_size + h.length) return false;
         const auto payload = output.subspan(http2::frame_header_size, h.length);
         output             = output.subspan(http2::frame_header_size + h.length);
+        if (h.type == static_cast<std::uint8_t>(http2::frame_type::origin))
+        {
+            if (role != http2::role::server || h.stream != 0 || h.flags != 0 || !whole_entries(payload)) return false;
+            continue;
+        }
         if (h.type != static_cast<std::uint8_t>(http2::frame_type::priority_update)) continue;
 
         if (h.stream != 0 || payload.size() < 4) return false;
@@ -386,9 +421,64 @@ private:
                                        : std::format("submit priority {} error {}\n", id, sent.error().value());
     }
 
+    // origin receives an ORIGIN frame, or submits one, as op 7's bit 7 (which's bit 4) says.
+    void origin(std::uint8_t which, script& sc)
+    {
+        static const std::array<std::string, 3> named{"https://a.example", "https://b.example:8443", ""};
+        const auto                              arg = sc.next();
+
+        if ((which & 0x10U) == 0)
+        {
+            std::uint8_t flags = 0;
+            if ((arg & 2U) != 0) flags |= static_cast<std::uint8_t>(1U << ((arg >> 2U) & 3U));
+            if ((arg & 0x10U) != 0) flags |= 0x80U;
+
+            std::vector<std::byte> payload;
+            for (std::size_t i = 0; i < ((arg >> 5U) & 3U); ++i)
+            {
+                const auto& o = named.at(i);
+                payload.push_back(static_cast<std::byte>(o.size() >> 8U));
+                payload.push_back(static_cast<std::byte>(o.size()));
+                const auto bytes = std::as_bytes(std::span{o});
+                payload.insert(payload.end(), bytes.begin(), bytes.end());
+            }
+            if ((arg & 0x80U) != 0)
+            {
+                const auto more = sc.take(sc.next());
+                payload.insert(payload.end(), more.begin(), more.end());
+            }
+
+            std::vector<std::byte> frame;
+            http2::encode_frame_header({.length = static_cast<std::uint32_t>(payload.size()),
+                                        .type   = static_cast<std::uint8_t>(http2::frame_type::origin),
+                                        .flags  = flags,
+                                        .stream = (arg & 1U) != 0 ? 1U : 0U},
+                                       frame);
+            frame.insert(frame.end(), payload.begin(), payload.end());
+            receive(frame);
+            return;
+        }
+
+        static const std::array<std::string, 3> submitted{"https://a.example",
+                                                          "https://b.example:8443",
+                                                          "https://[::1]"};
+        static const std::string                long_origin = "https://" + std::string(5'992, 'x');
+
+        std::vector<std::string> origins(submitted.begin(), submitted.begin() + (arg & 3U));
+        origins.insert(origins.end(), (arg >> 2U) & 3U, long_origin);
+        const auto err = s.submit_origin(origins);
+        events.log += std::format("submit origin {} {}\n", origins.size(), err.value());
+    }
+
     // rare_frame receives one of the frames random bytes rarely make (op 7's).
     void rare_frame(std::uint8_t which, script& sc)
     {
+        if ((which & 8U) != 0)
+        {
+            origin(which, sc);
+            return;
+        }
+
         std::vector<std::byte> frame;
         switch (which & 3U)
         {

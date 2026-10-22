@@ -14,6 +14,7 @@
 #include <optional>
 #include <ratio>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -45,10 +46,12 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "ip_addr.hpp"
 #include "listen.hpp"
 #include "tcp.hpp"
 #include "tls/version.hpp"
 #include "util/defer.hpp"
+#include "util/string_util.hpp"
 
 #ifdef NET_HAS_TLS
 #    include "tls/tls.hpp"
@@ -205,6 +208,116 @@ net::http::http2::session_config http2_session_config(const net::http::server_co
     return config;
 }
 
+// dns_name is whether host is a DNS name, as a certificate's are (without wildcards): labels of letters, digits and
+// hyphens (not at either end), each 1 to 63 of them, and 253 in all.
+bool dns_name(std::string_view host)
+{
+    if (host.empty() || host.size() > 253) return false;
+
+    for (const auto label : net::util::split_string(host, '.'))
+    {
+        if (label.empty() || label.size() > 63 || label.front() == '-' || label.back() == '-') return false;
+
+        const auto ldh = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'; };
+        if (!std::ranges::all_of(label, ldh)) return false;
+    }
+    return true;
+}
+
+// origin is one of server_config::http2_origins, as ORIGIN lists it: its ASCII serialization (RFC 6454, section 6.2),
+// and its host as a certificate is checked for it (an IPv6 address without its brackets).
+struct origin
+{
+    std::string serialized;
+    std::string host;
+};
+
+// host_of reads the host at the start of rest (lowercase), removing it: an IPv6 address in brackets, or up to the port;
+// nullopt if it isn't one.
+std::optional<origin> host_of(std::string_view& rest)
+{
+    if (rest.starts_with('['))
+    {
+        const auto close = rest.find(']');
+        if (close == std::string_view::npos) return std::nullopt;
+
+        const auto addr = net::ip_addr::parse(rest.substr(1, close - 1));
+        if (!addr.has_value() || !addr->is_ipv6()) return std::nullopt;
+        rest.remove_prefix(close + 1);
+
+        auto host = addr->to_string();
+        return origin{.serialized = "[" + host + "]", .host = std::move(host)};
+    }
+
+    const auto name = rest.substr(0, rest.find(':'));
+    rest.remove_prefix(name.size());
+
+    std::string host;
+    if (const auto addr = net::ip_addr::parse(name); addr.has_value() && addr->is_ipv4()) host = addr->to_string();
+    else if (dns_name(name)) host = name;
+    else return std::nullopt;
+    return origin{.serialized = host, .host = host};
+}
+
+// port_of reads what follows an origin's host: nothing, or ':' and a port from 1 to 65535. It returns what to write of
+// it (nothing for none, or the default, 443), or nullopt if it isn't a port.
+std::optional<std::string> port_of(std::string_view rest)
+{
+    if (rest.empty()) return std::string{};
+    if (!rest.starts_with(':')) return std::nullopt;
+    rest.remove_prefix(1);
+
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (rest.empty() || rest.size() > 5 || !std::ranges::all_of(rest, digit)) return std::nullopt;
+
+    unsigned port = 0;
+    for (const auto c : rest) port = (port * 10) + static_cast<unsigned>(c - '0');
+    if (port == 0 || port > 65'535) return std::nullopt;
+    return port == 443 ? std::string{} : ":" + std::to_string(port);
+}
+
+// origin_of reads an https origin, "https://host" or "https://host:port", normalized (lowercase, the default port left
+// out, an address written as ip_addr writes it), or nullopt if it isn't one.
+std::optional<origin> origin_of(std::string_view text)
+{
+    constexpr std::string_view scheme = "https://";
+    if (text.size() < scheme.size() || !net::util::equal_ignore_case(text.substr(0, scheme.size()), scheme))
+        return std::nullopt;
+    text.remove_prefix(scheme.size());
+
+    std::string lower{text};
+    for (auto& c : lower) c = net::util::to_lower_ascii(c);
+    std::string_view rest = lower;
+
+    auto host = host_of(rest);
+    if (!host.has_value()) return std::nullopt;
+    const auto port = port_of(rest);
+    if (!port.has_value()) return std::nullopt;
+
+    host->serialized = std::string{scheme} + host->serialized + *port;
+    return host;
+}
+
+// http2_origins_of is cfg's http2_origins, normalized and without repeats, throwing std::invalid_argument for one that
+// isn't an https origin, or (with TLS) whose host its certificate doesn't cover.
+std::vector<std::string> http2_origins_of(const net::http::server_config& cfg)
+{
+    std::vector<std::string> out;
+    for (const auto& text : cfg.http2_origins)
+    {
+        auto o = origin_of(text);
+        if (!o.has_value()) throw std::invalid_argument{"not an https origin: " + text};
+
+#ifdef NET_HAS_TLS
+        if (cfg.tls.has_value() && !net::tls::detail::covers(*cfg.tls, o->host))
+            throw std::invalid_argument{"the certificate isn't for " + text};
+#endif
+
+        if (!std::ranges::contains(out, o->serialized)) out.push_back(std::move(o->serialized));
+    }
+    return out;
+}
+
 // has_close is whether fields say the connection closes after this message.
 bool has_close(const net::http::headers& fields) { return fields.has_token("Connection"sv, "close"sv); }
 
@@ -273,6 +386,7 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
           .priorities          = cfg.http2_priorities,
           .notsent_lowat       = cfg.http2_notsent_lowat,
           .writable            = cfg.http2_writable,
+          .origins             = http2_origins_of(cfg),
       }
 #ifdef NET_HAS_TLS
     , tls_ctx{cfg.tls}

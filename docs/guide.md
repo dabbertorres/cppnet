@@ -844,6 +844,28 @@ scheduler.spawn(server.serve());
   const auto& certs = req.peer_certificates;
   if (!certs || !std::ranges::contains(certs->front().uris, "spiffe://example.com/billing")) { /* 403 */ }
   ```
+- **ORIGIN** (RFC 8336): `server_config::http2_origins` lists the origins an HTTP/2 connection over TLS says it
+  serves, in an ORIGIN frame sent after the server's SETTINGS. A client that coalesces by it (Firefox does) may then
+  send requests for any of them on that connection, if the certificate is valid for their hosts, without looking the
+  names up or connecting to them. Each is `https://host` or `https://host:port` (a DNS name, without wildcards, which
+  ORIGIN can't say; an IPv4 address; or an IPv6 one in brackets), normalized (lowercase, the default port 443 left out,
+  repeats dropped); the server's constructors throw `std::invalid_argument` for one that isn't, or whose host the
+  context's certificate doesn't cover (clients would ignore it). None is sent by default, nor without TLS (RFC 8336 has
+  clients ignore ORIGIN over cleartext), nor over HTTP/1.1. Only the application knows which of the certificate's
+  names it serves, so it lists them; and a request for an origin it doesn't serve it answers with 421, after which the
+  client sends it on a connection of its own:
+
+  ```cpp
+  net::http::server_config cfg{.tls = std::move(*ctx)};
+  cfg.http2_origins = {"https://example.com", "https://static.example.com"};
+
+  // in a handler, or middleware in front of the router:
+  if (req.host != "example.com" && req.host != "static.example.com")
+  {
+      co_await resp.send(net::http::status::MISDIRECTED_REQUEST, 0);
+      co_return;
+  }
+  ```
 
 ## TLS
 

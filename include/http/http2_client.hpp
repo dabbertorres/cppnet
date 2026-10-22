@@ -211,6 +211,7 @@ protected:
     void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
     void on_ping_ack(std::span<const std::byte, 8> opaque) override;
     void on_priority_update(http2::stream_id stream, priority p) override;
+    void on_origin(std::span<const std::string_view> origins) override;
 
     void                                 after_receive() override;
     std::optional<io::clock::time_point> check_connection(io::clock::time_point now) override;

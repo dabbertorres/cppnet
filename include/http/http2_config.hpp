@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
@@ -127,6 +129,10 @@ struct http2_options
     // Internal (for tests): what the writer waits with instead of the socket, if set (only while notsent_lowat is set):
     // server_config::http2_writable.
     writable_function writable{};
+
+    // The origins sent in ORIGIN after the server's SETTINGS, on connections over TLS: server_config::http2_origins,
+    // normalized (and checked against the certificate). Empty sends none.
+    std::vector<std::string> origins{};
 };
 
 // http2_client_options are what a client's HTTP/2 connections are made with: client_options'.

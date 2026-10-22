@@ -121,6 +121,12 @@ namespace detail
     std::expected<server_context, std::error_code> make_server_context(const server_options& options,
                                                                        server_hooks          hooks);
 
+    // covers is whether ctx's certificate (its chain's first) is for host by name, as a client checking it for that
+    // host would find: a DNS name among its subject alternative names (a wildcard's too; its common name if it has
+    // none), or an IP address (v4 or v6, without brackets) among them. Neither its dates nor its chain are checked. For
+    // a server checking the origins it lists (http::server_config::http2_origins), which clients would ignore if not.
+    [[nodiscard]] bool covers(const server_context& ctx, std::string_view host);
+
     // idle_clean is whether s holds nothing that a read hasn't taken: no data decrypted and unread, nor part of a
     // record; and neither the peer's close_notify nor a failure. For a pool of idle connections (whose sockets it
     // doesn't see into), deciding whether one may be reused.
@@ -249,6 +255,7 @@ private:
     friend class stream;
     friend std::expected<server_context, std::error_code> detail::make_server_context(const server_options& options,
                                                                                       detail::server_hooks  hooks);
+    friend bool detail::covers(const server_context& ctx, std::string_view host);
 
     explicit server_context(std::shared_ptr<detail::server_state> state) noexcept;
 

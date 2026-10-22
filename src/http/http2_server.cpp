@@ -182,6 +182,8 @@ namespace
         void on_goaway(http2::stream_id last, std::error_code err, std::string_view debug) override;
         void on_ping_ack(std::span<const std::byte, 8> opaque) override;
         void on_priority_update(http2::stream_id id, priority p) override;
+        // (a server's session never reports it: it ignores ORIGIN.)
+        void on_origin(std::span<const std::string_view> /*origins*/) override {}
 
         void                                 after_receive() override;
         coro::task<>                         finish_streams() override;
@@ -391,6 +393,17 @@ namespace
         // abort() stops the handlers' tokens too (and runs close()'s callback first).
         abort_token = abort;
         std::stop_callback on_abort{abort, [this] noexcept { stop_handlers(); }};
+
+        // ORIGIN (RFC 8336; docs/plans/http2.md, stage 6's tenth part), right after the session's opening (its
+        // SETTINGS, and the connection's WINDOW_UPDATE), before anything's received: over TLS only, as clients ignore
+        // it over cleartext. (The origins were checked when the server was made, so it can't fail but after a
+        // connection error, which there can't be yet.)
+        if (!options.origins.empty() && is_tls(conn))
+        {
+            std::scoped_lock lock{mu};
+            if (const auto err = session.submit_origin(options.origins))
+                logger.debug("failed to send ORIGIN: {}", err.message());
+        }
 
         co_await run(already_read);
     }

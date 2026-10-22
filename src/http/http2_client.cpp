@@ -871,6 +871,12 @@ void http2_client_connection::on_ping_ack(std::span<const std::byte, 8> /*opaque
 // (a client's session never reports it: a PRIORITY_UPDATE from the server ends the connection.)
 void http2_client_connection::on_priority_update(http2::stream_id /*stream*/, priority /*p*/) {}
 
+// NOTE: not yet kept: the connection's Origin Set, for coalescing, is the HTTP/2 plan's stage 6's eleventh part.
+void http2_client_connection::on_origin(std::span<const std::string_view> origins)
+{
+    logger.debug("HTTP/2 server sent ORIGIN, with {} entries", origins.size());
+}
+
 void http2_client_connection::after_receive()
 {
     // a stream the session's done with (its response ended, or it was reset) is free for another request, though its

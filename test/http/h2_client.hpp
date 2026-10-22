@@ -109,6 +109,10 @@ struct h2_client final : http2::session_events
     // HEADERS and its CONTINUATIONs), in order.
     std::map<http2::stream_id, std::vector<std::vector<std::byte>>> blocks;
 
+    // frame_types are the types of the frames received on the connection, in order (e.g. to check that ORIGIN comes
+    // right after the server's SETTINGS).
+    std::vector<http2::frame_type> frame_types;
+
     void
     on_headers(http2::stream_id id, http2::block_kind kind, std::span<const hpack::field> fields, bool end) override
     {
@@ -183,6 +187,14 @@ struct h2_client final : http2::session_events
     void on_priority_update(http2::stream_id stream, net::http::priority p) override
     {
         priority_updates.emplace_back(stream, p);
+    }
+
+    // origins are the ORIGIN frames received (as a client, for the server's tests): each's entries, in order.
+    std::vector<std::vector<std::string>> origins;
+
+    void on_origin(std::span<const std::string_view> entries) override
+    {
+        origins.emplace_back(entries.begin(), entries.end());
     }
 
     void done(response& r)
@@ -331,7 +343,8 @@ struct h2_client final : http2::session_events
     }
 
     // record_blocks keeps the header blocks of the frames the session has received (which it takes whole), as they
-    // were encoded: HEADERS' without its padding and priority, and CONTINUATIONs' added to the stream's last.
+    // were encoded: HEADERS' without its padding and priority, and CONTINUATIONs' added to the stream's last; and every
+    // frame's type (frame_types).
     void record_blocks(std::span<const std::byte> received)
     {
         const auto skipped = std::min(preface_left, received.size());
@@ -343,6 +356,7 @@ struct h2_client final : http2::session_events
             const auto h     = http2::decode_frame_header(received.first<http2::frame_header_size>());
             auto       block = received.subspan(http2::frame_header_size, h.length);
             received         = received.subspan(http2::frame_header_size + h.length);
+            frame_types.push_back(static_cast<http2::frame_type>(h.type));
 
             if (h.type == static_cast<std::uint8_t>(http2::frame_type::headers))
             {

@@ -38,6 +38,8 @@ scheduler (one write path for both sides, every client stream u=3 incremental), 
 client's request bodies by their requests' `Priority` fields, and TCP_NOTSENT_LOWAT on the client's HTTP/2 connections
 (`client_options::http2_notsent_lowat`), done (2026-10-21); and its ninth, reprioritizing a request in flight
 (`client_response::set_priority()`, through `detail::body_source`, and the session's `submit_priority_update()`), done
+(2026-10-22); and its tenth, ORIGIN in the session and the server (`frame_type::origin`, a server's `submit_origin()`, a
+client's `on_origin()`, and `server_config::http2_origins`, checked against the certificate and sent over TLS), done
 (2026-10-22).
 
 ## Goal
@@ -1835,6 +1837,97 @@ idle stream would be a connection error for the peer.
   at once (unchanged code, for the noise): 1286 to 1464 us a round before (median 1447), 1314 to 1409 after (median
   1366). All within the runs' spread, which the load (higher in the first pairs) widens.
 
+### Part 10: ORIGIN, the session and the server (done 2026-10-22)
+
+- As proposed (see "Connection coalescing and the ORIGIN frame"; Decided question 39 (a)). The codec:
+  `frame_type::origin` (0xc), and `encode_origin(origins, out)`: a frame on stream 0, without flags, each entry a 16-bit
+  length and the origin. The session: a server's `submit_origin(std::span<const std::string>)` (an `std::error_code`)
+  queues the origins, in order, in as few frames as the peer's MAX_FRAME_SIZE allows (one without entries for none,
+  which still says, as a client's first, that the connection is for its own origin only); it fails with
+  `invalid_argument`, sending nothing, in a client's session, or for an origin that couldn't fit a frame by itself (over
+  65535 bytes, or the peer's MAX_FRAME_SIZE but 2); after a connection error, with that. A server's session ignores any
+  ORIGIN it receives. A client's ignores one on a stream other than 0, or with any of the flags 0x1 to 0x8 set (RFC
+  8336's Appendix B, step 4), and otherwise reports it to `session_events::on_origin(std::span<const std::string_view>)`
+  (new, pure virtual): its entries as sent, views of the payload (in a vector made for the frame: ORIGIN is rare), up to
+  one whose length runs past the frame, which is dropped with the rest of it (a byte left over, short of a length, too).
+  The entries' syntax isn't the session's: a client's connection parses each as an origin and ignores those that don't
+  (part 11), as RFC 8336 has it ("If parsing fails, the field MUST be ignored"). Until then the client's connection only
+  logs the frame (debug); the server's `on_origin()` is a no-op, its session never reporting one. Nothing's added to the
+  session's state.
+- The server: `server_config::http2_origins` (a `std::vector<std::string>`, empty by default) is read when the server's
+  made (`http2_origins_of()` in `server.cpp`) into `detail::http2_options::origins`. Each is `https://host` or
+  `https://host:port`: the scheme in any case; the host a DNS name of letters, digits and hyphens (labels of 1 to 63,
+  neither starting nor ending with a hyphen, 253 in all; no wildcard, which ORIGIN can't say, nor a final dot), an IPv4
+  address, or an IPv6 one in brackets; the port 1 to 65535; and nothing else (no user info, no path, not even "/"). It's
+  normalized: lowercase, the default port (443) left out, an address written as `ip_addr` writes it, and repeats (once
+  normalized) dropped. One that isn't an origin is refused with `std::invalid_argument`; and with `tls` set, so is one
+  whose host the context's certificate doesn't cover, by `tls::detail::covers(ctx, host)` (internal, new): Botan's
+  `X509_Certificate::matches_dns_name()` on the certificate the context serves (which `server_state` now keeps, `leaf`):
+  its DNS subject alternative names, wildcards included (its common name only if it has none), and its IPv4 and IPv6
+  addresses (Botan 3.12 reads an address as one). `http2_server_connection::serve()` submits the origins, under `mu`,
+  before `run()`, when there are some and the connection is over TLS (`detail::is_tls()`): so the frame follows the
+  session's opening, its SETTINGS and the connection's WINDOW_UPDATE, and comes before the acknowledgement of the
+  client's SETTINGS, which `run()`'s first receive queues. The guide says that answering 421 for an origin the
+  application doesn't serve is the application's, with an example.
+- Not in the plan (where it's silent):
+  - Origins on a server without TLS (or in a build without it) are accepted, checked as origins only, and never sent,
+    rather than refused: a configuration may be shared by a cleartext server and one over TLS, and the plan's "none over
+    cleartext" test has them configured on one.
+  - The certificate's check is by name only (as `matches_dns_name()` checks it), not its dates or chain: it's the
+    certificate the server serves, which it can't change by refusing an origin; a client's whole verification for
+    another host is part 11's (`verify_for()`, Decided question 37).
+  - IP addresses as origins' hosts are taken (v6 in brackets), as certificates may name them; the plan's forms said only
+    "host".
+  - ORIGIN frames a session ignores (a server's, or a client's on a stream or with a reserved flag) aren't counted as
+    glitches, as unknown frames' aren't: RFC 8336 has them ignored, not treated as errors. Nor does the session limit
+    how many a client receives: each is reported, and part 11's Origin Set keeps at most 256 origins.
+  - The flags past the four low ones (0x10 to 0x80) don't make a frame ignored: RFC 8336's algorithm names only those
+    four.
+  - A frame whose only entry runs past it is reported without entries: what's ignored is the entry, not the frame, which
+    (if it's the first) still initializes the client's Origin Set.
+- Tests (no network). On bytes (`test/http/http2.cpp`, `[http][http2][session][origin]`): a server's frame, byte for
+  byte, and the client's report of it; none as a frame without entries; five origins of 6000 bytes in three frames (two,
+  two and one), one that fills a frame alone taken and one byte more refused, and with a client's MAX_FRAME_SIZE of 1
+  MiB, entries up to 65535 bytes taken and one more refused; a client's session refusing to send one; a server's
+  ignoring them (well-formed, empty, on a stream, malformed), with nothing but the SETTINGS acknowledgement in answer; a
+  client ignoring one on stream 1 and with each of the four reserved flags, and not one with 0xf0; entries up to one
+  that runs past the frame (the rest dropped), a byte left over, a frame whose only entry runs past (reported without
+  entries), one that runs past by a byte, and entries that aren't origins reported as they are; and ORIGIN inside a
+  header block a connection error, as any frame there. The server (`test/http/server_origin.cpp`,
+  `[http][http2][server][origin]`): 29 strings that aren't https origins refused (no scheme, http, a path or "/", a
+  query, a fragment, user info, a wildcard, hyphens at a label's ends, an empty label, a final dot, a label of 64, a
+  name of 257, an underscore, an empty port, ports 0, 65536 and 123456, a sign, two ports, unclosed brackets, or ones
+  followed by other than a port, IPv4 in brackets, IPv6 without, and an address that isn't one), and eight taken without
+  TLS (case, ports, a 63-letter label, IPv4, IPv6, a numeric label); a cleartext server with origins sends none
+  (`test::h2_client` with prior knowledge, whose new `frame_types` records the types of the frames it receives, and
+  `origins` the ORIGIN frames' entries). Over TLS (`test/tls/server.cpp`, `[tls][http][server][http2][origin]`,
+  `test::h2_client` over a `tls::stream`): "https://LOCALHOST", "https://localhost:443" and "https://127.0.0.1:8443" are
+  sent as one frame, ["https://localhost", "https://127.0.0.1:8443"], once, with only SETTINGS and WINDOW_UPDATE before
+  it; none without origins; and "https://other.example", "https://sub.localhost", "https://127.0.0.2" and
+  "https://[::1]", which localhost's certificate doesn't cover, refused, while "https://localhost:8443" and
+  "https://127.0.0.1" are taken. The checks bite (each piece broken alone, the `[origin]` tests run): a server's session
+  reporting ORIGIN, the stream's check left out, the flags' left out, every flag taken as reserved, a malformed entry
+  dropping the whole frame, an entry's bound off by two (the byte-short test added for it; libc++'s bounds check
+  aborts), a client's session allowed to send one, the frames not split, the frame's length counted wrong: each fails
+  the session's tests; the size check left out hangs the splitting test (the loop it guards never ends, so it stays);
+  sending over cleartext too fails `server_origin.cpp`'s, and never sending the TLS test; not lowercasing, keeping 443,
+  keeping repeats, leaving the certificate's check out, or `covers()` always false, the TLS tests; and each of the
+  origin's checks (a label's length and hyphens, its characters, the name's length, the port's range, brackets around
+  IPv4, what follows them) its refusals (what follows the brackets only once "https://[::1]x8443" was added: "x" alone
+  left nothing for a port, which failed anyway).
+- `fuzz_http2`: op 7 without bit 5, with bit 6, is ORIGIN: bit 7 clear receives one (on stream 0 or 1, with a reserved
+  flag or 0x80 or neither, up to three entries, one of them empty, and then random bytes from the script, whose lengths
+  may run past it), set submits one (up to three origins, then up to three of 6000 bytes, so they're split); the
+  recorder logs `on_origin()`'s entries (compared at once and a byte at a time); and `whole_frames()` checks that only a
+  server's output has ORIGIN, on stream 0 without flags, its entries filling it exactly. With the frame's length
+  counted one byte too many per entry, it failed `whole_frames()` within a run of 180 s; with an entry's bound off by
+  two, it found nothing in 180 s (it needs an entry's length within 2 bytes of the frame's end, which the unit test
+  has). 300 s on the final code (79,247 runs) found nothing; its 10-second ctest run passes.
+- Measured: nothing, as the plan asks for no benchmark. A connection of a server without origins pays one test of an
+  empty vector, in `serve()`: the session and the connections have no new members (`http2_options`, the server's, held
+  by reference, has the vector), nothing's allocated, and the per-request path is untouched; a session's
+  `session_events` has one more virtual function.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2892,10 +2985,10 @@ certificate.
       `client_response::set_priority()` (Decided question 34) through `detail::body_source`, moving the stream's own
       body in the client's scheduler too; tests on bytes and against cppnet's server. After 8, whose scheduler it
       updates.
-   10. **ORIGIN, the session and the server.** `frame_type::origin`, `submit_origin()`, `on_origin()` (a client's
-       session), and `server_config::http2_origins` checked against the certificate and sent over TLS (Decided question
-       39); tests on bytes and with `test::h2_client`. First of coalescing's three, as the server's side stands alone
-       (other clients, Firefox's, use it).
+   10. **ORIGIN, the session and the server.** Done (2026-10-22; see Learned in stage 6). `frame_type::origin`,
+       `submit_origin()`, `on_origin()` (a client's session), and `server_config::http2_origins` checked against the
+       certificate and sent over TLS (Decided question 39); tests on bytes and with `test::h2_client`. First of
+       coalescing's three, as the server's side stands alone (other clients, Firefox's, use it).
    11. **The client's origin sets.** Each TLS connection's Origin Set from ORIGIN frames, and the certificate checked
        for another host (`tls::detail::verify_for()`, Decided question 37), recorded but not yet used by the pool; tests
        of the sets (from `test::h2_client` as the server) and the check alone. Split from 12 as part 9 of stage 5 was

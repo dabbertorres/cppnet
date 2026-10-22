@@ -180,6 +180,20 @@ void encode_priority_update(stream_id prioritized, std::string_view value, std::
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
+void encode_origin(std::span<const std::string> origins, std::vector<std::byte>& out)
+{
+    std::size_t length = 0;
+    for (const auto& o : origins) length += 2 + o.size();
+
+    put_header(static_cast<std::uint32_t>(length), frame_type::origin, 0, 0, out);
+    for (const auto& o : origins)
+    {
+        put(static_cast<std::uint32_t>(o.size()), 2, out);
+        const auto bytes = std::as_bytes(std::span{o});
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+}
+
 void encode_headers(stream_id                  stream,
                     std::span<const std::byte> block,
                     bool                       end_stream,

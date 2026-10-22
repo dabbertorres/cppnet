@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -39,6 +40,7 @@
 #include "http/connection_pool.hpp"
 #include "http/h2_client.hpp"
 #include "http/http.hpp"
+#include "http/http2.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -54,8 +56,9 @@
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
 
-namespace http = net::http;
-namespace tls  = net::tls;
+namespace http  = net::http;
+namespace http2 = net::http::http2;
+namespace tls   = net::tls;
 
 using namespace std::chrono_literals;
 using namespace std::string_view_literals;
@@ -776,6 +779,97 @@ TEST_CASE("an HTTPS server serves HTTP/2 to clients that agree on h2", "[tls][ht
     auto [status, body] = sched.run_to_completion(test(&sched, server.port()));
     CHECK(status == "200");
     CHECK(body == "hello over TLS");
+}
+
+TEST_CASE("an HTTPS server's HTTP/2 connections send ORIGIN with its origins, after its SETTINGS",
+          "[tls][http][server][http2][origin]")
+{
+    struct test_case
+    {
+        std::string_view         name;
+        std::vector<std::string> origins;
+        std::vector<std::string> want; // the frame's entries (none: no frame)
+    };
+
+    const auto tc = GENERATE(
+        test_case{
+            .name    = "normalized, without repeats",
+            .origins = {"https://LOCALHOST", "https://localhost:443", "https://127.0.0.1:8443"},
+            .want    = {"https://localhost", "https://127.0.0.1:8443"}
+    },
+        test_case{.name = "none", .origins = {}, .want = {}});
+    CAPTURE(tc.name);
+
+    net::io::scheduler sched{make_pool()};
+    auto               cfg = tls_config();
+    cfg.http2_origins      = tc.origins;
+    https_server server{&sched, cfg};
+
+    // what the client received: the frames' types, and the ORIGIN frames' entries.
+    using received = std::pair<std::vector<http2::frame_type>, std::vector<std::vector<std::string>>>;
+
+    const auto test = [](net::io::scheduler* sched, std::string port) -> task<received>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+        REQUIRE(conn.has_value());
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"h2"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        REQUIRE(s.has_value());
+        REQUIRE(s->alpn() == "h2");
+
+        // by the time a request's answered, the ORIGIN (sent before the server read anything) has come.
+        test::h2_client client{&*s, &*s, &s->socket()};
+        const auto      id   = client.request("GET", "/");
+        const bool      done = co_await client.wait_for(id);
+        REQUIRE(done);
+        CHECK(client.responses[id].body == "hello over TLS");
+
+        co_await s->close();
+        co_return received{std::move(client.frame_types), std::move(client.origins)};
+    };
+
+    const auto [types, origins] = sched.run_to_completion(test(&sched, server.port()));
+    REQUIRE_FALSE(types.empty());
+    CHECK(types.front() == http2::frame_type::settings);
+
+    const auto origin = std::ranges::find(types, http2::frame_type::origin);
+    if (tc.want.empty())
+    {
+        CHECK(origins.empty());
+        CHECK(origin == types.end());
+        return;
+    }
+
+    CHECK(origins == std::vector<std::vector<std::string>>{tc.want});
+    REQUIRE(origin != types.end());
+    CHECK(std::count(types.begin(), types.end(), http2::frame_type::origin) == 1);
+
+    // only the server's opening (its SETTINGS, and its connection's WINDOW_UPDATE) before it.
+    const auto opening = [](http2::frame_type t)
+    { return t == http2::frame_type::settings || t == http2::frame_type::window_update; };
+    CHECK(std::all_of(types.begin(), origin, opening));
+}
+
+TEST_CASE("an HTTPS server refuses http2_origins its certificate doesn't cover", "[tls][http][server][http2][origin]")
+{
+    const auto origin = GENERATE(as<std::string>{},
+                                 "https://other.example",
+                                 "https://sub.localhost",
+                                 "https://127.0.0.2",
+                                 "https://[::1]");
+    CAPTURE(origin);
+
+    net::io::scheduler sched{make_pool()};
+    auto               cfg = tls_config();
+    cfg.http2_origins      = {"https://localhost", origin};
+    CHECK_THROWS_AS(https_server(&sched, cfg), std::invalid_argument);
+
+    // those it does, by name and by address.
+    cfg.http2_origins = {"https://localhost:8443", "https://127.0.0.1"};
+    CHECK_NOTHROW(https_server(&sched, cfg));
 }
 
 TEST_CASE("without http2, an HTTPS server doesn't agree on h2", "[tls][http][server][http2]")

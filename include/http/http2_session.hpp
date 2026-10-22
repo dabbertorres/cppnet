@@ -87,6 +87,15 @@ public:
     // complete set (what the frame leaves out is the default). One that came before the stream opened is reported
     // just after its head, so it overrides the request's Priority field.
     virtual void on_priority_update(stream_id stream, priority p) = 0;
+
+    // on_origin is an ORIGIN frame (RFC 8336; a client's only: a server's session ignores one): the origins the server
+    // says it serves on this connection, its entries as sent (each to be parsed as an origin's ASCII serialization, and
+    // ignored if it isn't one), in order; none, for a frame without entries (which still says that the connection is
+    // only for its own origin, if it's the first). A frame on a stream other than 0, or with any of the flags 0x1 to
+    // 0x8 set, is ignored, as RFC 8336 says (its Appendix B); and an entry whose length runs past the frame is, with
+    // the rest of the frame (those before it are reported). Whether to take it (RFC 8336 has a client ignore it over
+    // cleartext, and from a proxy) is the application's.
+    virtual void on_origin(std::span<const std::string_view> origins) = 0;
 };
 
 // session_config's default max_header_list_size is HPACK's (see http2_config.hpp, which doesn't include hpack.hpp).
@@ -138,6 +147,15 @@ public:
     // stream in a loop costs at most a frame each time the output's taken, never one for each call (which a server
     // counting them, as nghttp2's does, could take as a flood).
     std::expected<bool, std::error_code> submit_priority_update(stream_id stream, priority p);
+
+    // submit_origin sends ORIGIN (RFC 8336; a server's only: a client's fails with std::errc::invalid_argument): the
+    // origins (each an origin's ASCII serialization, e.g. "https://example.com", which isn't checked) this server
+    // serves on the connection, in as few frames as the peer's MAX_FRAME_SIZE allows (one, if they fit; one without
+    // entries, if there are none). It fails with std::errc::invalid_argument, sending nothing, if an origin couldn't
+    // fit a frame (more than 65535 bytes, or the peer's MAX_FRAME_SIZE but 2); and after a connection error, with it.
+    // ORIGIN is to be sent only over TLS (RFC 8336, section 2.2), which the session doesn't know of: that's the
+    // caller's to check.
+    std::error_code submit_origin(std::span<const std::string> origins);
 
     // reset resets a stream (RST_STREAM), unless it's already closed.
     void reset(stream_id stream, error_code code);
@@ -251,6 +269,7 @@ private:
                                        std::span<const std::byte>            payload,
                                        session_events&                       events,
                                        std::chrono::steady_clock::time_point now);
+    void            on_origin(const frame_header& h, std::span<const std::byte> payload, session_events& events) const;
 
     // take_idle_priority takes the PRIORITY_UPDATE kept for a stream that was idle, once a header block on it has
     // arrived (whatever becomes of the block), and drops those of streams that can no longer open (lower ids than the

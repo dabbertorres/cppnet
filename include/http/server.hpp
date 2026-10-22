@@ -12,6 +12,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
@@ -82,6 +83,18 @@ struct server_config
     // Internal (for tests): what an HTTP/2 connection's writer waits with for its socket to take more, instead of the
     // socket (only with http2_notsent_lowat set), if set: e.g. to hold the connection "unwritable".
     detail::writable_function http2_writable{};
+
+    // The origins an HTTP/2 connection over TLS says it serves, in an ORIGIN frame (RFC 8336) after the server's
+    // SETTINGS: a client that coalesces by it (Firefox) may then send requests for any of them on the connection,
+    // without looking their hosts up, if the certificate is valid for them. Each is "https://host" or
+    // "https://host:port" (a DNS name, without wildcards, which ORIGIN can't say; an IPv4 address; or an IPv6 one in
+    // brackets), normalized: lowercase, without the default port (443), without repeats. The constructors throw
+    // std::invalid_argument for one that isn't, or (with tls) one whose host the certificate doesn't cover, which
+    // clients would ignore. Empty (the default) sends none; nor is one sent without TLS (RFC 8336 has clients ignore
+    // it over cleartext), nor over HTTP/1.1. Only the application knows which of the certificate's names it serves, so
+    // they aren't listed by themselves; and a request for an origin it doesn't serve (server_request::host) it answers
+    // with 421 (status::MISDIRECTED_REQUEST), which has the client send it on a connection of its own.
+    std::vector<std::string> http2_origins{};
 
     std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 

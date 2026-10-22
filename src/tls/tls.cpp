@@ -960,6 +960,7 @@ struct server_state
     std::shared_ptr<const Botan::TLS::Policy>     policy;
     std::vector<std::string>                      alpn;
     std::shared_ptr<const server_hooks>           hooks; // null without any
+    Botan::X509_Certificate                       leaf;  // the server's certificate (its chain's first), for covers()
 };
 
 // callbacks are Botan's calls back into a connection. They're only made while the connection's mutex is held (from
@@ -1676,6 +1677,7 @@ std::expected<server_context, std::error_code> detail::make_server_context(const
         std::shared_ptr<Botan::TLS::Session_Manager> sessions = tickets;
         if (!sessions) sessions = std::make_shared<Botan::TLS::Session_Manager_Noop>();
 
+        auto leaf  = own->chain.front();
         auto state = std::make_shared<detail::server_state>(detail::server_state{
             .rng         = rng,
             .credentials = std::make_shared<credentials>("tls-server",
@@ -1692,6 +1694,7 @@ std::expected<server_context, std::error_code> detail::make_server_context(const
                                                     options.session_ticket_lifetime),
             .alpn        = options.alpn,
             .hooks       = std::move(shared_hooks),
+            .leaf        = std::move(leaf),
         });
 
         return server_context{std::move(state)};
@@ -1908,6 +1911,20 @@ bool detail::idle_clean(const stream& s) noexcept
     std::scoped_lock lock{c.mu};
     return c.received_start == c.received.size() && !c.peer_closed && !c.failure && !c.write_failure
         && c.header_have == 0 && c.record_left == 0;
+}
+
+bool detail::covers(const server_context& ctx, std::string_view host)
+{
+    // NOTE: Botan's check for a host's name (wildcards as RFC 6125 has them, the common name only without subject
+    //       alternative names), which reads an IPv4 or IPv6 address as one, checking the certificate's addresses.
+    try
+    {
+        return ctx.state->leaf.matches_dns_name(host);
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
 }
 
 }

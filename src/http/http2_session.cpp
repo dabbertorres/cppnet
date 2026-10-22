@@ -345,11 +345,12 @@ session::receive_frame(std::span<const std::byte> in, session_events& events, ti
     case frame_type::window_update: err = on_window_update(h, payload, events, now); break;
     case frame_type::continuation: err = on_continuation(h, payload, events, now); break;
     case frame_type::priority_update: err = on_priority_update(h, payload, events, now); break;
+    case frame_type::origin: on_origin(h, payload, events); break;
 
     // a client sends ENABLE_PUSH 0, and a client can't push.
     case frame_type::push_promise: err = connection_error(error_code::protocol_error, "PUSH_PROMISE"); break;
 
-    // unknown frame types are ignored (RFC 9113, section 4.1): e.g. RFC 8336's ORIGIN.
+    // unknown frame types are ignored (RFC 9113, section 4.1).
     default: break;
     }
 
@@ -929,6 +930,30 @@ std::error_code session::on_priority_update(const frame_header&        h,
     return {};
 }
 
+void session::on_origin(const frame_header& h, std::span<const std::byte> payload, session_events& events) const
+{
+    // a server ignores it (RFC 8336, section 2.2), and so does a client on a stream other than 0, or with any of the
+    // flags 0x1 to 0x8 set (its Appendix B, step 4; flags are left to future updates): not counted as glitches, as the
+    // RFC has them ignored (and unknown frames aren't counted either).
+    constexpr std::uint8_t reserved = 0x0f;
+    if (side == role::server || h.stream != 0 || (h.flags & reserved) != 0) return;
+
+    // entries are a length (16 bits) and an origin's ASCII serialization: one whose length runs past the payload
+    // can't be parsed, nor can what follows it, so they're ignored (RFC 8336, section 2.2: "If parsing fails, the
+    // field MUST be ignored"). NOTE: views of the payload (at most MAX_FRAME_SIZE, so at most 8192 entries), in a
+    // vector of their own, allocated only for this frame, which a server sends once or so a connection.
+    std::vector<std::string_view> origins;
+    while (payload.size() >= 2)
+    {
+        const std::size_t length = read16(payload);
+        if (length > payload.size() - 2) break;
+
+        origins.emplace_back(reinterpret_cast<const char*>(payload.data()) + 2, length);
+        payload = payload.subspan(2 + length);
+    }
+    events.on_origin(origins);
+}
+
 std::optional<priority> session::take_idle_priority(stream_id stream)
 {
     std::optional<priority> taken;
@@ -1040,6 +1065,32 @@ session::submit_data(stream_id stream, std::span<const std::byte> data, bool end
     }
 
     return sent;
+}
+
+std::error_code session::submit_origin(std::span<const std::string> origins)
+{
+    if (side == role::client) return std::make_error_code(std::errc::invalid_argument);
+    if (connection_failed) return failure;
+
+    // each entry is 2 bytes and its origin, and every one must fit a frame by itself (the peer's MAX_FRAME_SIZE is at
+    // least 16384, which an origin, a scheme and a host of at most 253 bytes and a port, never comes near).
+    const std::size_t room = peer.max_frame_size;
+    const auto        fits = [room](const std::string& o) { return o.size() <= 0xffff && 2 + o.size() <= room; };
+    if (!std::ranges::all_of(origins, fits)) return std::make_error_code(std::errc::invalid_argument);
+
+    // as many to a frame as fit, in order.
+    std::size_t first = 0;
+    do
+    {
+        std::size_t last   = first;
+        std::size_t length = 0;
+        while (last < origins.size() && length + 2 + origins[last].size() <= room) length += 2 + origins[last++].size();
+
+        encode_origin(origins.subspan(first, last - first), output);
+        first = last;
+    }
+    while (first < origins.size());
+    return {};
 }
 
 std::expected<bool, std::error_code> session::submit_priority_update(stream_id stream, priority p)

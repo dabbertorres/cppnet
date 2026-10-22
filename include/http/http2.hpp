@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -65,6 +66,10 @@ enum class frame_type : std::uint8_t
     window_update = 0x8,
     continuation  = 0x9,
 
+    // RFC 8336's (section 2): a server's origins, which a client may send it requests for on this connection, on
+    // stream 0.
+    origin = 0xc,
+
     // RFC 9218's (section 7.1): a client's new priority for a stream, on stream 0.
     priority_update = 0x10,
 };
@@ -125,6 +130,11 @@ void encode_data(stream_id stream, std::span<const std::byte> data, bool end_str
 // encode_priority_update encodes a PRIORITY_UPDATE frame (RFC 9218, section 7.1), on stream 0: the prioritized stream,
 // and a Priority field's value.
 void encode_priority_update(stream_id prioritized, std::string_view value, std::vector<std::byte>& out);
+
+// encode_origin encodes an ORIGIN frame (RFC 8336, section 2.1), on stream 0, without flags: an entry for each origin,
+// its length (16 bits) and its ASCII serialization. Each must be at most 65535 bytes, and the frame's payload (2 bytes
+// an entry, and the origins) fit the peer's MAX_FRAME_SIZE: session::submit_origin() splits them so.
+void encode_origin(std::span<const std::string> origins, std::vector<std::byte>& out);
 
 // encode_headers encodes a header block as a HEADERS frame and as many CONTINUATIONs as it needs to keep each frame's
 // payload within max_frame_size.

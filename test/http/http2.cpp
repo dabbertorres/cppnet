@@ -98,6 +98,13 @@ struct recorder final : http2::session_events
         log.push_back(std::format("priority {} u={}{}", stream, p.urgency, p.incremental ? " i" : ""));
     }
 
+    void on_origin(std::span<const std::string_view> origins) override
+    {
+        std::string line = "origin";
+        for (const auto o : origins) line += std::format(" [{}]", o);
+        log.push_back(std::move(line));
+    }
+
     // take returns the lines recorded since it was last called, without window updates (which are noise unless a
     // test is about them).
     std::vector<std::string> take(bool windows = false)
@@ -2203,4 +2210,244 @@ TEST_CASE("a server's session doesn't send PRIORITY_UPDATE", "[http][http2][sess
 
     CHECK(c.server.s.submit_priority_update(id, {.urgency = 1}).error() == std::errc::invalid_argument);
     CHECK_FALSE(c.server.s.has_output());
+}
+
+namespace
+{
+
+// origin_entries is an ORIGIN frame's payload: each entry's length (16 bits) and origin.
+std::vector<std::byte> origin_entries(std::initializer_list<std::string_view> origins)
+{
+    std::vector<std::byte> out;
+    for (const auto o : origins)
+    {
+        out.push_back(static_cast<std::byte>(o.size() >> 8U));
+        out.push_back(static_cast<std::byte>(o.size()));
+        const auto bytes = bytes_of(o);
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+    return out;
+}
+
+// origins_in lists out's ORIGIN frames, as "stream flags: [origin] ...", each entry's origin by its length (that many
+// bytes, or what's left).
+std::vector<std::string> origins_in(std::span<const std::byte> out)
+{
+    std::vector<std::string> found;
+    while (out.size() >= 9)
+    {
+        const auto h       = http2::decode_frame_header(out.first<9>());
+        auto       payload = out.subspan(9, h.length);
+        out                = out.subspan(9 + h.length);
+        if (h.type != static_cast<std::uint8_t>(http2::frame_type::origin)) continue;
+
+        auto line = std::format("{} {}:", h.stream, h.flags);
+        while (payload.size() >= 2)
+        {
+            const auto length = std::min<std::size_t>((std::to_integer<std::size_t>(payload[0]) << 8U)
+                                                          | std::to_integer<std::size_t>(payload[1]),
+                                                      payload.size() - 2);
+            line += std::format(" [{}]", as_string(payload.subspan(2, length)));
+            payload = payload.subspan(2 + length);
+        }
+        found.push_back(std::move(line));
+    }
+    return found;
+}
+
+// server_start is a server's empty SETTINGS, as a client's session receives first.
+raw server_start()
+{
+    raw r;
+    http2::encode_settings({}, {}, r.bytes);
+    return r;
+}
+
+}
+
+TEST_CASE("a server's ORIGIN lists its origins on stream 0, which the client reports", "[http][http2][session][origin]")
+{
+    connected c;
+
+    const std::vector<std::string> origins{"https://a.example", "https://b.example:8443"};
+    REQUIRE_FALSE(c.server.s.submit_origin(origins));
+
+    std::vector<std::byte> out;
+    c.server.s.take_output(out);
+    CHECK(to_hex(out)
+          == "00002b0c0000000000" // 43 bytes, ORIGIN, no flags, stream 0
+             "0011"
+                 + to_hex(bytes_of("https://a.example")) + "0016" + to_hex(bytes_of("https://b.example:8443")));
+
+    c.client.deliver(out);
+    REQUIRE_FALSE(c.client.failure);
+    CHECK(c.client.events.take() == std::vector<std::string>{"origin [https://a.example] [https://b.example:8443]"});
+
+    // none is a frame without entries: it still says the connection's only for its own origin.
+    REQUIRE_FALSE(c.server.s.submit_origin({}));
+    c.server.s.take_output(out);
+    CHECK(origins_in(out) == std::vector<std::string>{"0 0:"});
+    c.client.deliver(out);
+    CHECK(c.client.events.take() == std::vector<std::string>{"origin"});
+}
+
+TEST_CASE("a server's ORIGIN is split into frames of the peer's MAX_FRAME_SIZE", "[http][http2][session][origin]")
+{
+    SECTION("the default, 16384")
+    {
+        connected c;
+
+        // 2 bytes and 6000 an entry: two to a frame.
+        const std::string              long_host(5'990, 'a');
+        const std::vector<std::string> origins{"https://1" + long_host,
+                                               "https://2" + long_host,
+                                               "https://3" + long_host,
+                                               "https://4" + long_host,
+                                               "https://5" + long_host};
+        REQUIRE_FALSE(c.server.s.submit_origin(origins));
+
+        std::vector<std::byte> out;
+        c.server.s.take_output(out);
+        const auto frames = origins_in(out);
+        REQUIRE(frames.size() == 3);
+        CHECK(frames[0] == std::format("0 0: [{}] [{}]", origins[0], origins[1]));
+        CHECK(frames[1] == std::format("0 0: [{}] [{}]", origins[2], origins[3]));
+        CHECK(frames[2] == std::format("0 0: [{}]", origins[4]));
+
+        c.client.deliver(out);
+        REQUIRE_FALSE(c.client.failure);
+        CHECK(c.client.events.take().size() == 3);
+
+        // one that fills a frame by itself (16382 bytes and its length) fits; one more byte doesn't, and nothing's
+        // sent.
+        const std::vector<std::string> fills{std::string(16'382, 'x')};
+        REQUIRE_FALSE(c.server.s.submit_origin(fills));
+        c.server.s.take_output(out);
+        CHECK(out.size() == 9 + 16'384);
+
+        const std::vector<std::string> too_long{std::string(16'383, 'x')};
+        CHECK(c.server.s.submit_origin(too_long) == std::errc::invalid_argument);
+        CHECK_FALSE(c.server.s.has_output());
+    }
+
+    SECTION("a larger one, up to an entry's 65535 bytes")
+    {
+        http2::session_config client_config;
+        client_config.local.max_frame_size = 1U << 20U;
+        connected c{{}, client_config};
+
+        const std::vector<std::string> larger{std::string(16'383, 'x'), std::string(65'535, 'y')};
+        REQUIRE_FALSE(c.server.s.submit_origin(larger));
+        std::vector<std::byte> out;
+        c.server.s.take_output(out);
+        CHECK(out.size() == 9 + 2 + 16'383 + 2 + 65'535);
+
+        const std::vector<std::string> too_long{std::string(65'536, 'x')};
+        CHECK(c.server.s.submit_origin(too_long) == std::errc::invalid_argument);
+        CHECK_FALSE(c.server.s.has_output());
+    }
+}
+
+TEST_CASE("a client's session doesn't send ORIGIN", "[http][http2][session][origin]")
+{
+    connected                      c;
+    const std::vector<std::string> origins{"https://a.example"};
+    CHECK(c.client.s.submit_origin(origins) == std::errc::invalid_argument);
+    CHECK_FALSE(c.client.s.has_output());
+}
+
+TEST_CASE("a server's session ignores ORIGIN", "[http][http2][session][origin]")
+{
+    endpoint server{http2::role::server};
+
+    raw r;
+    r.client_start()
+        .frame(http2::frame_type::origin, 0, 0, origin_entries({"https://a.example"}))
+        .frame(http2::frame_type::origin, 0, 0, origin_entries({}))
+        .frame(http2::frame_type::origin, 0, 1, origin_entries({"https://a.example"}))
+        .frame(http2::frame_type::origin, 0, 0, std::vector<std::byte>{std::byte{0xff}})
+        .headers(1, request(), end_both);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take()
+          == std::vector<std::string>{"settings",
+                                      "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/"});
+
+    // nothing in answer but the SETTINGS' acknowledgement.
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::goaway).empty());
+    CHECK(frames_of(out, http2::frame_type::rst_stream).empty());
+}
+
+TEST_CASE("a client ignores ORIGIN on a stream other than 0, or with a reserved flag", "[http][http2][session][origin]")
+{
+    endpoint client{http2::role::client};
+
+    auto r = server_start();
+    r.frame(http2::frame_type::origin, 0, 1, origin_entries({"https://on-stream.example"}));
+    for (const std::uint8_t flag : {0x1, 0x2, 0x4, 0x8})
+        r.frame(http2::frame_type::origin, flag, 0, origin_entries({"https://flagged.example"}));
+
+    // flags past the four RFC 8336 reserves aren't its concern.
+    r.frame(http2::frame_type::origin, 0xf0, 0, origin_entries({"https://a.example"}));
+    client.deliver(r.bytes);
+    REQUIRE_FALSE(client.failure);
+    CHECK(client.events.take() == std::vector<std::string>{"settings", "origin [https://a.example]"});
+}
+
+TEST_CASE("a client reports ORIGIN's entries up to one that runs past the frame", "[http][http2][session][origin]")
+{
+    endpoint client{http2::role::client};
+
+    // an entry claiming 100 bytes, with 3: it and the rest of the frame are ignored.
+    auto past = origin_entries({"https://a.example", ""});
+    past.insert(past.end(), {std::byte{0}, std::byte{100}, std::byte{'a'}, std::byte{'b'}, std::byte{'c'}});
+    const auto after = origin_entries({"https://b.example"});
+    past.insert(past.end(), after.begin(), after.end());
+
+    // a byte left over, short of a length; and a frame whose only entry runs past it, reported without entries.
+    auto odd = origin_entries({"https://c.example"});
+    odd.push_back(std::byte{0});
+
+    // one that runs past by a byte.
+    auto just_past = origin_entries({"https://e.example"});
+    just_past.insert(just_past.end(), {std::byte{0}, std::byte{3}, std::byte{'a'}, std::byte{'b'}});
+
+    auto r = server_start();
+    r.frame(http2::frame_type::origin, 0, 0, past)
+        .frame(http2::frame_type::origin, 0, 0, just_past)
+        .frame(http2::frame_type::origin, 0, 0, odd)
+        .frame(http2::frame_type::origin, 0, 0, std::vector<std::byte>{std::byte{0xff}, std::byte{0xff}})
+        .frame(http2::frame_type::origin, 0, 0, origin_entries({"not an origin", "https://d.example"}));
+    client.deliver(r.bytes);
+    REQUIRE_FALSE(client.failure);
+
+    // entries that aren't origins are reported as they are: they're the application's to parse.
+    CHECK(client.events.take()
+          == std::vector<std::string>{
+              "settings",
+              "origin [https://a.example] []",
+              "origin [https://e.example]",
+              "origin [https://c.example]",
+              "origin",
+              "origin [not an origin] [https://d.example]",
+          });
+}
+
+TEST_CASE("ORIGIN in the middle of a header block is a connection error, as any frame",
+          "[http][http2][session][origin]")
+{
+    endpoint client{http2::role::client};
+    REQUIRE(client.s.open_stream() == 1U);
+    REQUIRE_FALSE(client.s.submit_headers(1, request(), true));
+
+    hpack::encoder         enc;
+    std::vector<std::byte> block;
+    enc.encode(response(), block);
+
+    auto r = server_start();
+    r.frame(http2::frame_type::headers, 0, 1, block).frame(http2::frame_type::origin, 0, 0, origin_entries({}));
+    client.deliver(r.bytes);
+    CHECK(client.failure == http2::error_code::protocol_error);
 }

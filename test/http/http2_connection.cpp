@@ -64,6 +64,7 @@ protected:
     void on_goaway(http2::stream_id /*last*/, std::error_code /*err*/, std::string_view /*debug*/) override {}
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override {}
     void on_priority_update(http2::stream_id /*id*/, net::http::priority /*p*/) override {}
+    void on_origin(std::span<const std::string_view> /*origins*/) override {}
 
     std::optional<net::io::clock::time_point> check_connection(net::io::clock::time_point /*now*/) override
     {
