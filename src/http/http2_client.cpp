@@ -18,24 +18,29 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/logger.h>
 #include <spdlog/spdlog.h>
 
 #include "coro/notifier.hpp"
 #include "coro/task.hpp"
 #include "http/connection.hpp"
+#include "http/headers.hpp"
 #include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
+#include "http/http2_config.hpp"
 #include "http/http2_connection.hpp"
 #include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
 #include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
+#include "http/structured_fields.hpp"
 #include "io/io.hpp"
 #include "io/limit_reader.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
+#include "tcp.hpp"
 #include "url.hpp"
 #include "util/defer.hpp"
 #include "util/string_util.hpp"
@@ -155,10 +160,33 @@ namespace
         return length;
     }
 
-    // body_priority is every request body's priority in the connection's scheduler (docs/plans/http2.md, stage 6's
-    // seventh part): RFC 9218's urgency, incremental, as the server takes a client that never signals, so bodies sent
-    // at once share the connection a frame each.
-    constexpr priority body_priority{.urgency = 3, .incremental = true};
+    // body_priority is a request body's priority in the connection's scheduler (docs/plans/http2.md, stage 6's eighth
+    // part): its request's Priority field (RFC 9218's signal of the response's priority, which a caller marking a
+    // request, e.g. u=7 for a background one, means for its upload too), read as the server reads it, over RFC 9218's
+    // default (u=3, not incremental: what the field leaves out, or all of it if it doesn't parse); without the field,
+    // u=3 incremental, as the server takes a client that never signals, so bodies sent at once without it share the
+    // connection a frame each. A field of several lines is joined (as the server does) in a string of its own, as
+    // that's rare.
+    priority body_priority(const headers& fields)
+    {
+        using namespace std::string_view_literals;
+        const auto lines = fields.get_all("Priority"sv);
+        if (!lines.has_value()) return {.urgency = 3, .incremental = true};
+
+        std::string joined;
+        return parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined));
+    }
+
+    // set_mark sets TCP_NOTSENT_LOWAT on a connection's TCP socket (over TLS, the stream's), if bytes isn't 0,
+    // returning whether it's set: its writer then waits for the socket to take more before each round.
+    bool set_mark(connection& conn, std::size_t bytes, spdlog::logger& logger)
+    {
+        if (bytes == 0) return false;
+
+        auto set = socket_of(conn).set_notsent_lowat(bytes);
+        if (!set.has_value()) logger.debug("failed to set TCP_NOTSENT_LOWAT: {}", set.error().message());
+        return set.has_value();
+    }
 
     // is_continue is whether an informational response's fields say 100 (Continue).
     bool is_continue(std::span<const hpack::field> fields) noexcept
@@ -194,7 +222,17 @@ http2_client_connection::http2_client_connection(io::scheduler*              sch
                                                  const http2_client_options& options,
                                                  callbacks                   on)
     : owned_connection{.owned = std::move(conn), .log = spdlog::default_logger()}
-    , http2_connection_base{scheduler, *owned, http2::role::client, options.session, *log}
+    // TCP_NOTSENT_LOWAT (docs/plans/http2.md, stage 6's eighth part), as the server sets it, now that it's HTTP/2: the
+    // kernel then holds little more than what's in flight, and the writer waits for it to take more before framing
+    // more, so what's past the scheduler's reordering of request bodies is the mark and a round. (The writable hook is
+    // only used while the mark's set.)
+    , http2_connection_base{scheduler,
+                            *owned,
+                            http2::role::client,
+                            options.session,
+                            *log,
+                            set_mark(*owned, options.notsent_lowat, *log),
+                            options.writable}
     , options{options}
     , on{std::move(on)}
 {}
@@ -360,7 +398,7 @@ http2_client_connection::open(const client_request& request, std::optional<std::
 
     stream->ended = end_stream;
     if (!end_stream) stream->data_left = ends_after;
-    send_order.update(*stream, body_priority);
+    send_order.update(*stream, body_priority(request.headers));
     streams.emplace(*id, stream);
     add_stream(*stream);
     idle_from.reset();

@@ -876,6 +876,40 @@ TEST_CASE("an HTTPS server sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP
     CHECK(intact);
 }
 
+TEST_CASE("an HTTPS client sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP sockets, not on HTTP/1.1's",
+          "[tls][http][client][http2][notsent-lowat]")
+{
+    const bool use_http2 = GENERATE(true, false);
+    CAPTURE(use_http2);
+
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+
+    // HTTP/2 agreed on with ALPN, or HTTP/1.1 (the client offering only it).
+    auto options  = trusting_options();
+    options.http2 = use_http2;
+    http::client client{&sched, options};
+
+    // the mark on the client's TCP socket (the response's body's handle, before the body's read, which gives an
+    // HTTP/1.1 connection back).
+    const auto test = [](http::client* client, std::string url) -> task<std::string>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        int        value = -1;
+        socklen_t  size  = sizeof(value);
+        const bool got = ::getsockopt(resp->body->native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, &size) == 0;
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        co_return std::format("HTTP/{} {}", resp->version.major, got ? std::to_string(value) : "(getsockopt failed)");
+    };
+
+    const auto mark = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/"));
+    CHECK(mark == (use_http2 ? "HTTP/2 16384" : "HTTP/1 0"));
+}
+
 TEST_CASE("an HTTPS server's error responses end with close_notify", "[tls][http][server]")
 {
     net::io::scheduler sched{make_pool()};

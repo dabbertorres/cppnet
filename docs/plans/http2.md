@@ -34,7 +34,9 @@ connections (`server_config::http2_notsent_lowat`, the writer waiting for the so
 `stop_at_interim`, and 417 sent again without the expectation), done (2026-10-21); and its sixth, `Expect: 100-continue`
 in the client over HTTP/2 (the stream's wait, `continue_deadline` checked by the connection's timer, and 417 sent again
 on the same connection), done (2026-10-21); and its seventh, the client's request bodies through the connection's
-scheduler (one write path for both sides, every client stream u=3 incremental), done (2026-10-21).
+scheduler (one write path for both sides, every client stream u=3 incremental), done (2026-10-21); and its eighth, the
+client's request bodies by their requests' `Priority` fields, and TCP_NOTSENT_LOWAT on the client's HTTP/2 connections
+(`client_options::http2_notsent_lowat`), done (2026-10-21).
 
 ## Goal
 
@@ -1685,6 +1687,63 @@ idle stream would be a connection error for the peer.
   before (median 1512), 1236 to 1630 after (median 1428), 98.4 allocations a response both. So no change the noise
   shows but for the uploads, which are a little faster and allocate more.
 
+### Part 8: the client's request bodies by priority (done 2026-10-21)
+
+- As proposed (see "Scheduling the client's request bodies", its second bullet, and "TCP_NOTSENT_LOWAT", its last;
+  Decided questions 33 (a), 28 (a) and 29 (a)). Each client stream's priority is its request's `Priority` field, read
+  by `open()` as the head's made (`body_priority()` in `http2_client.cpp`, a plain function): `headers::get_all()`,
+  its lines joined with `sf::join_lines()` (as the server joins them; into a local string, which allocates only when
+  there are several lines), `parse_priority()` over RFC 9218's default (u=3, not incremental), as the server's
+  `request_priority()` reads the same field; only a request without the field is u=3 incremental (Decided question 33:
+  "u=3 incremental (round-robin) without one"). Set through `send_order.update()` before the stream's added, as part
+  7's constant was. A request without the field costs the lookup (a pass over its fields, which `append_fields()` makes
+  anyway), nothing allocated.
+- The plan's second bullet said "over u=3 incremental", which reads as the base for the field's missing parameters
+  too: then `u=1` would have been u=1 incremental for the upload but not for the response, and a field that doesn't
+  parse the same as none. Decided question 33 has the field mean what it means to the server, so a field that leaves
+  `i` out is not incremental (`u=1` sends its body whole before others of u=1 take theirs, by stream), and one that
+  doesn't parse is RFC 9218's default whole (u=3, not incremental: `parse_priority()`'s rule), which differs from no
+  field: of one urgency, the two kinds take turns.
+- `client_options::http2_notsent_lowat` (16 KiB, as the server's, Decided question 28; 0 sets none), passed as
+  `http2_client_options::notsent_lowat`, is set by `http2_client_connection`'s constructor (`set_mark()`, called in the
+  base's initializer, on `socket_of()` of the connection it owns, so over TLS the TCP socket's): the connection's made only
+  once HTTP/2's chosen (by ALPN, or prior knowledge), so never on HTTP/1.1's, as on the server. A failure's logged at
+  debug and the writer then doesn't wait. If it's set, the writer waits for the socket as part 4 made the server's
+  (`waits_writable`). The test hook, as the server's: `client_options::http2_writable` (internal), passed as
+  `http2_client_options::writable`; the writer uses it only while the mark's set. (`client_options` now holds a
+  `std::function`, so it isn't trivially copyable without TLS either: the pool moves it in both builds.)
+- Tests (no network). `test/http/client_scheduling.cpp` (`[http][http2][client][scheduler][priority]`), part 7's setup
+  (the plug, `held`, the client's `wait_queued()`), with `held::take_turns()` (part 7's first test's loop, now shared:
+  the window a frame at a time, once every body with frames left has queued again): six bodies of two frames, `u=5, i`,
+  `u=1`, `u=1`, none, `i` and `u=5` as two field lines, `u=0`, go "FFBBCCDDAEAE" (urgent first; of one urgency,
+  non-incremental ones whole by stream, so a field without `i` isn't incremental, and incremental ones a frame each);
+  and a field that doesn't parse (`u=0, @`) is u=3 not incremental, taking turns with a body without one (u=3
+  incremental, whose kind goes first): "BABACC". `[client][notsent-lowat]`: the mark read back with
+  `getsockopt()` on the response body's `native_handle()` (before the body's read, which would give an HTTP/1.1
+  connection back), against cppnet's server: 16384 by default, 4096 when set, 0 with 0, and 0 over HTTP/1.1; and over
+  TLS (`test/tls/server.cpp`), 16384 over ALPN's HTTP/2 and 0 over HTTP/1.1. Through the hook (`test::writer_gate`,
+  moved from the server's tests to `test/http/h2_client.hpp`), against `test::h2_client` as the server with its windows
+  open: once a GET has settled the settings, the writer held, a u=7 body of 8 frames goes as far as `max_ahead` (4
+  frames) and queues the rest, then a u=0 and a u=3 body of a frame each queue behind it; let go, "BBBBUNBBBB". The
+  checks bite: with part 7's constant priority, the six-body test, the malformed one and the hook one fail; reading only
+  the first field line, the six-body one ("FFBBCCDEDEAA"); with the field over u=3 incremental, the six-body one
+  ("FFBCBCDDAEAE") and the malformed one ("ABABCC"); with no field read as RFC 9218's default too, part 7's rounds
+  ("AAABBBCCC") and at-once tests and the malformed one ("AABBCC"); without the mark, the read-backs (both, "2: 0") and the hook test
+  (B never queues, the watchdog ends it); with the mark set but the writer not told, the hook test. The existing client
+  tests pass unchanged with the mark on by default; the new ones passed 30 runs in a row.
+- Measured (`bench_request`, Release, five alternating runs of master's binary and the branch's, each stopped once the
+  uploads case had printed; one-minute load averages of 2.1 to 5.6. The machine slept between short maintenance wakes
+  while a first attempt ran, which showed as runs taking hours and cases ten times slower: those runs are thrown away,
+  and these were run holding a power assertion). The bench's uploads have no `Priority` field, so they're u=3
+  incremental as before: what changes for them is the mark, now set on the client's connection, and its writer's
+  waits. 8 request bodies at once (256 KiB each): 1393 to 1527 us a round before (median 1421, about 1410 MiB/s), 1413
+  to 1533 after (median 1486, about 1350 MiB/s), and 152.9 to 153.4 allocations a request before (median 153.1), 151.5
+  to 151.9 after (median 151.5): within the runs' spread in time, and slightly fewer allocations. Over HTTP/2, a
+  stream at a time (a GET): 79.7 to 87.2 us a request before (median 83.6), 80.7 to 95.2 after (median 82.8), 49.3 to
+  49.5 allocations both. The server's 8 responses at once (unchanged code, for the noise): 1210 to 1354 us a round
+  before (median 1256), 1215 to 1345 after (median 1248). So the client's mark costs loopback nothing the noise shows,
+  as part 4 found for the server's.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2734,8 +2793,8 @@ certificate.
       (`scheduling` for both roles: at once when uncontended, otherwise in turns; writes that don't wait without a
       coroutine), every stream u=3 incremental, so contended bodies take turns a frame at a time; `bench_request` with 8
       bodies at once. Split from 8 so the move onto the shared path is measured and reviewed without priorities.
-   8. **The client's request bodies by priority.** Each stream's priority from its request's `Priority` field (Open
-      question 33), and `client_options::http2_notsent_lowat` for the client's connections (part 4's writer); tests with
+   8. **The client's request bodies by priority.** Done (2026-10-21; see Learned in stage 6). Each stream's priority
+      from its request's `Priority` field (Open question 33), and `client_options::http2_notsent_lowat` for the client's connections (part 4's writer); tests with
       bodies of several urgencies. Small, once 7 is in.
    9. **Reprioritizing a request in flight.** The session's `submit_priority_update()` (a client's: only what changes,
       at most one pending a stream), `client_response::set_priority()` (Decided question 34) through

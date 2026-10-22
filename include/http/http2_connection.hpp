@@ -262,7 +262,8 @@ public:
 
     // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
     // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
-    // from the client's signals, a client's u=3 incremental (for now: docs/plans/http2.md, stage 6's seventh part).
+    // from the client's signals, a client's from its request's Priority field (docs/plans/http2.md, stage 6's eighth
+    // part).
     http2_scheduler send_order;
 
     // write_state is how far a stream's write has gone, from one step to the next.
@@ -388,8 +389,8 @@ private:
     bool receive(std::vector<std::byte>& pending);
 
     // write_loop is the writer: each round, it takes the session's output (see take_output()) and writes it, until the
-    // connection's ending and what's left is written; then it shuts the connection down. With waits_writable (the
-    // server's, with TCP_NOTSENT_LOWAT set: docs/plans/http2.md, stage 6's fourth part), a round after one that wrote
+    // connection's ending and what's left is written; then it shuts the connection down. With waits_writable (with
+    // TCP_NOTSENT_LOWAT set: docs/plans/http2.md, stage 6's fourth and eighth parts), a round after one that wrote
     // first waits for the connection to be writable (wait_for_socket()): what's written but not yet sent under the
     // mark. So fill() frames only when the socket can take more, and meanwhile streams' writes queue (past
     // max_ahead) for their turns: what's past reordering is the mark (in the kernel) and a round (in the writer's

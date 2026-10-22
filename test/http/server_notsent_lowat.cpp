@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -54,6 +53,7 @@ using namespace std::string_view_literals;
 using net::coro::task;
 using test::h2_client;
 using test::stop_probe;
+using test::writer_gate;
 
 namespace
 {
@@ -61,53 +61,6 @@ namespace
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
 constexpr std::size_t frame = 16'384; // the client's MAX_FRAME_SIZE: the server's DATA frames' size
-
-// writer_gate holds HTTP/2 connections' writers as a socket that can't take more would: its wait (the server's
-// http2_writable) passes each writer's wait in turn, once the test has allowed that many.
-struct writer_gate
-{
-    net::io::scheduler* sched = nullptr;
-
-    std::atomic<std::uint64_t> arrived{0}; // waits begun
-    std::atomic<std::uint64_t> allowed{std::numeric_limits<std::uint64_t>::max()};
-    std::atomic<std::uint64_t> held{0}; // waits that had to wait
-
-    // wait passes at once if it's allowed, and otherwise once it is (or fails, if the scheduler's stopped).
-    task<net::io::result> wait()
-    {
-        const auto n = arrived.fetch_add(1) + 1;
-        if (allowed.load() >= n) return net::coro::ready_task<net::io::result>(net::io::result{});
-        return waiting(n);
-    }
-
-    task<net::io::result> waiting(std::uint64_t n)
-    {
-        stop_probe::bump(sched, held);
-        for (auto seen = allowed.load(); seen < n; seen = allowed.load())
-        {
-            if (co_await sched->wait_on(allowed, seen) == std::errc::operation_canceled)
-                co_return net::io::result{.err = std::make_error_code(std::errc::operation_canceled)};
-        }
-        co_return net::io::result{};
-    }
-
-    // hold holds the waits from now on; grant lets one more pass; open lets them all.
-    void hold() { allowed.store(arrived.load()); }
-    void grant() { change(allowed.fetch_add(1) + 1); }
-    void open() { change(std::numeric_limits<std::uint64_t>::max()); }
-
-    void change(std::uint64_t to)
-    {
-        allowed.store(to);
-        sched->notify_all(allowed);
-    }
-
-    // hook is the server's http2_writable.
-    net::http::detail::writable_function hook()
-    {
-        return [this] { return wait(); };
-    }
-};
 
 // handlers is what the handlers share with the test: how many /queued probes have seen the streams queue.
 struct handlers

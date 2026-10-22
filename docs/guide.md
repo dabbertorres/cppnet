@@ -387,8 +387,16 @@ which was used. An HTTP/2 connection is shared by the host's requests, each on a
 server's limit on streams; then another connection is opened (within `max_connections_per_host`), or, with
 `strict_max_concurrent_streams`, requests wait for a stream. Its responses' bodies may be read in any order, or not at
 all: each stream holds at most its window (64 KiB) of a body not yet read, and the connection's window has room for
-every stream's. Request bodies that contend for a connection take turns, a frame each (a body alone goes as it's
-written); a body waiting its turn while others' are sent isn't counted against `io_timeout`, which bounds only a stall.
+every stream's. Request bodies that contend for a connection take turns by their requests' `Priority` fields (see
+Priority, under the server, below), read as the server reads them (what a field leaves out, or all of it if it doesn't
+parse, is RFC 9218's default, `u=3` not incremental): the most urgent first, and of one urgency, incremental ones a
+frame each, others one at a time, in the order they were sent (the two kinds taking turns). A request without the field
+counts as `u=3, i`, so bodies sent without them share the connection, a frame each. A body alone goes as it's
+written; a body waiting its turn while others' are sent isn't counted against `io_timeout`, which bounds only a stall.
+As the server's, the client's HTTP/2 connections set TCP_NOTSENT_LOWAT on their sockets
+(`client_options::http2_notsent_lowat`, 16 KiB; over TLS, the TCP socket's; not on HTTP/1.1's; 0 sets none), and their
+writers wait for the kernel to hold less than that before framing more, so a body that's more urgent isn't queued
+behind what the send buffer holds of others'.
 A response destroyed before its body's end resets just its stream. Requests to a host known to speak
 HTTP/2 (one of its connections agreed on it, or with prior knowledge) wait for a connection being made to it, rather
 than each making their own. As Go's client does, it knows that of a host only while it has connections: a burst of
@@ -791,10 +799,10 @@ scheduler.spawn(server.serve());
   writer waits for the kernel to hold less than that before it frames more (see `socket::wait_writable()`, above). So
   what's past reordering is the mark and a round of frames (64 KiB), rather than the send buffer, which the kernel
   grows up to megabytes; what's in flight isn't limited, so a path with a long round trip still fills its window. 0
-  sets none, and the writer writes as the socket takes it. A client sets a request's
-  priority with the same field (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other
-  signal, and its request bodies take turns, a frame each, whatever their priorities (for now). A field sent as several lines is
-  one value, its lines joined with commas: `req.headers.get()` gives only the first.
+  sets none, and the writer writes as the socket takes it. A client sets a request's priority with the same field
+  (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other signal, and orders its own
+  request bodies by it (`u=3, i` without one: see the client, above). A field sent as several lines is one value, its lines
+  joined with commas: `req.headers.get()` gives only the first.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

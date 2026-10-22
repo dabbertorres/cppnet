@@ -63,17 +63,14 @@ namespace net::http::detail
 
 connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}
-#ifdef NET_HAS_TLS
     , config{std::move(options)}
-#else
-    // NOTE: trivially copyable
-    , config{options}
-#endif
     , http2_config{
           .response_header_timeout = config.response_header_timeout,
           .io_timeout              = config.io_timeout,
           .expect_continue_timeout = config.expect_continue_timeout,
           .idle_timeout            = config.keep_alive ? config.idle_timeout : std::chrono::milliseconds::zero(),
+          .notsent_lowat           = config.http2_notsent_lowat,
+          .writable                = config.http2_writable,
       }
 {
     // a response's head may be as large as HTTP/1.1's (1 MiB), plus 32 bytes a field, for 100 of them.

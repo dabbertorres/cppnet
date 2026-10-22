@@ -99,7 +99,8 @@ namespace net::http::detail
 {
 
 // writable_function waits until an HTTP/2 connection's socket can take more (see socket::wait_writable()), as its
-// writer does before each round with TCP_NOTSENT_LOWAT set: for tests, which hold a connection "unwritable" with it.
+// writer (a server's or a client's) does before each round with TCP_NOTSENT_LOWAT set: for tests, which hold a
+// connection "unwritable" with it.
 using writable_function = std::function<coro::task<io::result>()>;
 
 // http2_options are what an HTTP/2 connection is served with: server_config's.
@@ -143,6 +144,14 @@ struct http2_client_options
     std::chrono::milliseconds idle_timeout = std::chrono::seconds{90};
 
     http2::session_config session{};
+
+    // The TCP_NOTSENT_LOWAT set on each connection's socket, after which its writer waits for the socket to be
+    // writable before each round: client_options::http2_notsent_lowat. 0 sets none, and the writer doesn't wait.
+    std::size_t notsent_lowat = 0;
+
+    // Internal (for tests): what the writer waits with instead of the socket, if set (only while notsent_lowat is set):
+    // client_options::http2_writable.
+    writable_function writable{};
 };
 
 }

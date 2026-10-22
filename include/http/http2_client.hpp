@@ -98,6 +98,8 @@ public:
         std::function<void()>                         freed;
     };
 
+    // With options.notsent_lowat, it sets TCP_NOTSENT_LOWAT on the connection's socket, and if that works, its writer
+    // waits for the socket to take more before each round (see http2_connection_base::write_loop()).
     http2_client_connection(io::scheduler*              scheduler,
                             std::unique_ptr<connection> conn,
                             const http2_client_options& options,
@@ -141,6 +143,10 @@ public:
     // http2::category()) if the server didn't process the request, so it may be sent again; state (if given) says how
     // far it got. A request with a Content-Length sends exactly that much of its body, failing with
     // std::errc::invalid_argument if the body's shorter. It takes the stream reserve() reserved, whatever happens.
+    //
+    // Its body takes its turns on the connection (with other requests' bodies sent at once) by its Priority field (RFC
+    // 9218), read as the head's sent, as the server reads it (what it leaves out, or all of it if it doesn't parse, is
+    // RFC 9218's default: u=3, not incremental); without the field, u=3 incremental.
     //
     // request.stop cancels it (and then the response's body): the stream is reset (CANCEL), failing its waits with
     // std::errc::operation_canceled, and the connection goes on. Stopped before the stream's opened, nothing's sent.
