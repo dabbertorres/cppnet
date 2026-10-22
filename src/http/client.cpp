@@ -23,6 +23,7 @@
 #include "http/http11.hpp"
 #include "http/http2.hpp"
 #include "http/http2_client.hpp"
+#include "http/origin.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/buffered_reader.hpp"
@@ -354,6 +355,10 @@ struct sent
 
     // the retry may go on the same HTTP/2 connection (a new stream): after a 417, which says nothing of the connection.
     bool same_connection = false;
+
+    // the retry's after a 421 (Misdirected Request) on another host's connection the request was coalesced onto: it
+    // goes on a connection of its own host's, as if it were the first attempt.
+    bool misdirected = false;
 };
 
 // head_deadline is when a response's head must have come by, from now.
@@ -484,6 +489,20 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
     co_return deliver(body, resp, request, !err);
 }
 
+// rewind_body gets a request's body to send again (see client_request::get_body), returning whether there is one to
+// send: there's nothing to get for a request without a body.
+bool rewind_body(net::http::client_request& request)
+{
+    if (request.body == nullptr) return true;
+    if (!request.get_body) return false;
+
+    auto body = request.get_body();
+    if (body == nullptr) return false;
+
+    request.body = std::move(body);
+    return true;
+}
+
 // send_http2 sends a request on a stream of an HTTP/2 connection. It may be sent again (on another connection):
 // - whatever it is, if it was refused before anything of it was sent (the connection was ending);
 // - whatever its method, if the server didn't process it (it was refused, or after a GOAWAY's last stream), unless its
@@ -491,7 +510,10 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
 // - if it's safe to repeat, and has no body, if the connection dropped (without GOAWAY) before its response's head: as
 //   HTTP/1.1's are, when a reused connection turns out to have been closed;
 // - without its expectation, at once, if it expected 100 (Continue) and had a 417 before its body was sent: on the same
-//   connection, as a 417 says nothing of it.
+//   connection, as a 417 says nothing of it;
+// - on a connection of its own host's, if it was coalesced onto another host's and had a 421 (Misdirected Request), and
+//   has no body, or get_body to read it again (docs/plans/http2.md, Decided question 40); the 421 is discarded (as a
+//   redirect's is).
 net::coro::task<sent>
 send_http2(net::http::detail::connection_pool::lease leased, net::http::client_request& request, bool first)
 {
@@ -510,6 +532,23 @@ send_http2(net::http::detail::connection_pool::lease leased, net::http::client_r
                        .retry           = true,
                        .same_connection = true};
     }
+
+    // RFC 8336, section 2.3: the connection isn't authoritative for the request's origin after all, so its Origin Set
+    // loses it, and the request goes where it would have gone without coalescing. (A 421 on the request's own host's
+    // connection is returned: another to the same host would likely reach the same server.)
+    if (leased.coalesced && resp.has_value() && resp->status_code == net::http::status::MISDIRECTED_REQUEST)
+    {
+        (void)leased.http2->remove_origin(net::http::detail::origin_text(request.uri.host, port_of(request.uri)));
+        if (!rewind_body(request)) co_return sent{.response = std::move(resp)};
+
+        co_await discard(std::move(*resp));
+
+        // NOTE: never returned, as the request's sent again (or that fails, with its own error).
+        co_return sent{.response    = std::unexpected(std::make_error_code(std::errc::protocol_error)),
+                       .retry       = true,
+                       .misdirected = true};
+    }
+
     if (resp.has_value() || !first) co_return sent{.response = std::move(resp)};
 
     const bool refused = resp.error() == net::http::http2::error_code::refused_stream;
@@ -726,28 +765,40 @@ coro::task<std::expected<client_response, std::error_code>> client::send(client_
         std::shared_ptr<detail::http2_client_connection> tried;
         sent                                             result;
 
-        for (int attempt = 0; attempt == 0 || result.retry; ++attempt)
+        // whether the attempt is a first: it may take an idle connection, and be sent again if it fails as it would
+        // on a connection the server had closed (see send_on()). And whether it may be coalesced onto another host's
+        // HTTP/2 connection (client_options::http2_coalescing): not after a 421 on one.
+        bool first    = true;
+        bool coalesce = true;
+
+        do
         {
             // a retry is because a reused connection had been closed, so the others may have been too.
             auto leased = co_await pool->acquire(dest->scheme,
                                                  request.uri.host,
                                                  dest->port,
-                                                 attempt == 0,
+                                                 first, // (allow_idle)
                                                  tried.get(),
-                                                 request.stop);
+                                                 request.stop,
+                                                 coalesce);
             if (!leased.has_value()) co_return fail(leased.error());
 
             // HTTP/2: the request takes a stream of a shared connection; HTTP/1.x: the connection, until the
             // response's body is read. Either gives up what it took, if it was canceled (HTTP/2's stream reserved for
             // it, too).
             tried  = leased->http2;
-            result = co_await send_on(pool, std::move(*leased), request, attempt == 0, dest->reusable);
+            result = co_await send_on(pool, std::move(*leased), request, first, dest->reusable);
             if (result.same_connection) tried = nullptr;
 
             // NOTE: a response that arrived as stop was requested is dropped, with its connection (HTTP/1.x) or
             //       stream.
             if (canceled()) co_return cancel();
+
+            // a coalesced request that had a 421 goes again as it went first, but to its own host.
+            first    = result.misdirected;
+            coalesce = coalesce && !result.misdirected;
         }
+        while (result.retry);
 
         if (!result.response.has_value()) co_return std::move(result.response);
 

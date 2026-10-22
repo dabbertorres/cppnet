@@ -107,7 +107,8 @@ connection_pool::acquire(std::string                    scheme,
                          std::string                    port,
                          bool                           allow_idle,
                          const http2_client_connection* skip,
-                         std::stop_token                stop)
+                         std::stop_token                stop,
+                         bool                           coalesce)
 {
 #ifdef NET_HAS_TLS
     const bool tls = scheme == "https";
@@ -126,28 +127,34 @@ connection_pool::acquire(std::string                    scheme,
     // NOTE: declared before the lock, so the connections are closed after unlocking.
     connections closing;
 
+    // another host's HTTP/2 connection may take an https request (see client_options::http2_coalescing): looked for
+    // once, then again after each wait. (Without the option, there are none to find: see start_http2().)
+    const bool may_coalesce = coalesce && tls;
+    bool       look         = may_coalesce;
+
     while (true)
     {
-        std::uint64_t seen = 0;
-        claim         found;
+        std::uint64_t seen  = 0;
+        auto          found = claim_any(key, host, port, tls, allow_idle, skip, look, closing, seen);
+        if (found.leased.has_value()) co_return std::move(*found.leased);
 
+        // none of them would take it: it connects, or waits, as it would have (and looks again after waiting).
+        if (found.looked)
         {
-            std::scoped_lock lock{mu};
-
-            // NOTE: before looking, so that a connection (or stream) freed after this is waited for no longer.
-            seen  = released.load(std::memory_order::acquire);
-            found = try_claim(key, tls, allow_idle, skip, closing);
+            look = false;
+            closing.clear();
+            continue;
         }
 
-        if (found.leased.has_value()) co_return std::move(*found.leased);
         if (found.connect) break;
 
         closing.clear();
 
         // counted as waiting before looking again, so that either freed() sees it waiting (and wakes it), or it sees
-        // what freed() released (both seq_cst).
+        // what freed() released (both seq_cst). Whatever was freed, a coalesced connection's stream may be.
         waiting.fetch_add(1, std::memory_order::seq_cst);
         const util::defer waited{[this] noexcept { waiting.fetch_sub(1, std::memory_order::relaxed); }};
+        look = may_coalesce;
         if (released.load(std::memory_order::seq_cst) != seen) continue;
 
         // NOTE: a token that can't be stopped is as none (nothing's registered).
@@ -197,14 +204,46 @@ connection_pool::acquire(std::string                    scheme,
     co_return lease{.conn = std::move(*conn), .http2 = nullptr, .key = key, .reused = false};
 }
 
-connection_pool::claim connection_pool::try_claim(
-    const std::string& key, bool tls, bool allow_idle, const http2_client_connection* skip, connections& closing)
+connection_pool::claim connection_pool::claim_any(const std::string&             key,
+                                                  const std::string&             host,
+                                                  const std::string&             port,
+                                                  bool                           tls,
+                                                  bool                           allow_idle,
+                                                  const http2_client_connection* skip,
+                                                  bool                           coalesce,
+                                                  connections&                   closing,
+                                                  std::uint64_t&                 seen)
+{
+    std::vector<coalescing_connection> candidates;
+    claim                              found;
+    {
+        std::scoped_lock lock{mu};
+
+        // NOTE: before looking, so that a connection (or stream) freed after this is waited for no longer.
+        seen  = released.load(std::memory_order::acquire);
+        found = try_claim(key, tls, allow_idle, skip, closing, coalesce ? &candidates : nullptr);
+    }
+
+    if (candidates.empty()) return found;
+    return {.leased = take_coalesced(candidates, origin_text(host, port)), .connect = false, .looked = true};
+}
+
+connection_pool::claim connection_pool::try_claim(const std::string&                  key,
+                                                  bool                                tls,
+                                                  bool                                allow_idle,
+                                                  const http2_client_connection*      skip,
+                                                  connections&                        closing,
+                                                  std::vector<coalescing_connection>* candidates)
 {
     // an HTTP/2 connection to the host with a stream free.
     if (auto shared = available_http2(key, skip))
         return {
             .leased = lease{.conn = nullptr, .http2 = std::move(shared), .key = key, .reused = true}
         };
+
+    // otherwise, another host's that may be authoritative for the request's origin: for take_coalesced() to check,
+    // without mu.
+    if (candidates != nullptr && coalescing_candidates(key, allow_idle, skip, *candidates)) return {};
 
     if (const auto found = hosts.find(key); found != hosts.end())
     {
@@ -269,6 +308,48 @@ bool connection_pool::speaks_http2(const std::string& key, bool tls) const
 
 void connection_pool::host_gone(const std::string& key) { http2_hosts.erase(key); }
 
+std::optional<connection_pool::lease>
+connection_pool::take_coalesced(const std::vector<coalescing_connection>& candidates, const std::string& origin)
+{
+    for (const auto& c : candidates)
+    {
+        // NOTE: not holding mu, as the first time a connection's asked for a host costs a certificate's verification.
+        if (!c.conn->authoritative_for(origin)) continue;
+
+        // with a stream free: under mu, as available_http2() reserves, so evict_idle() (which takes only an idle
+        // connection, under mu) can't close it once it's reserved. One that's left coalescing meanwhile refuses: it
+        // ended, or was evicted, and so closed, under mu.
+        std::scoped_lock lock{mu};
+        if (c.conn->reserve())
+            return lease{.conn = nullptr, .http2 = c.conn, .key = c.key, .reused = true, .coalesced = true};
+    }
+
+    return std::nullopt;
+}
+
+bool connection_pool::coalescing_candidates(const std::string&                  key,
+                                            bool                                allow_idle,
+                                            const http2_client_connection*      skip,
+                                            std::vector<coalescing_connection>& out) const
+{
+    if (coalescing.empty()) return false;
+
+    // an idle connection to the host is still its own, and free.
+    if (const auto it = hosts.find(key); allow_idle && it != hosts.end() && !it->second.idle.empty()) return false;
+
+    // (its own host's are left out, as they've none free.)
+    for (const auto& c : coalescing)
+    {
+        if (c.key != key && c.conn.get() != skip) out.push_back(c);
+    }
+    return !out.empty();
+}
+
+void connection_pool::uncoalesce(const http2_client_connection* conn) noexcept
+{
+    std::erase_if(coalescing, [conn](const auto& c) { return c.conn.get() == conn; });
+}
+
 std::shared_ptr<http2_client_connection>
 connection_pool::start_http2(const std::string& key, std::unique_ptr<connection> conn, std::string origin)
 {
@@ -284,6 +365,7 @@ connection_pool::start_http2(const std::string& key, std::unique_ptr<connection>
             connections closing;
             {
                 std::scoped_lock lock{pool->mu};
+                pool->uncoalesce(&closed);
 
                 // NOTE: unless it's been counted out already (evicted).
                 const auto it = pool->hosts.find(key);
@@ -298,9 +380,34 @@ connection_pool::start_http2(const std::string& key, std::unique_ptr<connection>
         {
             if (auto pool = weak.lock()) pool->freed();
         },
-        // NOTE: not used yet: the pool's coalescing is the HTTP/2 plan's stage 6's twelfth part.
         .origins_known = nullptr,
     };
+
+    // a connection whose server has sent ORIGIN may take other hosts' requests, with coalescing on: unless it's been
+    // evicted meanwhile. NOTE: only then, so a pool without it has no callback to call (nor allocates one), and none
+    // coalescing for a request to find.
+    if (config.http2_coalescing)
+    {
+        on.origins_known = [weak, key](http2_client_connection& known)
+        {
+            auto pool = weak.lock();
+            if (!pool) return;
+
+            {
+                std::scoped_lock lock{pool->mu};
+                const auto       it = pool->hosts.find(key);
+                if (it == pool->hosts.end()) return;
+
+                const auto found =
+                    std::ranges::find_if(it->second.http2, [&](const auto& c) { return c.get() == &known; });
+                if (found == it->second.http2.end()) return;
+                pool->coalescing.push_back({.conn = *found, .key = key});
+            }
+
+            // requests waiting (for a connection to their own hosts) may take its streams.
+            pool->freed();
+        };
+    }
 
     // a writer stuck (the server not reading) fails the connection, and so its streams, as the server's
     // write_timeout does: nothing else may notice, e.g. a request whose head is queued behind, without a
@@ -604,6 +711,7 @@ bool connection_pool::evict_idle(const std::string& except_key, connections& clo
     if (oldest_http2 != nullptr)
     {
         // counted out now, so there's room at once, though it closes in its own time.
+        uncoalesce(oldest_http2.get());
         std::erase(oldest->second.http2, oldest_http2);
         oldest_http2->close();
         forget(oldest->first, nullptr, closing);

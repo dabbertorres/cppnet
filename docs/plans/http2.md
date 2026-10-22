@@ -42,7 +42,9 @@ client's request bodies by their requests' `Priority` fields, and TCP_NOTSENT_LO
 client's `on_origin()`, and `server_config::http2_origins`, checked against the certificate and sent over TLS), done
 (2026-10-22); and its eleventh, the client's origin sets (each HTTP/2 connection's over TLS, from ORIGIN frames, and
 `tls::detail::verify_for()`, the server's certificate checked for another host), recorded but not yet used by the pool,
-done (2026-10-22).
+done (2026-10-22); and its twelfth, coalescing in the pool (`client_options::http2_coalescing`, a request taking a
+stream of another host's connection whose Origin Set has its origin) and a coalesced request's 421, done (2026-10-22):
+stage 6 is done.
 
 ## Goal
 
@@ -2031,6 +2033,113 @@ idle stream would be a connection error for the peer.
   allocation for a host and port within the string's own buffer, nor in cleartext); the two flags fit in padding. A TLS
   connection the pool makes formats its own origin once. Nothing on a request's path changes.
 
+### Part 12: coalescing in the pool, and 421 (done 2026-10-22)
+
+- As proposed (see "Connection coalescing and the ORIGIN frame"; Decided questions 35 (a), 36 (a), 38 (a) and 40 (a)).
+  `client_options::http2_coalescing` (off by default) turns it on. The pool keeps `coalescing`, a list of the HTTP/2
+  connections whose Origin Sets are initialized, each with its own host's key: part 11's `callbacks::origins_known` is
+  now set by `start_http2()` (only with coalescing on, so a pool without it has no callback, nor allocates one, and its
+  list stays empty: that's where the option's enforced), and adds the connection, if it's still its host's (not evicted
+  meanwhile), then calls `freed()`, so requests waiting may look at it; a connection's `closed` callback and
+  `evict_idle()` take it off (`uncoalesce()`). The connections stay under their own keys: per-host limits, idle
+  timeouts, eviction, `http2_hosts` and `stats()` count them as before. `acquire()` takes a `coalesce` flag (true by
+  default; the client's retry after a 421 passes false): with it, over TLS (an http request's origin would be taken for
+  the https one), `try_claim()`, given somewhere to put them (`coalescing_candidates()`), returns the candidates (the
+  coalescing connections of other hosts, but the one to skip) when the request's own host has no HTTP/2 connection with
+  a stream free, nor an idle one it may take, and there are any, rather than going on to connect or wait. `claim_any()`
+  (a plain function, which `acquire()`'s loop calls: `try_claim()` under the lock, then this) then checks them without
+  the pool's lock (`take_coalesced()`: `authoritative_for(origin_text(host, port))`, which verifies the certificate for
+  the host the first time a connection's asked, on the requesting task's thread), and reserves a stream of the first
+  that's authoritative and has one free, under the lock (`reserve()`, as `available_http2()` does, so `evict_idle()`,
+  which closes only an idle connection, under the lock, can't close it once it's reserved). A candidate that's left the
+  list meanwhile refuses by itself: it's left only by ending, or by being evicted, which closes it under the lock, so
+  `reserve()` fails; so there's no check that it's still listed. The lease says `coalesced`, its key is the connection's
+  host's (only HTTP/1.x's release reads it), and `reused` is true. If none takes it, the request goes on as it would
+  have: it connects, or waits, and after each wait looks again (a stream of a coalescing connection may be what was
+  freed).
+- 421: `send_http2()` takes a coalesced lease's 421 (whatever attempt it is): it removes the request's origin from the
+  connection's set (`remove_origin(origin_text(host, port))`, always, RFC 8336's MUST); then, if the request has no
+  body, or `get_body` gives a new reader of it (`rewind_body()`, which puts it in place), it discards the 421
+  (`discard()`, as a redirect's response: read to its end if it's at most 2 KiB, so the stream needn't be reset) and
+  returns `sent{.retry = true, .misdirected = true}` (with a placeholder error, never returned, as the 417's); otherwise
+  the 421 is returned. `client::send()`'s attempts are a loop over `first` and `coalesce` now, rather than a count: a
+  misdirected attempt's retry goes with `coalesce` false (for the rest of the hop's attempts) to `acquire()`, so on a
+  connection of the request's own host's, which a 421 is returned from as it is. A redirect's next hop may be coalesced
+  again.
+- Not in the plan (where it's silent):
+  - The retry after a 421 is a first attempt again: it may take an idle connection, and be sent again (once) if it fails
+    as on a connection the server had closed, or is refused, as the request's first attempt may. The coalesced attempt
+    was the pool's doing, so it doesn't use up the request's retry.
+  - Where the look comes: after the request's own host's HTTP/2 connections (as the plan says), and an idle HTTP/1.x
+    connection of its own host's, if it may take one (also "a connection free": it's checked before coalescing, so a
+    request that has one never looks; one whose idle connections turn out closed goes on to connect, without looking);
+    but before waiting for its own host's connection being made (to a host known to speak HTTP/2), or for a stream with
+    `strict_max_concurrent_streams`: a connection that's already there and authoritative is taken instead.
+  - The candidates are copies (a `shared_ptr` and the key each) made under the lock, so the pool's lock is never held
+    while a certificate's verified; a connection's set isn't checked again once the stream's reserved, so an origin
+    removed meanwhile (another request's 421) costs this one a 421 of its own, which is then handled as any: sent again
+    whether or not its `remove_origin()` found the origin still there.
+  - The option is checked once, where the callback's set: `acquire()` looks whenever the request is https, and finds
+    nothing in a pool without it (the first version also checked it in `acquire()`, which no test could tell apart).
+  - The certificate's checked before a stream's reserved, so a full connection is checked too (once per host): its
+    answer is kept for when it has a stream free.
+  - Its own host's coalescing connections aren't candidates (the request has just found none of them free), nor is the
+    connection to skip (the last attempt's).
+  - A request with a body sent again after a 421 always reads it again from `get_body`, as it can't tell whether the
+    server read any of it (as for a 307).
+- Tests (no network; `test/tls/client_coalescing.cpp`, `[tls][http][client][http2][coalescing]`), through `http::client`
+  with a `dns::resolver` whose injected configuration's hosts table names a.test, b.test and x.w.test 127.0.0.1 (native
+  back end, files only), against cppnet's servers over TLS on loopback with `test_pki`'s `names_chain` (a.test, b.test,
+  *.w.test and 127.0.0.1). Each host has a server of its own, on its own port, and a.test's (and x.w.test's) lists
+  b.test's origin, with b.test's server's port, in ORIGIN: so which server a request for b.test reached says which
+  connection it went on, with no hook into the pool (the first version had two,
+  `connection_pool::coalescing_connections()` and `detail::pool_of(client)`, removed). Each warms a.test's connection
+  with two requests first, so the pool's been told of its Origin Set by the time the second's response has come (the
+  first's might come in the read the ORIGIN came in, before the callback), and reads `client::stats()` before the
+  scheduler stops (which ends the connections). With coalescing on, b.test's request reaches a.test's server (one
+  connection, none of b.test's). It reaches b.test's own (two connections) without ORIGIN, with coalescing off, for an
+  origin not in the set (b.test listed on a.test's server's port), with `insecure_skip_verification`, over cleartext
+  (prior knowledge; the origins configured but never sent), and for an http URL to b.test while a.test's connection over
+  TLS lists its https origin. b.test with an idle HTTP/1.1 connection (b.test's server HTTP/1.1 only, asked first) takes
+  it (two requests at b.test's server, none at a.test's). A host the certificate doesn't cover, listed:
+  `test::h2_client` in its server role over a `tls::stream` (cppnet's server refuses to list it) lists b.test and
+  c.test, through the pool directly: b.test's lease is a.test's connection, `coalesced`, with a.test's key; c.test's
+  isn't coalesced, but looked up (and not found). A 421 from a.test's server to b.test's first request: it's sent again
+  to b.test's server (HTTP/1.1, the requests with `Connection: close`, so b.test has no connection left), and a second
+  request then reaches b.test's server too, so the origin's gone from a.test's connection's set (a.test's server had one
+  request of b.test's); with b.test's server (then over HTTP/2) answering 421 too, that's returned, and not sent again.
+  A POST with `set_body()`'s `get_body` is sent again, its body both times; one without `get_body` has the 421 returned,
+  its origin removed all the same (the GET after it reaches b.test's server). With x.w.test's connection listing
+  b.test's origin too, both answering 421: one 421, then b.test's own server, not the other coalesced connection. Two
+  requests coalesced at once, held by a.test's server until both have come, then both answered 421 (the second for an
+  origin already removed): both are sent again to b.test's server, and answered. And the retry after a 421 is a first
+  attempt: a.test's server allows one stream, which b.test's first request holds (until the test opens a gate), so a
+  second request to b.test connects (HTTP/1.1) and leaves its connection idle; the first's 421 then takes that idle
+  connection (b.test has one connection, not two). And it's sent again if that connection drops: b.test's server played
+  (`test::h2_client` over TLS) ends its first connection (close_notify, no GOAWAY) once the request's head has come, and
+  answers on its second, so the request, after a.test's 421, is answered (two heads at b.test's server).
+- The checks bite (each piece broken alone, the `[coalescing]` tests run): `origins_known` not set, every test that
+  coalesces; `take_coalesced()` without `authoritative_for()`, the origin-not-in-the-set case, and the 421 and body
+  tests; the callback set without the option, the off case; http requests looking too (no TLS check), the http URL case;
+  the 421 keeping the origin, the 421 and body tests' second requests; not sending it again, the 421, body,
+  two-coalesced and in-flight tests; any 421 sent again (not only a coalesced one's), the 421 test's case where b.test's
+  own server answers 421 (which was only caught once that server was HTTP/2: over HTTP/1.1 the 421 doesn't go through
+  `send_http2()`); `rewind_body()` taking a body without `get_body` as rewindable, or not putting the new reader in
+  place, the body test; the lease not marked `coalesced`, the uncovered host's test, and the 421, body and two-coalesced
+  tests; the retry allowed to coalesce again, the two-coalesced test (two 421s); a request with an idle connection of
+  its own looking anyway, the idle test; a second 421 returned when its origin was already removed, the in-flight test;
+  the retry not a first attempt, the first-attempt test (two connections of b.test's) and the dropped-connection test
+  (the request fails). Not observable: a connection left in the list once it's ended or been evicted (`uncoalesce()`
+  left out of either): `reserve()` refuses it, so it's never taken, and what's left is a `shared_ptr` held (and its
+  certificate's checks, if asked) until the pool goes: memory, which no test sees without a hook into the pool.
+- Measured: nothing, as the plan asks for no benchmark. A pool without coalescing on has no callback; an https request's
+  look in `acquire()` then costs a test of an empty vector, under the lock it takes anyway, and `claim_any()` an empty
+  vector on its stack; an `erase_if()` over the empty list runs when an HTTP/2 connection ends or is evicted; the pool
+  has a vector more (24 bytes). A request whose own host has a connection free never looks (it's found first). With it
+  on, a request that would connect copies the candidates (a `shared_ptr` and a key each) and formats its origin once a
+  look; a host's first coalesced request verifies the certificate (once per host and connection, part 11's).
+  `acquire()`'s frame keeps two booleans more.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2545,7 +2654,7 @@ throughput isn't changed (by frame count and order).
 
 ## Stage 6
 
-Decided (2026-10-21). Seven things, chosen for stage 6, to finish HTTP/2. On the server: TCP_NOTSENT_LOWAT, so that
+Decided (2026-10-21); done (2026-10-22: see Learned in stage 6). Seven things, chosen for stage 6, to finish HTTP/2. On the server: TCP_NOTSENT_LOWAT, so that
 little of what's past part 10's scheduler sits in the socket's send buffer; ending a response with a Content-Length on
 its last DATA frame, rather than with an empty one; and 431 for a header list over the limit, rather than a reset. On
 both sides: connection coalescing and the ORIGIN frame (RFC 8336). On the client: `Expect: 100-continue` (waiting for
@@ -3048,7 +3157,8 @@ certificate.
    Trailers come before HPACK and priorities as they're what a user needs (gRPC); HPACK's two parts, internal, before
    priorities' three, the largest change.
 
-6. **Decided (2026-10-21), in twelve pull requests, in this order** (see "Stage 6"; each mergeable and tested alone):
+6. **Decided (2026-10-21), in twelve pull requests, in this order** (see "Stage 6"; each mergeable and tested alone), all
+   done (2026-10-22):
    1. **Ending streams with their last DATA.** Done (2026-10-21; see Learned in stage 6). A body of known length ends
       with its last DATA frame, on both sides: `http2_stream_base::data_left`, set from the response's Content-Length
       (`http2_stream_ops::send_head` takes it) and the request's; trailers set after the head of such a response
@@ -3096,10 +3206,10 @@ certificate.
        ORIGIN frames, and the certificate checked for another host (`tls::detail::verify_for()`, Decided question 37),
        recorded but not yet used by the pool; tests of the sets (from `test::h2_client` as the server) and the check
        alone. Split from 12 as part 9 of stage 5 was from 10: the protocol's and TLS's rules tested apart from the pool.
-   12. **Coalescing in the pool, and 421.** `client_options::http2_coalescing` (Decided questions 35 and 36), the pool's
-       list of connections with origin sets, searched before connecting (Decided question 38), and a coalesced request's
-       421 (Decided question 40); tests with two names on loopback servers. Last: it changes how the pool picks
-       connections, which every request goes through.
+   12. **Coalescing in the pool, and 421.** Done (2026-10-22; see Learned in stage 6). `client_options::http2_coalescing`
+       (Decided questions 35 and 36), the pool's list of connections with origin sets, searched before connecting (Decided
+       question 38), and a coalesced request's 421 (Decided question 40); tests with two names on loopback servers. Last:
+       it changes how the pool picks connections, which every request goes through.
 
    Server-side fixes first (small, independent), then the client's 100-continue (an API users ask for), its bodies and
    priorities (building on part 10's scheduler), and coalescing last (the largest, and the pool's).

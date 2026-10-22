@@ -41,7 +41,9 @@ enum class client_errc : std::uint8_t
 // request takes a stream of a connection the host's requests share. A request's version and Connection field are
 // HTTP/1.x's, and mean nothing over HTTP/2 (its connections aren't closed after a request, and there's no HTTP/1.0):
 // client_options::http2 = false is how to have them. A request's Priority field (RFC 9218) orders its body among the
-// connection's others, and client_response::set_priority() changes its response's priority in flight.
+// connection's others, and client_response::set_priority() changes its response's priority in flight. With
+// client_options::http2_coalescing, a request to an https origin may take a stream of another host's connection, whose
+// server has said (with ORIGIN, RFC 8336) that it serves the origin, and whose certificate is valid for the host.
 //
 // An HTTP/1.x connection is reused once the response's body has been read to its end (until a read reports
 // io::errc::end_of_stream, or all of its Content-Length has been read). Destroying a response whose body hasn't been
@@ -110,6 +112,12 @@ public:
     // at once, once, without its Expect field (over HTTP/1.1 on another connection, over HTTP/2 on the same one), its
     // body read then (so no get_body is needed); a 417 once the body's been sent is returned. response_header_timeout
     // starts once the body's sent.
+    //
+    // A request coalesced onto another host's HTTP/2 connection (see client_options::http2_coalescing) that gets a 421
+    // (Misdirected Request) has its origin removed from that connection's Origin Set (RFC 8336), and is sent again, at
+    // once, once, on a connection of its own host's, not coalesced; the 421 is discarded, as a redirect's response is.
+    // One with a body needs request.get_body to read it again, as for a 307: without, the 421 is returned. So is a 421
+    // on a connection of the request's own host's.
     coro::task<std::expected<client_response, std::error_code>> send(client_request request);
 
     // get sends a GET request for url (e.g. "http://example.com/path"), as send() does, canceled by stop (see

@@ -416,6 +416,30 @@ body, whose connection dropped (without GOAWAY) before its response. The request
 once idle for `idle_timeout` (at once, if it's 0), and fail if their writes stall for `io_timeout`. Destroying the
 client lets the bodies being read finish.
 
+With `client_options::http2_coalescing` (off by default), a request to an `https://` origin whose host has no HTTP/2
+connection with a stream free (nor an idle HTTP/1.1 one) may take a stream of another host's, rather than connecting
+(connection coalescing): one whose server has listed the request's origin in an ORIGIN frame (RFC 8336; e.g. a CDN
+serving many names from one certificate, or cppnet's server with `server_config::http2_origins`, below), and whose
+certificate is valid for the request's host, checked as a new connection's handshake would check it (once per host and
+connection, on the requesting task's thread). The host isn't looked up. Only ORIGIN coalesces (browsers also coalesce
+hosts whose addresses are the connection's: not cppnet), never over cleartext, nor with `tls.insecure_skip_verification`
+(nothing then says whose a server is). The connection still counts as its own host's (`stats()`,
+`max_connections_per_host`, `idle_timeout`). It's off by default as the host isn't resolved: whoever holds a certificate
+valid for a name (mis-issued, or with a stolen key) could, by listing it, take a client's requests for it without being
+on the way to its server (RFC 8336, section 4: the client checks neither Certificate Transparency nor revocation), and a
+client that fetches URLs others choose (webhooks, a crawler) in the process that sends its own credentialed requests
+would let such a server have both. A server that gets a request for an origin it doesn't serve answers 421 (Misdirected
+Request): the origin's then dropped from the connection's set, the 421 discarded, and the request sent again, once, on a
+connection of its own host's (with its body, read again from `client_request::get_body`, as for a 307; without it, a
+request with a body gets the 421 back). A 421 on a connection of the request's own host's is returned as it is.
+
+```cpp
+net::http::client client{&scheduler, {.http2_coalescing = true}};
+
+auto a = co_await client.get("https://www.example.com/");      // connects: its server lists static.example.com
+auto b = co_await client.get("https://static.example.com/x");  // on www's connection, if its certificate has the name
+```
+
 Redirects (301, 302, 303, 307 and 308, with a `Location`) are followed only when asked for: up to
 `client_options::max_redirects` of them (0 by default, so `send()` returns the redirect's response; Go's 10 is a
 sensible limit), or `client_request::max_redirects`, which overrides it for one request. Each is a request of its own
@@ -844,16 +868,16 @@ scheduler.spawn(server.serve());
   const auto& certs = req.peer_certificates;
   if (!certs || !std::ranges::contains(certs->front().uris, "spiffe://example.com/billing")) { /* 403 */ }
   ```
-- **ORIGIN** (RFC 8336): `server_config::http2_origins` lists the origins an HTTP/2 connection over TLS says it
-  serves, in an ORIGIN frame sent after the server's SETTINGS. A client that coalesces by it (Firefox does) may then
-  send requests for any of them on that connection, if the certificate is valid for their hosts, without looking the
-  names up or connecting to them. Each is `https://host` or `https://host:port` (a DNS name, without wildcards, which
-  ORIGIN can't say; an IPv4 address; or an IPv6 one in brackets), normalized (lowercase, the default port 443 left out,
-  repeats dropped); the server's constructors throw `std::invalid_argument` for one that isn't, or whose host the
-  context's certificate doesn't cover (clients would ignore it). None is sent by default, nor without TLS (RFC 8336 has
-  clients ignore ORIGIN over cleartext), nor over HTTP/1.1. Only the application knows which of the certificate's
-  names it serves, so it lists them; and a request for an origin it doesn't serve it answers with 421, after which the
-  client sends it on a connection of its own:
+- **ORIGIN** (RFC 8336): `server_config::http2_origins` lists the origins an HTTP/2 connection over TLS says it serves,
+  in an ORIGIN frame sent after the server's SETTINGS. A client that coalesces by it (Firefox does, and cppnet's with
+  `client_options::http2_coalescing`) may then send requests for any of them on that connection, if the certificate is
+  valid for their hosts, without looking the names up or connecting to them. Each is `https://host` or
+  `https://host:port` (a DNS name, without wildcards, which ORIGIN can't say; an IPv4 address; or an IPv6 one in
+  brackets), normalized (lowercase, the default port 443 left out, repeats dropped); the server's constructors throw
+  `std::invalid_argument` for one that isn't, or whose host the context's certificate doesn't cover (clients would
+  ignore it). None is sent by default, nor without TLS (RFC 8336 has clients ignore ORIGIN over cleartext), nor over
+  HTTP/1.1. Only the application knows which of the certificate's names it serves, so it lists them; and a request for
+  an origin it doesn't serve it answers with 421, after which the client sends it on a connection of its own:
 
   ```cpp
   net::http::server_config cfg{.tls = std::move(*ctx)};

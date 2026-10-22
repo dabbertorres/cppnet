@@ -95,6 +95,19 @@ struct client_options
     // within max_connections_per_host).
     bool strict_max_concurrent_streams = false;
 
+    // Whether a request to an https origin whose host has no HTTP/2 connection with a stream free may take a stream of
+    // another host's (connection coalescing; docs/plans/http2.md, stage 6), rather than connecting: one whose server
+    // has said, with an ORIGIN frame (RFC 8336), that it's authoritative for the request's origin, and whose
+    // certificate is valid for its host, checked as a new connection's handshake would check it (once per host and
+    // connection). Never over cleartext, nor with tls.insecure_skip_verification (nothing then says whose a server
+    // is); and only by ORIGIN, never by addresses. Off by default: such a request's host isn't resolved, so whoever
+    // holds a certificate valid for its name (mis-issued, or with a stolen key) could take its requests without being
+    // on the way to its server, by listing its origin (RFC 8336, section 4: the client checks neither Certificate
+    // Transparency nor revocation); and a client that sends requests others choose (e.g. webhooks) alongside its own
+    // credentialed ones would let such a server have both. A 421 (Misdirected Request) to a request sent so removes its
+    // origin from the connection's set, and has it sent again on a connection of its own host's (see client::send()).
+    bool http2_coalescing = false;
+
     // The TCP_NOTSENT_LOWAT set on each HTTP/2 connection's socket (over TLS, the TCP socket's; not on HTTP/1.x's,
     // whose requests aren't reordered), as the server's (server_config::http2_notsent_lowat): the most the kernel holds
     // written but not yet sent, before the connection's writer, which waits for the socket to take more before each
@@ -150,8 +163,11 @@ namespace detail
         {
             std::unique_ptr<connection>              conn;
             std::shared_ptr<http2_client_connection> http2;
-            std::string                              key;
-            bool reused = false; // it was idle in the pool, rather than newly connected
+            std::string                              key; // the connection's host's (see make_key())
+            bool reused = false;                          // it was idle in the pool, rather than newly connected
+
+            // it's a stream of another host's HTTP/2 connection (see client_options::http2_coalescing).
+            bool coalesced = false;
         };
 
         connection_pool(io::scheduler* scheduler, client_options options);
@@ -174,12 +190,19 @@ namespace detail
         // Requesting stop ends it (waiting, connecting, or the handshake), failing with std::errc::operation_canceled;
         // a connection that was being made for it is closed (and counted out). Once it's returned a lease, stop isn't
         // its business: an HTTP/2 lease's stream stays reserved until its send(), which then fails (giving it back).
+        //
+        // With client_options::http2_coalescing (and coalesce), an https request whose host has neither an HTTP/2
+        // connection with a stream free nor an idle one (if allow_idle) first looks for a stream of another host's
+        // HTTP/2 connection that's authoritative for its origin (see http2_client_connection::authoritative_for()), and
+        // reserves it if there's one: the lease is coalesced, and its key is the connection's host's (it stays counted
+        // there). It looks again after each wait.
         coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
                                                                   std::string                    host,
                                                                   std::string                    port,
                                                                   bool                           allow_idle,
-                                                                  const http2_client_connection* skip = nullptr,
-                                                                  std::stop_token                stop = {});
+                                                                  const http2_client_connection* skip     = nullptr,
+                                                                  std::stop_token                stop     = {},
+                                                                  bool                           coalesce = true);
 
         // release returns a leased connection: kept idle if it's reusable (it's at the start of a response, with
         // nothing unread), and closed otherwise.
@@ -219,6 +242,14 @@ namespace detail
             std::vector<std::shared_ptr<http2_client_connection>> http2;
         };
 
+        // coalescing_connection is an HTTP/2 connection whose Origin Set has been initialized (see
+        // http2_client_connection::origins()), and its host's key.
+        struct coalescing_connection
+        {
+            std::shared_ptr<http2_client_connection> conn;
+            std::string                              key;
+        };
+
         static std::string make_key(const std::string& scheme, const std::string& host, const std::string& port);
 
         // connect connects to host, within deadline, and for https, runs a TLS handshake: either ended by stop.
@@ -239,6 +270,23 @@ namespace detail
         std::shared_ptr<http2_client_connection> available_http2(const std::string&             key,
                                                                  const http2_client_connection* skip);
 
+        // take_coalesced reserves a stream of one of candidates (another host's connections, from try_claim()) that's
+        // authoritative for origin (an https origin, see origin_text()), and has one free, if there is one, not holding
+        // mu: the first time a connection's asked for a host, its certificate's verified, on this thread.
+        std::optional<lease> take_coalesced(const std::vector<coalescing_connection>& candidates,
+                                            const std::string&                        origin);
+
+        // coalescing_candidates fills out with the coalescing connections a request to the host may take, returning
+        // whether there are any: other hosts', but skip, unless the host has an idle connection (if allow_idle).
+        // Holding mu.
+        bool coalescing_candidates(const std::string&                  key,
+                                   bool                                allow_idle,
+                                   const http2_client_connection*      skip,
+                                   std::vector<coalescing_connection>& out) const;
+
+        // uncoalesce takes a connection off coalescing, if it's there (holding mu).
+        void uncoalesce(const http2_client_connection* conn) noexcept;
+
         // speaks_http2 is whether host is known to speak HTTP/2 (holding mu): it's cleartext, with prior knowledge, or
         // one of its connections agreed on HTTP/2 and it has had connections since (see http2_hosts).
         [[nodiscard]] bool speaks_http2(const std::string& key, bool tls) const;
@@ -258,14 +306,31 @@ namespace detail
         {
             std::optional<lease> leased{};
             bool                 connect = false;
+            bool                 looked  = false; // at other hosts' connections, which wouldn't take it
         };
 
-        // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
-        claim try_claim(const std::string&             key,
+        // claim_any is try_claim() (holding mu, reading released into seen first, for waiting), then, if that gave
+        // candidates (with coalesce), take_coalesced() for them, without mu: looked, if none of them took it.
+        claim claim_any(const std::string&             key,
+                        const std::string&             host,
+                        const std::string&             port,
                         bool                           tls,
                         bool                           allow_idle,
                         const http2_client_connection* skip,
-                        connections&                   closing);
+                        bool                           coalesce,
+                        connections&                   closing,
+                        std::uint64_t&                 seen);
+
+        // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
+        // try_claim, given candidates, fills it with the connections a request may be coalesced onto, and returns
+        // neither a lease nor room to connect, if the host has no HTTP/2 connection with a stream free, nor an idle one
+        // (if allow_idle), and there are any: for take_coalesced() to look through, without mu.
+        claim try_claim(const std::string&                  key,
+                        bool                                tls,
+                        bool                                allow_idle,
+                        const http2_client_connection*      skip,
+                        connections&                        closing,
+                        std::vector<coalescing_connection>* candidates);
         bool  has_room(const host_connections& host) const noexcept;
         bool  evict_idle(const std::string& except_key, connections& closing);
         void  forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
@@ -288,6 +353,11 @@ namespace detail
         // nothing of a host but its connections): so it's bounded by the connections, and a burst of requests to a host
         // with none connects in parallel, while one to a host with some waits for a connection being made.
         std::unordered_set<std::string> http2_hosts;
+
+        // the HTTP/2 connections whose Origin Sets have been initialized, with client_options::http2_coalescing: added
+        // as each tells of it (http2_client_connection::callbacks::origins_known), taken off as each ends or is
+        // evicted. They're also their own hosts' (in hosts), so they're bounded by the connections.
+        std::vector<coalescing_connection> coalescing;
 
         // Bumped whenever a connection is released, for wait_on(); and how many requests wait on it.
         std::atomic<std::uint64_t> released = 0;
