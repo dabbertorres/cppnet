@@ -23,10 +23,6 @@ struct test_pki
     // the CAs the tests trust: one with an ECDSA key, and one with an RSA key.
     std::filesystem::path ca;
 
-    // the ECDSA one alone, and its key: for certificates made as a test runs (see names_until()).
-    std::filesystem::path ecdsa_ca;
-    std::filesystem::path ecdsa_ca_key;
-
     // a certificate (and key) for localhost and 127.0.0.1, from the ECDSA CA: its key is ECDSA's, on P-256.
     std::filesystem::path localhost_chain;
     std::filesystem::path localhost_key;
@@ -96,11 +92,6 @@ net::tls::client_context trusting_client(std::vector<std::string> alpn = {});
 
 // server_with is a server context with chain and key.
 net::tls::server_context server_with(const std::filesystem::path& chain, const std::filesystem::path& key);
-
-// names_until is a server context with a certificate for names_chain's names (a.test, b.test, *.w.test and
-// 127.0.0.1), from the ECDSA CA, made when it's called, valid from an hour ago until not_after (to the second): for a
-// test that has a certificate expire while it runs.
-net::tls::server_context names_until(std::chrono::system_clock::time_point not_after);
 
 // client_auth_server is a server context with localhost's certificate, asking for clients' certificates as auth says
 // (trusting the client CA, unless auth is none), and allowing TLS versions up to max_version.

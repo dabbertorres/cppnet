@@ -105,10 +105,10 @@ struct handshake
     std::optional<std::expected<tls::stream, std::error_code>> result;
     std::atomic<std::uint64_t>                                 done{0};
 
-    static task<> run(handshake* self, net::tcp_socket accepted, tls::server_context ctx)
+    static task<> run(handshake* self, net::tcp_socket accepted)
     {
         self->result = co_await tls::stream::accept(std::move(accepted),
-                                                    std::move(ctx),
+                                                    server_with(pki().names_chain, pki().names_key),
                                                     net::io::clock::now() + 5s,
                                                     {.alpn = std::vector<std::string>{"h2"}});
         self->done.store(1);
@@ -125,13 +125,9 @@ struct handshake
     }
 };
 
-// connect connects a client's HTTP/2 connection to the server the test plays (with ctx, or names_chain's certificate),
-// as a.test (its own origin given as own_host's, with the port), telling of its Origin Set to known.
-task<connected> connect(net::io::scheduler*                sched,
-                        transport                          how,
-                        told*                              known,
-                        std::string                        own_host = "a.test",
-                        std::optional<tls::server_context> ctx      = std::nullopt)
+// connect connects a client's HTTP/2 connection to the server the test plays (with names_chain's certificate), as
+// a.test (its own origin given as own_host's, with the port), telling of its Origin Set to known.
+task<connected> connect(net::io::scheduler* sched, transport how, told* known, std::string own_host = "a.test")
 {
     auto       listener = net::listener::make(sched, "127.0.0.1", "0").value();
     const auto port     = listener.local_port();
@@ -150,9 +146,7 @@ task<connected> connect(net::io::scheduler*                sched,
     else
     {
         handshake server{sched};
-        REQUIRE(sched->spawn(handshake::run(&server,
-                                            std::move(*accepted),
-                                            ctx ? *ctx : server_with(pki().names_chain, pki().names_key))));
+        REQUIRE(sched->spawn(handshake::run(&server, std::move(*accepted))));
 
         auto ctx = tls::client_context::make({.trusted_ca_file            = pki().ca,
                                               .insecure_skip_verification = how == transport::insecure_tls,
@@ -373,56 +367,6 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
         CHECK(out.answers[i].authoritative == want[i]);
         CHECK(out.again[i].authoritative == want[i]);
     }
-}
-
-TEST_CASE("an HTTP/2 client's connection checks the server's certificate for a host once, when it's first asked",
-          "[tls][http][client][http2][origin]")
-{
-    // the certificate's valid for five or six seconds more (seconds to spare, even for a slow handshake under TSan on a
-    // loaded machine): long enough to connect, and ask for b.test, then waited
-    // out. b.test's answer is remembered; x.w.test's and a.test's, first asked then, find it expired.
-    const auto not_after = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()) + 6s;
-
-    told known;
-
-    net::io::scheduler sched{make_pool()};
-    known.sched = &sched;
-
-    struct seen
-    {
-        bool before      = false; // b.test, while it's valid
-        bool after       = false; // b.test, once it's expired
-        bool wildcard    = true;  // x.w.test, first asked once it's expired
-        bool own_expired = true;  // its own, likewise
-    };
-
-    const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known, std::chrono::system_clock::time_point not_after) -> task<seen>
-        {
-            auto c      = co_await connect(sched, transport::tls, known, "a.test", test::names_until(not_after));
-            auto server = played(*c.server);
-
-            const bool sent = co_await send(server, {"https://b.test", "https://x.w.test"});
-            REQUIRE(sent);
-
-            seen out{.before = c.conn->authoritative_for("https://b.test")};
-
-            const auto left =
-                std::chrono::duration_cast<net::io::clock::duration>(not_after - std::chrono::system_clock::now() + 1s);
-            (void)co_await sched->sleep_until(net::io::clock::now() + left);
-
-            out.after       = c.conn->authoritative_for("https://b.test");
-            out.wildcard    = c.conn->authoritative_for("https://x.w.test");
-            out.own_expired = c.conn->authoritative_for(own(c.port));
-
-            c.conn->close();
-            co_return out;
-        }(&sched, &known, not_after));
-
-    CHECK(out.before);
-    CHECK(out.after);
-    CHECK_FALSE(out.wildcard);
-    CHECK_FALSE(out.own_expired);
 }
 
 TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http][client][http2][origin]")

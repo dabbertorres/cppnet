@@ -977,54 +977,62 @@ TEST_CASE("a client's stream verifies the server's certificate for another host,
     }
 }
 
-TEST_CASE("a client's stream verifies the server's certificate for another host as it is then: expired since the "
-          "handshake",
+TEST_CASE("a client's stream verifies the server's certificate for another host as it is at a given time",
           "[tls][verification][verify-for]")
 {
-    // valid for five or six seconds more: long enough for the handshake (milliseconds; even a slow one, under TSan on a
-    // loaded machine, has seconds to spare), then waited out.
-    const auto not_after = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()) + 6s;
+    struct test_case
+    {
+        std::string_view                    name;
+        std::string                         host;
+        std::chrono::system_clock::duration later; // verified at this long from now
+        std::string_view                    reason = {};
+        std::error_code                     err    = {};
+    };
+
+    // Botan's reasons (the certificate is valid from an hour before the tests' certificates were made, for a day).
+    constexpr auto expired       = "Certificate has expired"sv;
+    constexpr auto not_yet_valid = "Certificate is not yet valid"sv;
+
+    std::vector<test_case> cases{
+        {.name = "now", .host = "b.test", .later = {}},
+        {.name = "expired since the handshake", .host = "b.test", .later = 48h, .reason = expired},
+        {.name = "its own, expired since the handshake", .host = "a.test", .later = 48h, .reason = expired},
+        {.name = "before it's valid", .host = "b.test", .later = -2h, .reason = not_yet_valid},
+    };
 
     net::io::scheduler sched{make_pool()};
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
-    REQUIRE(sched.spawn(serve_once(&listener, test::names_until(not_after), echo)));
+    REQUIRE(sched.spawn(serve_once(&listener, server_with(pki().names_chain, pki().names_key), echo)));
 
-    struct seen
-    {
-        std::error_code connected{};
-        std::error_code before{};    // b.test's, at once
-        std::error_code after{};     // b.test's, once it's expired
-        std::error_code own_after{}; // a.test's (the handshake's), then
-    };
-    const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, std::uint16_t port, std::chrono::system_clock::time_point not_after) -> task<seen>
+    const auto connected = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::uint16_t port, std::vector<test_case>* cases) -> task<std::error_code>
         {
             auto s = co_await connect_to(sched, port, trusting_client(), "a.test");
-            if (!s.has_value()) co_return seen{.connected = s.error()};
+            if (!s.has_value()) co_return s.error();
 
-            seen out{.before = tls::detail::verify_for(*s, "b.test")};
+            for (auto& tc : *cases)
+                tc.err = tls::detail::verify_for(*s, tc.host, std::chrono::system_clock::now() + tc.later);
 
-            const auto left =
-                std::chrono::duration_cast<net::io::clock::duration>(not_after - std::chrono::system_clock::now() + 1s);
-            (void)co_await sched->sleep_until(net::io::clock::now() + left);
-
-            out.after     = tls::detail::verify_for(*s, "b.test");
-            out.own_after = tls::detail::verify_for(*s, "a.test");
             co_await s->close();
-            co_return out;
-        }(&sched, listener.local_port(), not_after));
+            co_return std::error_code{};
+        }(&sched, listener.local_port(), &cases));
 
-    CAPTURE(out.connected.message(), out.before.message());
-    REQUIRE_FALSE(out.connected);
-    CHECK_FALSE(out.before);
+    CAPTURE(connected.message());
+    REQUIRE_FALSE(connected);
 
-    for (const auto& err : {out.after, out.own_after})
+    for (const auto& tc : cases)
     {
-        CAPTURE(err.message());
-        CHECK(err.category() == tls::verification_category());
-        CHECK(err == tls::alert::bad_certificate);
-        CHECK(err.message().contains("Certificate has expired"));
+        CAPTURE(tc.name, tc.host, tc.err.message());
+        if (tc.reason.empty())
+        {
+            CHECK_FALSE(tc.err);
+            continue;
+        }
+
+        CHECK(tc.err.category() == tls::verification_category());
+        CHECK(tc.err == tls::alert::bad_certificate);
+        CHECK(tc.err.message().contains(tc.reason));
     }
 }
 

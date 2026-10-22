@@ -1967,7 +1967,8 @@ bool detail::verifies(const stream& s) noexcept
     return client != nullptr && !client->skip_verification;
 }
 
-std::error_code detail::verify_for(const stream& s, std::string_view host)
+std::error_code
+detail::verify_for(const stream& s, std::string_view host, std::optional<std::chrono::system_clock::time_point> at)
 {
     if (!verifies(s) || host.empty()) return std::make_error_code(std::errc::invalid_argument);
 
@@ -1985,8 +1986,8 @@ std::error_code detail::verify_for(const stream& s, std::string_view host)
     try
     {
         // what the handshake's verification has (see Botan's TLS client: its trust store for the host, the server's
-        // usage, and its clock), but for host; and no stapled OCSP responses, which aren't kept (the policy doesn't
-        // require revocation information, and a handshake with host would have fresh ones).
+        // usage, and its clock, unless at's given), but for host; and no stapled OCSP responses, which aren't kept (the
+        // policy doesn't require revocation information, and a handshake with host would have fresh ones).
         const std::string name{host};
         const auto        roots  = c.client->credentials->trusted_certificate_authorities("tls-client", name);
         const auto        result = verify_chain(chain,
@@ -1995,7 +1996,7 @@ std::error_code detail::verify_for(const stream& s, std::string_view host)
                                                 Botan::Usage_Type::TLS_SERVER_AUTH,
                                                 name,
                                                 *c.client->policy,
-                                                c.cb->tls_current_timestamp(),
+                                                at.value_or(c.cb->tls_current_timestamp()),
                                                 c.cb->tls_verify_cert_chain_ocsp_timeout());
         if (result.successful_validation()) return {};
         return {static_cast<int>(result.result()), verification_category()};
