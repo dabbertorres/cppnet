@@ -17,6 +17,7 @@
 #include "http/chunked_writer.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
+#include "http/priority.hpp"
 #include "http/request.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/io.hpp"
@@ -206,22 +207,26 @@ constexpr bool status_is_server_error(status s) noexcept { return status::INTERN
 
 namespace detail
 {
-    // trailer_source is what the client's response bodies implement for client_response::trailers(), which finds it
-    // with a dynamic_cast: the trailer fields the body kept, once it's been read to its end.
-    class trailer_source
+    // body_source is what the client's response bodies implement for what client_response asks of its body, which it
+    // finds with a dynamic_cast (so client_response holds nothing more for them): its trailers() and set_priority().
+    class body_source
     {
     public:
         // trailers are the body's trailer fields: empty until a read has reported its end, and for a body without
         // any. Valid as long as the body is.
         [[nodiscard]] virtual const trailer_fields& trailers() const noexcept = 0;
 
+        // set_priority asks the server to send the rest of the body with priority p, returning whether it could (see
+        // client_response::set_priority()).
+        virtual bool set_priority(const priority& p) = 0;
+
     protected:
-        trailer_source() noexcept                                 = default;
-        trailer_source(const trailer_source&) noexcept            = default;
-        trailer_source& operator=(const trailer_source&) noexcept = default;
-        trailer_source(trailer_source&&) noexcept                 = default;
-        trailer_source& operator=(trailer_source&&) noexcept      = default;
-        ~trailer_source()                                         = default;
+        body_source() noexcept                              = default;
+        body_source(const body_source&) noexcept            = default;
+        body_source& operator=(const body_source&) noexcept = default;
+        body_source(body_source&&) noexcept                 = default;
+        body_source& operator=(body_source&&) noexcept      = default;
+        ~body_source()                                      = default;
     };
 }
 
@@ -275,6 +280,18 @@ struct client_response
     // put in its place). They're kept apart from headers (RFC 9110, section 6.5), and without the fields that can't be
     // trailers (see trailer_allowed()), which are dropped. They're the body's: valid as long as it is.
     [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept;
+
+    // set_priority asks the server to send the rest of the response with priority p (RFC 9218; e.g. {.urgency = 7}
+    // for a download that's become background): over HTTP/2, a PRIORITY_UPDATE frame for its stream (an urgency past
+    // 7 sent as 7), which the server may ignore. It returns false, sending nothing, over HTTP/1.1, for a body that
+    // isn't the client's (e.g. one the caller put in its place), or once the response has ended (the server's sent all
+    // of it, though it may not all have been read yet) or failed. Repeating what was last asked sends nothing more, and
+    // updates made faster than the connection's writer takes them are sent as the last of them. Any thread may call
+    // it, while the body's being read too.
+    //
+    // (The request's own body, if it were still being sent, would take p's turns among the connection's other
+    // uploads; but send() returns once it's all gone, so by then it has.)
+    bool set_priority(const priority& p);
 };
 
 // server_response represents an outgoing HTTP response from a server to a client.

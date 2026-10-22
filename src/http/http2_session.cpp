@@ -970,13 +970,36 @@ std::error_code session::submit_headers(stream_id stream, std::span<const hpack:
     if (connection_failed || it == streams.end() || it->second.local_closed)
         return make_error_code(error_code::stream_closed);
 
-    // a response to HEAD has no body, whatever its Content-Length says.
+    // a response to HEAD has no body, whatever its Content-Length says. And a request's Priority field is the first
+    // thing its stream says of its priority (see submit_priority_update()), read as the server reads it: its lines
+    // joined (RFC 9651, section 4.2; in a string of their own only if there are several, which is rare), over RFC
+    // 9218's default. (Trailers have no :method.)
     if (side == role::client)
     {
+        bool             request = false;
+        std::size_t      lines   = 0;
+        std::string_view first;
+        std::string      joined;
         for (const auto& f : fields)
         {
-            if (f.name == ":method") it->second.head_request = f.value == "HEAD";
+            if (f.name == ":method")
+            {
+                request                 = true;
+                it->second.head_request = f.value == "HEAD";
+            }
+            else if (f.name == "priority")
+            {
+                if (++lines == 1)
+                {
+                    first = f.value;
+                    continue;
+                }
+                if (lines == 2) joined = first;
+                joined += ", ";
+                joined += f.value;
+            }
         }
+        if (request && lines > 0) it->second.said = parse_priority(lines == 1 ? first : std::string_view{joined});
     }
 
     encoded_block.clear();
@@ -1017,6 +1040,98 @@ session::submit_data(stream_id stream, std::span<const std::byte> data, bool end
     }
 
     return sent;
+}
+
+std::expected<bool, std::error_code> session::submit_priority_update(stream_id stream, priority p)
+{
+    // only a client sends it (RFC 9218, section 7.1): a server's session takes one as a connection error.
+    if (side == role::server) return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    // a stream the server's ended (or that's gone) has no response left to reprioritize: the server would ignore it
+    // (and count it, as a glitch, as this side does).
+    const auto it = streams.find(stream);
+    if (connection_failed || it == streams.end() || it->second.remote_closed) return false;
+
+    // past 7 is 7, as the schedulers take it (the server would ignore an urgency past 7, keeping the default).
+    p.urgency = std::min<std::uint8_t>(p.urgency, 7);
+
+    auto&      s       = it->second;
+    const auto pending = std::ranges::find(pending_updates, stream, &pending_update::stream);
+    if (p == s.said) return true;
+
+    if (pending == pending_updates.end())
+    {
+        pending_updates.push_back({.stream = stream, .at = output.size(), .before = s.said});
+        write_priority_update(stream, p, output.size(), 0);
+        s.said = p;
+        return true;
+    }
+
+    // one's waiting: it says this instead, or, if this is what was said before it, it's taken back.
+    const auto at = pending->at;
+    const auto old =
+        frame_header_size + decode_frame_header(std::span{output}.subspan(at).first<frame_header_size>()).length;
+    if (p == pending->before)
+    {
+        take_back_update(stream);
+        return true;
+    }
+
+    write_priority_update(stream, p, at, old);
+    s.said = p;
+    return true;
+}
+
+void session::write_priority_update(stream_id stream, priority p, std::size_t at, std::size_t old)
+{
+    // NOTE: encoded_block is only used within a call (as submit_headers() encodes a block), so it's reused here.
+    encoded_block.clear();
+    encode_priority_update(stream, to_string(p), encoded_block);
+
+    const auto first = output.begin() + static_cast<std::ptrdiff_t>(at);
+    if (old == encoded_block.size())
+    {
+        std::ranges::copy(encoded_block, first);
+        return;
+    }
+
+    if (old == 0)
+    {
+        output.insert(first, encoded_block.begin(), encoded_block.end());
+    }
+    else
+    {
+        output.erase(first, first + static_cast<std::ptrdiff_t>(old));
+        output.insert(output.begin() + static_cast<std::ptrdiff_t>(at), encoded_block.begin(), encoded_block.end());
+    }
+
+    // the frames after it moved.
+    for (auto& u : pending_updates)
+    {
+        if (u.at > at) u.at = u.at + encoded_block.size() - old;
+    }
+}
+
+void session::take_back_update(stream_id stream)
+{
+    // NOTE: none, nearly always.
+    if (pending_updates.empty()) return;
+
+    const auto pending = std::ranges::find(pending_updates, stream, &pending_update::stream);
+    if (pending == pending_updates.end()) return;
+
+    const auto at = pending->at;
+    const auto length =
+        frame_header_size + decode_frame_header(std::span{output}.subspan(at).first<frame_header_size>()).length;
+    if (const auto it = streams.find(stream); it != streams.end()) it->second.said = pending->before;
+    pending_updates.erase(pending);
+
+    const auto first = output.begin() + static_cast<std::ptrdiff_t>(at);
+    output.erase(first, first + static_cast<std::ptrdiff_t>(length));
+    for (auto& u : pending_updates)
+    {
+        if (u.at > at) u.at -= length;
+    }
 }
 
 void session::reset(stream_id stream, error_code code)
@@ -1071,6 +1186,7 @@ void session::take_output(std::vector<std::byte>& out)
     out.clear();
     out.swap(output);
     pending_replies = 0;
+    pending_updates.clear();
 }
 
 std::int64_t session::send_window(stream_id stream) const noexcept
@@ -1146,6 +1262,9 @@ void session::close_local(stream_id stream)
 
 void session::close_remote(stream_id stream)
 {
+    // the server's ended its response: an update waiting for it is taken back (it would only be ignored).
+    take_back_update(stream);
+
     const auto it = streams.find(stream);
     if (it == streams.end()) return;
 
@@ -1155,6 +1274,7 @@ void session::close_remote(stream_id stream)
 
 void session::forget(stream_id stream)
 {
+    take_back_update(stream);
     if (streams.erase(stream) == 0) return;
 
     if (peer_initiated(stream)) --open_peer_streams;

@@ -16,7 +16,11 @@
 // - 5: consume (the next byte chooses a stream; the one after, how much, in 256s).
 // - 6: PING, or GOAWAY (the next byte: bit 0 which, 1 whether the last stream is the peer's last or the most, 4-7 the
 //      code).
-// - 7: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
+// - 7, with the op's bit 5: submit a PRIORITY_UPDATE (the next byte: bits 0-3 choose a stream, 4-7 its urgency, past 7
+//      too; the op's bit 6, incremental): a client's, which is sent only if it changes what the stream last said, and
+//      replaces one not yet taken (a server's fails). The output's taken after every record but these, so several may
+//      wait in it, to be replaced, or taken back (e.g. as the next record receives the end of a stream).
+// - 7, without: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
 //      - 0: SETTINGS changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the session's
 //        encoder to follow;
 //      - 1: SETTINGS with NO_RFC7540_PRIORITIES of the next byte (0, 1, or a value that's invalid);
@@ -27,9 +31,13 @@
 //        its length).
 // A stream is chosen from those the application knows (a server's requests, a client's own), in order.
 //
+// Each output is checked to be whole frames, its PRIORITY_UPDATEs on stream 0 with values in to_string()'s form (so
+// one replaced or taken back in place has left the frames around it whole).
+//
 // The server's script follows the client's preface and SETTINGS, and the client's the server's SETTINGS, each with
 // only NO_RFC7540_PRIORITIES (1, as both sides send it), so that the fuzzer starts past them. The client opens streams
-// before it receives: a GET (1), a POST with a Content-Length of 3 and no body yet (3), and a HEAD (5).
+// before it receives: a GET (1), a POST with a Content-Length of 3 and no body yet (3), a HEAD (5), and a GET with a
+// Priority field of two lines, "u=1" and "i" (7).
 #include "http/http2.hpp"
 
 #include <algorithm>
@@ -182,6 +190,27 @@ bool blocks_decode(http2::role                                    role,
     return decoded == submitted.size();
 }
 
+// whole_frames is whether a session's output is whole frames, nothing left over, its PRIORITY_UPDATEs on stream 0 with
+// values in to_string()'s form (so one replaced or taken back in place has left the frames around it whole).
+bool whole_frames(http2::role role, std::span<const std::byte> output)
+{
+    if (role == http2::role::client) output = output.subspan(http2::preface.size());
+
+    while (output.size() >= http2::frame_header_size)
+    {
+        const auto h = http2::decode_frame_header(output.first<http2::frame_header_size>());
+        if (output.size() < http2::frame_header_size + h.length) return false;
+        const auto payload = output.subspan(http2::frame_header_size, h.length);
+        output             = output.subspan(http2::frame_header_size + h.length);
+        if (h.type != static_cast<std::uint8_t>(http2::frame_type::priority_update)) continue;
+
+        if (h.stream != 0 || payload.size() < 4) return false;
+        const auto value = std::string_view{reinterpret_cast<const char*>(payload.data()) + 4, payload.size() - 4};
+        if (net::http::to_string(net::http::parse_priority(value)) != value) return false;
+    }
+    return output.empty();
+}
+
 // script is the fuzzer's input, read a byte at a time.
 struct script
 {
@@ -220,6 +249,7 @@ public:
             open(get, true);
             open(post, false);
             open(head, true);
+            open(get_prioritized, true);
         }
     }
 
@@ -230,20 +260,23 @@ public:
         script sc{input};
         while (!sc.done())
         {
-            step(sc);
-            collect();
+            // (the output's taken after each step but a PRIORITY_UPDATE's, so several may wait in it to be replaced
+            // or taken back.)
+            if (!step(sc)) collect();
         }
 
         out.unused = pending.size();
         out.events = std::move(events.log);
         collect();
 
-        if (!blocks_decode(role, out.output, events.table_sizes, submitted))
+        if (!whole_frames(role, out.output) || !blocks_decode(role, out.output, events.table_sizes, submitted))
         {
-            std::println(stderr,
-                         "PROPERTY FAILED: the {}'s header blocks don't decode to what it submitted\n{}",
-                         role == http2::role::server ? "server" : "client",
-                         out.events);
+            std::println(
+                stderr,
+                "PROPERTY FAILED: the {}'s output isn't whole frames, or its header blocks don't decode to what it "
+                "submitted\n{}",
+                role == http2::role::server ? "server" : "client",
+                out.events);
             std::abort();
         }
         return std::move(out);
@@ -262,6 +295,14 @@ private:
         hpack::field{    .name = ":authority", .value = "example.com"},
         hpack::field{         .name = ":path",           .value = "/"},
         hpack::field{.name = "content-length",           .value = "3"},
+    };
+    static constexpr std::array get_prioritized{
+        hpack::field{   .name = ":method",         .value = "GET"},
+        hpack::field{   .name = ":scheme",       .value = "https"},
+        hpack::field{.name = ":authority", .value = "example.com"},
+        hpack::field{     .name = ":path",           .value = "/"},
+        hpack::field{  .name = "priority",         .value = "u=1"},
+        hpack::field{  .name = "priority",           .value = "i"},
     };
     static constexpr std::array head{
         hpack::field{   .name = ":method",        .value = "HEAD"},
@@ -334,6 +375,15 @@ private:
         const auto sent = s.submit_data(id, data, (arg & 0x80U) != 0);
         events.log += sent.has_value() ? std::format("submit data {} {}\n", id, *sent)
                                        : std::format("submit data {} error {}\n", id, sent.error().value());
+    }
+
+    void submit_priority_update(bool incremental, std::uint8_t arg)
+    {
+        const auto id = stream(arg & 0xfU);
+        const auto sent =
+            s.submit_priority_update(id, {.urgency = static_cast<std::uint8_t>(arg >> 4U), .incremental = incremental});
+        events.log += sent.has_value() ? std::format("submit priority {} {}\n", id, *sent)
+                                       : std::format("submit priority {} error {}\n", id, sent.error().value());
     }
 
     // rare_frame receives one of the frames random bytes rarely make (op 7's).
@@ -419,7 +469,8 @@ private:
         receive(frame);
     }
 
-    void step(script& sc)
+    // step runs the script's next record, returning whether it was a submitted PRIORITY_UPDATE.
+    bool step(script& sc)
     {
         const auto op = sc.next();
         switch (op & 7U)
@@ -466,10 +517,18 @@ private:
             break;
         }
 
-        case 7: rare_frame(op >> 3U, sc); break;
+        case 7:
+            if ((op & 0x20U) != 0)
+            {
+                submit_priority_update((op & 0x40U) != 0, sc.next());
+                return true;
+            }
+            rare_frame(op >> 3U, sc);
+            break;
 
         default: break;
         }
+        return false;
     }
 
     // receive passes what's arrived to the session: at once, or a byte at a time, each time with what's left of the

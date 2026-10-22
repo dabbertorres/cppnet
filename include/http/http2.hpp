@@ -122,6 +122,10 @@ void encode_rst_stream(stream_id stream, std::uint32_t code, std::vector<std::by
 void encode_window_update(stream_id stream, std::uint32_t increment, std::vector<std::byte>& out);
 void encode_data(stream_id stream, std::span<const std::byte> data, bool end_stream, std::vector<std::byte>& out);
 
+// encode_priority_update encodes a PRIORITY_UPDATE frame (RFC 9218, section 7.1), on stream 0: the prioritized stream,
+// and a Priority field's value.
+void encode_priority_update(stream_id prioritized, std::string_view value, std::vector<std::byte>& out);
+
 // encode_headers encodes a header block as a HEADERS frame and as many CONTINUATIONs as it needs to keep each frame's
 // payload within max_frame_size.
 void encode_headers(stream_id                  stream,

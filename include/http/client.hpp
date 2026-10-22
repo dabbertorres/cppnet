@@ -40,7 +40,8 @@ enum class client_errc : std::uint8_t
 // HTTP/2 is spoken to servers that agree on it (or, over cleartext, with client_options::http2_prior_knowledge): each
 // request takes a stream of a connection the host's requests share. A request's version and Connection field are
 // HTTP/1.x's, and mean nothing over HTTP/2 (its connections aren't closed after a request, and there's no HTTP/1.0):
-// client_options::http2 = false is how to have them.
+// client_options::http2 = false is how to have them. A request's Priority field (RFC 9218) orders its body among the
+// connection's others, and client_response::set_priority() changes its response's priority in flight.
 //
 // An HTTP/1.x connection is reused once the response's body has been read to its end (until a read reports
 // io::errc::end_of_stream, or all of its Content-Length has been read). Destroying a response whose body hasn't been

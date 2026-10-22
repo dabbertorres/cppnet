@@ -45,6 +45,7 @@
 #include "http/http2_client.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_session.hpp"
+#include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -672,6 +673,55 @@ TEST_CASE("an HTTP/2 request body whose Priority field doesn't parse takes RFC 9
         const bool went = co_await h.take_turns(2);
         REQUIRE(went);
         CHECK(h.frames() == "BABACC");
+    };
+
+    sched.run_to_completion(test(&sched, &outcomes));
+}
+
+TEST_CASE("an HTTP/2 request reprioritized while its body waits takes its new turns, and tells the server",
+          "[http][http2][client][scheduler][priority]")
+{
+    std::array<outcome, 4> outcomes; // (before the scheduler, which waits for the requests)
+    net::io::scheduler     sched{make_pool()};
+
+    const auto test = [](net::io::scheduler* sched, std::array<outcome, 4>* outcomes) -> task<>
+    {
+        auto fake = co_await connect_fake(sched, {.io_timeout = 10s});
+        // NOLINTNEXTLINE(bugprone-exception-escape): close() only throws if it can't allocate.
+        net::util::defer closing{[&fake] noexcept { fake.conn->close(); }};
+        held             h{sched, &fake};
+
+        const bool plugged = co_await h.plug(&outcomes->at(0));
+        REQUIRE(plugged);
+
+        // three bodies without fields, u=3 incremental, which would take turns ("ABCABC").
+        for (std::size_t i = 0; i < 3; ++i)
+        {
+            const bool queued = co_await h.send(upload(2 * frame), &outcomes->at(i + 1));
+            REQUIRE(queued);
+        }
+
+        // reprioritized as they wait (as client_response::set_priority() does, through the response's body): C first,
+        // whole, and A after B; and the server's told. (A stream the connection doesn't have can't be.)
+        CHECK(fake.conn->reprioritize(h.ids.at(2), {.urgency = 0}));
+        CHECK(fake.conn->reprioritize(h.ids.at(0), {.urgency = 7}));
+        CHECK_FALSE(fake.conn->reprioritize(99, {.urgency = 1}));
+
+        const bool went = co_await h.take_turns(2);
+        REQUIRE(went);
+        CHECK(h.frames() == "CCBBAA");
+
+        const bool told = co_await h.server.pump([&h] { return h.server.priority_updates.size() >= 2; });
+        REQUIRE(told);
+        const std::vector<std::pair<http2::stream_id, http::priority>> want{
+            {h.ids.at(2), {.urgency = 0}},
+            {h.ids.at(0), {.urgency = 7}},
+        };
+        CHECK(h.server.priority_updates == want);
+
+        // once the connection's ended, failing the streams, none can be (though the session knows nothing of it).
+        fake.conn->close();
+        CHECK_FALSE(fake.conn->reprioritize(h.ids.at(1), {.urgency = 1}));
     };
 
     sched.run_to_completion(test(&sched, &outcomes));

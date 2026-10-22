@@ -1920,3 +1920,287 @@ TEST_CASE("PRIORITY_UPDATE for a stream after this side's GOAWAY is ignored, not
     REQUIRE_FALSE(server.failure);
     CHECK(server.events.take() == std::vector<std::string>{"priority 1 u=5"});
 }
+
+namespace
+{
+
+// frames_with_updates is out's PRIORITY_UPDATE frames, as "stream value" (a frame on a stream other than 0 as
+// "on stream n"), and its other frames' types, as "type n": so where an update is among the frames is seen too.
+std::vector<std::string> frames_with_updates(std::span<const std::byte> out)
+{
+    if (as_string(out).starts_with(http2::preface)) out = out.subspan(http2::preface.size());
+
+    std::vector<std::string> found;
+    while (out.size() >= 9)
+    {
+        const auto h       = http2::decode_frame_header(out.first<9>());
+        const auto payload = out.subspan(9, h.length);
+        out                = out.subspan(9 + h.length);
+
+        if (h.type != static_cast<std::uint8_t>(http2::frame_type::priority_update))
+        {
+            found.push_back(std::format("type {}", h.type));
+        }
+        else if (h.stream != 0)
+        {
+            found.push_back(std::format("on stream {}", h.stream));
+        }
+        else
+        {
+            found.push_back(std::format("update {} [{}]", read_u32(payload), as_string(payload.subspan(4))));
+        }
+    }
+    REQUIRE(out.empty());
+    return found;
+}
+
+// updates_in is out's PRIORITY_UPDATE frames alone (see frames_with_updates()).
+std::vector<std::string> updates_in(std::span<const std::byte> out)
+{
+    auto found = frames_with_updates(out);
+    std::erase_if(found, [](const std::string& f) { return !f.starts_with("update"); });
+    return found;
+}
+
+// with_priority is a request with a Priority field of these lines.
+std::vector<hpack::field> with_priority(std::initializer_list<std::string_view> lines, std::string_view method = "GET")
+{
+    auto fields = request(method);
+    for (const auto line : lines) fields.push_back({.name = "priority", .value = line});
+    return fields;
+}
+
+// open_request opens a client's stream for a request with fields (ending it, unless end is false).
+http2::stream_id open_request(endpoint& client, std::span<const hpack::field> fields, bool end = true)
+{
+    const auto id = client.s.open_stream();
+    REQUIRE(id.has_value());
+    REQUIRE_FALSE(client.s.submit_headers(*id, fields, end));
+    return *id;
+}
+
+}
+
+TEST_CASE("a client's PRIORITY_UPDATE is on stream 0, for its stream, with the priority's value",
+          "[http][http2][session][priority][client]")
+{
+    connected  c;
+    const auto id = open_request(c.client, request());
+
+    CHECK(c.client.s.submit_priority_update(id, {.urgency = 5, .incremental = true}) == true);
+
+    std::vector<std::byte> out;
+    c.client.s.take_output(out);
+    CHECK(frames_with_updates(out) == std::vector<std::string>{"type 1", "update 1 [u=5, i]"});
+
+    // the server takes it as the stream's priority.
+    c.server.deliver(out);
+    REQUIRE_FALSE(c.server.failure);
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{
+              "headers 1 head end :method=GET :scheme=https :authority=example.com :path=/",
+              "priority 1 u=5 i",
+          });
+
+    // a complete set: the default is "", and an urgency past 7 is 7.
+    CHECK(c.client.s.submit_priority_update(id, {}) == true);
+    c.client.s.take_output(out);
+    CHECK(updates_in(out) == std::vector<std::string>{"update 1 []"});
+    CHECK(c.client.s.submit_priority_update(id, {.urgency = 9}) == true);
+    c.client.s.take_output(out);
+    CHECK(updates_in(out) == std::vector<std::string>{"update 1 [u=7]"});
+    c.server.deliver(out);
+    CHECK(c.server.events.take() == std::vector<std::string>{"priority 1 u=7"});
+}
+
+TEST_CASE("a client's PRIORITY_UPDATE is sent only when it changes what the stream last said",
+          "[http][http2][session][priority][client]")
+{
+    connected              c;
+    std::vector<std::byte> out;
+
+    SECTION("the request's field is what it said first")
+    {
+        const auto id = open_request(c.client, with_priority({"u=1"}));
+        CHECK(c.client.s.submit_priority_update(id, {.urgency = 1}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+
+        CHECK(c.client.s.submit_priority_update(id, {.urgency = 1, .incremental = true}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out) == std::vector<std::string>{"update 1 [u=1, i]"});
+
+        // then that's what it said.
+        CHECK(c.client.s.submit_priority_update(id, {.urgency = 1, .incremental = true}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+    }
+
+    SECTION("a field of several lines is them joined")
+    {
+        const auto id = open_request(c.client, with_priority({"u=6", "i"}));
+        CHECK(c.client.s.submit_priority_update(id, {.urgency = 6, .incremental = true}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+    }
+
+    SECTION("what a field leaves out, or all of one that doesn't parse, is the default")
+    {
+        const auto partial   = open_request(c.client, with_priority({"i"}));
+        const auto malformed = open_request(c.client, with_priority({"u=1, @"}));
+        CHECK(c.client.s.submit_priority_update(partial, {.urgency = 3, .incremental = true}) == true);
+        CHECK(c.client.s.submit_priority_update(malformed, {}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+    }
+
+    SECTION("without a field, it's said nothing: the first update is sent, even the default")
+    {
+        const auto id = open_request(c.client, request());
+        CHECK(c.client.s.submit_priority_update(id, {}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out) == std::vector<std::string>{"update 1 []"});
+
+        CHECK(c.client.s.submit_priority_update(id, {}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+    }
+}
+
+TEST_CASE("a client's PRIORITY_UPDATE not yet taken is replaced in place, or taken back",
+          "[http][http2][session][priority][client]")
+{
+    connected              c;
+    std::vector<std::byte> out;
+    const auto             first  = open_request(c.client, with_priority({"u=1"}, "POST"), false);
+    const auto             second = open_request(c.client, request());
+    c.client.s.take_output(out);
+    c.server.deliver(out);
+    c.server.events.take();
+
+    SECTION("by a later one, longer or shorter, where it was")
+    {
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 5}) == true);
+        REQUIRE(c.client.s.submit_data(first, bytes_of("abc"), false) == 3U);
+        REQUIRE(c.client.s.submit_priority_update(second, {.urgency = 0}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 6, .incremental = true}) == true);
+        REQUIRE(c.client.s.submit_priority_update(second, {.urgency = 2}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 4}) == true);
+
+        c.client.s.take_output(out);
+        CHECK(frames_with_updates(out) == std::vector<std::string>{"update 1 [u=4]", "type 0", "update 3 [u=2]"});
+
+        // what it says, the server takes.
+        c.server.deliver(out);
+        REQUIRE_FALSE(c.server.failure);
+        CHECK(c.server.events.take() == std::vector<std::string>{"priority 1 u=4", "data 1 [abc]", "priority 3 u=2"});
+    }
+
+    SECTION("by one saying what was said before it")
+    {
+        REQUIRE(c.client.s.submit_priority_update(second, {.urgency = 0}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 5}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 1}) == true);
+
+        c.client.s.take_output(out);
+        CHECK(frames_with_updates(out) == std::vector<std::string>{"update 3 [u=0]"});
+
+        // and it's what's said: the same again sends nothing, another does.
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 1}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out).empty());
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 5}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out) == std::vector<std::string>{"update 1 [u=5]"});
+    }
+
+    SECTION("once taken, the next is a frame of its own")
+    {
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 5}) == true);
+        c.client.s.take_output(out);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 1}) == true);
+        c.client.s.take_output(out);
+        CHECK(updates_in(out) == std::vector<std::string>{"update 1 [u=1]"});
+    }
+
+    SECTION("when its stream ends: the server ends its response (the request's still being sent, or not), or it's "
+            "reset")
+    {
+        const auto third = open_request(c.client, request());
+        REQUIRE(c.client.s.submit_priority_update(second, {.urgency = 0}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 5}) == true);
+        REQUIRE(c.client.s.submit_priority_update(third, {.urgency = 6}) == true);
+
+        // (the third's head too.)
+        std::vector<std::byte> head;
+        c.client.s.take_output(head);
+        CHECK(frames_with_updates(head)
+              == std::vector<std::string>{"type 1", "update 3 [u=0]", "update 1 [u=5]", "update 5 [u=6]"});
+        c.server.deliver(head);
+        REQUIRE(c.client.s.submit_priority_update(second, {.urgency = 1}) == true);
+        REQUIRE(c.client.s.submit_priority_update(first, {.urgency = 2}) == true);
+        REQUIRE(c.client.s.submit_priority_update(third, {.urgency = 4}) == true);
+
+        // the first's request goes on (its stream's half-closed (remote)); the second's has ended (so it's closed).
+        REQUIRE_FALSE(c.server.s.submit_headers(first, response(), true));
+        REQUIRE_FALSE(c.server.s.submit_headers(second, response(), true));
+        std::vector<std::byte> answer;
+        c.server.s.take_output(answer);
+        c.client.deliver(answer);
+        c.client.s.reset(third, http2::error_code::cancel);
+
+        c.client.s.take_output(out);
+        CHECK(frames_with_updates(out) == std::vector<std::string>{"type 3"});
+    }
+}
+
+TEST_CASE("a client's PRIORITY_UPDATE is for a stream whose response may still come",
+          "[http][http2][session][priority][client]")
+{
+    connected              c;
+    std::vector<std::byte> out;
+    const auto             ended    = open_request(c.client, request());
+    const auto             sending  = open_request(c.client, request("POST"), false);
+    const auto             answered = open_request(c.client, request());
+    const auto             reset    = open_request(c.client, request());
+    const auto             early    = open_request(c.client, request("POST"), false);
+    c.client.s.take_output(out);
+    c.server.deliver(out);
+
+    // the server's ended one's response, and another's whose request is still being sent (early: half-closed (remote)),
+    // and answered another without ending it; the client's reset one, and another's request is still being sent.
+    REQUIRE_FALSE(c.server.s.submit_headers(ended, response(), true));
+    REQUIRE_FALSE(c.server.s.submit_headers(answered, response(), false));
+    REQUIRE_FALSE(c.server.s.submit_headers(early, response(), true));
+    c.server.s.take_output(out);
+    c.client.deliver(out);
+    c.client.s.reset(reset, http2::error_code::cancel);
+    c.client.s.take_output(out);
+
+    // a stream whose request has ended (half-closed (local)), or is still being sent, may be reprioritized; one whose
+    // response has ended (even with its request still being sent), one reset, and one the client never opened, can't.
+    CHECK(c.client.s.submit_priority_update(answered, {.urgency = 1}) == true);
+    CHECK(c.client.s.submit_priority_update(sending, {.urgency = 2}) == true);
+    CHECK(c.client.s.submit_priority_update(ended, {.urgency = 3}) == false);
+    CHECK(c.client.s.submit_priority_update(reset, {.urgency = 4}) == false);
+    CHECK(c.client.s.submit_priority_update(early, {.urgency = 4}) == false);
+    CHECK(c.client.s.submit_priority_update(99, {.urgency = 5}) == false);
+
+    c.client.s.take_output(out);
+    CHECK(updates_in(out) == std::vector<std::string>{"update 5 [u=1]", "update 3 [u=2]"});
+
+    // nor once the connection's failed.
+    c.client.deliver(std::vector<std::byte>(9, std::byte{0xff}));
+    REQUIRE(c.client.failure);
+    CHECK(c.client.s.submit_priority_update(answered, {.urgency = 6}) == false);
+}
+
+TEST_CASE("a server's session doesn't send PRIORITY_UPDATE", "[http][http2][session][priority]")
+{
+    connected  c;
+    const auto id = open_request(c.client, request());
+    pump(c.client, c.server);
+
+    CHECK(c.server.s.submit_priority_update(id, {.urgency = 1}).error() == std::errc::invalid_argument);
+    CHECK_FALSE(c.server.s.has_output());
+}

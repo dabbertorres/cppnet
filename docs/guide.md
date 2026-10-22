@@ -397,6 +397,13 @@ As the server's, the client's HTTP/2 connections set TCP_NOTSENT_LOWAT on their 
 (`client_options::http2_notsent_lowat`, 16 KiB; over TLS, the TCP socket's; not on HTTP/1.1's; 0 sets none), and their
 writers wait for the kernel to hold less than that before framing more, so a body that's more urgent isn't queued
 behind what the send buffer holds of others'.
+Once `send()` has returned, `resp->set_priority({.urgency = 7})` asks the server to send the rest of the response with
+another priority (RFC 9218's `PRIORITY_UPDATE`; e.g. a download that's gone to the background, or a request the user's
+now waiting for): a request's field is its first priority, and the update replaces it (what it leaves out is the
+default, not what the field said). It sends something only when the priority changes, and updates made faster than the
+connection's writer takes them go as their last. It returns false, sending nothing, over HTTP/1.1, for a body the
+caller put in place of the client's, and once the response has ended (all of it's come) or failed; the server may
+ignore it (cppnet's takes it, see Priority below). Any thread may call it, while the body's being read too.
 A response destroyed before its body's end resets just its stream. Requests to a host known to speak
 HTTP/2 (one of its connections agreed on it, or with prior knowledge) wait for a connection being made to it, rather
 than each making their own. As Go's client does, it knows that of a host only while it has connections: a burst of
@@ -800,9 +807,10 @@ scheduler.spawn(server.serve());
   what's past reordering is the mark and a round of frames (64 KiB), rather than the send buffer, which the kernel
   grows up to megabytes; what's in flight isn't limited, so a path with a long round trip still fills its window. 0
   sets none, and the writer writes as the socket takes it. A client sets a request's priority with the same field
-  (`req.headers.set("Priority", to_string({.urgency = 1}))`): `http::client` sends no other signal, and orders its own
-  request bodies by it (`u=3, i` without one: see the client, above). A field sent as several lines is one value, its lines
-  joined with commas: `req.headers.get()` gives only the first.
+  (`req.headers.set("Priority", to_string({.urgency = 1}))`), orders its own request bodies by it (`u=3, i` without
+  one: see the client, above), and changes a response's in flight with `client_response::set_priority()`, which sends
+  `PRIORITY_UPDATE`. A field sent as several lines is one value, its lines joined with commas: `req.headers.get()`
+  gives only the first.
 - **HTTPS:** give `server_config::tls` a `tls::server_context`, made from the certificate chain and private key (PEM
   files). Making it reports a file that can't be loaded as an error, before the server starts:
 

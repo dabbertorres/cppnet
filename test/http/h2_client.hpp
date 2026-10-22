@@ -177,8 +177,13 @@ struct h2_client final : http2::session_events
     }
     void on_ping_ack(std::span<const std::byte, 8> /*opaque*/) override { ++pings; }
 
-    // (as a server, for the client's tests: cppnet's client never sends PRIORITY_UPDATE.)
-    void on_priority_update(http2::stream_id /*stream*/, net::http::priority /*p*/) override {}
+    // priority_updates are the PRIORITY_UPDATEs received (as a server, for the client's tests), in order.
+    std::vector<std::pair<http2::stream_id, net::http::priority>> priority_updates;
+
+    void on_priority_update(http2::stream_id stream, net::http::priority p) override
+    {
+        priority_updates.emplace_back(stream, p);
+    }
 
     void done(response& r)
     {
@@ -313,21 +318,8 @@ struct h2_client final : http2::session_events
     {
         std::vector<std::byte> frames;
         s.take_output(frames);
-        append_priority_update(id, value, frames);
+        http2::encode_priority_update(id, value, frames);
         co_return !(co_await net::io::write_all(*out, frames)).err;
-    }
-
-    // append_priority_update appends a PRIORITY_UPDATE frame (RFC 9218, section 7.1) to out.
-    static void append_priority_update(http2::stream_id id, std::string_view value, std::vector<std::byte>& out)
-    {
-        http2::encode_frame_header({.length = static_cast<std::uint32_t>(4 + value.size()),
-                                    .type   = static_cast<std::uint8_t>(http2::frame_type::priority_update),
-                                    .flags  = 0,
-                                    .stream = 0},
-                                   out);
-        for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::byte>(id >> shift));
-        const auto bytes = std::as_bytes(std::span{value});
-        out.insert(out.end(), bytes.begin(), bytes.end());
     }
 
     // sync sends a PING, and pumps until it's acknowledged: by then, the server has received all that was sent before.

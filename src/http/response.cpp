@@ -17,6 +17,7 @@
 #include "coro/task.hpp"
 #include "http/chunked_writer.hpp"
 #include "http/headers.hpp"
+#include "http/priority.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/discard_writer.hpp"
 #include "io/limit_writer.hpp"
@@ -53,8 +54,16 @@ const trailer_fields& client_response::trailers() const noexcept
     // NOTE: a body the caller put in place of the client's has none.
     static const trailer_fields none;
 
-    const auto* source = dynamic_cast<const detail::trailer_source*>(body.get());
+    const auto* source = dynamic_cast<const detail::body_source*>(body.get());
     return source != nullptr ? source->trailers() : none;
+}
+
+// NOTE: not const, though nothing of the response object changes: what the server sends of it does.
+// NOLINTNEXTLINE(readability-make-member-function-const)
+bool client_response::set_priority(const priority& p)
+{
+    auto* source = dynamic_cast<detail::body_source*>(body.get());
+    return source != nullptr && source->set_priority(p);
 }
 
 status parse_status(std::string_view str) noexcept

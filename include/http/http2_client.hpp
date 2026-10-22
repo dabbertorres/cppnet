@@ -22,6 +22,7 @@
 #include "http/http2.hpp"
 #include "http/http2_config.hpp"
 #include "http/http2_connection.hpp"
+#include "http/priority.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
@@ -170,6 +171,13 @@ public:
     // done is a request being done with its stream: its response's body, or send() if the request failed (resetting
     // it if it's not finished, and telling the pool it's free).
     void done(http2::stream_id id);
+
+    // reprioritize changes a request's priority once its response's head has come (client_response::set_priority(),
+    // through its body; docs/plans/http2.md, stage 6's ninth part): it sends the server a PRIORITY_UPDATE for the
+    // stream (only if it changes what the stream last said: see http2::session::submit_priority_update()), and moves
+    // the request's body in the connection's scheduler, should it still be waiting there. It returns false, doing
+    // nothing, once the response has ended (or failed), or the stream's done with. It takes the lock.
+    bool reprioritize(http2::stream_id id, priority p);
 
     // cancel fails a request's stream with std::errc::operation_canceled (unless it's failed already), and resets it
     // (CANCEL), if it's still there: a request's stop callback (see canceler), so it takes the lock, and must not be

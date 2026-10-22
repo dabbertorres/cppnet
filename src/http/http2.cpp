@@ -172,6 +172,14 @@ void encode_data(stream_id stream, std::span<const std::byte> data, bool end_str
     out.insert(out.end(), data.begin(), data.end());
 }
 
+void encode_priority_update(stream_id prioritized, std::string_view value, std::vector<std::byte>& out)
+{
+    put_header(static_cast<std::uint32_t>(4 + value.size()), frame_type::priority_update, 0, 0, out);
+    put(prioritized & max_stream_id, 4, out);
+    const auto bytes = std::as_bytes(std::span{value});
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
 void encode_headers(stream_id                  stream,
                     std::span<const std::byte> block,
                     bool                       end_stream,

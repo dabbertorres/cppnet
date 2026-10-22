@@ -36,7 +36,9 @@ in the client over HTTP/2 (the stream's wait, `continue_deadline` checked by the
 on the same connection), done (2026-10-21); and its seventh, the client's request bodies through the connection's
 scheduler (one write path for both sides, every client stream u=3 incremental), done (2026-10-21); and its eighth, the
 client's request bodies by their requests' `Priority` fields, and TCP_NOTSENT_LOWAT on the client's HTTP/2 connections
-(`client_options::http2_notsent_lowat`), done (2026-10-21).
+(`client_options::http2_notsent_lowat`), done (2026-10-21); and its ninth, reprioritizing a request in flight
+(`client_response::set_priority()`, through `detail::body_source`, and the session's `submit_priority_update()`), done
+(2026-10-22).
 
 ## Goal
 
@@ -1744,6 +1746,95 @@ idle stream would be a connection error for the peer.
   before (median 1256), 1215 to 1345 after (median 1248). So the client's mark costs loopback nothing the noise shows,
   as part 4 found for the server's.
 
+### Part 9: reprioritizing a request in flight (done 2026-10-22)
+
+- As proposed (see "Reprioritizing a request in flight"; Decided question 34 (a)). The session:
+  `submit_priority_update(stream, p)` (`std::expected<bool, std::error_code>`; a server's `invalid_argument`) queues a
+  PRIORITY_UPDATE on stream 0 (`encode_priority_update()`, new in the codec, which `test::h2_client` now uses too) with
+  `to_string(p)`, and returns whether the stream's response may still be reprioritized: false, sending nothing, for a
+  stream that isn't open, one the server has ended (half-closed (remote): RFC 9218 has updates go to streams open or
+  half-closed (local), and the server would only count it as a glitch), and after a connection error. Each stream keeps
+  what it last said (`stream_state::said`, 2 bytes in what was padding, its urgency 0xff for nothing said), set by
+  `submit_headers()` from a request head's `priority` lines (joined, as the server joins them, over RFC 9218's default;
+  a head is a block with `:method`, so trailers don't count), so an update that says the same sends nothing (and
+  returns true). An update made while the last is still in the output (`pending_updates`: the frame's offset and what
+  was said before it, cleared by `take_output()`) is rewritten where it is (`write_priority_update()`, moving the later
+  pending frames' offsets when the length changes).
+- `client_response::set_priority(const priority&)` asks the body, as `trailers()` does: `detail::trailer_source` is
+  now `detail::body_source`, with a virtual `set_priority()` beside `trailers()`; `pooled_body`'s returns false; and
+  `http2_response_body`'s calls `http2_client_connection::reprioritize(id, p)`, which takes the lock, returns false
+  for a stream that's gone or failed (the connection's end fails streams the session still has: a test closes the
+  connection and checks), submits the update, and if the session took it, `send_order.update()`s the stream; then
+  wakes the writer (which writes only if there's output). Nothing's added to `client_response`, and nothing happens
+  unless it's called. It's not const (tidy would have it so, as nothing of the object changes: a NOLINT says why).
+- Not in the plan (where it's silent, or its wording didn't fit):
+  - A request without a `Priority` field has said nothing, so its first update is sent even if it's RFC 9218's
+    default (u=3, not incremental). "Initially the request's field's" read literally would make the default "the
+    same" and send nothing; but cppnet's server (and Go's) take a client that never signals as u=3 incremental, so the
+    default is a change there, and the RFC's servers apply the most recent signal anyway.
+  - An update back to what the stream said before the one waiting takes that one back (rather than rewriting it to
+    say what the server already has), and one waiting when its stream can no longer take it is taken back too: the
+    server's END_STREAM arriving (`close_remote()`) or the stream being forgotten (a reset, either side's;
+    `forget()`), as the server would count a closed stream's update as a glitch.
+  - An urgency past 7 (which `parse_priority()` never makes, but a caller can) is sent as 7, as the schedulers take
+    it; the server would otherwise ignore "u=9", keeping the default, while this side's scheduler took it as 7.
+  - "Moves the stream's own request body in the client's scheduler": done (`send_order.update()`, a few instructions),
+    but through `set_priority()` it never finds a body waiting: `send()` returns only once its body has all been
+    framed (`send_body()`, then `wait_for_head()`), and a response exists only once `send()` has returned. So the test
+    of the body moving calls the connection's `reprioritize()` directly, as `set_priority()` does. It would matter if a
+    later part had `send()` return before the body's done (a full-duplex stream).
+  - The plan's test of a response's DATA "then in the new order against another response" end to end isn't here:
+    cppnet's client can't hold its windows to make responses contend, and the server's reordering on a
+    PRIORITY_UPDATE is part 10's test ("a PRIORITY_UPDATE after the first frame"). What's checked end to end is the
+    server's view of the stream's priority, which part 10's scheduler reads.
+- Tests (no network). On bytes (`test/http/http2.cpp`, `[http][http2][session][priority][client]`, and through a
+  server's session, which takes each update as the stream's priority): the frame on stream 0 with the stream and the
+  value (a default's "", u=9 as "u=7"); nothing for the same as the request's field (one line, two lines joined, a
+  field leaving `i` out, one that doesn't parse), for a repeat, but the first update of a request without a field even
+  when it's the default; one waiting replaced where it was, longer and shorter, with a DATA frame and another stream's
+  update after it intact; one taken back by going back to what was said before it (then the same sending nothing, and
+  another a frame); one taken by the output, the next a frame of its own; ones taken back as their streams end (the
+  server ending one whose request is still being sent, and one whose request had ended; the client resetting one);
+  true for streams half-closed (local) and still sending, false for one whose response has ended (also while its
+  request is still being sent), one reset, one never opened, and after a connection error; and a server's refused.
+  Against cppnet's server (`test/http/client_priority.cpp`, `[http][http2][client][priority]`): a handler reports
+  its stream's priority (`detail::stream_priority()`) as it starts and after a gate, which the test opens once a /ping
+  on the same connection, sent after the updates, is answered (so the server has them: no timing); from a field's u=5
+  to `u=1, i`; the last of several, with a repeat; without a field (u=3 incremental, the client not yet aware) to the
+  default, u=3; and u=9 as u=7. And false over HTTP/1.1, once the body's been read to its end, once canceled (true
+  before), for a body the caller replaced, and for a response without one. In the client's scheduler
+  (`client_scheduling.cpp`, against `test::h2_client`, whose `priority_updates` now records what it receives): three
+  bodies without fields queued (they'd go "ABCABC"), C moved to u=0 and A to u=7, go "CCBBAA", the server having both
+  updates; then the connection closed, an update's refused. The checks bite: without the same-check, the change test
+  and the replacing one fail; always appending, the replacing one; without the request's field as what was said, both
+  of those; without the clamp, the frame test; without the half-closed (remote) check, the open-streams test; without
+  `take_output()` clearing the pending ones, the replacing test (frames corrupted); without taking back on
+  `close_remote()`, or on `forget()`, the replacing test's ending section (its first version passed without the
+  `close_remote()` one, as a stream whose request had ended is forgotten at once: a stream still sending was added); a
+  server allowed to send one, its test; `http2_response_body::set_priority()` returning false, both end-to-end tests;
+  without `send_order.update()`, the scheduler test; without the failure check, its closed connection; `pooled_body`'s
+  returning true, the HTTP/1.1 case. (A clamp in `reprioritize()` too didn't bite, as the scheduler takes past 7 as 7,
+  so it was dropped; so was a check of the stream's `received_end`, which the session's own makes.)
+- `fuzz_http2`: op 7 with bit 5 submits a PRIORITY_UPDATE (a stream, an urgency up to 15, incremental from bit 6),
+  after which the output isn't taken (every other record's is), so several wait in it, to be replaced, or taken back as
+  a later record receives a stream's end; the client opens a fourth stream first, a GET with a `Priority` field of two
+  lines ("u=1", "i"); and a new property, `whole_frames()`: each side's output is whole frames, nothing over, its
+  PRIORITY_UPDATEs on stream 0 with values in `to_string()`'s form. Before the output was held across records, a 240 s
+  run didn't find a break (the later frames' offsets not moved in `write_priority_update()`), as no two updates were
+  ever waiting at once; with it, that break was found within the same run's length, and the same in
+  `take_back_update()` within 2 seconds (ASan's negative-size memmove). 300 s on the final code (88,800 runs) found
+  nothing.
+- Measured (`bench_request`, Release, five alternating runs of master's binary and the branch's, each stopped once the
+  uploads case had printed, holding a power assertion; one-minute load averages of 3.4 to 13.9, falling through the
+  runs). Nothing in the bench calls `set_priority()`, so what's measured is what the session's new checks cost a request
+  that doesn't (a client's head looks for `priority` among its fields, as it already looked for `:method`; nothing's
+  allocated). Over HTTP/2, a stream at a time: 85.8 to 104.7 us a request before (median 96.5), 88.8 to 104.1 after
+  (median 94.5), 49.3 to 49.4 allocations both (49.2 to 49.3 after); the bytes unchanged (112 up and 132 down for the
+  first request, 21 and 40 after). 8 request bodies at once: 1505 to 1814 us a round before (median 1727), 1516 to
+  1733 after (median 1543), 151.6 to 152.6 allocations a request before, 151.3 to 152.4 after. The server's 8 responses
+  at once (unchanged code, for the noise): 1286 to 1464 us a round before (median 1447), 1314 to 1409 after (median
+  1366). All within the runs' spread, which the load (higher in the first pairs) widens.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among
@@ -2796,10 +2887,11 @@ certificate.
    8. **The client's request bodies by priority.** Done (2026-10-21; see Learned in stage 6). Each stream's priority
       from its request's `Priority` field (Open question 33), and `client_options::http2_notsent_lowat` for the client's connections (part 4's writer); tests with
       bodies of several urgencies. Small, once 7 is in.
-   9. **Reprioritizing a request in flight.** The session's `submit_priority_update()` (a client's: only what changes,
-      at most one pending a stream), `client_response::set_priority()` (Decided question 34) through
-      `detail::body_source`, moving the stream's own body in the client's scheduler too; tests on bytes and against
-      cppnet's server. After 8, whose scheduler it updates.
+   9. **Reprioritizing a request in flight.** Done (2026-10-22; see Learned in stage 6). The session's
+      `submit_priority_update()` (a client's: only what changes, at most one pending a stream),
+      `client_response::set_priority()` (Decided question 34) through `detail::body_source`, moving the stream's own
+      body in the client's scheduler too; tests on bytes and against cppnet's server. After 8, whose scheduler it
+      updates.
    10. **ORIGIN, the session and the server.** `frame_type::origin`, `submit_origin()`, `on_origin()` (a client's
        session), and `server_config::http2_origins` checked against the certificate and sent over TLS (Decided question
        39); tests on bytes and with `test::h2_client`. First of coalescing's three, as the server's side stands alone

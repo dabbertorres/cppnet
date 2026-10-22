@@ -53,7 +53,7 @@ constexpr std::size_t max_response_header_bytes = std::size_t{1'024} * 1'024;
 // It keeps a chunked body's trailers (see client_response::trailers()), which outlive the body's reader.
 class pooled_body final
     : public net::io::reader
-    , public net::http::detail::trailer_source
+    , public net::http::detail::body_source
 {
 public:
     pooled_body(std::shared_ptr<net::http::detail::connection_pool> pool,
@@ -130,6 +130,9 @@ public:
     }
 
     [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept override { return kept; }
+
+    // (HTTP/1.1 has no way to change a response's priority once it's been asked for.)
+    bool set_priority(const net::http::priority& /*p*/) override { return false; }
 
 private:
     // finish returns the connection to the pool, which may reuse it if the whole body was read.

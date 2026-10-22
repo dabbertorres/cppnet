@@ -263,7 +263,7 @@ public:
     // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
     // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
     // from the client's signals, a client's from its request's Priority field (docs/plans/http2.md, stage 6's eighth
-    // part).
+    // part), then client_response::set_priority() (its ninth).
     http2_scheduler send_order;
 
     // write_state is how far a stream's write has gone, from one step to the next.

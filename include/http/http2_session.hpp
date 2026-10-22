@@ -125,6 +125,20 @@ public:
     std::expected<std::size_t, std::error_code>
     submit_data(stream_id stream, std::span<const std::byte> data, bool end_stream);
 
+    // submit_priority_update asks the server for a new priority for one of the client's streams (a client's only: a
+    // server's fails with std::errc::invalid_argument): a PRIORITY_UPDATE frame (RFC 9218, section 7.1), on stream 0,
+    // with to_string(p) as its value (a complete set: what it leaves out is the default), an urgency past 7 sent as 7.
+    // It returns whether the stream's response may still be reprioritized: the stream is open, and the server hasn't
+    // ended it (RFC 9218 has updates go to streams open or half-closed (local) only); otherwise it sends nothing.
+    //
+    // Only what changes is sent: a stream keeps what it last said (initially its request's Priority field's, if it had
+    // one), and an update that says the same sends nothing. An update made while the last one is still waiting to be
+    // taken (take_output()) replaces it in place, or takes it back if it says what was said before it; and one waiting
+    // when its stream can no longer take it (the server ends it, or it's reset) is taken back. So a caller updating a
+    // stream in a loop costs at most a frame each time the output's taken, never one for each call (which a server
+    // counting them, as nghttp2's does, could take as a flood).
+    std::expected<bool, std::error_code> submit_priority_update(stream_id stream, priority p);
+
     // reset resets a stream (RST_STREAM), unless it's already closed.
     void reset(stream_id stream, error_code code);
 
@@ -163,19 +177,34 @@ public:
     [[nodiscard]] bool failed() const noexcept { return connection_failed; }
 
 private:
+    // unsaid is stream_state::said's urgency for a stream that's said nothing of its priority.
+    static constexpr std::uint8_t unsaid = 0xff;
+
     struct stream_state
     {
-        bool                         local_closed  = false; // this side has sent END_STREAM
-        bool                         remote_closed = false; // the peer has sent END_STREAM
-        bool                         head_received = false; // the peer's (final) head has arrived
-        bool                         known = false; // the application knows of it: it opened it, or had its request
-        bool                         head_request = false; // a client's request was HEAD: its response has no body
-        bool                         no_body      = false; // the response is 204 or 304: it has no body
-        std::int64_t                 send_window  = 0;
-        std::int64_t                 recv_window  = 0;
-        std::uint64_t                unconsumed   = 0; // consumed, but not yet given back with WINDOW_UPDATE
+        bool local_closed  = false; // this side has sent END_STREAM
+        bool remote_closed = false; // the peer has sent END_STREAM
+        bool head_received = false; // the peer's (final) head has arrived
+        bool known         = false; // the application knows of it: it opened it, or had its request
+        bool head_request  = false; // a client's request was HEAD: its response has no body
+        bool no_body       = false; // the response is 204 or 304: it has no body
+        // what a client's stream last said of its priority (its request's field, then its PRIORITY_UPDATEs), or
+        // nothing (urgency unsaid). NOTE: in what was padding, with the flags.
+        priority                     said{.urgency = unsaid};
+        std::int64_t                 send_window = 0;
+        std::int64_t                 recv_window = 0;
+        std::uint64_t                unconsumed  = 0; // consumed, but not yet given back with WINDOW_UPDATE
         std::optional<std::uint64_t> content_length;
         std::uint64_t                received = 0; // of DATA
+    };
+
+    // pending_update is a PRIORITY_UPDATE in the output, not yet taken: where its frame starts, and what its stream
+    // had said before it (so an update back to that takes it back).
+    struct pending_update
+    {
+        stream_id   stream = 0;
+        std::size_t at     = 0;
+        priority    before;
     };
 
     // header_block is a header block arriving in a HEADERS frame and CONTINUATIONs.
@@ -272,6 +301,14 @@ private:
     // connection_error queues GOAWAY with code, and fails the session.
     std::error_code connection_error(error_code code, std::string_view debug = {});
 
+    // write_priority_update puts a PRIORITY_UPDATE for stream with p's value into the output at at (replacing the
+    // frame there, of length old bytes, if it's not 0), moving the pending updates after it to match.
+    void write_priority_update(stream_id stream, priority p, std::size_t at, std::size_t old);
+
+    // take_back_update takes a stream's pending PRIORITY_UPDATE (if it has one) out of the output: it can't take it
+    // now (the server's ended it, or it's gone).
+    void take_back_update(stream_id stream);
+
     // close_local and close_remote end one side of a stream, forgetting the stream once both are.
     void close_local(stream_id stream);
     void close_remote(stream_id stream);
@@ -323,6 +360,10 @@ private:
     // stream's head (see take_idle_priority()). Each is past highest_peer_stream; at most max_concurrent_streams with
     // the open streams (RFC 9218, section 7.1), so a few, and looked through.
     std::vector<std::pair<stream_id, priority>> idle_priorities;
+
+    // the PRIORITY_UPDATEs in the output (a client's), at most one a stream, until it's taken: so few, and looked
+    // through (none, nearly always).
+    std::vector<pending_update> pending_updates;
 
     std::int64_t  connection_send_window = 65'535;
     std::int64_t  connection_recv_window = 65'535;

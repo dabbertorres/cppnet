@@ -58,7 +58,7 @@ namespace
     // over as it reaches the body's end (see client_response::trailers()).
     class http2_response_body final
         : public io::reader
-        , public trailer_source
+        , public body_source
     {
     public:
         // NOTE: not holding the connection's lock: the stop callback is registered here, and runs at once (taking the
@@ -103,6 +103,8 @@ namespace
         [[nodiscard]] io::handle native_handle() const noexcept override { return conn->native_handle(); }
 
         [[nodiscard]] const trailer_fields& trailers() const noexcept override { return kept; }
+
+        bool set_priority(const priority& p) override { return conn->reprioritize(stream->id, p); }
 
     private:
         coro::task<io::result> read_stoppable(std::span<std::byte> data)
@@ -695,6 +697,32 @@ void http2_client_connection::done(http2::stream_id id)
     wake_writer();
     wake_timer();
     if (on.freed) on.freed();
+}
+
+bool http2_client_connection::reprioritize(http2::stream_id id, priority p)
+{
+    {
+        std::scoped_lock lock{mu};
+        const auto       it = streams.find(id);
+        if (it == streams.end()) return false;
+
+        // a response that's failed (e.g. the connection's ended, which the session needn't know) has nothing left to
+        // reprioritize; nor has one that's ended (all of it's come, though not all may have been read), which the
+        // session refuses.
+        auto& s = *it->second;
+        if (s.failure) return false;
+
+        const auto sent = session.submit_priority_update(id, p);
+        if (!sent.has_value() || !*sent) return false;
+
+        // the request's body too, in this side's scheduler: from its next frame, if it's waiting (whose urgencies past
+        // 7 are 7's, as the session sends them).
+        send_order.update(s, p);
+    }
+
+    // (only if there's output: an update that changes nothing sends nothing.)
+    wake_writer();
+    return true;
 }
 
 void http2_client_connection::cancel(http2::stream_id id)
