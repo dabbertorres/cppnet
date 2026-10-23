@@ -1,6 +1,6 @@
 # Plan: WebSockets
 
-Status: proposed (2026-10-22). The questions at the end are open.
+Status: decided (2026-10-22): every question at the end as recommended. Not started.
 
 ## Goal
 
@@ -142,12 +142,12 @@ hundred lines.
 ### Where it lives
 
 A module of its own, `websocket/` (`net::websocket`, `include/websocket/`, `src/websocket/`, `test/websocket/`),
-depending on `http/` (the handshake is HTTP's), as `instrument/` does (Open question 1). Public:
+depending on `http/` (the handshake is HTTP's), as `instrument/` does (Decided question 1). Public:
 `websocket/websocket.hpp` (`connection`, `accept()`, `connect()`, the options) and `websocket/error.hpp`. Internal, as
 HPACK's are: `websocket/frame.hpp` (the codec), `websocket/session.hpp` (the protocol without I/O),
 `websocket/handshake.hpp`. HTTP gets one internal header, `http/tunnel.hpp` (below), and knows nothing else of
 WebSockets but RFC 8441's `:protocol`. Three helpers go to `util/` (which depends on nothing but `encoding/`):
-`util/sha1.hpp` (Open question 2), `util/utf8.hpp` (`util::utf8_validator`: `structured_fields.cpp`'s check moved,
+`util/sha1.hpp` (Decided question 2), `util/utf8.hpp` (`util::utf8_validator`: `structured_fields.cpp`'s check moved,
 with a `feed(std::span<const std::byte>)` that skips ASCII 8 bytes at a time, and `complete()`; Structured Fields' use
 it) and `util/random.hpp` (`util::random_bytes(std::span<std::byte>)`: `dns/native.cpp`'s `fill_random()` and its
 per-thread batch moved, `random_id()` built on it).
@@ -171,7 +171,7 @@ caller's) and hands them over.
 
 - `session(role, limits)`, `role::server` requiring masked frames and `role::client` refusing them.
 - `begin_frame(const frame_header&)` checks the frame against the state: RSV bits set without an extension that
-  allows them (none, until Open question 15); an unknown opcode; a control frame fragmented or over 125 bytes; a
+  allows them (none, until Decided question 15); an unknown opcode; a control frame fragmented or over 125 bytes; a
   continuation with no message started, or a text/binary frame inside one; masking per role; the message's total past
   `limits::max_message`; anything but a close after the peer's close. It returns what the frame is (data, of which
   message type and whether it's the message's first and last; or a control frame) or the close code to fail with
@@ -198,7 +198,7 @@ the GUID, in base64); `check_request(const server_request&)` (HTTP/1.1: GET, ver
 token `websocket` and `Connection` with `upgrade`, ignoring case, `Sec-WebSocket-Version` 13, `Sec-WebSocket-Key`
 whose strict base64 decodes to 16 bytes, no body; HTTP/2: the extended CONNECT below, version 13, no key);
 `select_subprotocol(server's list, request)` (the first of the server's that the client offers, gorilla's and coder's
-rule; `Sec-WebSocket-Protocol` may be several lines); `check_origin(req, options)` (Open question 7). Extensions
+rule; `Sec-WebSocket-Protocol` may be several lines); `check_origin(req, options)` (Decided question 7). Extensions
 offered are ignored: none is accepted, so `Sec-WebSocket-Extensions` isn't sent and RSV bits stay invalid. The client's
 side: `make_request()` (a random 16-byte key, `Origin` only if given) and `check_response()` (101, `Upgrade`,
 `Connection`, the accept, a subprotocol it offered, no extension it didn't).
@@ -237,7 +237,7 @@ variant's larger alternative already). The hook, on the handler's task:
 may) is already in the reader, and nothing more is allocated for buffers. After the handler returns, the loop tests
 `rw.switched()` once: no default response, `finish()`, discarding or keep-alive; it flushes and ends the connection,
 which `serve_connection()` closes (close_notify first over TLS; the server closing TCP first, as RFC 6455 7.1.1 has it).
-The WebSocket's life is the handler's call (Open question 3): the connection keeps its `max_connections` slot, `join()`
+The WebSocket's life is the handler's call (Decided question 3): the connection keeps its `max_connections` slot, `join()`
 waits for it, and `abort()`'s callback (shutting the reading side, stopping `req.stop`) ends it, all unchanged.
 
 ### The server: HTTP/2 streams (RFC 8441)
@@ -246,10 +246,10 @@ The session (`http2_session.cpp`) learns `:protocol`: `pseudo_slot()` takes it f
 CONNECT with `:protocol`, `:scheme`, `:path` and `:authority` if this side has sent ENABLE_CONNECT_PROTOCOL = 1 (a
 `:protocol` otherwise, or on any other method, is malformed, as before), and `settings` gets `enable_connect_protocol`,
 sent by a server whose `session_config` says so and read by a client (0 or 1; 1 then 0 is PROTOCOL_ERROR, as RFC 8441
-3 forbids withdrawing it; ignored from a client). `server_config::http2_websockets` (Open question 12) sets it.
+3 forbids withdrawing it; ignored from a client). `server_config::http2_websockets` (Decided question 12) sets it.
 
 The server's `start_stream()` sets `server_request::protocol` (a `std::string`, empty unless the request was an
-extended CONNECT) and presents a `websocket` one as Open question 11 decides (recommended: as GET with `protocol`
+extended CONNECT) and presents a `websocket` one as Decided question 11 decided (as GET with `protocol`
 set, so one route serves both versions); any other `:protocol` gets 501, as an unknown method does. `accept()`
 answers it with 200 (no `Sec-WebSocket-Accept`; the subprotocol), through a new entry of `http2_stream_ops`
 (`open_tunnel`, in the static table), which sends the head without END_STREAM, turns the stream's `read_timeout` off
@@ -267,7 +267,7 @@ against `http2_max_concurrent_streams`, so a connection's WebSockets are bounded
 `websocket::connection` (movable; its state, the session and the tunnel, is one allocation per WebSocket, so that
 the address the write queue's waiters hold doesn't move):
 
-- **Reading** (Open question 4): `read_message(std::string&)` / `read_message(std::vector<std::byte>&)` replace the
+- **Reading** (Decided question 4): `read_message(std::string&)` / `read_message(std::vector<std::byte>&)` replace the
   buffer's contents with the next whole message (no allocation once the buffer's capacity suffices), returning its
   `message_type` (text or binary); and streaming, `next_message()` returning the type, then `message()` as an
   `io::reader` of it, ending with `end_of_stream` at the message's end (unread rest skipped by the next
@@ -278,7 +278,7 @@ the address the write queue's waiters hold doesn't move):
   a second concurrent one fails with `device_or_resource_busy`, as a socket's.
 - **Writing**: `write_message(message_type, std::span<const std::byte>)` (one frame), `begin_message(type)` returning
   an `io::writer` (each `write()` a frame, `end_message()` a final empty continuation) and `ping(payload)`. Writes from
-  several tasks are serialized (Open question 5): the write side is a turn (a `coro::notifier`, as `tls::stream`'s flush
+  several tasks are serialized (Decided question 5): the write side is a turn (a `coro::notifier`, as `tls::stream`'s flush
   queue), held for a whole message, so messages never interleave; control frames go between a streamed message's
   frames. A read's replies (pong, the close's echo) don't wait for a writer: if a write holds the turn, they're left to
   it (it sends them after its frame); otherwise the read writes them itself. The server writes the payload through the
@@ -293,7 +293,7 @@ the address the write queue's waiters hold doesn't move):
   (on a notifier) for the reading task to see it; the client then waits for the server's end of the stream, as RFC 6455
   7.1.1 asks, within the same timeout. `connection` going out of scope without a close aborts the tunnel (no close
   frame: the peer sees 1006). A close that fails, or times out, aborts.
-- **How the end is reported** (Open question 10): errors are `std::error_code`s, as everywhere. Close codes are in
+- **How the end is reported** (Decided question 10): errors are `std::error_code`s, as everywhere. Close codes are in
   `websocket::close_category()`, which `close_code` (`normal_closure` 1000, `going_away`, `protocol_error`,
   `unsupported_data`, `no_status_received` 1005, `abnormal_closure` 1006, `invalid_payload` 1007, `policy_violation`,
   `message_too_big` 1009, `mandatory_extension`, `internal_error`, and 3000-4999 as numbers) makes codes in: the peer's
@@ -309,9 +309,9 @@ the address the write queue's waiters hold doesn't move):
 
 `connection_options` (inside `accept_options` and `connect_options`):
 
-- `max_message` (Open question 6; recommended 1 MiB) bounds a message, whichever API reads it (streaming too, so a
+- `max_message` (Decided question 6: 1 MiB) bounds a message, whichever API reads it (streaming too, so a
   message is bounded as a body is); a frame is bounded only by it. Past it, 1009 and the connection fails.
-- `idle_timeout` (Open question 8; recommended 60 s) with keep-alive pings as Beast's: while a read waits, its
+- `idle_timeout` (Decided question 8: 60 s) with keep-alive pings as Beast's: while a read waits, its
   transport's read timeout is half of it; when that passes with nothing received, the read sends a ping (through the
   write turn, as a reply) and waits the other half; nothing by then fails the connection with `timed_out` (aborting it).
   So pings cost no task and no timer, and the transport's existing timeout does the timing; but only while the
@@ -322,7 +322,7 @@ the address the write queue's waiters hold doesn't move):
   (`operation_canceled`) and aborts the tunnel (the client-leaving case of HTTP/1.1's `pooled_body`). `abort()` reaches
   a server's WebSockets through it as well as through the socket. `http::timeout` on a WebSocket route therefore bounds
   the whole session (its linked token is `req.stop` by then), which the guide says.
-- **The server's `close()`** (Open question 9; recommended: going away): the tunnel's `closing()` token, through
+- **The server's `close()`** (Decided question 9: going away): the tunnel's `closing()` token, through
   `set_stop_token()` on the transport (the socket, linked by a `util::linked_stop_source` when there's also `stop`; the
   HTTP/2 stream's flag), interrupts a waiting read with nothing read; the read sends a close with 1001 (`going_away`),
   clears the token, and reads on for the peer's close within `close_timeout`, then reports `going_away` (sent). Without
@@ -333,8 +333,8 @@ the address the write queue's waiters hold doesn't move):
 
 A WebSocket endpoint is a route like any other: `GET("/chat"_route, chat)` in either router, the handler calling
 `accept()`; routing, path values and route middleware run before it, as for any request (authentication middleware
-can answer 401 before the handshake). Over HTTP/2 the same route serves extended CONNECT if Open question 11 goes as
-recommended. `instrument::http_metrics` and `http_tracing` see the switch as the response's status (101, or 200 over
+can answer 401 before the handshake). Over HTTP/2 the same route serves extended CONNECT as Decided question 11 went
+(as GET). `instrument::http_metrics` and `http_tracing` see the switch as the response's status (101, or 200 over
 HTTP/2) and the whole session as the request's duration (the guide says so; a histogram of WebSocket routes'
 durations means sessions'). `server_request::extensions` and `route` stay valid for the handler's call, which is the
 WebSocket's life.
@@ -350,7 +350,7 @@ same `tls::client_options`, offering only `http/1.1` with ALPN, so a server can'
 `response_header_timeout` for the handshake. It sends the request with `http11::request_encode_head()` and decodes the
 response with `http11::response_decode()` on its own `buffered_reader` (16 KiB, as the server's), whose leftovers are
 the first frames; `connect_options::headers` (e.g. `Authorization`, a cookie), `subprotocols`, `origin`. Redirects
-aren't followed (Open question 14). `connect_options::stop` covers connecting and the handshake (and, kept, the
+aren't followed (Decided question 14). `connect_options::stop` covers connecting and the handshake (and, kept, the
 connection). A response other than 101 fails with `bad_status`; a 101 whose accept, subprotocol or extensions are
 wrong fails too (RFC 6455 4.1: the client MUST fail the connection).
 
@@ -416,7 +416,7 @@ waiting for the server's first SETTINGS isn't used.
   DATA), `[http2][server][websocket]`: the 200, echo, END_STREAM at the close, a reset aborting the handler's WebSocket,
   no read timeout on the stream, 501 for another `:protocol`, the route serving both versions; and cppnet's client
   against cppnet's server over prior knowledge and TLS.
-- **Autobahn** (Open question 16): `fuzzingclient` against `example/websocket-echo` and `fuzzingserver` against a small
+- **Autobahn** (Decided question 16): `fuzzingclient` against `example/websocket-echo` and `fuzzingserver` against a small
   client driver (`example/websocket-autobahn`, which runs each case and echoes), by hand where Docker is available,
   sections 1-7 and 9 expected to pass (12-13 excluded with compression), its report kept out of the repository; and an
   optional workflow that does it on GitHub's Linux runner. Not part of the required `build`.
@@ -450,16 +450,18 @@ Each a pull request, mergeable and tested alone, in this order:
 7. **Extended CONNECT in the session.** `:protocol`, `settings::enable_connect_protocol`, the rules; tests on bytes and
    `fuzz_http2`. Nothing advertises it yet: the protocol's rules apart from the server, as stage 6's ORIGIN part was.
 8. **WebSockets over HTTP/2, the server.** `server_config::http2_websockets`, `server_request::protocol`, the
-   presentation of extended CONNECT (Open question 11), `http2_stream_ops::open_tunnel`, the stream's interruptible
+   presentation of extended CONNECT (Decided question 11), `http2_stream_ops::open_tunnel`, the stream's interruptible
    read; `test::h2_client`'s extended CONNECT; browsers by hand. Last of the server's: it changes what every HTTP/2
    server advertises.
 9. **WebSockets over HTTP/2, the client.** `http2_client_connection::open_tunnel()`, `connect_options::http2`, the
    pool's check of the peer's setting; tests against cppnet's server.
-10. **An optional Autobahn workflow** (if Open question 16 goes so): a `workflow_dispatch` (and weekly) job on
+10. **An optional Autobahn workflow** (Decided question 16): a `workflow_dispatch` (and weekly) job on
     `ubuntu-26.04`, outside the matrix and the required `build`, running both suites in Docker against the examples
     and failing on a case that isn't OK or NON-STRICT.
 
-## Open questions
+## Decided questions
+
+All decided as recommended (2026-10-22).
 
 1. **Where it lives.** (a) Its own module, `net::websocket` in `websocket/`, depending on `http/`; (b) inside HTTP,
    `net::http::websocket` in `http/`. **Recommended: (a)**: HTTP stays unaware of it but for `tunnel` and
@@ -536,10 +538,10 @@ Each a pull request, mergeable and tested alone, in this order:
 
 ## Out of scope
 
-- permessage-deflate and other extensions (Open question 15).
+- permessage-deflate and other extensions (Decided question 15).
 - WebSockets over HTTP/3 (RFC 9220), with `http3.md`.
 - Other upgrades and tunnels: `h2c` upgrade, CONNECT proxying (plain CONNECT stays refused as a target), `:protocol`
   values but `websocket` (CONNECT-UDP, WebTransport).
 - A hub or broadcast layer, JSON messages, reconnection: the application's, on top of `connection`.
 - Proxies for the client (HTTP CONNECT, SOCKS): the HTTP client has none either.
-- Handing a server's connection over to the application (Open question 3 (b)).
+- Handing a server's connection over to the application (Decided question 3 (b)).
