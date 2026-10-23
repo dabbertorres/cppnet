@@ -237,8 +237,8 @@ variant's larger alternative already). The hook, on the handler's task:
 may) is already in the reader, and nothing more is allocated for buffers. After the handler returns, the loop tests
 `rw.switched()` once: no default response, `finish()`, discarding or keep-alive; it flushes and ends the connection,
 which `serve_connection()` closes (close_notify first over TLS; the server closing TCP first, as RFC 6455 7.1.1 has it).
-The WebSocket's life is the handler's call (Decided question 3): the connection keeps its `max_connections` slot, `join()`
-waits for it, and `abort()`'s callback (shutting the reading side, stopping `req.stop`) ends it, all unchanged.
+The WebSocket's life is the handler's call (Decided question 3): the connection keeps its `max_connections` slot,
+`join()` waits for it, and `abort()`'s callback (shutting the reading side, stopping `req.stop`) ends it, all unchanged.
 
 ### The server: HTTP/2 streams (RFC 8441)
 
@@ -278,8 +278,8 @@ the address the write queue's waiters hold doesn't move):
   a second concurrent one fails with `device_or_resource_busy`, as a socket's.
 - **Writing**: `write_message(message_type, std::span<const std::byte>)` (one frame), `begin_message(type)` returning
   an `io::writer` (each `write()` a frame, `end_message()` a final empty continuation) and `ping(payload)`. Writes from
-  several tasks are serialized (Decided question 5): the write side is a turn (a `coro::notifier`, as `tls::stream`'s flush
-  queue), held for a whole message, so messages never interleave; control frames go between a streamed message's
+  several tasks are serialized (Decided question 5): the write side is a turn (a `coro::notifier`, as `tls::stream`'s
+  flush queue), held for a whole message, so messages never interleave; control frames go between a streamed message's
   frames. A read's replies (pong, the close's echo) don't wait for a writer: if a write holds the turn, they're left to
   it (it sends them after its frame); otherwise the read writes them itself. The server writes the payload through the
   buffered writer (large ones through `write_through`); the client masks it into `prepare()`d space, a buffer's worth at
@@ -416,10 +416,10 @@ waiting for the server's first SETTINGS isn't used.
   DATA), `[http2][server][websocket]`: the 200, echo, END_STREAM at the close, a reset aborting the handler's WebSocket,
   no read timeout on the stream, 501 for another `:protocol`, the route serving both versions; and cppnet's client
   against cppnet's server over prior knowledge and TLS.
-- **Autobahn** (Decided question 16): `fuzzingclient` against `example/websocket-echo` and `fuzzingserver` against a small
-  client driver (`example/websocket-autobahn`, which runs each case and echoes), by hand where Docker is available,
-  sections 1-7 and 9 expected to pass (12-13 excluded with compression), its report kept out of the repository; and an
-  optional workflow that does it on GitHub's Linux runner. Not part of the required `build`.
+- **Autobahn** (Decided question 16): `fuzzingclient` against `example/websocket-echo` and `fuzzingserver` against a
+  small client driver (`example/websocket-autobahn`, which runs each case and echoes), by hand where Docker is
+  available, sections 1-7 and 9 expected to pass (12-13 excluded with compression), its report kept out of the
+  repository; and an optional workflow that does it on GitHub's Linux runner. Not part of the required `build`.
 - **By hand**: `websocat ws://127.0.0.1:8080/echo` (and `wss://` with `--cert/--key`), a browser's console
   (`new WebSocket(...)`, Firefox and Chrome, which use HTTP/2 over TLS once the server advertises it), Python's
   `websockets` client, and `test/test_server.go` gaining an echo endpoint (gorilla or coder, in that throwaway module)
