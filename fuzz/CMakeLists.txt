@@ -68,3 +68,4 @@ add_fuzzer(
   fuzz_dns dns.cpp "${PROJECT_SOURCE_DIR}/src/exception.cpp"
   "${PROJECT_SOURCE_DIR}/src/dns/error.cpp" "${PROJECT_SOURCE_DIR}/src/dns/message.cpp"
 )
+add_fuzzer(fuzz_utf8 utf8.cpp "${PROJECT_SOURCE_DIR}/src/util/utf8.cpp")

@@ -32,8 +32,7 @@ inline constexpr std::size_t max_cname_links = 8;
 // else last. Names over 253 bytes, with empty labels or labels over 63, or under .onion (RFC 7686), are left out.
 [[nodiscard]] std::vector<std::string> name_list(const config& conf, std::string_view name);
 
-// random_id is a query ID, from the OS's randomness (getrandom() on Linux, arc4random_buf() elsewhere), taken a batch
-// at a time per thread.
+// random_id is a query ID, from the OS's randomness (util::random_bytes(), taken a batch at a time per thread).
 [[nodiscard]] std::uint16_t random_id() noexcept;
 
 // sort_by_rfc6724 sorts addrs by RFC 6724's destination address selection (as Go's addrselect.go: rules 1, 2, 5, 6, 8

@@ -22,7 +22,6 @@
 #include <variant>
 #include <vector>
 
-#include "config.hpp" // IWYU pragma: keep (for the platform macros)
 #include "coro/task.hpp"
 #include "dns/config.hpp"
 #include "dns/error.hpp"
@@ -37,16 +36,8 @@
 #include "ipv6_addr.hpp"
 #include "tcp.hpp"
 #include "udp.hpp"
+#include "util/random.hpp"
 #include "util/string_util.hpp"
-
-#ifdef NET_IS_LINUX
-#    include <cerrno>
-#    include <exception>
-
-#    include <sys/random.h>
-#else
-#    include <cstdlib>
-#endif
 
 namespace
 {
@@ -57,26 +48,6 @@ using lookup_result = std::expected<std::vector<net::ip_addr>, std::error_code>;
 
 constexpr std::size_t max_name  = 253;
 constexpr std::size_t max_label = 63;
-
-// fill_random fills out from the OS's randomness.
-void fill_random(std::span<std::byte> out) noexcept
-{
-#ifdef NET_IS_LINUX
-    while (!out.empty())
-    {
-        const auto got = ::getrandom(out.data(), out.size(), 0);
-        if (got < 0)
-        {
-            if (errno == EINTR) continue;
-            // NOTE: only kernels older than 3.17 lack it; glibc's arc4random() aborts too, without randomness.
-            std::terminate();
-        }
-        out = out.subspan(static_cast<std::size_t>(got));
-    }
-#else
-    ::arc4random_buf(out.data(), out.size());
-#endif
-}
 
 // avoid_dns is whether name mustn't be asked of DNS servers: one under .onion (RFC 7686), as Go has it.
 bool avoid_dns(std::string_view name) noexcept
@@ -641,18 +612,9 @@ std::vector<std::string> name_list(const config& conf, std::string_view name)
 
 std::uint16_t random_id() noexcept
 {
-    constexpr std::size_t batch = 64;
-
-    thread_local std::array<std::uint16_t, batch> ids{};
-    thread_local std::size_t                      left = 0;
-
-    if (left == 0)
-    {
-        fill_random(std::as_writable_bytes(std::span{ids}));
-        left = ids.size();
-    }
-
-    return ids[--left];
+    std::uint16_t id = 0;
+    util::random_bytes(std::as_writable_bytes(std::span{&id, 1}));
+    return id;
 }
 
 coro::task<std::expected<std::vector<ip_addr>, std::error_code>> native_lookup(io::scheduler*                scheduler,

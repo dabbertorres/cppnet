@@ -1,6 +1,7 @@
 # Plan: WebSockets
 
-Status: decided (2026-10-22): every question at the end as recommended. Not started.
+Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
+Learned in stage 1).
 
 ## Goal
 
@@ -425,12 +426,43 @@ waiting for the server's first SETTINGS isn't used.
   `websockets` client, and `test/test_server.go` gaining an echo endpoint (gorilla or coder, in that throwaway module)
   for the client.
 
+## Learned in stage 1
+
+- `util::sha1` (`util/sha1.hpp`) is a class fed incrementally: `update()` (bytes, or a `std::string_view`) returns the
+  hasher, so the handshake's accept key is `sha1{}.update(key).update(guid).finish()` without joining the strings;
+  `finish()` pads, returns the 20 bytes (`sha1::digest`) and leaves the hasher as a new one. No one-shot function: the
+  chain is one. The message schedule is kept to 16 words, computed as the rounds use them. Its tests are FIPS 180's and
+  RFC 3174's vectors (the empty string, "abc", the 448-bit and 896-bit messages, a million 'a's, RFC 3174's fourth),
+  lengths 55 to 65, 119, 120 and 128 (digests from Python's `hashlib`), every split of a 241-byte message in two and
+  in pieces of 1 to 129 bytes, and RFC 6455 4.2.2's accept key, through `encoding::base64`.
+- `util::utf8_validator` (`util/utf8.hpp`) keeps Structured Fields' rules (RFC 3629 as byte ranges: the second byte's
+  range narrowed after E0, ED, F0 and F4; C0, C1, F5 to FF and continuation bytes refused as leads), so it fails at the
+  first byte that no UTF-8 can have where it is: E0 80 fails at the 80, ED A0 (a surrogate) and F4 90 (past U+10FFFF) at
+  their second bytes, not when the character's complete, which is what failing fast on a text frame's byte needs. Beside
+  `feed(std::span<const std::byte>)` (out of line, `src/util/utf8.cpp`) it has an inline `feed(std::byte)`, which
+  Structured Fields' Display Strings use for their percent-decoded bytes, and `reset()`. Once a feed has failed, its
+  state is meaningless until `reset()`. The ASCII path is taken only at a character's boundary and on an ASCII byte:
+  then whole words (8 bytes, loaded with `memcpy`, no high bit in any) are skipped, and the run's rest byte by byte, so
+  text that's mostly multi-byte doesn't pay a word's load per character.
+- The validator is tested against a decoder of code points rather than byte ranges (`test/util/utf8_reference.hpp`: a
+  byte fails once its character so far can't be completed to a code point in range for its length, not a surrogate,
+  not past U+10FFFF), over every sequence of one and two bytes and those of three and four from each lead byte with
+  continuations at the ranges' edges, fed a byte at a time (failing at the same byte) and at once. `fuzz_utf8` checks
+  the same on any input, and fed in pieces of several sizes (the piece that fails holds the byte that does): the plan
+  had this inside `fuzz_websocket`, but it costs nothing on its own, before the codec exists.
+- `util::random_bytes` (`util/random.hpp`) takes spans smaller than a batch (256 bytes, per thread; the DNS resolver's
+  was 64 IDs, 128 bytes) from its end, refilling it part way through a draw if need be, and fills larger ones
+  directly. `dns::detail::random_id()` is two of its bytes. `util/random.cpp` includes `config.hpp` for the platform
+  macros (which depends on nothing). `util::uuid`'s own `fill_random()` (`std::random_device`) and OpenTelemetry's ids
+  (`std::mt19937_64`) are left as they were.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
 
-1. **The helpers.** `util::sha1`, `util::utf8_validator` (moved from Structured Fields, with the ASCII path) and
-   `util::random_bytes` (moved from the DNS resolver). Tests. First: small, no I/O, and the next stages need them.
+1. **The helpers.** Done (2026-10-24; see Learned in stage 1). `util::sha1`, `util::utf8_validator` (moved from
+   Structured Fields, with the ASCII path) and `util::random_bytes` (moved from the DNS resolver). Tests. First: small,
+   no I/O, and the next stages need them.
 2. **The codec and the session.** `websocket/frame.hpp`, `session.hpp`, `handshake.hpp` (`accept_key()` and the checks),
    `websocket/error.hpp`; tests on bytes; `fuzz_websocket`. Without I/O, and nothing uses it yet: reviewed and fuzzed on
    its own, as HPACK and HTTP/2's session were.

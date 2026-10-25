@@ -11,6 +11,8 @@
 #include <utility>
 #include <variant>
 
+#include "util/utf8.hpp"
+
 namespace
 {
 
@@ -98,49 +100,6 @@ std::string_view prefix(std::string_view in, std::size_t n) noexcept
 {
     return {in.begin(), in.begin() + static_cast<std::ptrdiff_t>(n)};
 }
-
-// utf8_check checks that bytes fed to it one at a time are UTF-8 (RFC 3629: no overlong forms, no surrogates, nothing
-// past U+10FFFF).
-class utf8_check
-{
-public:
-    [[nodiscard]] bool feed(std::uint8_t b) noexcept
-    {
-        if (need == 0)
-        {
-            if (b < 0x80) return true;
-            if (b >= 0xc2 && b <= 0xdf) return expect(1, 0x80, 0xbf);
-            if (b == 0xe0) return expect(2, 0xa0, 0xbf);
-            if ((b >= 0xe1 && b <= 0xec) || b == 0xee || b == 0xef) return expect(2, 0x80, 0xbf);
-            if (b == 0xed) return expect(2, 0x80, 0x9f);
-            if (b == 0xf0) return expect(3, 0x90, 0xbf);
-            if (b >= 0xf1 && b <= 0xf3) return expect(3, 0x80, 0xbf);
-            if (b == 0xf4) return expect(3, 0x80, 0x8f);
-            return false;
-        }
-        if (b < low || b > high) return false;
-        --need;
-        low  = 0x80;
-        high = 0xbf;
-        return true;
-    }
-
-    // complete is whether no character is part way through.
-    [[nodiscard]] bool complete() const noexcept { return need == 0; }
-
-private:
-    bool expect(int bytes, std::uint8_t lo, std::uint8_t hi) noexcept
-    {
-        need = bytes;
-        low  = lo;
-        high = hi;
-        return true;
-    }
-
-    int          need = 0;    // continuation bytes still to come
-    std::uint8_t low  = 0x80; // the next continuation byte's range
-    std::uint8_t high = 0xbf;
-};
 
 }
 
@@ -268,7 +227,7 @@ public:
     {
         if (in.size() < 2 || in[1] != '"') return false;
         in.remove_prefix(2); // the '%"'
-        utf8_check utf8;
+        net::util::utf8_validator utf8;
         for (std::size_t i = 0; i < in.size(); ++i)
         {
             const char c = in[i];
@@ -279,7 +238,7 @@ public:
                 const int high = lchex(in[i + 1]);
                 const int low  = lchex(in[i + 2]);
                 if (high < 0 || low < 0) return false;
-                if (!utf8.feed(static_cast<std::uint8_t>((high * 16) + low))) return false;
+                if (!utf8.feed(static_cast<std::byte>((high * 16) + low))) return false;
                 i += 2;
             }
             else if (c == '"')
@@ -290,7 +249,7 @@ public:
                 in.remove_prefix(i + 1);
                 return true;
             }
-            else if (!utf8.feed(static_cast<std::uint8_t>(c)))
+            else if (!utf8.feed(static_cast<std::byte>(c)))
             {
                 return false; // an ASCII character where the rest of one in UTF-8 should be
             }
