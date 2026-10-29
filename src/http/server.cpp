@@ -39,6 +39,7 @@
 #include "http/request_target.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "http/tunnel.hpp"
 #include "io/buffered_reader.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/discard_writer.hpp"
@@ -587,9 +588,11 @@ struct server::connection_state
     };
 
     // The marks a watch waits for: whichever comes second (on whichever thread, as the handler may be running on
-    // another by then) begins it.
+    // another by then) begins it. And a third, the handler switching protocols, after which none does (see
+    // switch_now()).
     static constexpr std::uint8_t handler_waited = 1;
     static constexpr std::uint8_t body_read      = 2;
+    static constexpr std::uint8_t switched       = 4;
 
     // gate_open marks one of them, returning whether it was the second.
     bool gate_open(std::uint8_t mark) noexcept
@@ -632,10 +635,13 @@ struct server::connection_state
     // begin_watch begins a watch, unless there's no need (see the watch, above).
     void begin_watch() noexcept
     {
-        if (reader.size() != 0 || stop.stop_requested()) return;
+        if (reader.size() != 0 || stop.stop_requested())
+        {
+            no_watch();
+            return;
+        }
 
         watching = true;
-        watch_handoff.store(nullptr, std::memory_order::relaxed);
         input.hold(true);
 
         // the handler may take as long as it likes: the server's deadline applies once it's done.
@@ -645,6 +651,19 @@ struct server::connection_state
         // on the pool, as the watch's first read (and its wait) would otherwise delay the handler.
         auto* pool = sock.get_scheduler()->pool();
         if (auto watcher = std::exchange(watcher_parked, nullptr); !pool->resume(watcher)) watcher.resume();
+    }
+
+    // no_watch publishes that the gate opened, but begin_watch() found no need for a watch, for a switch that may be
+    // waiting to know (see switch_now()), as a watch's end would be.
+    void no_watch() noexcept
+    {
+        void* waiting = watch_handoff.exchange(this, std::memory_order::acq_rel);
+        if (waiting == nullptr) return;
+
+        // on the pool, as this may be the server's thread, in the middle of starting the handler (see handler_runs).
+        auto  switching = std::coroutine_handle<>::from_address(waiting);
+        auto* pool      = detail::socket_of(*conn).get_scheduler()->pool();
+        if (!pool->resume(switching)) switching.resume();
     }
 
     // after_watch puts the connection back as it was before the watch, once its result's been taken.
@@ -666,6 +685,91 @@ struct server::connection_state
             (void)co_await watch_ended{.state = state};
             state->after_watch();
         }(this);
+    }
+
+    // The switch: a handler may switch the connection to another protocol (see http/tunnel.hpp), whose bytes it then
+    // has, as the tunnel, until it returns: the connection's reader and writer (so what the client sent along with its
+    // request, and what a watch read, are kept), the input held, and no read timeout but the tunnel's own.
+
+    // tunnel_bytes is the connection's tunnel.
+    class tunnel_bytes final : public detail::tunnel
+    {
+    public:
+        explicit tunnel_bytes(connection_state* state) noexcept
+            : state{state}
+        {}
+
+        [[nodiscard]] io::buffered_reader& reader() noexcept override { return state->reader; }
+        [[nodiscard]] io::buffered_writer& writer() noexcept override { return state->writer; }
+
+        void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept override
+        {
+            detail::socket_of(*state->conn).set_read_timeout(timeout);
+        }
+
+        // NOTE: over TLS, the socket's token is the stream's (see tls::stream::set_stop_token()).
+        void set_stop_token(std::stop_token stop) noexcept override
+        {
+            detail::socket_of(*state->conn).set_stop_token(std::move(stop));
+        }
+
+        [[nodiscard]] std::stop_token closing() const noexcept override { return state->closing; }
+
+        void abort() noexcept override
+        {
+            aborted.store(true, std::memory_order::release);
+            detail::socket_of(*state->conn).shutdown_read();
+        }
+
+        // was_aborted is whether abort() was called: then what's written but not flushed isn't sent.
+        [[nodiscard]] bool was_aborted() const noexcept { return aborted.load(std::memory_order::acquire); }
+
+    private:
+        connection_state* state;
+        std::atomic_bool  aborted = false;
+    };
+
+    // switch_now is the connection's switch_hook (see detail::switch_hook), on the handler's task.
+    static coro::task<detail::tunnel*> switch_now(void* context)
+    {
+        auto* state = static_cast<connection_state*>(context);
+
+        // until the request's body has been read to its end (on the handler's task, or for none, before it starts: so,
+        // before this), what follows its head is the body.
+        if ((state->watch_gate.load(std::memory_order::acquire) & body_read) == 0)
+            return coro::ready_task<detail::tunnel*>(nullptr);
+
+        // From now, no watch begins. If the gate had opened, whoever opened it (maybe the server's thread, as this
+        // runs) began one, or found no need: which is waited for.
+        if ((state->watch_gate.fetch_or(switched, std::memory_order::acq_rel) & handler_waited) != 0)
+            return state->switch_after_watch();
+
+        return coro::ready_task<detail::tunnel*>(state->switch_input());
+    }
+
+    // switch_after_watch is switch_now(), once the gate has opened: a watch in progress is abandoned, as the server's
+    // own paths do (its read timing out at once), keeping what its read buffered.
+    coro::task<detail::tunnel*> switch_after_watch()
+    {
+        detail::socket_of(*conn).set_read_deadline(io::clock::now());
+
+        // NOTE: watching is read only once the watch is known to have ended (or not begun), as it's set as it begins.
+        (void)co_await watch_ended{.state = this};
+        if (watching) after_watch();
+
+        co_return switch_input();
+    }
+
+    // switch_input makes the connection's input the tunnel's: reads no longer flush what's written (the tunnel's user
+    // does), nor have the request body's timeout, or a deadline. Writes keep their timeout.
+    detail::tunnel* switch_input() noexcept
+    {
+        input.hold(true);
+
+        auto& sock = detail::socket_of(*conn);
+        sock.set_read_deadline(std::nullopt);
+        sock.set_read_timeout(std::nullopt);
+        return &tunnel;
     }
 
     // start_request is whether to serve the request whose head (or HTTP/2's preface) was just read: not if close()
@@ -734,9 +838,14 @@ struct server::connection_state
     std::coroutine_handle<>   watcher_parked;   // the watcher, between watches
     std::error_code           watch_result;     // the last watch's, once watch_handoff says it's ended
 
-    // watch_handoff is null while a watch's read is in progress, this state once it's ended, or the server's coroutine
-    // if it's waiting for that.
+    // watch_handoff is null while a watch's read is in progress (and from the start of each request, until a watch has
+    // ended, or not begun: see no_watch()), this state once it's ended, or the server's coroutine (or a switch's) if
+    // it's waiting for that.
     std::atomic<void*> watch_handoff{nullptr};
+
+    // The switch's (see above): made once, for each request's response_writer to point to.
+    tunnel_bytes        tunnel{this};
+    detail::switch_hook switching{.call = &connection_state::switch_now, .context = this};
 
     // NOTE: last, so it's destroyed first (parked: the watch is always ended first), as it uses the rest.
     coro::task<> watcher;
@@ -889,6 +998,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
 
         // (for a request without a body, at once.)
         state.watch_gate.store(0, std::memory_order::relaxed);
+        state.watch_handoff.store(nullptr, std::memory_order::relaxed);
         http11::call_at_body_end(req, {.call = &connection_state::body_ended, .context = &state});
 
         if (!state.start_request())
@@ -925,7 +1035,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
         io::discard_writer no_body;
         start_response(state, no_body);
 
-        response_writer rw{&state.writer, &resp, http11::response_encode, &state.closing};
+        response_writer rw{&state.writer, &resp, http11::response_encode, &state.closing, &state.switching};
 
         // the client may wait for 100 Continue before it sends the body: it's sent when the handler first reads it.
         if (expected == detail::expectation::continue_100 && body_to_come(req))
@@ -959,6 +1069,14 @@ coro::task<> server::serve_requests(detail::connection& conn)
             co_await state.abandon_watch();
             co_await end_after_handler_failure(conn, state, rw, failure);
             break;
+        }
+
+        // the handler switched protocols, and had the connection until it returned (see the switch, above; no watch is
+        // in progress): the connection ends, sending what the handler left written, unless it aborted it.
+        if (rw.switched())
+        {
+            if (!state.tunnel.was_aborted()) co_await state.writer.flush();
+            co_return;
         }
 
         if (!co_await default_response(state, rw))

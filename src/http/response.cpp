@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <optional>
 #include <stdexcept>
@@ -78,14 +79,15 @@ status parse_status(std::string_view str) noexcept
     return static_cast<status>(v);
 }
 
-response_writer::response_writer(io::writer*            writer,
-                                 server_response*       base,
-                                 response_encoder       encode,
-                                 const std::stop_token* close_after)
+response_writer::response_writer(io::writer*                writer,
+                                 server_response*           base,
+                                 response_encoder           encode,
+                                 const std::stop_token*     close_after,
+                                 const detail::switch_hook* switching)
     : resp{
           base
 }
-    , backend{http11_backend{.writer = writer, .encode = encode, .close_after = close_after}}
+    , backend{http11_backend{.writer = writer, .encode = encode, .close_after = close_after, .switching = switching}}
 {}
 
 response_writer::response_writer(detail::http2_stream*           stream,
@@ -119,8 +121,8 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
     // possibly another client's).
     if (final_sent) throw std::logic_error{"the response was already sent"};
 
-    // nothing can switch protocols (Upgrade is ignored): to an HTTP/1.1 client, a 101 would say the connection had
-    // switched, and HTTP/2 has none (RFC 9113, section 8.6).
+    // to an HTTP/1.1 client, a 101 says the connection has switched, which only detail::switch_protocols() does (so a
+    // 101 always comes with a connection that has); and HTTP/2 has none (RFC 9113, section 8.6).
     if (status_code == status::SWITCHING_PROTOCOLS)
         throw std::system_error{std::make_error_code(std::errc::not_supported), "can't switch protocols"};
 
@@ -285,6 +287,56 @@ coro::task<std::error_code> response_writer::send_continue()
     if (!encoded.has_value()) co_return encoded.error();
 
     co_return co_await flush(h1.writer);
+}
+
+coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_protocols(response_writer& rw,
+                                                                                     fields_view      fields)
+{
+    using result = std::expected<tunnel*, std::error_code>;
+
+    if (rw.final_sent) throw std::logic_error{"the response was already sent"};
+
+    // HTTP/2 has no 101 (RFC 9113, section 8.6), and switches a stream with an extended CONNECT instead.
+    const auto* h1     = std::get_if<response_writer::http11_backend>(&rw.backend);
+    const bool  http10 = rw.resp->version.major == 1 && rw.resp->version.minor == 0;
+    if (h1 == nullptr || h1->switching == nullptr || http10)
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::not_supported)));
+
+    // NOTE: checked before the connection is touched, so that a failure leaves the handler to respond as it would.
+    if (!valid_fields(fields) || !valid_fields(rw.resp->headers))
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+
+    return rw.switch_to(fields);
+}
+
+coro::task<std::expected<detail::tunnel*, std::error_code>> response_writer::switch_to(fields_view fields)
+{
+    const auto& h1 = std::get<http11_backend>(backend);
+
+    auto* tunnel = co_await h1.switching->call(h1.switching->context);
+    if (tunnel == nullptr) co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
+    // the connection's switched from here, whether or not the 101 gets through: so the server ends it after the
+    // handler, rather than sending another response.
+    final_sent = true;
+    tunneled   = true;
+
+    // a 101 has no content (RFC 9110, section 15.2).
+    resp->status_code = status::SWITCHING_PROTOCOLS;
+    resp->headers.remove("Content-Length"sv);
+    resp->headers.remove("Transfer-Encoding"sv);
+    for (const auto& [name, values] : fields)
+    {
+        resp->headers.remove(name);
+        for (const auto& value : values) resp->headers.add(name, std::string_view{value});
+    }
+
+    auto encoded = co_await h1.encode(h1.writer, *resp);
+    if (!encoded.has_value()) co_return std::unexpected(encoded.error());
+
+    // NOTE: the connection's reads don't flush what's written any more (see detail::switch_hook).
+    if (auto err = co_await flush(h1.writer)) co_return std::unexpected(err);
+    co_return tunnel;
 }
 
 coro::task<io::result> response_writer::finish()

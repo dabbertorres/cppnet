@@ -1,7 +1,8 @@
 # Plan: WebSockets
 
 Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
-Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2).
+Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2). Stage 3, switching
+an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3).
 
 ## Goal
 
@@ -523,6 +524,57 @@ waiting for the server's first SETTINGS isn't used.
   `max_message`, 1005 and 1015 on the wire, dropping after this side's close, the reply's code, the sending side's own
   checks), which the table tests cover.
 
+## Learned in stage 3
+
+- The split between the hook and `response_writer`: the hook (`connection_state::switch_now()`, a `switch_hook`'s
+  `call`, returning a `coro::task<tunnel*>`, a ready task unless it has a watch to wait for) does the connection's part
+  only (the gate, the watch, the reader's hold, the timeouts), and `switch_protocols()` (a friend of `response_writer`)
+  the response's: it checks what it can first (sent already: `std::logic_error`, as `send()`; HTTP/2, HTTP/1.0 and a
+  `response_writer` without a hook, e.g. the server's own error responses': `not_supported`; a field that can't be sent,
+  given or the response's own: `invalid_argument`), so a refusal sends nothing and leaves the handler to respond; then
+  calls the hook, and once the connection's committed marks the response `switched()` and `sent()` before encoding the
+  101 (so a 101 that fails to go still ends the connection, the error returned), puts `fields` over the response's own
+  of the same names (dropping Content-Length and Transfer-Encoding), encodes and flushes. `switched()` is public on
+  `response_writer` (middleware may ask); `switch_protocols()` stays internal. It returns `std::expected<tunnel*,
+  std::error_code>`; the tunnel is the connection's, for the handler's call.
+- A rule the plan didn't have: a request whose body hasn't been read to its end can't switch (`invalid_argument`,
+  nothing done): what follows its head is the body until then, which the tunnel would take for the new protocol's bytes.
+  The hook reads the gate's `body_read` mark (set on the handler's task, or before it for a request without a body), so
+  it costs nothing. WebSockets' requests have no body (`check_request()`), so it only guards misuse.
+- `switch_hook` is defined in `response.hpp` (with `tunnel` forward-declared), not `tunnel.hpp`: `response.cpp` is built
+  into the fuzz targets, which don't have spdlog, and `tunnel.hpp` needs `io::clock` (`io/scheduler.hpp`) for
+  `set_read_timeout()`.
+- The watch, where the plan was too quick: a switch that finds the gate opened (its `fetch_or` sees `handler_waited`,
+  `body_read` being known set) can't tell whether a watch was begun, as `begin_watch()` may be running on the server's
+  thread (in `handler_runs::await_suspend()`, right after the handler suspended) while the handler, resumed on another
+  worker, switches. So it always waits through the handoff (`switch_after_watch()`: a read deadline of now first,
+  harmless if no watch begins), and `begin_watch()` declining (something buffered, as when the client sent bytes with
+  its request, or stopped) publishes as a watch's end would (`no_watch()`, an exchange, resuming a waiting switch on the
+  pool, as it may be inside `handler_runs`). `watch_handoff` is reset per request by the loop (a relaxed store beside
+  the gate's), not by `begin_watch()`, whose store could overwrite a switch already waiting. That race isn't reachable
+  deterministically, so no test forces it; the tests take each path the hook has: no watch (the handler didn't suspend),
+  a watch abandoned, a watch declined (bytes sent along), and a watch that had ended (the client half-closed).
+- `tunnel::abort()` also drops what's buffered: the loop's end doesn't flush an aborted tunnel's writer (an HTTP/2
+  reset would drop it too), so a peer that doesn't read can't hold the connection for `write_timeout` after an abort.
+  A handler that throws after switching takes the failure path as before (logged, flushed, lingering).
+- `closing()` is the server's `close()` token as is; until stage 5 nothing else happens on `close()` (the tunnel goes
+  on, and `join()` waits for its handler).
+- `bench_request` (Release, four runs of the build before and three after, interleaved; the best of each, and the
+  range): pipelined 1137 ns per request before (1137 to 1169), 1143 after (1143 to 1159); one request per read 1316
+  (1316 to 1369), 1360 (1360 to 1364); over a socket 28.1 us (28.1 to 30.1), 28.4 (28.4 to 30.3); to a handler that
+  waits once (so watched) 36.3 us (36.3 to 39.5), 37.3 (37.3 to 38.8). Allocations per request the same everywhere
+  (1.4, 4.2, 3.0, 2.0, and the HTTP/2 and middleware lines as they were). So nothing measurable, as the plan expected:
+  the pointer in `http11_backend`, the test of `switched()` after the handler (the bench's own copy of the loop has it
+  too), and a relaxed store per request for the handoff.
+- Each rule and path was broken alone (28 breaks: the body rule, the `switched` mark, waiting for the watch, the
+  watch's deadline of now, `no_watch()`'s publication, the per-request handoff reset, the tunnel's abort (its mark,
+  its shutdown), the loop's flush and its end, the input's hold, the read timeout and deadline cleared, the tunnel's
+  timeout, stop token and `closing()`, Content-Length dropped, the fields merged, `sent()` and `switched()` set, the
+  HTTP/1.0, field and hookless refusals, the 101's flush, the hook's refusal, and sending twice), and the tests failed
+  for every one but `after_watch()` in `switch_after_watch()`, which leaves nothing observable once the switch has set
+  the input up (it keeps `watching` false, as the server's paths do). Three of them hang rather than fail (the watch
+  never ending, or the 101 never sent), which the test run's time limit shows.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -533,11 +585,11 @@ Each a pull request, mergeable and tested alone, in this order:
 2. **The codec and the session.** Done (2026-10-29; see Learned in stage 2). `websocket/frame.hpp`, `session.hpp`,
    `handshake.hpp` (`accept_key()` and the checks), `websocket/error.hpp`; tests on bytes; `fuzz_websocket`. Without
    I/O, and nothing uses it yet: reviewed and fuzzed on its own, as HPACK and HTTP/2's session were.
-3. **Switching an HTTP/1.1 connection.** `http/tunnel.hpp`, the switch hook (the watch's gate, the reader's hold, the
-   socket's timeouts), `switched()` and the loop's end; tested with a handler that switches through
-   `http::detail::switch_protocols()` (internal) and echoes raw bytes, with and without a watch begun, over TLS too;
-   `bench_request` before and after. Split from 4 so the server's part, which every request's path goes past, is
-   measured and reviewed apart from the protocol.
+3. **Switching an HTTP/1.1 connection.** Done (2026-10-29; see Learned in stage 3). `http/tunnel.hpp`, the switch hook
+   (the watch's gate, the reader's hold, the socket's timeouts), `switched()` and the loop's end; tested with a handler
+   that switches through `http::detail::switch_protocols()` (internal) and echoes raw bytes, with and without a watch
+   begun, over TLS too; `bench_request` before and after. Split from 4 so the server's part, which every request's path
+   goes past, is measured and reviewed apart from the protocol.
 4. **Accepting WebSockets.** `websocket::accept()`, `connection` (reading whole and streamed, writing, the write turn,
    control replies, the close handshake, close codes as errors), `max_message`, `example/websocket-echo`, the guide's
    section; the server tests above but timeouts and `close()`. Autobahn's `fuzzingclient` by hand, in the pull request.

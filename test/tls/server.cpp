@@ -39,11 +39,15 @@
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
 #include "http/h2_client.hpp"
+#include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "http/tunnel.hpp"
+#include "http/tunnel_echo.hpp"
+#include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -1159,5 +1163,71 @@ TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is sti
         CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
         CHECK(received.ends_with("\r\n\r\nstopped"));
     }
+    CHECK(err == net::io::errc::end_of_stream);
+}
+
+TEST_CASE("an HTTPS handler switches protocols, and the connection ends with close_notify",
+          "[tls][http][server][tunnel]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // whether the handler waits before it switches, so the switch ends a watch (whose read is the TLS stream's),
+    // unless the client sent bytes along with its request (which are kept), and there was no need for one.
+    const bool waits = GENERATE(false, true);
+    const bool early = GENERATE(false, true);
+    CAPTURE(waits, early);
+
+    http::router router;
+    router.GET("/echo",
+               [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   if (waits) (void)co_await sched.sleep_until(net::io::clock::now() + 50ms);
+
+                   http::headers fields;
+                   fields.set("Upgrade"sv, "echo"sv);
+                   fields.set("Connection"sv, "Upgrade"sv);
+
+                   auto switched = co_await http::detail::switch_protocols(rw, fields);
+                   if (!switched.has_value()) co_return;
+
+                   const auto echoed = co_await test::echo(**switched);
+                   (void)co_await net::io::write_all((*switched)->writer(), echoed ? echoed.message() : "ok");
+               });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    const auto test = [&] -> task<std::pair<std::string, std::error_code>>
+    {
+        std::string received;
+
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
+
+        (void)co_await net::io::write_all(
+            *s,
+            std::string{"GET /echo HTTP/1.1\r\nHost: x\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n"}
+                + (early ? "early\n" : ""));
+        if (auto err = co_await test::read_until(*s, received, early ? "early\n"sv : "\r\n\r\n"sv))
+            co_return std::pair{received, err};
+
+        (void)co_await net::io::write_all(*s, "bye\n"sv);
+        auto err = co_await test::read_to_end(*s, received);
+        co_return std::pair{received, err};
+    };
+
+    auto [received, err] = sched.run_to_completion(test());
+    CAPTURE(received, err.message());
+    CHECK(received.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(received.contains("\r\nUpgrade: echo\r\n"));
+    CHECK(received.ends_with(early ? "\r\n\r\nearly\nbye\nok"sv : "\r\n\r\nbye\nok"sv));
+
+    // the server's close_notify, not the TCP stream cut short.
     CHECK(err == net::io::errc::end_of_stream);
 }

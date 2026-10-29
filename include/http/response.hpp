@@ -316,10 +316,31 @@ using response_decoder =
                                             std::size_t,
                                             util::function_ref<void(status, const headers&)>) noexcept;
 
+struct response_writer;
+
 namespace detail
 {
     // http2_stream is an HTTP/2 stream the server serves (see http/http2_server.hpp).
     class http2_stream;
+
+    // tunnel is a connection's bytes once it has switched protocols (see http/tunnel.hpp).
+    class tunnel;
+
+    // switch_hook is how a response_writer reaches the connection it responds on, to switch it: made once per
+    // connection (a function and its context, as io::start_callback is), so a response_writer holds only a pointer to
+    // it. call readies the connection, on the handler's task, and returns its tunnel: from then, nothing but the
+    // tunnel's user reads the connection (e.g. the server's watch for the client leaving, which it ends if one's in
+    // progress, keeping what it read), reads don't flush what's written, and they have no timeout. It returns null,
+    // having done nothing, if what follows the request's head isn't the new protocol's yet: its body, which hasn't been
+    // read to its end.
+    struct switch_hook
+    {
+        coro::task<tunnel*> (*call)(void* context) = nullptr;
+        void* context                              = nullptr;
+    };
+
+    // switch_protocols switches the connection rw's request came on to another protocol (see http/tunnel.hpp).
+    coro::task<std::expected<tunnel*, std::error_code>> switch_protocols(response_writer& rw, fields_view fields);
 
     // http2_stream_ops are what a response_writer does with an HTTP/2 stream, which its server provides: so that
     // response_writer doesn't depend on HTTP/2's server (as it doesn't on HTTP/1.1's encoder).
@@ -345,10 +366,12 @@ struct response_writer
 public:
     // An HTTP/1.x response, whose head encoder writes to writer. Once close_after (if given) is stopped, a final
     // response not yet sent says the connection closes after it (Connection: close): the server's close() does that.
-    response_writer(io::writer*            writer,
-                    server_response*       base,
-                    response_encoder       encoder,
-                    const std::stop_token* close_after = nullptr);
+    // switching (if given) is the connection's, for detail::switch_protocols().
+    response_writer(io::writer*                writer,
+                    server_response*           base,
+                    response_encoder           encoder,
+                    const std::stop_token*     close_after = nullptr,
+                    const detail::switch_hook* switching   = nullptr);
 
     // An HTTP/2 response, on stream.
     response_writer(detail::http2_stream* stream, const detail::http2_stream_ops* ops, server_response* base) noexcept;
@@ -380,10 +403,11 @@ public:
     // HTTP/1.1, and keeps the headers, which the final response then sends too (as RFC 8297 expects of Early Hints).
     // It isn't sent to an HTTP/1.0 client, which doesn't know them (RFC 9110, section 15.2): send() then returns a
     // writer that drops what's written. status::SWITCHING_PROTOCOLS can't be sent (std::system_error, with
-    // std::errc::not_supported), as nothing can switch protocols: it would tell an HTTP/1.1 client the connection had
-    // switched, and HTTP/2 has no 101 (RFC 9113, section 8.6). A request that expects 100 Continue gets one from the
-    // server, when the handler first reads its body, unless the handler sent its own 100 or the final response before
-    // (another interim response doesn't count; see expect_continue()).
+    // std::errc::not_supported): it would tell an HTTP/1.1 client the connection had switched, which only switching it
+    // does (as what speaks the other protocol does, e.g. WebSockets; see switched()), and HTTP/2 has no 101 (RFC 9113,
+    // section 8.6). A request that expects 100 Continue gets one from the server, when the handler first reads its
+    // body, unless the handler sent its own 100 or the final response before (another interim response doesn't count;
+    // see expect_continue()).
     //
     // NOTE: when the encoder finishes without a coroutine (e.g. the head fits in the connection's buffer), so does
     //       send(), which then throws when it's called, rather than when it's awaited.
@@ -410,6 +434,10 @@ public:
     // sent is whether the final (not 1xx) response has been sent.
     [[nodiscard]] bool sent() const noexcept { return final_sent; }
 
+    // switched is whether the response was a 101 (Switching Protocols), after which the connection was the handler's,
+    // speaking another protocol (e.g. WebSocket), until the handler returned. It counts as sent too.
+    [[nodiscard]] bool switched() const noexcept { return tunneled; }
+
     // expect_continue is the server's: the request expects 100 (Continue) before its client sends the body (Expect:
     // 100-continue, RFC 9110, section 10.1.1), which is to come. It returns the callback for the body's first read to
     // await (see io::start_callback), which sends the 100 then (just the status, without the response's headers),
@@ -425,6 +453,9 @@ public:
     [[nodiscard]] bool continue_unmet() const noexcept { return continuation == continue_state::unmet; }
 
 private:
+    friend coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_protocols(response_writer& rw,
+                                                                                                fields_view fields);
+
     // continue_state is how a request's expectation of 100 Continue stands.
     enum class continue_state : std::uint8_t
     {
@@ -441,6 +472,9 @@ private:
     // send_interim finishes sending an interim response over HTTP/1.1, flushing it once encoding (which may need a
     // coroutine) does.
     coro::task<io::writer*> send_interim(coro::task<response_encoder_result> encoding);
+
+    // switch_to does detail::switch_protocols()'s part once it has checked what it can without the connection.
+    coro::task<std::expected<detail::tunnel*, std::error_code>> switch_to(fields_view fields);
 
     // how a response's body is framed: by its Content-Length, chunks, or closing the connection.
     enum class framing : std::uint8_t
@@ -464,11 +498,12 @@ private:
     // or closing the connection.
     struct http11_backend
     {
-        io::writer*            writer;
-        response_encoder       encode;
-        const std::stop_token* close_after;
-        http11::chunked_writer chunked{nullptr};
-        bool                   chunked_open = false;
+        io::writer*                writer;
+        response_encoder           encode;
+        const std::stop_token*     close_after;
+        const detail::switch_hook* switching;
+        http11::chunked_writer     chunked{nullptr};
+        bool                       chunked_open = false;
     };
 
     // http2_backend sends the response on an HTTP/2 stream, which frames its body itself.
@@ -482,6 +517,7 @@ private:
     std::variant<http11_backend, http2_backend> backend;
     io::limit_writer                            body;
     bool                                        final_sent   = false;
+    bool                                        tunneled     = false; // see switched()
     continue_state                              continuation = continue_state::none;
 };
 

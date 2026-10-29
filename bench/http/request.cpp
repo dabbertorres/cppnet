@@ -273,6 +273,9 @@ task<void> serve(const Router& router, net::io::reader& input, net::io::writer& 
         counted.handle += allocations.load(std::memory_order::relaxed) - at;
         at = allocations.load(std::memory_order::relaxed);
 
+        // as the server does: a handler that switched protocols had the connection (none does, here).
+        if (rw.switched()) break;
+
         // skips what's left of the body (none, here).
         std::array<std::byte, 64> scratch{};
         while (!(co_await req.body->read(scratch)).err)
