@@ -69,3 +69,14 @@ add_fuzzer(
   "${PROJECT_SOURCE_DIR}/src/dns/error.cpp" "${PROJECT_SOURCE_DIR}/src/dns/message.cpp"
 )
 add_fuzzer(fuzz_utf8 utf8.cpp "${PROJECT_SOURCE_DIR}/src/util/utf8.cpp")
+add_fuzzer(
+  fuzz_websocket
+  websocket.cpp
+  "${PROJECT_SOURCE_DIR}/src/encoding/hex.cpp"
+  "${PROJECT_SOURCE_DIR}/src/io/io.cpp"
+  "${PROJECT_SOURCE_DIR}/src/util/random.cpp"
+  "${PROJECT_SOURCE_DIR}/src/util/utf8.cpp"
+  "${PROJECT_SOURCE_DIR}/src/websocket/error.cpp"
+  "${PROJECT_SOURCE_DIR}/src/websocket/frame.cpp"
+  "${PROJECT_SOURCE_DIR}/src/websocket/session.cpp"
+)

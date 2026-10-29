@@ -1,7 +1,7 @@
 # Plan: WebSockets
 
 Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
-Learned in stage 1).
+Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2).
 
 ## Goal
 
@@ -456,6 +456,73 @@ waiting for the server's first SETTINGS isn't used.
   macros (which depends on nothing). `util::uuid`'s own `fill_random()` (`std::random_device`) and OpenTelemetry's ids
   (`std::mt19937_64`) are left as they were.
 
+## Learned in stage 2
+
+- Everything internal is in `websocket::detail` (`frame.hpp`, `session.hpp`, `handshake.hpp`), as the plan named the
+  session. `websocket/websocket.hpp` exists already, holding only the handshake's options (`accept_options{subprotocols,
+  origins, insecure_any_origin}`, `connect_options{headers, subprotocols, origin}`); `connection`, `accept()`,
+  `connect()` and `connection_options` come with stages 4 and 6. The session's limit is its own `detail::limits`
+  (`max_message`, 1 MiB), which `connection_options` will fill.
+- Errors (`error.hpp`): `close_code` is an error code enum, the peer's codes (`err == close_code::going_away` is the
+  peer's going away), and `sent(code)` makes this side's, at `sent_base` 10000 (TLS's 512 fits alerts' 8 bits; 10000
+  keeps a close's 16, and 11002 reads as 1002 sent). There's no condition enum matching either side's, as TLS's `alert`
+  is (an enum can't be both a code and a condition): `close_code_of(err)` gives the code whichever side sent it, and
+  `from_peer(err)` the side. 1000, 1001, 1005 and 1006 are `io::status_condition::closed` from either side. 1012 to 1014
+  (IANA's service restart, try again later, bad gateway) are named, as the plan allows them on the wire.
+- The codec's failures are the error the connection ends with, the close this side sends (`sent(protocol_error)`), not
+  a bare close code, so they're `std::error_code`s as everything else's; the sender's own mistakes (`encode_close()`
+  given a code that can't be sent, `frame_for()` misused) are `invalid_argument`. `decode_header()` returns
+  `std::expected<std::optional<decoded_header>, std::error_code>` (none: more bytes), and fails a length as soon as its
+  bytes are in, before the mask key, so a header fails at the same byte however it's read. `encode_close()` takes
+  `no_status_received` as "a close without a code" (an empty payload), which a close needs and the plan didn't say how
+  to ask for.
+- The session's shape, where the plan left it open: `begin_frame()` gives a `frame_info` (data, with its message's type
+  on every fragment and whether it's the first and last; control; or dropped), `end_frame()` a `received` (data,
+  message_end, ping, pong, close with its code and reason, dropped), `remaining()` what's left of the frame's payload.
+  Misuse (a frame begun inside another, more payload than the frame has, the end before the payload's) is
+  `invalid_argument` and not kept; a protocol failure is kept, and every later receiving call returns it.
+- After the peer's close every frame fails with 1002, a second close too: the plan had "anything but a close", but a
+  second close is no better than data (RFC 6455 has the peer send nothing after its close), and the owner stops reading
+  once it has the close. After this side's close, data, pings and pongs are dropped (pings not answered, as a pong
+  would follow the close), but still checked for what the framing requires (RSV, opcodes, masks, control frames,
+  continuations in order): only UTF-8 and `max_message` are skipped, as nothing's kept of them. A message begun before
+  the close is still followed through its fragments, so its continuations aren't taken for strays.
+- Sending: `frame_for()` refuses everything after this side's close with `broken_pipe` (writing after a shutdown,
+  which `status_condition::closed` takes in), and after a receiving failure everything but the close that fails the
+  connection. Data may still be sent between the peer's close and this side's reply (RFC 6455 5.5.1 lets an endpoint
+  finish the message it's sending first). `close_reply()` writes the reply's payload, the peer's code alone (none for
+  1005), as gorilla's default close handler does.
+- The handshake: `check_request()` returns the key, and `check_response()` the subprotocol chosen, as views of the
+  message's fields, so the message must outlive them (two tests first kept them past a temporary, which ASan caught).
+  Over HTTP/2 `check_request()` fails with `not_websocket` until stage 8 gives `server_request` its `protocol`: the
+  extended CONNECT's checks need it, so the seam is that one branch. A body is a Content-Length other than 0 or any
+  Transfer-Encoding. `Sec-WebSocket-Version` must be one line, `13`; the key one line, 24 characters of strict base64
+  decoding to 16 bytes. Subprotocols are compared exactly (browsers compare the server's choice so), from the server's
+  list, over every `Sec-WebSocket-Protocol` line. `make_request()` gives a `client_handshake{request, key}`, setting
+  the handshake's fields over the caller's and dropping a caller's `Sec-WebSocket-Extensions` (no extension can be
+  taken). `check_response()` fails a missing `Upgrade`/`Connection` with `not_websocket`, the accept compared exactly.
+- Origins (Decided question 7), where the plan was silent on ports: the request's own host is its Host's (or an
+  absolute target's) and its port, a port left out on either side being the origin's scheme's default (80 for http and
+  ws, 443 for https and wss). So a TLS-terminating proxy's backend (Host without a port, Origin https) passes, and a
+  different port doesn't. Patterns are `host[:port]`: `*` for exactly one label (`*.example.com` matches neither
+  `example.com` nor `a.b.example.com`), a port, `:*` for any, or none for the default (`localhost` doesn't allow
+  `http://localhost:3000`; `localhost:3000` does). `null`, an origin with a path, a malformed one and several lines are
+  refused; `insecure_any_origin` takes even those.
+- Tests share `test/websocket/frames.hpp`: `frame()` builds a frame, and `read(session, input, piece)` reads frames
+  through a session as its owner will, from input arriving `piece` bytes at a time, recording the frames taken, the
+  events, and the failure with the bytes being read when it came (`failed_byte()`, read a byte at a time). The session's
+  rules are one table over both roles, each case read at once and a byte at a time, which must agree. `fuzz_websocket`
+  uses the same reader (as `fuzz_utf8` covers the validator, `fuzz_websocket` leaves it out).
+- Each rule was broken alone (42 breaks: the codec's, the session's both ways, the handshake's and the error
+  category's), and the tests failed for every one. `fuzz_websocket` (45 s each, from a corpus of ten minutes' run)
+  found 14 of the 28 breaks in the codec and the session (the masked server frame, fragmented and oversized control
+  frames, both minimal-length checks, a 1-byte close, a close reason that isn't UTF-8, RSV bits, reserved opcodes, the
+  two continuation rules, frames after the peer's close, the mask's offset, an unmasked client's frames), through
+  re-encoding and the sending session taking what the receiving one took; it can't see a rule that reading at once, a
+  byte at a time and the sending side all agree on (UTF-8, an unmasked frame to a server, the length's top bit,
+  `max_message`, 1005 and 1015 on the wire, dropping after this side's close, the reply's code, the sending side's own
+  checks), which the table tests cover.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -463,9 +530,9 @@ Each a pull request, mergeable and tested alone, in this order:
 1. **The helpers.** Done (2026-10-24; see Learned in stage 1). `util::sha1`, `util::utf8_validator` (moved from
    Structured Fields, with the ASCII path) and `util::random_bytes` (moved from the DNS resolver). Tests. First: small,
    no I/O, and the next stages need them.
-2. **The codec and the session.** `websocket/frame.hpp`, `session.hpp`, `handshake.hpp` (`accept_key()` and the checks),
-   `websocket/error.hpp`; tests on bytes; `fuzz_websocket`. Without I/O, and nothing uses it yet: reviewed and fuzzed on
-   its own, as HPACK and HTTP/2's session were.
+2. **The codec and the session.** Done (2026-10-29; see Learned in stage 2). `websocket/frame.hpp`, `session.hpp`,
+   `handshake.hpp` (`accept_key()` and the checks), `websocket/error.hpp`; tests on bytes; `fuzz_websocket`. Without
+   I/O, and nothing uses it yet: reviewed and fuzzed on its own, as HPACK and HTTP/2's session were.
 3. **Switching an HTTP/1.1 connection.** `http/tunnel.hpp`, the switch hook (the watch's gate, the reader's hold, the
    socket's timeouts), `switched()` and the loop's end; tested with a handler that switches through
    `http::detail::switch_protocols()` (internal) and echoes raw bytes, with and without a watch begun, over TLS too;
