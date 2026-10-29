@@ -715,6 +715,11 @@ struct server::connection_state
 
         [[nodiscard]] std::stop_token closing() const noexcept override { return state->closing; }
 
+        [[nodiscard]] io::scheduler* get_scheduler() const noexcept override
+        {
+            return detail::socket_of(*state->conn).get_scheduler();
+        }
+
         void abort() noexcept override
         {
             aborted.store(true, std::memory_order::release);

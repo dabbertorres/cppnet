@@ -611,13 +611,13 @@ scheduler.spawn(server.serve());
   ```
 
   An HTTP/1.0 client gets none (it doesn't know them: `send()` then returns a writer that drops what's written).
-  `status::SWITCHING_PROTOCOLS` can't be sent (`std::system_error`, `std::errc::not_supported`), as nothing can switch
-  protocols. A request with `Expect: 100-continue`, whose client may wait before it sends the body, gets a 100
-  (Continue) from the server when the handler first reads the body, unless the handler has sent its own 100 or the
-  final response by then (as Go's server: another interim response, e.g. a 103, doesn't stop it); a handler that
-  answers without reading it (e.g. a 413, for a body too large) sends none, and over HTTP/1.1 the connection closes
-  after its response, rather than waiting for a body that may never come. Any other expectation is answered 417
-  (Expectation Failed), without calling the handler.
+  `status::SWITCHING_PROTOCOLS` can't be sent (`std::system_error`, `std::errc::not_supported`): a 101 goes only with a
+  connection that really switches, which accepting a WebSocket does (see WebSockets). A request with `Expect:
+  100-continue`, whose client may wait before it sends the body, gets a 100 (Continue) from the server when the handler
+  first reads the body, unless the handler has sent its own 100 or the final response by then (as Go's server: another
+  interim response, e.g. a 103, doesn't stop it); a handler that answers without reading it (e.g. a 413, for a body too
+  large) sends none, and over HTTP/1.1 the connection closes after its response, rather than waiting for a body that may
+  never come. Any other expectation is answered 417 (Expectation Failed), without calling the handler.
 - **The request's body** is `req.body`, a reader. Whatever the handler doesn't read is skipped. As a response's, it
   ends (`io::errc::end_of_stream`) only once all of it has been read: one the client cuts short fails (with
   `std::errc::connection_aborted`, if the connection ends first).
@@ -891,6 +891,72 @@ scheduler.spawn(server.serve());
   }
   ```
 
+## WebSockets
+
+A handler accepts a WebSocket (RFC 6455) with `websocket::accept()` (`websocket/websocket.hpp`), and has it, as a
+`websocket::connection`, until it returns: a WebSocket is a route like any other, so routing, path values and
+middleware (e.g. authentication answering 401) run before the handshake.
+
+```cpp
+router.GET("/echo",
+           [](net::http::server_request& req, net::http::response_writer& resp) -> net::coro::task<void>
+           {
+               auto conn = co_await net::websocket::accept(req, resp);
+               if (!conn) co_return;   // refused: accept() has answered
+
+               std::string message;
+               while (true)
+               {
+                   auto type = co_await conn->read_message(message);
+                   if (!type) co_return;   // how it ended: e.g. the client's close, answered already
+                   if (co_await conn->write_message(*type, message)) co_return;
+               }
+           });
+```
+
+- **The handshake:** `accept()` checks the request, and answers one that isn't a WebSocket handshake with 400 Bad
+  Request (426 Upgrade Required, saying version 13, for another version), returning why (`websocket::errc`, in
+  `websocket/error.hpp`); the connection then serves the next request as usual. Otherwise it sends 101 (Switching
+  Protocols), with what the handler put in `resp.headers()` (e.g. a `Set-Cookie`), and the connection is the
+  WebSocket's. `accept_options::subprotocols` are the server's, most preferred first: the first the client offers is
+  chosen (`conn->subprotocol()`). Only HTTP/1.1 so far (a request over HTTP/2 gets 400).
+- **Origins:** browsers send cookies with WebSocket handshakes from any site, so a page elsewhere could open one with
+  its visitor's cookies (cross-site WebSocket hijacking). A request whose `Origin` isn't the request's own host and
+  port is refused (403 Forbidden), unless it matches `accept_options::origins` (e.g. `"*.example.com"`,
+  `"localhost:3000"`). A program that isn't a browser sends no `Origin`, and isn't checked. `insecure_any_origin` turns
+  the check off, for endpoints that don't authenticate with what browsers send by themselves.
+- **Reading:** one task reads at a time (a second read fails with `std::errc::device_or_resource_busy`), and it must
+  read, as reads are what answer the client's pings (with a pong) and its close. `read_message(buffer)` replaces a
+  `std::string`'s or a `std::vector<std::byte>`'s contents with the next whole message, returning its type (`text` or
+  `binary`); nothing's allocated once the buffer's capacity holds it. Or a message is streamed: `next_message()` returns
+  its type, then `conn->message()` is an `io::reader` of it, ending (`io::errc::end_of_stream`) at its end. What isn't
+  read of a message is skipped by the next read. Text is checked to be UTF-8 as it comes, and a message is limited to
+  `accept_options::connection.max_message` (1 MiB), however it's read.
+- **Writing:** any number of tasks may write at once, their messages taking turns, never interleaved.
+  `write_message(type, data)` sends a message, and returns once it has gone to the connection, so a client that doesn't
+  read makes writes wait (until the server's `write_timeout`, which then fails the WebSocket). `begin_message(type)`
+  waits for its turn, and returns a `message_writer` (an `io::writer`), each write a frame, ended by `end_message()`,
+  for a message too large to hold at once; other messages wait for its end (so a task mustn't write a whole message
+  while it has one open), but `ping()` and the replies to the client's pings and close go between its frames.
+- **Closing:** `co_await conn->close(code, reason)` sends a close (`close_code::normal_closure` by default), then
+  waits for the client's, reading for it itself (and dropping messages that come before it) unless another task is
+  reading, for up to `accept_options::connection.close_timeout` (5 s): then it aborts the connection. A connection
+  destroyed (e.g. its handler returning) without a close aborts it, so the client sees it end without one. Once the
+  handler returns, the server ends the TCP connection, as RFC 6455 has the server do.
+- **How it ended:** an error, as everything else: the client's close, as its code (`err == close_code::going_away`;
+  `conn->close_reason()` is its reason), from the read that received it; a close the server sent for what the client
+  did wrong (`websocket::sent(close_code::protocol_error)`, `invalid_payload` for text that isn't UTF-8,
+  `message_too_big`); `close_code::abnormal_closure` if the connection ended without a close; or the transport's error
+  (e.g. `std::errc::timed_out`). `websocket::from_peer(err)` says whose a close was, and `close_code_of(err)` its code.
+  The closes that only mean it ended (normal closure, going away, none, abnormal closure) compare equal to
+  `io::status_condition::closed`. Once a WebSocket has failed, everything returns the same failure; writing after the
+  server's close has gone fails with `std::errc::broken_pipe`.
+- **Limits:** a WebSocket holds its HTTP connection, so it counts against `max_connections` until its handler returns,
+  `join()` waits for it, and `abort()` ends it (its reads fail with `abnormal_closure`). `instrument::http_metrics` and
+  `http_tracing` see the 101 as the response's status, and the whole WebSocket as the request's duration.
+
+`example/websocket-echo` is an echo server (the one Autobahn's TestSuite tests).
+
 ## TLS
 
 The HTTP client uses TLS for `https://` URLs by itself. To use it directly, TLS (`tls/tls.hpp`, built unless `NET_TLS`
@@ -988,6 +1054,7 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 | `http/client.hpp`                      | the HTTP client                                           |
 | `http/server.hpp`, `http/router.hpp`, `http/static_router.hpp`, `http/middleware.hpp`, `http/timeout.hpp` | the HTTP server |
 | `http/priority.hpp`                    | `http::priority`: reading and writing a `Priority` field (RFC 9218) |
+| `websocket/websocket.hpp`             | WebSockets (and `websocket/error.hpp`, which it includes)  |
 | `util/linked_stop_source.hpp`          | stop sources that a parent token also stops               |
 | `tls/tls.hpp`                          | TLS                                                       |
 | `tls/version.hpp`, `tls/certificate.hpp` | `tls::version` and `tls::certificate` (included by `tls/tls.hpp` and `http/request.hpp`; without TLS too) |

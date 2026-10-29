@@ -45,6 +45,10 @@ public:
     // WebSocket's close, going away): nothing else ends the tunnel then.
     [[nodiscard]] virtual std::stop_token closing() const noexcept = 0;
 
+    // get_scheduler is the scheduler the connection's I/O waits on (e.g. for what speaks the protocol to wait on, or
+    // for its tasks' pool).
+    [[nodiscard]] virtual io::scheduler* get_scheduler() const noexcept = 0;
+
     // abort ends the tunnel abruptly: reads (a waiting one too) find the end of the stream, and what's written but not
     // flushed isn't sent when the connection ends. Any thread may call it.
     virtual void abort() noexcept = 0;

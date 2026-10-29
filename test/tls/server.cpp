@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,10 @@
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
+#include "websocket/frame.hpp"
+#include "websocket/frames.hpp"
+#include "websocket/raw_peer.hpp"
+#include "websocket/websocket.hpp"
 
 namespace http  = net::http;
 namespace http2 = net::http::http2;
@@ -1227,6 +1232,78 @@ TEST_CASE("an HTTPS handler switches protocols, and the connection ends with clo
     CHECK(received.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     CHECK(received.contains("\r\nUpgrade: echo\r\n"));
     CHECK(received.ends_with(early ? "\r\n\r\nearly\nbye\nok"sv : "\r\n\r\nbye\nok"sv));
+
+    // the server's close_notify, not the TCP stream cut short.
+    CHECK(err == net::io::errc::end_of_stream);
+}
+TEST_CASE("a WebSocket over HTTPS echoes, and closes with the close handshake, then close_notify",
+          "[tls][http][server][websocket]")
+{
+    namespace ws = net::websocket;
+    using test::websocket::client_frame;
+    using ws::detail::opcode;
+
+    net::io::scheduler sched{make_pool()};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw);
+                   if (!conn.has_value()) co_return;
+
+                   std::string message;
+                   while (true)
+                   {
+                       const auto type = co_await conn->read_message(message);
+                       if (!type.has_value()) co_return;
+                       if (co_await conn->write_message(*type, message)) co_return;
+                   }
+               });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    const auto test = [&] -> task<std::tuple<std::string, std::vector<std::string>, std::error_code>>
+    {
+        std::vector<std::string> frames;
+
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return std::tuple{"connect failed", frames, conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::tuple{"handshake failed", frames, s.error()};
+
+        test::websocket::raw_peer peer{*s, *s};
+        (void)co_await peer.send(test::websocket::handshake());
+        auto head = co_await peer.read_head();
+        if (!head.has_value()) co_return std::tuple{"no head", frames, head.error()};
+
+        const std::string large(100'000, 'x');
+        (void)co_await peer.send(test::websocket::join(client_frame(opcode::text, "hello"sv),
+                                                       client_frame(opcode::ping, "p"sv),
+                                                       client_frame(opcode::binary, large)));
+        for (int i = 0; i < 3; ++i)
+        {
+            auto f = co_await peer.read_frame();
+            if (!f.has_value()) co_return std::tuple{*head, frames, f.error()};
+            frames.push_back(f->payload.size() == large.size() ? "large" : f->text());
+        }
+
+        (void)co_await peer.send(test::websocket::close_frame(ws::close_code::normal_closure));
+        auto [rest, err] = co_await peer.read_until_end();
+        for (const auto& f : rest) frames.push_back(std::format("close:{}", static_cast<int>(f.close().code)));
+        co_return std::tuple{*head, frames, err};
+    };
+
+    const auto [head, frames, err] = sched.run_to_completion(test());
+    CAPTURE(head, err.message());
+    CHECK(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(head.contains("\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
+    CHECK(frames == std::vector<std::string>{"hello", "p", "large", "close:1000"});
 
     // the server's close_notify, not the TCP stream cut short.
     CHECK(err == net::io::errc::end_of_stream);

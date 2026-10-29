@@ -2,7 +2,8 @@
 
 Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
 Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2). Stage 3, switching
-an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3).
+an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3). Stage 4, accepting WebSockets, done (2026-10-29; see
+Learned in stage 4).
 
 ## Goal
 
@@ -575,6 +576,67 @@ waiting for the server's first SETTINGS isn't used.
   the input up (it keeps `watching` false, as the server's paths do). Three of them hang rather than fail (the watch
   never ending, or the 101 never sent), which the test run's time limit shows.
 
+## Learned in stage 4
+
+- The API, where the plan left it open: `message_type` (`text`, `binary`); `connection_options{max_message,
+  close_timeout}` is `accept_options::connection` (the client's `connect_options` gets it in stage 6); `accept()` takes
+  the request as `const`. `begin_message()` returns a `message_writer` by value (an `io::writer` with `end_message()`),
+  bound to its message by a count, so a writer kept past its message's end fails (`invalid_argument`) rather than ending
+  someone else's; a task holding one must end it before writing a whole message, which waits for it. `ping(payload)`
+  only sends: the pong is read as reads come to it. `close(code, reason)` takes `no_status_received` for a close without
+  a code. `subprotocol()` and `close_reason()` are views of the state.
+- `close_timeout` is used by `connection::close()` already (stage 5 adds the server's `close()`): `close()` sends its
+  close, then reads for the peer's itself, each wait's read timeout what's left of the timeout, or, if another task is
+  reading, waits for it with `scheduler::wait_on()` on a word the reader bumps when it lets the read side go (the plan's
+  notifier has no deadline). `tunnel::get_scheduler()` is new, for that and for the write turn's notifier's pool. The
+  wait for the write turn itself has no deadline: a write blocked on the peer is bounded by `write_timeout`.
+- The write side is two turns, not one: the wire (whoever writes to the tunnel's buffered writer) and the message turn
+  (held by a message written a frame at a time). Whole messages wait for both, a streamed message's frames and `ping()`
+  for the wire only, which is how control frames go between a streamed message's frames even while its writer is idle.
+  The read's replies go when the reader finds the wire free; otherwise the holder sends them after its frame's flush
+  (then flushes again), before it lets the wire go. Only the latest ping's pong is kept.
+- Failures: one sticky failure for reads and writes, the first: the peer's close as its code (so a write after the
+  peer's close returns its code, not `broken_pipe`, which only writes between this side's close and the peer's get); a
+  protocol failure as `sent(code)`, whose close is sent (the connection doesn't then wait for the peer's: RFC 6455 7.1.7
+  has it close; the handler returns and the server closes TCP); a transport failure as `abnormal_closure` (for
+  `status_condition::closed`) or the error (e.g. a write's `timed_out`), which also aborts the tunnel. Text written
+  isn't checked to be UTF-8 (the peer does; gorilla and coder don't either).
+- A refused handshake is answered with the error's message as a text body; the 426 also has `Upgrade: websocket` and
+  `Connection: Upgrade`, as RFC 9110 15.5.22 requires of a 426. A switch that `switch_protocols()` refuses (a writer
+  that isn't the server connection's, a field that can't be sent) answers nothing, leaving the handler to.
+- Reading without a coroutine: `pump()` steps through what's buffered toward its goal (a message begun, a whole message,
+  some of one, the peer's close), so a message that's all there is read by a plain function (a ready task); otherwise
+  one coroutine, `drive()`, a template returning the operation's own result. A large frame of a whole message with
+  nothing buffered is read straight into the caller's buffer (unmasked and validated there). Measured with a throwaway
+  probe (`bench_request`'s counting, a peer on a blocking socket so its allocations don't count): 1000 buffered
+  messages, 1 allocation in all for `read_message()` (the first read, which waited) and none for `write_message()`; read
+  and echo one at a time, 4 allocations per read (`drive()`'s frame, `buffered_reader::fill_after()`'s, and two more
+  in waiting for the socket, not traced further) and none per write. A contended write turn allocates (the notifier's list of waiters).
+- `connection`'s destructor aborts the tunnel unless this side's close has gone. With every write flushed and no read
+  left (tasks must be done by then), what the abort changes isn't observable: the peer sees the connection end without
+  a close either way.
+- The tests (`test/websocket/server.cpp`, `[websocket][server]`, and a TLS case in `test/tls/server.cpp`) are the
+  Testing section's but the idle pings and the server's `close()` (stage 5's); `close()`'s own timeout is tested here,
+  as `close()` uses it, with a short `close_timeout`. Their scripted client (`test/websocket/raw_peer.hpp`) sends from a
+  task of its own alongside its reads: an echo of a 1 MiB message deadlocked until `write_timeout` while the client was
+  still sending the next one.
+- Autobahn's `fuzzingclient` (Docker, `crossbario/autobahn-testsuite`; config and report in a scratch directory) against
+  `example/websocket-echo` in a Release build (its `max_message` 16 MiB, for section 9's largest messages), sections 1-7
+  and 9: 300 cases, 297 OK and 3 INFORMATIONAL (7.1.6, 7.13.1 and 7.13.2, which only record what the server did), no
+  NON-STRICT, none FAILED, the first time, and again on the commit's code (nothing needed fixing). Section 9 took 10.1 s
+  in all (the whole run 16.7 s): 9.1.6 (a 16 MiB text message) 338 ms, 9.2.6 (16 MiB binary) 203 ms, the slowest 9.5.1
+  (1 MiB in 64-byte frames) 951 ms and 9.6.1 901 ms. The suite's report stays out of the repository.
+- Each rule and path was broken alone (22 breaks: the latest pong, the close's echo, a failure's close, 1006 for the
+  transport's end, a whole message waiting for a streamed one, a stale writer, writes after the close failing rather
+  than waiting, the second read refused, `close()` told when the read side's let go, `read_message()` and
+  `next_message()` skipping a message's rest, the direct read unmasked and validated, `max_message`, `close()`'s read
+  timeout, the turn's notification, a reply left to the wire's holder, the 426's fields, the subprotocol, the accept,
+  the destructor's abort, a failure's abort, and a streamed read stopping at a frame's end), and the tests failed for
+  every one but two: the destructor's abort, unobservable as above; and the streamed read's stop at a frame's end, which
+  only made a read return less than it could (the rule went). A failure's abort was caught once a read waits while a
+  write times out (the abort is what ends that read). The peer's close not answered hangs rather than fails, which the
+  run's time limit shows.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -590,9 +652,10 @@ Each a pull request, mergeable and tested alone, in this order:
    that switches through `http::detail::switch_protocols()` (internal) and echoes raw bytes, with and without a watch
    begun, over TLS too; `bench_request` before and after. Split from 4 so the server's part, which every request's path
    goes past, is measured and reviewed apart from the protocol.
-4. **Accepting WebSockets.** `websocket::accept()`, `connection` (reading whole and streamed, writing, the write turn,
-   control replies, the close handshake, close codes as errors), `max_message`, `example/websocket-echo`, the guide's
-   section; the server tests above but timeouts and `close()`. Autobahn's `fuzzingclient` by hand, in the pull request.
+4. **Accepting WebSockets.** Done (2026-10-29; see Learned in stage 4). `websocket::accept()`, `connection` (reading
+   whole and streamed, writing, the write turn, control replies, the close handshake, close codes as errors),
+   `max_message`, `example/websocket-echo`, the guide's section; the server tests above but timeouts and `close()`.
+   Autobahn's `fuzzingclient` by hand, in the pull request.
 5. **Timeouts and the server's close.** `idle_timeout` and keep-alive pings, `close_timeout`, `stop`, `close()`'s 1001
    (`tunnel::closing()`, the socket's token); their tests. Split from 4 as they touch the server's lifecycle and are
    tested with time.
@@ -683,9 +746,9 @@ All decided as recommended (2026-10-22).
     each way with context takeover) and CRIME-like risks for secrets mixed with attacker-chosen text.
 16. **Autobahn.** (a) By hand only, where Docker is; (b) that, plus an optional workflow (`workflow_dispatch` and
     weekly) on GitHub's Linux runner, which has Docker, outside the required `build`; (c) in every CI run.
-    **Recommended: (b)**: the suite is the reference for conformance, and the workflow costs nothing locally (the user's
-    machine runs no Docker, and the macOS runners have none); (c) would put a Docker job and minutes of cases on every
-    push, and the table-driven tests cover its cases' rules between runs.
+    **Recommended: (b)**: the suite is the reference for conformance, and the workflow costs nothing locally (Docker is
+    available locally, but the macOS runners have none); (c) would put a Docker job and minutes of cases on every push,
+    and the table-driven tests cover its cases' rules between runs.
 
 ## Out of scope
 

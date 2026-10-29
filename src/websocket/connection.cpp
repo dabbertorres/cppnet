@@ -1,0 +1,1198 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "coro/notifier.hpp"
+#include "coro/task.hpp"
+#include "http/headers.hpp"
+#include "http/request.hpp"
+#include "http/response.hpp"
+#include "http/tunnel.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
+#include "io/io.hpp"
+#include "io/reader.hpp"
+#include "io/scheduler.hpp"
+#include "io/writer.hpp"
+#include "util/defer.hpp"
+#include "websocket/frame.hpp"
+#include "websocket/handshake.hpp"
+#include "websocket/session.hpp"
+#include "websocket/websocket.hpp"
+
+namespace
+{
+
+using namespace std::string_view_literals;
+
+using net::coro::ready_task;
+using net::coro::task;
+
+// transport_failure is what a failed read or write of the transport ends the WebSocket with: the stream ending, however
+// it ended (e.g. reset), without a close is abnormal_closure; other errors (e.g. a timeout) are themselves.
+std::error_code transport_failure(std::error_code err) noexcept
+{
+    if (err == net::io::status_condition::closed) return make_error_code(net::websocket::close_code::abnormal_closure);
+    return err;
+}
+
+std::error_code invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
+
+// control_frames are control frames to send (the replies to the peer's ping and close), encoded: at most a pong and a
+// close.
+struct control_frames
+{
+    std::array<std::byte, 2 * (net::websocket::detail::max_header_size + net::websocket::detail::max_control_payload)>
+                bytes{};
+    std::size_t size = 0;
+
+    void append(const net::websocket::detail::frame_header& header, std::span<const std::byte> payload) noexcept
+    {
+        size += net::websocket::detail::encode_header(header, std::span{bytes}.subspan(size).first<14>());
+        std::ranges::copy(payload, bytes.begin() + static_cast<std::ptrdiff_t>(size));
+        if (header.masked)
+            net::websocket::detail::apply_mask(std::span{bytes}.subspan(size, payload.size()), header.mask_key, 0);
+        size += payload.size();
+    }
+};
+
+}
+
+namespace net::websocket::detail
+{
+
+// connection_state is a connection's: the session, and what the tasks reading and writing share, in one allocation
+// (so that it doesn't move, as waiters and the message's reader and writer point to it).
+//
+// Reading: one task at a time (reading, a claim), which owns the read side's state (from current to scratch) while it
+// holds the claim. It reads frames from the tunnel's buffered reader (pump(), which takes what's buffered without a
+// coroutine, so a message that's there already is read without one), answering the peer's pings and close as it comes
+// to them (send_replies()).
+//
+// Writing: the tunnel's buffered writer is written by one task at a time, which holds the wire (wire_busy); and a
+// message written a frame at a time (begin_message()) holds the message turn (message_open) until it ends, which whole
+// messages wait for too, but control frames don't. Whoever waits for either waits on turn. A read's replies don't wait:
+// if the wire's busy, they're left pending, for its holder to send before it lets go (write_replies_or_release()).
+struct connection_state
+{
+    connection_state(http::detail::tunnel& t, role r, const connection_options& options, std::string_view protocol)
+        : tunnel{t}
+        , scheduler{t.get_scheduler()}
+        , close_timeout{options.close_timeout}
+        , subprotocol{protocol}
+        , sess{r, limits{.max_message = options.max_message}}
+        , turn{scheduler->pool()}
+    {}
+
+    // message_reader is the connection's message(): the message next_message() began.
+    class message_reader final : public io::reader
+    {
+    public:
+        explicit message_reader(connection_state* state) noexcept
+            : state{state}
+        {}
+
+        coro::task<io::result> read(std::span<std::byte> data) override;
+
+        using io::reader::read;
+
+        [[nodiscard]] io::handle native_handle() const noexcept override;
+
+    private:
+        connection_state* state;
+    };
+
+    // What a read is for.
+    enum class goal : std::uint8_t
+    {
+        begin, // next_message(): a message's first frame begun (what's left of one before it skipped)
+        whole, // read_message(): a whole message, into the target's buffer
+        some,  // message().read(): some of the current message's data, into the target's span, or its end
+        close, // close(): the peer's close, dropping all else
+    };
+
+    // What a step of reading (pump()) came to.
+    enum class pumped : std::uint8_t
+    {
+        done,   // the goal's reached
+        more,   // more must be read
+        reply,  // a reply (a pong) is pending, to send before going on
+        failed, // the connection has failed (failed): perhaps with a close to send
+    };
+
+    enum class frame_kind : std::uint8_t
+    {
+        none, // the next frame's header is to be read
+        data,
+        control,
+        dropped,
+    };
+
+    // target is where a read puts a message's data.
+    struct target
+    {
+        // whole: grow makes room for size more bytes at the end of buffer (a std::string or std::vector<std::byte>),
+        // returning them.
+        std::span<std::byte> (*grow)(void* buffer, std::size_t size) = nullptr;
+        void* buffer                                                 = nullptr;
+
+        // some: the caller's span, and how much of it has been filled.
+        std::span<std::byte> span{};
+        std::size_t          filled = 0;
+    };
+
+    // ---- reading
+
+    // begin_read claims the read side for a read, unless another has it (std::errc::device_or_resource_busy), or the
+    // connection has failed.
+    std::error_code begin_read() noexcept
+    {
+        if (reading.exchange(true, std::memory_order::acq_rel))
+            return std::make_error_code(std::errc::device_or_resource_busy);
+
+        if (auto err = failure())
+        {
+            end_read();
+            return err;
+        }
+        return {};
+    }
+
+    // end_read lets the read side go, telling close() if it's waiting for it.
+    void end_read() noexcept
+    {
+        // NOTE: sequentially consistent, as close() sets close_waiting before trying to claim the read side: so either
+        //       it claims it, or this sees it waiting.
+        reading.store(false, std::memory_order::seq_cst);
+        if (close_waiting.load(std::memory_order::seq_cst))
+        {
+            read_changes.fetch_add(1, std::memory_order::release);
+            scheduler->notify_all(read_changes);
+        }
+    }
+
+    // pump reads frames from what's buffered toward g, as far as it can without reading more.
+    // NOTE: one loop over the frames, whatever the goal, so a message that's all there is read without a coroutine.
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+    pumped pump(goal g, target& t)
+    {
+        auto& reader = tunnel.reader();
+
+        // more is what to say when more must be read: unless some data's been read already, which a read returns.
+        const auto more = [&] { return g == goal::some && t.filled > 0 ? pumped::done : pumped::more; };
+
+        if (g == goal::some && (!in_message || skipping)) return pumped::done;
+
+        while (true)
+        {
+            switch (current)
+            {
+            case frame_kind::none:
+            {
+                auto begun = begin_frame();
+                if (!begun) return fail_reading(begun.error());
+                if (!*begun) return more();
+
+                if (current == frame_kind::data && !skipping)
+                {
+                    if (g == goal::begin && first) return pumped::done;
+                    if (g == goal::whole)
+                    {
+                        dest        = t.grow(t.buffer, static_cast<std::size_t>(sess.remaining()));
+                        dest_filled = 0;
+                    }
+                }
+                continue;
+            }
+
+            case frame_kind::control:
+            case frame_kind::dropped:
+            {
+                auto skipped = skip_payload();
+                if (!skipped) return fail_reading(skipped.error());
+                if (!*skipped) return more();
+
+                const auto step = end_control();
+                if (step) return *step;
+                continue;
+            }
+
+            case frame_kind::data: break;
+            }
+
+            // a data frame: the message's, or one to skip.
+            if (skipping || g == goal::close)
+            {
+                auto skipped = skip_payload();
+                if (!skipped) return fail_reading(skipped.error());
+                if (!*skipped) return more();
+            }
+            else if (g == goal::begin)
+            {
+                return pumped::done;
+            }
+            else if (sess.remaining() > 0)
+            {
+                auto       into = g == goal::whole ? dest.subspan(dest_filled) : t.span.subspan(t.filled);
+                const auto size = std::min({static_cast<std::size_t>(sess.remaining()), reader.size(), into.size()});
+                if (size == 0) return more();
+
+                into = into.first(size);
+                std::ranges::copy(reader.buffered().first(size), into.begin());
+                reader.consume(size);
+                if (auto err = payload(into)) return fail_reading(err);
+
+                if (g == goal::whole) dest_filled += size;
+                else t.filled += size;
+
+                if (sess.remaining() > 0)
+                {
+                    if (g == goal::some && t.filled == t.span.size()) return pumped::done;
+                    continue;
+                }
+            }
+
+            // the frame's payload is all read.
+            auto frame_end = end_frame();
+            if (!frame_end) return fail_reading(frame_end.error());
+
+            current = frame_kind::none;
+            if (frame_end->what != received::kind::message_end) continue;
+
+            in_message = false;
+            if (skipping)
+            {
+                skipping = false;
+                continue;
+            }
+            if (g == goal::whole || g == goal::some) return pumped::done;
+        }
+    }
+
+    // begin_frame begins the frame whose header is buffered, returning false if it isn't all there yet.
+    std::expected<bool, std::error_code> begin_frame()
+    {
+        auto& reader  = tunnel.reader();
+        auto  decoded = decode_header(reader.buffered());
+        if (!decoded) return std::unexpected(decoded.error());
+        if (!*decoded) return false;
+
+        std::expected<frame_info, std::error_code> info;
+        {
+            std::scoped_lock lock{mu};
+            info = sess.begin_frame((*decoded)->header);
+        }
+        if (!info) return std::unexpected(info.error());
+        reader.consume((*decoded)->size);
+
+        switch (info->what)
+        {
+        case frame_info::kind::data:
+            current = frame_kind::data;
+            first   = info->first;
+            if (info->first)
+            {
+                in_message = true;
+                type       = static_cast<message_type>(info->type);
+            }
+            break;
+        case frame_info::kind::control: current = frame_kind::control; break;
+        case frame_info::kind::dropped: current = frame_kind::dropped; break;
+        }
+        return true;
+    }
+
+    // skip_payload passes what's buffered of the current frame's payload to the session without keeping it (through
+    // scratch, as the session unmasks in place), returning whether it's all been.
+    std::expected<bool, std::error_code> skip_payload()
+    {
+        auto& reader = tunnel.reader();
+        while (sess.remaining() > 0 && reader.size() > 0)
+        {
+            const auto size = std::min({static_cast<std::size_t>(sess.remaining()), reader.size(), scratch.size()});
+            const auto into = std::span{scratch}.first(size);
+            std::ranges::copy(reader.buffered().first(size), into.begin());
+            reader.consume(size);
+            if (auto err = payload(into)) return std::unexpected(err);
+        }
+        return sess.remaining() == 0;
+    }
+
+    std::error_code payload(std::span<std::byte> bytes)
+    {
+        std::scoped_lock lock{mu};
+        return sess.payload(bytes);
+    }
+
+    std::expected<received, std::error_code> end_frame()
+    {
+        std::scoped_lock lock{mu};
+        return sess.end_frame();
+    }
+
+    // end_control ends a control (or dropped) frame: a ping's pong is left pending, and the peer's close answered (left
+    // pending too) and reported. It returns what to say, if the read can't go on.
+    std::optional<pumped> end_control()
+    {
+        current = frame_kind::none;
+        {
+            std::scoped_lock lock{mu};
+            auto             frame_end = sess.end_frame();
+            if (!frame_end)
+            {
+                set_failure(frame_end.error());
+            }
+            else if (frame_end->what == received::kind::ping)
+            {
+                // only the latest ping is answered, if they come faster than pongs go (RFC 6455, section 5.5.3).
+                pong_pending = true;
+                pong_size    = static_cast<std::uint8_t>(frame_end->payload.size());
+                std::ranges::copy(frame_end->payload, pong.begin());
+                return pumped::reply;
+            }
+            else if (frame_end->what == received::kind::close)
+            {
+                reason_size = frame_end->close.reason.size();
+                std::ranges::copy(frame_end->close.reason, reason.begin());
+
+                // answered with the peer's code, unless this side's close went first.
+                if (sess.state() == close_state::close_received)
+                {
+                    close_pending = true;
+                    close_size    = static_cast<std::uint8_t>(sess.close_reply(std::span{close_payload}.first<2>()));
+                }
+                if (!failed) failed = make_error_code(frame_end->close.code);
+            }
+            else
+            {
+                return std::nullopt;
+            }
+        }
+
+        // writers waiting see the failure.
+        turn.notify();
+        return pumped::failed;
+    }
+
+    // fail_reading fails the connection with what was wrong with what the peer sent: the close for this side to send
+    // (left pending).
+    pumped fail_reading(std::error_code err)
+    {
+        {
+            std::scoped_lock lock{mu};
+            set_failure(err);
+        }
+        turn.notify();
+        return pumped::failed;
+    }
+
+    // set_failure fails the connection with err, unless it has failed already, leaving the close it calls for pending.
+    // Must be called holding mu.
+    void set_failure(std::error_code err) noexcept
+    {
+        if (failed) return;
+        failed = err;
+
+        const auto code = close_code_of(err);
+        if (!code || from_peer(err) || sess.state() != close_state::open) return;
+
+        if (auto size = encode_close(*code, {}, close_payload); size.has_value())
+        {
+            close_pending = true;
+            close_size    = *size;
+        }
+    }
+
+    // fail_transport fails the connection with what failed the transport (see transport_failure()), aborting it,
+    // returning the connection's failure (which may have come first).
+    std::error_code fail_transport(std::error_code err) noexcept
+    {
+        std::error_code why;
+        {
+            std::scoped_lock lock{mu};
+            if (!failed) failed = transport_failure(err);
+            why = failed;
+        }
+
+        turn.notify();
+        tunnel.abort();
+        return why;
+    }
+
+    std::error_code failure() noexcept
+    {
+        std::scoped_lock lock{mu};
+        return failed;
+    }
+
+    // drive finishes a read (holding the read side, which it lets go): it reads toward g until it's reached (no error)
+    // or the connection fails (its failure), reading more and sending replies as pump() asks, starting from what it
+    // last said; then it returns what finish makes of that, and the target. One coroutine, for a read that has to wait.
+    template<typename Finish>
+    auto drive(goal g, target t, pumped step, Finish finish)
+        -> coro::task<std::invoke_result_t<Finish, std::error_code, const target&>>
+    {
+        util::defer done{[this] noexcept { end_read(); }};
+        auto&       reader = tunnel.reader();
+
+        std::error_code err;
+        while (step != pumped::done)
+        {
+            if (step == pumped::failed)
+            {
+                // the close the failure calls for, if it's this side's to send.
+                (void)co_await send_replies();
+                err = failure();
+                break;
+            }
+
+            if (step == pumped::reply)
+            {
+                err = co_await send_replies();
+                if (err) break;
+            }
+            else if (ended)
+            {
+                err = fail_transport(ended);
+                break;
+            }
+            else if (g == goal::whole && current == frame_kind::data && !skipping && reader.size() == 0
+                     && sess.remaining() >= reader.capacity())
+            {
+                // a large frame of a whole message, with nothing buffered: read straight into the message.
+                const auto into = dest.subspan(dest_filled, static_cast<std::size_t>(sess.remaining()));
+                auto       read = co_await reader.read(into);
+                if (read.count > 0)
+                {
+                    if (auto bad = payload(into.first(read.count)))
+                    {
+                        step = fail_reading(bad);
+                        continue;
+                    }
+                    dest_filled += read.count;
+                }
+                if (read.err) ended = read.err;
+            }
+            else if (const auto before = reader.size(); auto failed_fill = co_await reader.fill())
+            {
+                // what was read with the failure is read first.
+                if (reader.size() == before)
+                {
+                    err = fail_transport(failed_fill);
+                    break;
+                }
+                ended = failed_fill;
+            }
+
+            step = pump(g, t);
+        }
+
+        co_return finish(err, t);
+    }
+
+    // ---- writing
+
+    // What a frame being written is, for which turn it waits.
+    enum class frame_use : std::uint8_t
+    {
+        message,     // a whole message: waits for the wire, and for a message being written a frame at a time
+        part,        // a frame of the message being written a frame at a time (its holder's)
+        message_end, // that message's last
+        control,     // a control frame: waits only for the wire
+    };
+
+    // started is what start_frame() came to: a failure, or that it must wait, or the header of the frame to write, the
+    // wire being this write's.
+    struct started
+    {
+        std::error_code err{};
+        bool            wait = false;
+        frame_header    header{};
+    };
+
+    // start_frame takes the wire for a frame of use, if it's free (and, for a whole message, no message is being
+    // written a frame at a time), and frames it. A streamed message's frame is message's (its writer's).
+    started start_frame(frame_use use, opcode op, std::size_t length, std::uint64_t message = 0)
+    {
+        started start;
+        bool    ended = false; // a message written a frame at a time ended, with its last frame refused
+        {
+            std::scoped_lock lock{mu};
+
+            const bool parted = use == frame_use::part || use == frame_use::message_end;
+            if (parted && (!message_open || message != message_count)) return {.err = invalid()};
+
+            if (failed || sess.state() == close_state::close_sent || sess.state() == close_state::closed)
+            {
+                start.err = failed ? failed : std::make_error_code(std::errc::broken_pipe);
+            }
+            else if (wire_busy || (use == frame_use::message && message_open))
+            {
+                return {.wait = true};
+            }
+            else
+            {
+                if (parted) op = std::exchange(message_first, false) ? message_op : opcode::continuation;
+                auto header = sess.frame_for(op, use != frame_use::part, length);
+                if (header) wire_busy = true;
+                start.err    = header ? std::error_code{} : header.error();
+                start.header = header.value_or(frame_header{});
+            }
+
+            // the message's turn goes with its last frame (the wire's release, or now, if it's refused, tells
+            // whoever waits).
+            if (use == frame_use::message_end)
+            {
+                message_open = false;
+                ended        = static_cast<bool>(start.err);
+            }
+        }
+
+        if (ended) turn.notify();
+        return start;
+    }
+
+    // write_frame writes a frame of use with payload, once it's its turn, returning once it's gone (with the replies
+    // pending by then).
+    coro::task<std::error_code>
+    write_frame(frame_use use, opcode op, std::span<const std::byte> payload, std::uint64_t message = 0)
+    {
+        auto start = start_frame(use, op, payload.size(), message);
+        if (start.err) return ready_task<std::error_code>(start.err);
+        if (start.wait) return write_waiting(use, op, payload, message);
+        return send(start.header, payload);
+    }
+
+    coro::task<std::error_code>
+    write_waiting(frame_use use, opcode op, std::span<const std::byte> payload, std::uint64_t message)
+    {
+        while (true)
+        {
+            const auto seen  = turn.value();
+            auto       start = start_frame(use, op, payload.size(), message);
+            if (start.err) co_return start.err;
+            if (!start.wait) co_return co_await send(start.header, payload);
+
+            (void)co_await turn.wait(seen);
+        }
+    }
+
+    // send writes a frame (holding the wire), flushes it and lets the wire go.
+    coro::task<std::error_code> send(const frame_header& header, std::span<const std::byte> payload)
+    {
+        std::array<std::byte, max_header_size> head{};
+        const auto                             size = encode_header(header, head);
+
+        // usually, the frame fits in the writer's buffer: then it needs no coroutine, unless the flush waits.
+        // NOTE: a client's frames are masked, which the client's stage brings: a server's aren't.
+        if (auto room = tunnel.writer().prepare(size + payload.size()); !room.empty())
+        {
+            std::ranges::copy(std::span{head}.first(size), room.begin());
+            std::ranges::copy(payload, room.begin() + static_cast<std::ptrdiff_t>(size));
+            return flush_and_release();
+        }
+
+        return send_through(head, size, payload);
+    }
+
+    coro::task<std::error_code>
+    send_through(std::array<std::byte, max_header_size> head, std::size_t size, std::span<const std::byte> payload)
+    {
+        auto wrote = co_await io::write_all(tunnel.writer(), std::span<const std::byte>{head}.first(size), payload);
+        if (wrote.err) co_return fail_write(wrote.err);
+        co_return co_await flush_and_release();
+    }
+
+    // flush_and_release flushes what's written, then the replies pending by then, until there are none, then lets the
+    // wire go.
+    coro::task<std::error_code> flush_and_release()
+    {
+        while (true)
+        {
+            auto flushing = tunnel.writer().flush();
+            if (!flushing.finished_without_coroutine()) return flush_waiting(std::move(flushing));
+
+            if (auto res = std::move(flushing).result(); res.err)
+                return ready_task<std::error_code>(fail_write(res.err));
+            if (!write_replies_or_release()) return ready_task<std::error_code>();
+        }
+    }
+
+    coro::task<std::error_code> flush_waiting(coro::task<io::result> flushing)
+    {
+        if (auto res = co_await std::move(flushing); res.err) co_return fail_write(res.err);
+        if (!write_replies_or_release()) co_return std::error_code{};
+        co_return co_await flush_and_release();
+    }
+
+    // write_replies_or_release writes the replies pending into the writer's buffer (empty, as it's just been flushed),
+    // returning true; or, if there are none, lets the wire go.
+    bool write_replies_or_release()
+    {
+        control_frames frames;
+        {
+            std::scoped_lock lock{mu};
+            take_replies(frames);
+            if (frames.size == 0) wire_busy = false;
+        }
+
+        if (frames.size != 0)
+        {
+            if (auto room = tunnel.writer().prepare(frames.size); !room.empty())
+            {
+                std::ranges::copy(std::span{frames.bytes}.first(frames.size), room.begin());
+                return true;
+            }
+
+            // only after a failed write, whose leftovers are in the buffer: the replies can't go.
+            std::scoped_lock lock{mu};
+            wire_busy = false;
+        }
+
+        turn.notify();
+        return false;
+    }
+
+    // take_replies frames the replies pending into frames (a pong, then a close): those the session refuses, as this
+    // side's close has gone, are dropped. Must be called holding mu.
+    void take_replies(control_frames& frames)
+    {
+        if (std::exchange(pong_pending, false))
+        {
+            const auto payload = std::span{pong}.first(pong_size);
+            if (auto header = sess.frame_for(opcode::pong, true, payload.size())) frames.append(*header, payload);
+        }
+
+        if (std::exchange(close_pending, false))
+        {
+            const auto payload = std::span{close_payload}.first(close_size);
+            if (auto header = sess.frame_for(opcode::close, true, payload.size())) frames.append(*header, payload);
+        }
+    }
+
+    // send_replies sends the replies pending, if the wire's free; otherwise they're left to its holder.
+    coro::task<std::error_code> send_replies()
+    {
+        control_frames frames;
+        {
+            std::scoped_lock lock{mu};
+            if (wire_busy) return ready_task<std::error_code>();
+
+            take_replies(frames);
+            if (frames.size == 0) return ready_task<std::error_code>();
+            wire_busy = true;
+        }
+
+        // the wire's free, so the buffer's empty (unless a write failed).
+        if (auto room = tunnel.writer().prepare(frames.size); !room.empty())
+            std::ranges::copy(std::span{frames.bytes}.first(frames.size), room.begin());
+        return flush_and_release();
+    }
+
+    // fail_write fails the connection with what failed a write (holding the wire, which it lets go), returning the
+    // connection's failure.
+    std::error_code fail_write(std::error_code err) noexcept
+    {
+        {
+            std::scoped_lock lock{mu};
+            wire_busy = false;
+        }
+        return fail_transport(err);
+    }
+
+    // ---- closing
+
+    // close sends this side's close (payload), then waits for the peer's until close_timeout passes (see
+    // connection::close()).
+    coro::task<std::error_code> close(std::array<std::byte, max_control_payload> payload, std::size_t size)
+    {
+        const auto deadline = io::clock::now() + close_timeout;
+
+        if (auto err = co_await send_close(std::span{payload}.first(size))) co_return err;
+        co_return co_await await_close(deadline);
+    }
+
+    // send_close sends this side's close, unless it's gone already (or the peer's close is still to be answered, which
+    // its reply does), once the wire's free. It returns the connection's failure, unless it's the peer's close.
+    coro::task<std::error_code> send_close(std::span<const std::byte> payload)
+    {
+        while (true)
+        {
+            const auto                  seen = turn.value();
+            std::optional<frame_header> header;
+            bool                        replies = false;
+            {
+                std::scoped_lock lock{mu};
+                const bool       peer_closed = sess.state() == close_state::close_received;
+                if (sess.state() == close_state::closed || sess.state() == close_state::close_sent) co_return {};
+                if (failed && !peer_closed) co_return failed;
+
+                if (!wire_busy && peer_closed)
+                {
+                    replies = true;
+                }
+                else if (!wire_busy)
+                {
+                    auto framed = sess.frame_for(opcode::close, true, payload.size());
+                    if (!framed) co_return framed.error();
+                    header    = *framed;
+                    wire_busy = true;
+                }
+            }
+
+            if (header) co_return co_await send(*header, payload);
+            if (replies)
+            {
+                if (auto err = co_await send_replies()) co_return err;
+                continue;
+            }
+
+            (void)co_await turn.wait(seen);
+        }
+    }
+
+    // await_close waits for the peer's close, once this side's has gone: reading for it, unless another task is
+    // reading, which is waited for. If deadline passes first, it aborts the connection, with std::errc::timed_out.
+    coro::task<std::error_code> await_close(io::clock::time_point deadline)
+    {
+        close_waiting.store(true, std::memory_order::seq_cst);
+        util::defer not_waiting{[this] noexcept { close_waiting.store(false, std::memory_order::relaxed); }};
+
+        while (true)
+        {
+            const auto seen = read_changes.load(std::memory_order::acquire);
+            if (closed()) co_return std::error_code{};
+            if (auto err = failure())
+            {
+                tunnel.abort();
+                co_return err;
+            }
+
+            // NOTE: sequentially consistent, with close_waiting's store and end_read()'s: so either this claims the
+            //       read side, or end_read() sees close_waiting.
+            if (!reading.exchange(true, std::memory_order::seq_cst))
+            {
+                util::defer done{[this] noexcept { end_read(); }};
+                const auto  err = co_await read_close(deadline);
+                if (closed()) co_return std::error_code{};
+
+                tunnel.abort();
+                co_return err;
+            }
+
+            if (auto err = co_await scheduler->wait_on(read_changes, seen, deadline)) co_return fail_transport(err);
+        }
+    }
+
+    // closed is whether the close handshake is done.
+    bool closed()
+    {
+        std::scoped_lock lock{mu};
+        return sess.state() == close_state::closed;
+    }
+
+    // read_close reads (holding the read side) until the peer's close comes, dropping what comes before it, or until
+    // deadline passes: then the connection fails with std::errc::timed_out (aborting it). It returns the connection's
+    // failure (the peer's close, if it came).
+    coro::task<std::error_code> read_close(io::clock::time_point deadline)
+    {
+        auto&       reader = tunnel.reader();
+        util::defer no_timeout{[this] noexcept { tunnel.set_read_timeout(std::nullopt); }};
+
+        target t;
+        while (true)
+        {
+            switch (pump(goal::close, t))
+            {
+            case pumped::done:
+            case pumped::failed: (void)co_await send_replies(); co_return failure();
+
+            case pumped::reply:
+                if (auto err = co_await send_replies()) co_return err;
+                break;
+
+            case pumped::more:
+            {
+                if (ended) co_return fail_transport(ended);
+
+                // each wait for more no longer than what's left.
+                const auto left = deadline - io::clock::now();
+                if (left <= io::clock::duration::zero())
+                    co_return fail_transport(std::make_error_code(std::errc::timed_out));
+                tunnel.set_read_timeout(left);
+
+                if (const auto before = reader.size(); auto err = co_await reader.fill())
+                {
+                    if (reader.size() == before) co_return fail_transport(err);
+                    ended = err;
+                }
+                break;
+            }
+            }
+        }
+    }
+
+    http::detail::tunnel&     tunnel;
+    io::scheduler*            scheduler;
+    std::chrono::milliseconds close_timeout;
+    std::string               subprotocol;
+
+    // the session, and what both sides share: the write side's turns, the replies pending, and the failure.
+    std::mutex      mu;
+    session         sess;
+    std::error_code failed{}; // see connection: the first failure, which every operation then returns
+
+    bool          wire_busy     = false; // a task is writing to the tunnel's writer
+    bool          message_open  = false; // a message is being written a frame at a time
+    bool          message_first = false; // and its next frame is its first
+    opcode        message_op    = opcode::text;
+    std::uint64_t message_count = 0; // of messages written a frame at a time: the current one's, for its writer
+    bool          pong_pending  = false;
+    bool          close_pending = false;
+    std::uint8_t  pong_size     = 0;
+    std::uint8_t  close_size    = 0;
+
+    std::array<std::byte, max_control_payload> pong{};
+    std::array<std::byte, max_control_payload> close_payload{};
+
+    // notified when the wire or the message turn is let go, or the connection fails.
+    coro::notifier turn;
+
+    // The read side's claim, and close()'s wait for it (see end_read()).
+    std::atomic_bool           reading       = false;
+    std::atomic_bool           close_waiting = false;
+    std::atomic<std::uint64_t> read_changes  = 0;
+
+    // The read side's (the claim's holder's).
+    frame_kind           current    = frame_kind::none;
+    bool                 first      = false; // the current data frame is its message's first
+    bool                 in_message = false; // a message's first frame has come, and not its last
+    bool                 skipping   = false; // what's left of it is to be skipped
+    message_type         type       = message_type::text;
+    std::span<std::byte> dest{}; // whole: the current frame's place in the message
+    std::size_t          dest_filled = 0;
+    std::error_code      ended{}; // what failed the transport's last read, which read some first
+
+    std::array<std::byte, max_control_payload> scratch{};
+
+    // the peer's close's reason, once it has come.
+    std::array<char, max_close_reason> reason{};
+    std::size_t                        reason_size = 0;
+
+    message_reader stream{this};
+};
+
+coro::task<io::result> connection_state::message_reader::read(std::span<std::byte> data)
+{
+    using goal   = connection_state::goal;
+    using pumped = connection_state::pumped;
+
+    if (data.empty()) return ready_task<io::result>();
+    if (auto err = state->begin_read()) return ready_task<io::result>(io::result{.err = err});
+
+    // the end of the message, or of a result: the end of the stream if nothing was read.
+    const auto result = [](std::size_t count)
+    { return count == 0 ? io::result{.err = make_error_code(io::errc::end_of_stream)} : io::result{.count = count}; };
+
+    connection_state::target t{.span = data};
+    const auto               step = state->pump(goal::some, t);
+    if (step == pumped::done)
+    {
+        state->end_read();
+        return ready_task<io::result>(result(t.filled));
+    }
+
+    return state->drive(goal::some,
+                        t,
+                        step,
+                        [result](std::error_code err, const connection_state::target& t)
+                        { return err ? io::result{.err = err} : result(t.filled); });
+}
+
+io::handle connection_state::message_reader::native_handle() const noexcept
+{
+    return state->tunnel.reader().native_handle();
+}
+
+}
+
+namespace net::websocket
+{
+
+namespace
+{
+
+    using detail::connection_state;
+
+    // read_whole reads a whole message into buffer (a std::string or std::vector<std::byte>).
+    template<typename Buffer>
+    task<std::expected<message_type, std::error_code>> read_whole(connection_state* state, Buffer& buffer)
+    {
+        using goal   = connection_state::goal;
+        using pumped = connection_state::pumped;
+        using result = std::expected<message_type, std::error_code>;
+
+        if (auto err = state->begin_read()) return ready_task<result>(std::unexpected(err));
+
+        buffer.clear();
+        state->skipping = state->in_message;
+
+        connection_state::target t{
+            .grow =
+                [](void* to, std::size_t size)
+            {
+                auto&      buf   = *static_cast<Buffer*>(to);
+                const auto start = buf.size();
+                buf.resize(start + size);
+                return std::as_writable_bytes(std::span{buf}).subspan(start);
+            },
+            .buffer = &buffer,
+        };
+
+        const auto step = state->pump(goal::whole, t);
+        if (step == pumped::done)
+        {
+            state->end_read();
+            return ready_task<result>(state->type);
+        }
+
+        return state->drive(goal::whole,
+                            t,
+                            step,
+                            [state](std::error_code err, const connection_state::target& /*t*/) -> result
+                            {
+                                if (err) return std::unexpected(err);
+                                return state->type;
+                            });
+    }
+
+    // as_result is a write's result, of size bytes, from what writing them came to.
+    task<io::result> as_result(task<std::error_code> writing, std::size_t size)
+    {
+        if (writing.finished_without_coroutine())
+        {
+            auto err = std::move(writing).result();
+            return ready_task<io::result>(io::result{.count = err ? 0 : size, .err = err});
+        }
+
+        return [](task<std::error_code> writing, std::size_t size) -> task<io::result>
+        {
+            auto err = co_await std::move(writing);
+            co_return io::result{.count = err ? 0 : size, .err = err};
+        }(std::move(writing), size);
+    }
+
+    // refuse responds to a handshake that's refused for err.
+    task<> refuse(http::response_writer& rw, std::error_code err)
+    {
+        auto code = http::status::BAD_REQUEST;
+        if (err == errc::origin_refused)
+        {
+            code = http::status::FORBIDDEN;
+        }
+        else if (err == errc::bad_version)
+        {
+            // the version the server speaks (RFC 6455, section 4.2.2), and the protocol it's to be upgraded to (RFC
+            // 9110, section 15.5.22).
+            code = http::status::UPGRADE_REQUIRED;
+            rw.headers().set("Sec-WebSocket-Version"sv, "13"sv);
+            rw.headers().set("Upgrade"sv, "websocket"sv);
+            rw.headers().set("Connection"sv, "Upgrade"sv);
+        }
+
+        const auto text = err.message() + "\n";
+        rw.headers().set("Content-Type"sv, "text/plain; charset=utf-8"sv);
+        auto* body = co_await rw.send(code, text.size());
+        (void)co_await io::write_all(*body, text);
+    }
+
+}
+
+task<std::expected<connection, std::error_code>>
+accept(const http::server_request& req, http::response_writer& rw, const accept_options& options)
+{
+    auto key = detail::check_request(req);
+    if (auto refused = key.has_value() ? detail::check_origin(req, options) : key.error())
+    {
+        co_await refuse(rw, refused);
+        co_return std::unexpected(refused);
+    }
+
+    const auto subprotocol = detail::select_subprotocol(options.subprotocols, req.headers);
+
+    http::headers fields;
+    fields.set("Upgrade"sv, "websocket"sv);
+    fields.set("Connection"sv, "Upgrade"sv);
+    fields.set("Sec-WebSocket-Accept"sv, detail::accept_key(*key));
+    if (!subprotocol.empty()) fields.set("Sec-WebSocket-Protocol"sv, subprotocol);
+
+    auto switched = co_await http::detail::switch_protocols(rw, fields);
+    if (!switched.has_value()) co_return std::unexpected(switched.error());
+
+    co_return connection{
+        std::make_unique<connection_state>(**switched, detail::role::server, options.connection, subprotocol)};
+}
+
+connection::connection(std::unique_ptr<detail::connection_state> state) noexcept
+    : state{std::move(state)}
+{}
+
+connection::connection(connection&& other) noexcept = default;
+
+connection& connection::operator=(connection&& other) noexcept
+{
+    if (this != &other)
+    {
+        connection old{std::move(*this)};
+        state = std::move(other.state);
+    }
+    return *this;
+}
+
+connection::~connection()
+{
+    if (!state) return;
+
+    // without this side's close, the peer sees the connection end without one.
+    bool closed = false;
+    {
+        std::scoped_lock lock{state->mu};
+        closed = state->sess.state() == detail::close_state::close_sent
+              || state->sess.state() == detail::close_state::closed;
+    }
+    if (!closed) state->tunnel.abort();
+}
+
+task<std::expected<message_type, std::error_code>> connection::read_message(std::string& message)
+{
+    return read_whole(state.get(), message);
+}
+
+task<std::expected<message_type, std::error_code>> connection::read_message(std::vector<std::byte>& message)
+{
+    return read_whole(state.get(), message);
+}
+
+task<std::expected<message_type, std::error_code>> connection::next_message()
+{
+    using goal   = connection_state::goal;
+    using pumped = connection_state::pumped;
+    using result = std::expected<message_type, std::error_code>;
+
+    auto* s = state.get();
+    if (auto err = s->begin_read()) return ready_task<result>(std::unexpected(err));
+
+    s->skipping = s->in_message;
+
+    connection_state::target t;
+    const auto               step = s->pump(goal::begin, t);
+    if (step == pumped::done)
+    {
+        s->end_read();
+        return ready_task<result>(s->type);
+    }
+
+    return s->drive(goal::begin,
+                    t,
+                    step,
+                    [s](std::error_code err, const connection_state::target& /*t*/) -> result
+                    {
+                        if (err) return std::unexpected(err);
+                        return s->type;
+                    });
+}
+
+io::reader& connection::message() noexcept { return state->stream; }
+
+task<std::error_code> connection::write_message(message_type type, std::span<const std::byte> data)
+{
+    using use = connection_state::frame_use;
+    return state->write_frame(use::message, static_cast<detail::opcode>(type), data);
+}
+
+task<std::expected<message_writer, std::error_code>> connection::begin_message(message_type type)
+{
+    using result = std::expected<message_writer, std::error_code>;
+
+    // begin takes the message turn, if it's free, saying whether it did, or why it failed.
+    const auto begin = [](connection_state* state, message_type type) -> std::optional<result>
+    {
+        std::scoped_lock lock{state->mu};
+        if (state->failed) return std::unexpected(state->failed);
+        if (state->sess.state() == detail::close_state::close_sent
+            || state->sess.state() == detail::close_state::closed)
+            return std::unexpected(std::make_error_code(std::errc::broken_pipe));
+        if (state->message_open) return std::nullopt;
+
+        state->message_open  = true;
+        state->message_first = true;
+        state->message_op    = static_cast<detail::opcode>(type);
+        return message_writer{state, ++state->message_count};
+    };
+
+    if (auto begun = begin(state.get(), type)) return ready_task<result>(std::move(*begun));
+
+    return [](connection_state* state, message_type type, auto begin) -> task<result>
+    {
+        while (true)
+        {
+            const auto seen = state->turn.value();
+            if (auto begun = begin(state, type)) co_return std::move(*begun);
+            (void)co_await state->turn.wait(seen);
+        }
+    }(state.get(), type, begin);
+}
+
+task<std::error_code> connection::ping(std::span<const std::byte> data)
+{
+    if (data.size() > detail::max_control_payload) return ready_task<std::error_code>(invalid());
+
+    using use = connection_state::frame_use;
+    return state->write_frame(use::control, detail::opcode::ping, data);
+}
+
+task<std::error_code> connection::close(close_code code, std::string_view reason)
+{
+    std::array<std::byte, detail::max_control_payload> payload{};
+    auto                                               size = detail::encode_close(code, reason, payload);
+    if (!size) return ready_task<std::error_code>(size.error());
+
+    return state->close(payload, *size);
+}
+
+std::string_view connection::subprotocol() const noexcept { return state->subprotocol; }
+
+std::string_view connection::close_reason() const noexcept { return {state->reason.data(), state->reason_size}; }
+
+task<io::result> message_writer::write(std::span<const std::byte> data)
+{
+    if (data.empty()) return ready_task<io::result>();
+
+    using use = connection_state::frame_use;
+    return as_result(state->write_frame(use::part, detail::opcode::continuation, data, message), data.size());
+}
+
+task<std::error_code> message_writer::end_message()
+{
+    using use = connection_state::frame_use;
+    return state->write_frame(use::message_end, detail::opcode::continuation, {}, message);
+}
+
+io::handle message_writer::native_handle() const noexcept { return state->tunnel.writer().native_handle(); }
+
+}
