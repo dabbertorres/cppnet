@@ -12,8 +12,7 @@
 #include "websocket/frame.hpp"
 
 // WebSockets' protocol, without I/O: a session judges the frames read from the connection, and gives the headers of
-// those to write, by the rules of RFC 6455 (see docs/plans/websockets.md). It's what a WebSocket's connection is built
-// from, not for applications.
+// those to write, by the rules of RFC 6455. It's what a WebSocket's connection is built from, not for applications.
 //
 // It's pull-shaped, rather than event-shaped as http2::session is, so that a payload is never copied: its owner
 // decodes a header (decode_header()) and passes it to begin_frame(), reads the payload into a buffer of its own (or its

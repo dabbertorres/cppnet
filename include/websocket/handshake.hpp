@@ -14,7 +14,7 @@
 
 // WebSockets' opening handshake (RFC 6455, section 4), as plain functions over HTTP's requests and responses: the
 // server's checks of a request and the client's of a response, and what each sends. What accept() and connect() are
-// built from (see docs/plans/websockets.md), not for applications. Failures are websocket::errc.
+// built from, not for applications. Failures are websocket::errc.
 namespace net::websocket::detail
 {
 
@@ -31,8 +31,8 @@ inline constexpr std::string_view guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 //   Transfer-Encoding), or without the token websocket in Upgrade, or upgrade in Connection (lists, ignoring case);
 // - bad_version, unless Sec-WebSocket-Version is one line, 13 (the server answers 426, saying 13);
 // - bad_key, unless Sec-WebSocket-Key is one line, of 16 bytes in base64 (strictly: 24 characters, padded, canonical).
-// HTTP/2's handshake (RFC 8441's extended CONNECT, which a later stage presents as a GET with server_request::protocol
-// set) isn't one yet: a request over HTTP/2 fails with not_websocket.
+// HTTP/2's handshake (RFC 8441's extended CONNECT, which server_request can't express yet: it has no :protocol) isn't
+// one yet: a request over HTTP/2 fails with not_websocket.
 [[nodiscard]] std::expected<std::string_view, std::error_code> check_request(const http::server_request& req);
 
 // select_subprotocol is the first of the server's subprotocols that the request's Sec-WebSocket-Protocol offers (a
@@ -60,7 +60,7 @@ struct client_handshake
 
 // check_response checks a server's response to a handshake that sent key and offered the subprotocols offered,
 // returning the subprotocol the server chose (a view of its headers; empty for none). It fails with:
-// - bad_status, for a status other than 101 (Switching Protocols): redirects aren't followed (Decided question 14);
+// - bad_status, for a status other than 101 (Switching Protocols): redirects aren't followed, as browsers don't;
 // - not_websocket, without the token websocket in Upgrade, or upgrade in Connection;
 // - bad_accept, unless Sec-WebSocket-Accept is one line, accept_key(key) exactly;
 // - bad_extension, for any extension in Sec-WebSocket-Extensions (none was offered);

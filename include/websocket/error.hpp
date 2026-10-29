@@ -5,8 +5,7 @@
 #include <system_error>
 #include <type_traits>
 
-// WebSockets' errors (RFC 6455): how a WebSocket ended, as close codes, and why a handshake failed (see
-// docs/plans/websockets.md, "How the end is reported").
+// WebSockets' errors (RFC 6455): how a WebSocket ended, as close codes, and why a handshake failed.
 //
 // A WebSocket's end is an error in close_category():
 // - the code of the close the peer sent (e.g. 1000 for normal_closure; no_status_received, 1005, for a close without a

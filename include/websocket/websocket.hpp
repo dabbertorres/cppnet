@@ -58,12 +58,12 @@ struct accept_options
     // is chosen, compared exactly (as browsers compare the choice); none, if the client offers none of them.
     std::vector<std::string> subprotocols{};
 
-    // origins allow handshakes from other origins than the request's own (Decided question 7). A request with an Origin
-    // (as browsers send) is refused unless the origin's host and port are the request's own (its Host's, a port left
-    // out being the origin's scheme's default), or match one of these: a host (ignoring case), each of whose labels may
-    // be * for any one label (e.g. "*.example.com", which doesn't match "example.com" nor "a.b.example.com"),
-    // optionally with a port, or :* for any (e.g. "localhost:3000"); without one, the origin's port must be its
-    // scheme's default. A request without an Origin (e.g. a program's, not a browser's) isn't checked.
+    // origins allow handshakes from other origins than the request's own. A request with an Origin (as browsers send)
+    // is refused unless the origin's host and port are the request's own (its Host's, a port left out being the
+    // origin's scheme's default), or match one of these: a host (ignoring case), each of whose labels may be * for any
+    // one label (e.g. "*.example.com", which doesn't match "example.com" nor "a.b.example.com"), optionally with a
+    // port, or :* for any (e.g. "localhost:3000"); without one, the origin's port must be its scheme's default. A
+    // request without an Origin (e.g. a program's, not a browser's) isn't checked.
     //
     // The check is what keeps a page on another site from opening a WebSocket with the user's cookies (cross-site
     // WebSocket hijacking): browsers send cookies with cross-site WebSocket handshakes.

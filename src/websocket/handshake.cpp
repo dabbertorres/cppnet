@@ -184,7 +184,8 @@ std::string accept_key(std::string_view key)
 
 std::expected<std::string_view, std::error_code> check_request(const http::server_request& req)
 {
-    // NOTE: HTTP/2's handshake comes with the plan's stage 8 (server_request::protocol): until then, it isn't one.
+    // NOTE: an HTTP/2 handshake (an extended CONNECT) needs the request's :protocol, which server_request doesn't have
+    //       yet: until it does, it isn't one.
     if (req.version.major != 1 || req.version.minor < 1) return failure(errc::not_websocket);
     if (req.method != http::request_method::GET || has_body(req.headers) || !upgrades(req.headers))
         return failure(errc::not_websocket);

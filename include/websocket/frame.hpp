@@ -12,8 +12,8 @@
 #include "websocket/error.hpp"
 
 // WebSockets' frames (RFC 6455, section 5): their headers, masking, and close frames' payloads. What WebSockets are
-// built from (see docs/plans/websockets.md), not for applications. Nothing here knows the protocol's state: that's
-// detail::session's (websocket/session.hpp).
+// built from, not for applications. Nothing here knows the protocol's state: that's detail::session's
+// (websocket/session.hpp).
 //
 // Failures are the error the connection ends with: a close this side sends, with the code (sent(), e.g.
 // sent(close_code::protocol_error)), for what's malformed in what the peer sent.
