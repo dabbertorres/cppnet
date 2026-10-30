@@ -4,7 +4,8 @@ Status: decided (2026-10-22): every question at the end as recommended. Stage 1,
 Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2). Stage 3, switching
 an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3). Stage 4, accepting WebSockets, done (2026-10-29; see
 Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29; see Learned in stage 5). Stage 6,
-the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6).
+the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6). The server's close reaching a WebSocket whose peer
+never lets its reads wait, fixed (2026-10-29; see Fixed after stage 6).
 
 ## Goal
 
@@ -663,9 +664,10 @@ waiting for the server's first SETTINGS isn't used.
   if it didn't. A close of this side's already under way (`close_sent`) isn't disturbed: a read takes the deadline off
   and reads on, and so does `read_close()` itself, `close()`'s own timeout bounding both.
 - Only a read that has to wait notices: a message that's buffered already is read first, and a WebSocket that isn't
-  reading at all hears nothing until it next reads (the deadline stays set until then). A WebSocket accepted after
-  `close()` (its request already being served) gets its 101, and goes away at its first read that waits: the callback
-  runs as it's registered.
+  reading at all hears nothing until it next reads (the deadline stays set until then). (No longer: a peer that never
+  let a read wait kept the WebSocket open, so every step of a read now looks; see "Fixed after stage 6".) A WebSocket
+  accepted after `close()` (its request already being served) gets its 101, and goes away at its first read that waits:
+  the callback runs as it's registered.
 - `stop`: the transport's stop token cancels the socket's waits (reads and writes), and a callback (`cancel()`) fails the
   connection with `operation_canceled` unless it has failed already (so a stop after a clean close, or after the peer's
   close, changes nothing), wakes the writers waiting for their turn (a whole message waiting behind a streamed one whose
@@ -797,6 +799,58 @@ waiting for the server's first SETTINGS isn't used.
   timed out, and a `close()` called after the read had answered the server's close; `response_header_timeout` taken out
   hangs rather than fails (the scripted server waits for the client), which the run's time limit shows; and
   `await_end()` not dropping what comes never ends once the buffer's full (the tests' 10 s limits fail it).
+
+## Fixed after stage 6: the server's close and a busy peer
+
+- The gap: the server's `close()` reached a WebSocket only through the read deadline of now, which a read meets only
+  when it has to wait. A peer sending nonstop (small messages, one endless message of frames, or empty continuation
+  frames, which never reach `max_message`) always left something buffered or ready on the socket, so the read never
+  waited, the WebSocket never went away, and `server.join()` waited for ever: a client could keep the server from
+  closing. Before the fix, every busy test below failed once the client's 5 s read timeout passed.
+- The fix: the callback (`interrupt`) also sets a flag of the connection's own (`server_closing`, an
+  `std::atomic_bool`), before the deadline, and `pump()` looks at it at the start of each step, returning
+  `pumped::closing`; `drive()` takes that to `go_away()` (what `wait_failed()` did when the deadline came: the 1001 as a
+  reply, then `read_close()` within `close_timeout`, or nothing if a close of this side's is under way), and
+  `read_close()` takes it and reads on. A wait that the deadline ends now only goes on to the next step. A step takes no
+  more than what one read of the transport brought (a buffer's worth, or one direct read into a large frame), so a read
+  in progress sees the close within that, however busy the peer; and `read_close()` already checked the clock before
+  each fill, so a peer that sends on is cut off at `close_timeout` (a test breaks that check, and fails).
+- Why a flag, not `closing.stop_requested()`: the stop state's word is the server's, written by every connection's
+  callback as it's registered and unregistered (HTTP/1.1 connections' and WebSockets'), so loading it on each step would
+  share a cache line that connections coming and going write. The flag is relaxed: it carries nothing but itself
+  (`take_closing()` unregisters the callback, which waits for it, before taking the deadline off and clearing the flag),
+  and it's set before the deadline, so a read that the deadline wakes (through the socket's lock) sees it. It sits in
+  padding beside `reading` and `close_waiting` (after the other read side's state, it set off clang-tidy's padding
+  check).
+- The behaviour changed: a message that's buffered already is no longer read first. Once the server's close has come,
+  the next step of a read goes away, and messages not yet read, buffered or not, are dropped, as those that come after
+  it always were. `message()`'s read after its message's end still returns the end of the stream first (it reads
+  nothing). The connection's comment and the guide say so.
+- What else a peer could hold open, checked: `close()`'s own `read_close()` (the same clock check; and the server's
+  close under it now taken by a step as well as by a timed-out fill), `close()` waiting for another reader (its
+  `wait_on()` has the deadline), streamed reads (each `message().read()` is a step), whole reads of a large message
+  (each fill or direct read is followed by a step), skipping (inside a step), and the client (no `closing()`; its wait
+  for the server's end checks its deadline each round). Not changed: a handler that isn't reading hears nothing (as
+  before, documented), and a write held by a peer that doesn't read is bounded by the server's `write_timeout`, not by
+  `close_timeout` (an abort shuts only the reading side), so `join()` may wait that long for a handler that awaits its
+  own writer. The idle timeout's ping is untouched (`wait_failed()` looks at the flag first, as it looked at the token).
+- `bench_websocket` (Release), before and after, interleaved, 15 runs each while another worktree's tests loaded the
+  machine (so the medians are noise), best of each: small in flight 4.66 and 4.65 us per message, one at a time 32.88
+  and 32.46 us; large in flight 51.36 and 51.58 us, one at a time 136.56 and 135.98 us; allocations the same (4.00, 0.18
+  to 0.37, 10.0, 7.3 to 7.7). The flag's load doesn't show.
+- Tests (`test/websocket/server.cpp`): `[going-away][busy]`, a peer that never lets the reads wait (`send_nonstop()`,
+  64 KiB batches of frames, from a task of its own), three shapes (small messages read whole, an endless message of
+  4 KiB frames streamed, an endless message of empty frames read whole), each answering the 1001 once seen (`join()`
+  well within a 5 s `close_timeout`) or sending on (the connection cut at a 300 ms `close_timeout`, as a lower bound);
+  the going-away test of a WebSocket that isn't reading gets a message sent before the close (dropped: the read returns
+  1001, where it returned the message before the fix); and the close-in-progress test gets a peer sending nonstop as the
+  server closes (the handler's close finishes, with no 1001; this one passes without the fix too, and is there for the
+  paths the fix adds). 25 runs in a row and 30 six at a time, then 25 more after the flag moved into padding, all
+  passed. Each part was broken alone (11 breaks: the step's check, the callback's flag, the wait going on to the step,
+  `drive()`'s `go_away()`, `go_away()` taking the close, its state check, its `read_close()`, `read_close()`'s `closing`
+  case and its timed-out fill, the flag cleared, and `read_close()`'s clock check), and every one was caught: eight
+  failed, and three (the step's check, `read_close()`'s case and the flag cleared) hang rather than fail, a read
+  spinning without ever suspending, which the run's time limit shows.
 
 ## Stages
 

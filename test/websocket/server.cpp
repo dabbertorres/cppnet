@@ -2163,7 +2163,210 @@ TEST_CASE("the server's close gives up on a WebSocket's peer that doesn't answer
           == std::vector<std::string>{"read: 1001 sent reason=", "then write: 1001 sent", "then close: 1001 sent"});
 }
 
-TEST_CASE("a WebSocket that isn't reading when the server closes goes away at its next read",
+namespace
+{
+
+// flow is what a peer sending nonstop (send_nonstop()) and the test share: how much it has sent, when it's to stop,
+// and whether it has.
+struct flow
+{
+    std::atomic<std::uint64_t> sent = 0;
+    std::atomic<std::uint64_t> stop = 0;
+    std::atomic<std::uint64_t> done = 0;
+};
+
+// send_nonstop sends batch over and over, until it's told to stop or a write fails, so the server's reads always find
+// something to read (the peer sends faster than they take it), and never have to wait.
+task<void> send_nonstop(raw_peer* peer, std::vector<std::byte> batch, net::io::scheduler* sched, flow* f)
+{
+    while (f->stop.load() == 0)
+    {
+        if (co_await peer->send(batch)) break;
+        f->sent.fetch_add(batch.size());
+        sched->notify_all(f->sent);
+    }
+    raise(sched, f->done);
+}
+
+// batch_of is frame repeated up to about 64 KiB.
+std::vector<std::byte> batch_of(std::span<const std::byte> frame)
+{
+    std::vector<std::byte> batch;
+    while (batch.size() < std::size_t{64} * 1'024) batch.insert(batch.end(), frame.begin(), frame.end());
+    return batch;
+}
+
+// What a peer that never lets the server's reads wait sends.
+enum class busy_shape : std::uint8_t
+{
+    messages,    // small whole messages, read whole
+    streamed,    // one message that never ends, of 4 KiB frames, read as a stream
+    empty_parts, // one message that never ends, of empty frames (so it never reaches max_message), read whole
+};
+
+}
+
+TEST_CASE("the server's close reaches a WebSocket whose peer never lets its reads wait",
+          "[websocket][server][close][going-away][busy]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> joined = 0;
+    flow                       sending;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const auto shape = GENERATE(busy_shape::messages, busy_shape::streamed, busy_shape::empty_parts);
+    // whether the peer answers the server's close (having stopped sending once it has seen it), or sends on, never
+    // answering.
+    const bool answers = GENERATE(true, false);
+    CAPTURE(shape, answers);
+
+    const auto close_timeout = answers ? std::chrono::milliseconds{5s} : std::chrono::milliseconds{300ms};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(
+                       req,
+                       rw,
+                       {
+                           .connection = {.max_message = std::uint64_t{1} << 62, .close_timeout = close_timeout}
+                   });
+                   if (!conn.has_value()) co_return;
+
+                   std::error_code err;
+                   if (shape == busy_shape::streamed)
+                   {
+                       const auto type = co_await conn->next_message();
+                       err             = type.error_or(std::error_code{});
+                       std::array<std::byte, 4'096> buf{};
+                       while (!err)
+                       {
+                           const auto res = co_await conn->message().read(buf);
+                           err            = res.err;
+                       }
+                   }
+                   else
+                   {
+                       std::string message;
+                       while (!err)
+                       {
+                           const auto type = co_await conn->read_message(message);
+                           err             = type.error_or(std::error_code{});
+                       }
+                   }
+                   out.add("read: " + describe(err));
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    struct busy_result
+    {
+        std::string                 head;
+        std::vector<received_frame> frames;
+        std::error_code             err;
+        net::io::clock::duration    to_end{}; // from the server's close to the connection's end
+        net::io::clock::duration    to_join{};
+    };
+
+    // steps is the peer's part once it's sending nonstop.
+    const auto steps = [&](raw_peer& peer, busy_result& result) -> task<void>
+    {
+        // the server's reads are under way, and behind.
+        if (!co_await reach(&sched, sending.sent, std::uint64_t{1} << 20)) co_return;
+
+        const auto closed = net::io::clock::now();
+        server->close();
+        (void)sched.spawn(
+            [](http::server* server, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined)
+                -> task<void>
+            {
+                co_await server->join();
+                out->add("joined");
+                raise(sched, *joined);
+            }(server.get(), &out, &sched, &joined));
+
+        auto close = co_await peer.read_frame();
+        if (!close.has_value())
+        {
+            result.err = close.error();
+            co_return;
+        }
+        result.frames.push_back(std::move(*close));
+
+        if (answers)
+        {
+            raise(&sched, sending.stop);
+            if (!co_await reach(&sched, sending.done)) co_return;
+            out.add("answering");
+            (void)co_await peer.send(close_frame(ws::close_code::going_away));
+        }
+
+        auto [rest, err] = co_await peer.read_until_end();
+        result.to_end    = net::io::clock::now() - closed;
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+
+        if (!co_await reach(&sched, joined)) out.add("join() didn't return");
+        result.to_join = net::io::clock::now() - closed;
+    };
+
+    const auto client = [&] -> task<busy_result>
+    {
+        busy_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        std::vector<std::byte> batch;
+        switch (shape)
+        {
+        case busy_shape::messages: batch = batch_of(client_frame(opcode::text, "hello"sv)); break;
+        case busy_shape::streamed:
+        {
+            (void)co_await peer.send(client_frame(opcode::binary, "first"sv, false));
+            const std::vector<std::byte> part(4'096, std::byte{'x'});
+            batch = batch_of(client_frame(opcode::continuation, part, false));
+            break;
+        }
+        case busy_shape::empty_parts:
+            (void)co_await peer.send(client_frame(opcode::text, "first"sv, false));
+            batch = batch_of(client_frame(opcode::continuation, ""sv, false));
+            break;
+        }
+
+        if (!sched.spawn(send_nonstop(&peer, std::move(batch), &sched, &sending))) co_return result;
+        co_await steps(peer, result);
+
+        // the sender's done with the connection before it goes (its writes fail, once the server has ended it).
+        raise(&sched, sending.stop);
+        if (!co_await reach(&sched, sending.done)) out.add("the sender didn't stop");
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(result.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1001"});
+
+    if (answers)
+    {
+        // the handshake finishes as soon as the peer answers: well within close_timeout.
+        CHECK(result.err == net::io::errc::end_of_stream);
+        CHECK(result.to_join < close_timeout);
+        CHECK(out.get() == std::vector<std::string>{"answering", "read: 1001 sent", "joined"});
+    }
+    else
+    {
+        // a peer that sends on is cut off at close_timeout, however much it sends.
+        CHECK(result.err == net::io::status_condition::closed);
+        CHECK(result.to_end >= close_timeout);
+        CHECK(out.get() == std::vector<std::string>{"read: 1001 sent", "joined"});
+    }
+}
+
+TEST_CASE("a WebSocket that isn't reading when the server closes goes away at its next read, whatever's buffered",
           "[websocket][server][close][going-away]")
 {
     record                     out;
@@ -2173,7 +2376,9 @@ TEST_CASE("a WebSocket that isn't reading when the server closes goes away at it
 
     // whether the server closes before the handler accepts, or after.
     const bool before = GENERATE(false, true);
-    CAPTURE(before);
+    // whether the peer sent a message before the server closed: it's dropped, as what comes after is.
+    const bool message = GENERATE(false, true);
+    CAPTURE(before, message);
 
     http::router router;
     router.GET("/ws",
@@ -2209,6 +2414,7 @@ TEST_CASE("a WebSocket that isn't reading when the server closes goes away at it
         raw_peer peer{*conn, *conn};
         (void)co_await peer.send(test::websocket::handshake());
         if (!before) result.head = (co_await peer.read_head()).value_or("");
+        if (message) (void)co_await peer.send(client_frame(opcode::text, "early"sv));
 
         (void)co_await reach(&sched, ready);
         server->close();
@@ -2248,11 +2454,14 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
 {
     record                     out;
     std::atomic<std::uint64_t> finished = 0;
+    flow                       sending;
     net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
 
     // whether close() reads for the peer's close itself, or waits for another task that's reading.
     const bool other_reads = GENERATE(false, true);
-    CAPTURE(other_reads);
+    // whether the peer sends nonstop as the server closes (so the reads never wait), until it answers.
+    const bool busy = GENERATE(false, true);
+    CAPTURE(other_reads, busy);
 
     http::router router;
     router.GET("/ws",
@@ -2297,8 +2506,20 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
         if (!close.has_value()) co_return result;
         result.frames.push_back(std::move(*close));
 
+        if (busy)
+        {
+            if (!sched.spawn(send_nonstop(&peer, batch_of(client_frame(opcode::text, "hello"sv)), &sched, &sending)))
+                co_return result;
+            (void)co_await reach(&sched, sending.sent, std::uint64_t{1} << 20);
+        }
+
         server->close();
         (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+        if (busy)
+        {
+            raise(&sched, sending.stop);
+            if (!co_await reach(&sched, sending.done)) co_return result;
+        }
         (void)co_await peer.send(close_frame(ws::close_code{4001}));
 
         auto [rest, err] = co_await peer.read_until_end();

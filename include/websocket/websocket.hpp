@@ -209,12 +209,13 @@ private:
 // operation returns the same failure. Writing after this side's close has been sent fails with std::errc::broken_pipe
 // (as io::status_condition::closed matches).
 //
-// The server's close() (http::server's) ends a WebSocket that's reading: the read that's waiting (or the next that has
-// to wait) sends a close saying going_away (1001), then reads on for the peer's close (dropping messages that come
-// before it), for up to connection_options::close_timeout (then aborting the connection), and returns
-// sent(close_code::going_away), as everything does after it. A WebSocket whose own close() is under way finishes that
-// instead. One that isn't reading isn't told until it next reads (a message buffered already is read first). So the
-// server's close() then join() drain the WebSockets that are reading.
+// The server's close() (http::server's) ends a WebSocket that's reading: the read in progress (at once if it's waiting,
+// or once it has taken what it has buffered, however busy the peer keeps it) or the next read sends a close saying
+// going_away (1001), then reads on for the peer's close (dropping the messages not yet read, those buffered already
+// too, and those that come before the close), for up to connection_options::close_timeout (then aborting the
+// connection, however much the peer is still sending), and returns sent(close_code::going_away), as everything does
+// after it. A WebSocket whose own close() is under way finishes that instead. One that isn't reading isn't told until
+// it next reads. So the server's close() then join() drain the WebSockets that are reading.
 //
 // A server's connection is its handler's until the handler returns: it mustn't outlive the handler's call, which ends
 // the HTTP connection. A client's is its own, and ends when it's destroyed. Destroying it without a close (sent by

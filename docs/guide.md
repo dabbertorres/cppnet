@@ -943,12 +943,13 @@ router.GET("/echo",
   reading, for up to `accept_options::connection.close_timeout` (5 s): then it aborts the connection. A connection
   destroyed (e.g. its handler returning) without a close aborts it, so the client sees it end without one. Once the
   handler returns, the server ends the TCP connection, as RFC 6455 has the server do.
-- **The server's `close()`:** a WebSocket that's reading is told the server's going away: the read that's waiting (or
-  the next one that has to wait: a message already buffered is read first) sends a close with
-  `close_code::going_away` (1001), reads on for the client's close for up to `close_timeout` (then aborts), and returns
-  `websocket::sent(close_code::going_away)`; a `close()` of the handler's own that's under way finishes instead. So
-  `server.close()` then `join()` drains WebSockets as it does requests, as long as they read; one that isn't reading
-  hears nothing until it next reads (`abort()` ends it whatever it's doing).
+- **The server's `close()`:** a WebSocket that's reading is told the server's going away: the read in progress (at
+  once if it's waiting, or once it has taken what it has buffered, however busy the client keeps it) or the next read
+  sends a close with `close_code::going_away` (1001), reads on for the client's close (dropping the messages not yet
+  read, those buffered already too) for up to `close_timeout` (then aborts, however much the client is still sending),
+  and returns `websocket::sent(close_code::going_away)`; a `close()` of the handler's own that's under way finishes
+  instead. So `server.close()` then `join()` drains WebSockets as it does requests, as long as they read; one that
+  isn't reading hears nothing until it next reads (`abort()` ends it whatever it's doing).
 - **Idle WebSockets:** while a read waits, `accept_options::connection.idle_timeout` (60 s; 0 turns it off) bounds how
   long the client may say nothing: at half of it, the read pings the client (whose pong, or anything else, starts the
   wait over), and at the end of it, the WebSocket fails with `std::errc::timed_out` and is aborted. The pings also keep

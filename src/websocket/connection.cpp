@@ -162,11 +162,12 @@ namespace
 // messages wait for too, but control frames don't. Whoever waits for either waits on turn. A read's replies don't wait:
 // if the wire's busy, they're left pending, for its holder to send before it lets go (write_replies_or_release()).
 //
-// Timeouts and stopping cost reads nothing until they come: the idle timeout is half of it as the transport's read
-// timeout, whose expiry a read takes for the time to ping (wait_failed()); the server's close() sets a read deadline of
-// now (interrupt), which a read that waits (or the next) finds the same way, interrupting only reads (the transport's
-// stop token would cancel writes too, cutting a frame short); and stop is the transport's stop token, canceling its
-// waits, with a callback (cancel()) for the rest.
+// Timeouts and stopping cost reads next to nothing until they come: the idle timeout is half of it as the transport's
+// read timeout, whose expiry a read takes for the time to ping (wait_failed()); the server's close() (interrupt) sets a
+// flag that each step of a read (pump()) looks at, so a peer that never lets a read wait can't keep the WebSocket from
+// going away, and a read deadline of now, which a read that's waiting finds the same way as the idle timeout,
+// interrupting only reads (the transport's stop token would cancel writes too, cutting a frame short); and stop is the
+// transport's stop token, canceling its waits, with a callback (cancel()) for the rest.
 struct connection_state
 {
     // A server's state is over its connection's tunnel (t), a client's over its own (own, which it keeps: t is it).
@@ -233,13 +234,20 @@ struct connection_state
         return std::chrono::duration_cast<io::clock::duration>(idle_timeout) / 2;
     }
 
-    // interrupt is the server's close()'s callback: reads wait no more, failing with std::errc::timed_out having read
-    // nothing (see take_closing()).
+    // interrupt is the server's close()'s callback: the next step of a read goes away (see pump() and go_away()), and
+    // a read that's waiting waits no more, failing with std::errc::timed_out having read nothing.
     struct interrupt
     {
         connection_state* state;
 
-        void operator()() const noexcept { state->tunnel.set_read_deadline(io::clock::now()); }
+        void operator()() const noexcept
+        {
+            // NOTE: relaxed, as the flag says nothing of other memory: take_closing() unregisters this callback, which
+            //       waits for it to return, before it touches the deadline. Set before the deadline, so a read that the
+            //       deadline wakes sees it (the deadline's set under the socket's lock, which the wake goes through).
+            state->server_closing.store(true, std::memory_order::relaxed);
+            state->tunnel.set_read_deadline(io::clock::now());
+        }
     };
 
     // canceler is stop's callback.
@@ -280,10 +288,11 @@ struct connection_state
     // What a step of reading (pump()) came to.
     enum class pumped : std::uint8_t
     {
-        done,   // the goal's reached
-        more,   // more must be read
-        reply,  // a reply (a pong) is pending, to send before going on
-        failed, // the connection has failed (failed): perhaps with a close to send
+        done,    // the goal's reached
+        more,    // more must be read
+        reply,   // a reply (a pong) is pending, to send before going on
+        failed,  // the connection has failed (failed): perhaps with a close to send
+        closing, // the server is closing (see go_away())
     };
 
     enum class frame_kind : std::uint8_t
@@ -348,6 +357,12 @@ struct connection_state
         const auto more = [&] { return g == goal::some && t.filled > 0 ? pumped::done : pumped::more; };
 
         if (g == goal::some && (!in_message || skipping)) return pumped::done;
+
+        // the server's close() is looked for at each step, rather than only when a read has to wait, so a peer that
+        // always leaves something to read (sending nonstop) can't keep the WebSocket open past it: a step takes no more
+        // than one read of the transport gave, so it's seen within that. Messages not yet read (buffered ones too) are
+        // dropped then, as the ones that come after it are.
+        if (closing_now()) return pumped::closing;
 
         while (true)
         {
@@ -606,49 +621,62 @@ struct connection_state
         tunnel.abort();
     }
 
-    // take_closing is whether the server's close() is why a read's wait timed out (interrupt): if so, it takes the read
-    // deadline off, once the callback can't set it any more, so reads wait again. Only the read side's holder calls it.
+    // closing_now is whether the server's close() has come, and no read has taken it yet (see take_closing()).
+    // NOTE: a flag of the connection's own, rather than closing.stop_requested(), whose word every connection's
+    //       callbacks on the server's token write as they're registered and unregistered; and relaxed (see interrupt),
+    //       a plain load, so a read pays no more than that for it.
+    [[nodiscard]] bool closing_now() const noexcept { return server_closing.load(std::memory_order::relaxed); }
+
+    // take_closing is whether the server's close() has come (interrupt): if so, it takes the read deadline off, once
+    // the callback can't set it any more, so reads wait again, and clears the flag. Only the read side's holder calls
+    // it.
     bool take_closing() noexcept
     {
-        if (!on_closing || !closing.stop_requested()) return false;
+        if (!closing_now()) return false;
 
         // NOTE: unregistered (waiting for it, if it's being made on another thread) before the deadline's taken off, so
-        //       it can't set it again after.
+        //       it can't set it again after; and before the flag's cleared, which it then can't set again either.
         on_closing.reset();
         tunnel.set_read_deadline(std::nullopt);
+        server_closing.store(false, std::memory_order::relaxed);
         return true;
     }
 
+    // go_away is what the server's close() comes to in a read (holding the read side): it sends this side's close
+    // (going away) and reads for the peer's (see read_close()), returning the connection's failure; or, if a close of
+    // this side's is under way (close()'s), which goes on as it was, none, for the read to go on.
+    coro::task<std::error_code> go_away()
+    {
+        (void)take_closing();
+
+        bool going_away = false;
+        {
+            std::scoped_lock lock{mu};
+            if (failed) co_return failed;
+
+            if (sess.state() == close_state::open)
+            {
+                set_failure(sent(close_code::going_away));
+                going_away = true;
+            }
+        }
+        if (!going_away) co_return std::error_code{};
+
+        // writers waiting see the failure; the close goes as a reply (left to a write in progress, if there is one),
+        // and then the peer's is read for, as close() does.
+        turn.notify();
+        (void)co_await send_replies();
+        co_return co_await read_close(io::clock::now() + close_timeout);
+    }
+
     // wait_failed is what a read's wait failing with err, having read nothing, comes to (holding the read side): the
-    // server's close() sends this side's close (going away) and reads for the peer's; the first half of the idle
-    // timeout passing pings the peer, and the second, with nothing received since, fails the connection; anything else
-    // fails it too. It returns the error the read ends with, or none, for it to go on.
+    // server's close() goes on to the read's next step, which goes away; the first half of the idle timeout passing
+    // pings the peer, and the second, with nothing received since, fails the connection; anything else fails it too.
+    // It returns the error the read ends with, or none, for it to go on.
     coro::task<std::error_code> wait_failed(std::error_code err)
     {
         if (err != std::errc::timed_out) co_return fail_transport(err);
-
-        if (take_closing())
-        {
-            bool going_away = false;
-            {
-                std::scoped_lock lock{mu};
-                if (failed) co_return failed;
-
-                // a close under way (close()'s) goes on as it was.
-                if (sess.state() == close_state::open)
-                {
-                    set_failure(sent(close_code::going_away));
-                    going_away = true;
-                }
-            }
-            if (!going_away) co_return std::error_code{};
-
-            // writers waiting see the failure; the close goes as a reply (left to a write in progress, if there is
-            // one), and then the peer's is read for, as close() does.
-            turn.notify();
-            (void)co_await send_replies();
-            co_return co_await read_close(io::clock::now() + close_timeout);
-        }
+        if (closing_now()) co_return std::error_code{};
 
         if (!idle_wait || std::exchange(idle_pinged, true)) co_return fail_transport(err);
 
@@ -683,6 +711,11 @@ struct connection_state
             if (step == pumped::reply)
             {
                 err = co_await send_replies();
+                if (err) break;
+            }
+            else if (step == pumped::closing)
+            {
+                err = co_await go_away();
                 if (err) break;
             }
             else if (ended)
@@ -1155,6 +1188,9 @@ struct connection_state
                 if (auto err = co_await send_replies()) co_return err;
                 break;
 
+            // the server's close(): this side's close has gone (or is going) already, so it reads on.
+            case pumped::closing: (void)take_closing(); break;
+
             case pumped::more:
             {
                 if (ended) co_return fail_transport(ended);
@@ -1169,8 +1205,8 @@ struct connection_state
                 {
                     if (reader.size() == before)
                     {
-                        // the server's close(): this side's close has gone (or is going) already, so it reads on.
-                        if (err == std::errc::timed_out && take_closing()) break;
+                        // the server's close(): the next step takes it.
+                        if (err == std::errc::timed_out && closing_now()) break;
                         co_return fail_transport(err);
                     }
                     ended = err;
@@ -1213,10 +1249,12 @@ struct connection_state
     // notified when the wire or the message turn is let go, or the connection fails.
     coro::notifier turn;
 
-    // The read side's claim, and close()'s wait for it (see end_read()).
-    std::atomic_bool           reading       = false;
-    std::atomic_bool           close_waiting = false;
-    std::atomic<std::uint64_t> read_changes  = 0;
+    // The read side's claim, and close()'s wait for it (see end_read()); and whether the server's close() has come,
+    // and no read has taken it yet (see interrupt).
+    std::atomic_bool           reading        = false;
+    std::atomic_bool           close_waiting  = false;
+    std::atomic_bool           server_closing = false;
+    std::atomic<std::uint64_t> read_changes   = 0;
 
     // The read side's (the claim's holder's).
     frame_kind           current    = frame_kind::none;
