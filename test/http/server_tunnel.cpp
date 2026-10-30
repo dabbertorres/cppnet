@@ -509,7 +509,8 @@ TEST_CASE("closing the server lets a switched connection's handler finish, telli
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
-    std::atomic<std::uint64_t> joined = 0;
+    std::atomic<std::uint64_t> joined  = 0;
+    std::atomic<std::uint64_t> checked = 0; // the handler has looked at closing() before the server's close()
 
     http::router router;
     router.GET("/echo",
@@ -520,7 +521,10 @@ TEST_CASE("closing the server lets a switched connection's handler finish, telli
                    auto& t = **switched;
 
                    const bool closing_before = t.closing().stop_requested();
-                   const auto echoed         = co_await test::echo(t);
+                   checked.store(1);
+                   sched.notify_all(checked);
+
+                   const auto echoed = co_await test::echo(t);
                    (void)co_await net::io::write_all(t.writer(),
                                                      std::format("closing={},{} echo={}",
                                                                  closing_before,
@@ -538,6 +542,13 @@ TEST_CASE("closing the server lets a switched connection's handler finish, telli
 
         (void)co_await net::io::write_all(*conn, upgrade_request);
         if (auto err = co_await test::read_until(*conn, received, "\r\n\r\n"sv)) co_return std::pair{received, err};
+
+        // the 101 arrives once it's flushed, before the handler has looked: it's closed after.
+        const auto looked = net::io::clock::now() + 5s;
+        while (checked.load() == 0)
+        {
+            if (co_await sched.wait_on(checked, 0, looked)) break;
+        }
 
         server->close();
         REQUIRE(sched.spawn(
