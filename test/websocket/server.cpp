@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include <poll.h>
+
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -33,6 +35,7 @@
 #include "http/router.hpp"
 #include "http/timeout.hpp"
 #include "io/io.hpp"
+#include "io/poll.hpp"
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "tcp.hpp"
@@ -1358,6 +1361,17 @@ TEST_CASE("a WebSocket answers only the latest ping while a write holds the conn
         raw_peer peer{*conn, *conn};
         (void)co_await peer.send(test::websocket::handshake());
         if (!(co_await peer.read_head()).has_value()) co_return frames;
+
+        // the pings go once the large message has begun to arrive, so the writer holds the connection by then (it
+        // can't finish, as nothing's read until it's told): sent sooner, the handler's read could answer them before
+        // the writer had the connection.
+        // NOTE: poll() says whether it's readable, as a wait may end for a readiness its read_head() consumed.
+        const auto arriving = net::io::clock::now() + 10s;
+        pollfd     readable{.fd = conn->native_handle(), .events = POLLIN, .revents = 0};
+        while (::poll(&readable, 1, 0) == 0)
+        {
+            if (co_await sched.wait_until(conn->native_handle(), net::io::poll_op::read, arriving)) break;
+        }
 
         (void)co_await peer.send(join(client_frame(opcode::ping, "1"sv),
                                       client_frame(opcode::ping, "2"sv),
