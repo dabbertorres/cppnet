@@ -485,6 +485,24 @@ void stream_tunnel::abort() noexcept
     c.wake_writer();
 }
 
+void stream_tunnel::end() noexcept
+{
+    auto& c = *stream.conn;
+    {
+        std::scoped_lock lock{c.mu};
+        if (stream.failure || stream.ended) return;
+
+        // NOTE: what's been flushed has gone to the session (a write returns once it's all been framed), so this
+        //       comes after it.
+        stream.ended = true;
+        if (auto sent = c.session.submit_data(stream.id, {}, true); !sent.has_value())
+            c.fail_stream(stream, sent.error());
+    }
+
+    stream.changed.notify();
+    c.wake_writer();
+}
+
 std::error_code stream_tunnel::check_wait(std::optional<io::clock::time_point>& timeout_at)
 {
     wake_at.reset();

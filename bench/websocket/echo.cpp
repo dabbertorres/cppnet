@@ -7,6 +7,8 @@
 //   waiting for each answer does;
 // - in flight: one task writes the messages while another reads their echoes, so as many are on the way as the
 //   connection holds (until the writes wait for the server to read).
+// Each over HTTP/1.1 (the WebSocket's own connection), then over HTTP/2 (RFC 8441: a stream of the client's connection,
+// over cleartext with prior knowledge, made by a request first).
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -34,6 +36,7 @@
 #include "http/router.hpp"
 #include "http/server.hpp"
 #include "io/scheduler.hpp"
+#include "io/util.hpp"
 #include "websocket/websocket.hpp"
 
 // NOLINTBEGIN(misc-new-delete-overloads,cppcoreguidelines-no-malloc,cppcoreguidelines-avoid-non-const-global-variables,readability-inconsistent-declaration-parameter-name):
@@ -168,10 +171,22 @@ task<measured> in_flight(net::io::scheduler* sched, ws::connection* conn, load l
     co_return result;
 }
 
-// run opens a WebSocket, and measures each load both ways, repeats times, returning the best (by time) of each.
-task<std::vector<measured>> run(net::io::scheduler* sched, http::client* client, std::string url)
+// run opens a WebSocket (over HTTP/2 if warm, the URL of a request to send first, so the client has an HTTP/2
+// connection for it), and measures each load both ways, repeats times, returning the best (by time) of each.
+task<std::vector<measured>> run(net::io::scheduler* sched, http::client* client, std::string url, std::string warm = {})
 {
     std::vector<measured> best;
+
+    if (!warm.empty())
+    {
+        auto resp = co_await client->get(warm);
+        if (!resp.has_value() || resp->version.major != 2)
+        {
+            std::println(stderr, "failed to make an HTTP/2 connection");
+            co_return best;
+        }
+        (void)co_await net::io::read_all(*resp->body);
+    }
 
     auto conn = co_await ws::connect(*client, url, {.connection = {.max_message = std::uint64_t{1} << 20}});
     if (!conn.has_value())
@@ -213,6 +228,7 @@ int main()
 
     http::router router;
     router.GET("/ws", echo);
+    router.GET("/", [](const http::server_request& /*req*/, http::response_writer& /*rw*/) -> task<> { co_return; });
 
     http::server server{
         &scheduler,
@@ -222,21 +238,40 @@ int main()
     scheduler.spawn(server.serve());
 
     http::client client{&scheduler};
-    const auto   url  = std::format("ws://127.0.0.1:{}/ws", server.local_port());
-    const auto   best = scheduler.run_to_completion(run(&scheduler, &client, url));
-    if (best.size() != loads.size() * 2) return 1;
+    const auto   url = std::format("ws://127.0.0.1:{}/ws", server.local_port());
+
+    http::client_options h2;
+    h2.http2_prior_knowledge = true;
+    http::client h2_client{&scheduler, h2};
+
+    // (one scheduler, so both runs are one task.)
+    const auto both = [](net::io::scheduler* sched,
+                         http::client*       h1,
+                         http::client*       h2,
+                         std::string         url,
+                         std::string         warm) -> task<std::vector<measured>>
+    {
+        auto best = co_await run(sched, h1, url);
+        auto over = co_await run(sched, h2, url, warm);
+        best.insert(best.end(), over.begin(), over.end());
+        co_return best;
+    };
+    const auto best = scheduler.run_to_completion(
+        both(&scheduler, &client, &h2_client, url, std::format("http://127.0.0.1:{}/", server.local_port())));
+    if (best.size() != loads.size() * 4) return 1;
 
     std::println("cppnet's client and server, over loopback ({} workers; best of {}):",
                  workers->concurrency(),
                  repeats);
     for (std::size_t i = 0; i < best.size(); ++i)
     {
-        const auto&       l      = loads[i / 2];
-        const auto        per    = std::chrono::duration<double, std::micro>(best[i].took).count() / l.count;
-        const auto        allocs = static_cast<double>(best[i].allocations) / l.count;
-        const auto* const how    = i % 2 == 0 ? "one at a time" : "in flight";
-        const auto        mib    = static_cast<double>(l.size) / per * 1e6 / (1'024.0 * 1'024.0);
-        std::println("{}, {}:", l.name, how);
+        const auto&       l       = loads[(i / 2) % loads.size()];
+        const auto        per     = std::chrono::duration<double, std::micro>(best[i].took).count() / l.count;
+        const auto        allocs  = static_cast<double>(best[i].allocations) / l.count;
+        const auto* const how     = i % 2 == 0 ? "one at a time" : "in flight";
+        const auto* const version = i < loads.size() * 2 ? "HTTP/1.1" : "HTTP/2";
+        const auto        mib     = static_cast<double>(l.size) / per * 1e6 / (1'024.0 * 1'024.0);
+        std::println("{}, {}, {}:", version, l.name, how);
         std::println(
             "{:>10.2f} us per message ({:.0f} messages/s, {:.1f} MiB/s each way), {:.2f} allocations per message",
             per,

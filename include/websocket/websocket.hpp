@@ -121,6 +121,15 @@ struct connect_options
     // write, close()) fails so, as everything does after it, and the connection is aborted (the server sees it end
     // without a close).
     std::stop_token stop{};
+
+    // http2 opens the WebSocket over HTTP/2 (RFC 8441: as an extended CONNECT, the WebSocket a stream of the
+    // connection) when the client has an HTTP/2 connection to the URL's host (and port, and scheme) already, whose
+    // server has said it allows that (SETTINGS_ENABLE_CONNECT_PROTOCOL = 1, as cppnet's server does by default; not
+    // before its SETTINGS have come), and that has a stream free: then the WebSocket shares that connection with the
+    // client's requests. Otherwise, or with this off, it's over HTTP/1.1, on a connection of its own: connect() never
+    // connects (nor waits for a stream) just to find out, as Chrome doesn't. Another host's connection is never used,
+    // even one the client would coalesce a request onto (client_options::http2_coalescing).
+    bool http2 = true;
 };
 
 class connection;
@@ -147,27 +156,29 @@ class connection;
 coro::task<std::expected<connection, std::error_code>>
 accept(const http::server_request& req, http::response_writer& rw, const accept_options& options = {});
 
-// connect opens a WebSocket (RFC 6455, section 4.1) to url: ws:// or wss:// (or http:// or https://, the same over
-// HTTP/1.1, as browsers allow), with client's configuration: its resolver, connect_timeout and attempt_delay to
-// connect, and for wss, its TLS options (the certificate authorities trusted, a client certificate) and
-// tls_handshake_timeout. The connection is the WebSocket's own (never the client's to reuse, nor counted in its
-// limits), always HTTP/1.1 (over TLS, it offers only http/1.1 with ALPN). The handshake's request has options' fields,
-// and its response must come within response_header_timeout of the request's being sent; writing it, and the
-// WebSocket's writes, may go without progress for io_timeout. It fails with:
+// connect opens a WebSocket (RFC 6455, section 4.1) to url: ws:// or wss:// (or http:// or https://, the same, as
+// browsers allow), with client's configuration: its resolver, connect_timeout and attempt_delay to connect, and for
+// wss, its TLS options (the certificate authorities trusted, a client certificate) and tls_handshake_timeout. The
+// connection is the WebSocket's own (never the client's to reuse, nor counted in its limits), HTTP/1.1 (over TLS, it
+// offers only http/1.1 with ALPN); or, if client has an HTTP/2 connection to the host that allows it, a stream of that
+// (RFC 8441: see connect_options::http2). The handshake's request has options' fields, and its response must come
+// within response_header_timeout of the request's being sent; writing it, and the WebSocket's writes, may go without
+// progress for io_timeout. It fails with:
 // - std::errc::invalid_argument for a url that isn't valid, and std::errc::protocol_not_supported for another scheme
 //   (or wss without TLS);
 // - what connecting failed with (e.g. std::errc::timed_out past connect_timeout, a TLS error), or the handshake's
 //   writing or reading (e.g. std::errc::timed_out past response_header_timeout, or a response that isn't HTTP);
 // - websocket::errc for a response that isn't the server's accepting (RFC 6455 has the client fail the connection):
 //   bad_status for a status other than 101 (Switching Protocols), which includes redirects (they aren't followed, as
-//   browsers don't); not_websocket without Upgrade: websocket and Connection: upgrade; bad_accept for the wrong
-//   Sec-WebSocket-Accept; bad_subprotocol for a subprotocol that wasn't offered; bad_extension for any extension (none
-//   is offered);
+//   browsers don't), or over HTTP/2, other than a 2xx (RFC 8441, section 5); not_websocket without Upgrade: websocket
+//   and Connection: upgrade; bad_accept for the wrong Sec-WebSocket-Accept (neither of which HTTP/2 has);
+//   bad_subprotocol for a subprotocol that wasn't offered; bad_extension for any extension (none is offered);
 // - std::errc::operation_canceled once options.stop is requested.
 // What the server sent right after its response is the WebSocket's first frames.
 //
 // NOTE: url and options are copied before it returns, so they needn't outlive the task; client must (but not the
-//       connection, which only needs client's scheduler).
+//       connection, which only needs client's scheduler: over HTTP/2, it holds the client's connection, which then
+//       stays open until it's done, as a response's body being read does).
 coro::task<std::expected<connection, std::error_code>>
 connect(const http::client& client, std::string_view url, const connect_options& options = {});
 
@@ -233,7 +244,9 @@ private:
 // answered), waits for the server to end the TCP connection, as RFC 6455 (section 7.1.1) has the server end it first,
 // for up to close_timeout: so close(), or the read, returns once it has (or the timeout's passed: the connection then
 // ends with its destruction), and the client doesn't hold the closed connection's state (TIME_WAIT) instead of the
-// server.
+// server. Over HTTP/2, where the stream's END_STREAM is TCP's orderly end (RFC 8441, section 5), the client ends its
+// side of the stream as soon as its close has gone (a stream has no TIME_WAIT), and then waits for the server's
+// END_STREAM the same way; destroyed before both sides have ended it, the stream is reset (CANCEL).
 class connection
 {
 public:

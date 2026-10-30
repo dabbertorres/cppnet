@@ -239,49 +239,86 @@ std::error_code check_origin(const http::server_request& req, const accept_optio
     return std::ranges::any_of(options.origins, matches) ? std::error_code{} : refused;
 }
 
+namespace
+{
+
+    // base_request is a client's handshake request for target, either version's: options' headers and then the
+    // handshake's own (see connect_options::headers), but those that say which version (Upgrade, Connection, the key),
+    // and without Sec-WebSocket-Extensions.
+    http::client_request base_request(const url& target, const connect_options& options)
+    {
+        http::client_request request;
+        request.uri     = target;
+        request.headers = options.headers;
+
+        request.headers.remove("Sec-WebSocket-Extensions"sv);
+        request.headers.set("Sec-WebSocket-Version"sv, "13"sv);
+
+        if (options.subprotocols.empty())
+        {
+            request.headers.remove("Sec-WebSocket-Protocol"sv);
+        }
+        else
+        {
+            std::string offered;
+            for (const auto& protocol : options.subprotocols)
+            {
+                if (!offered.empty()) offered.append(", "sv);
+                offered.append(protocol);
+            }
+            request.headers.set("Sec-WebSocket-Protocol"sv, std::move(offered));
+        }
+
+        if (!options.origin.empty()) request.headers.set("Origin"sv, options.origin);
+        return request;
+    }
+
+}
+
 client_handshake make_request(const url& target, const connect_options& options)
 {
     std::array<std::byte, key_size> random{};
     util::random_bytes(random);
 
-    client_handshake out{.request = {}, .key = encoding::base64::encoding{}.encode(random)};
+    client_handshake out{.request = base_request(target, options), .key = encoding::base64::encoding{}.encode(random)};
     auto&            request = out.request;
     request.method           = http::request_method::GET;
     request.version          = {.major = 1, .minor = 1};
-    request.uri              = target;
-    request.headers          = options.headers;
 
-    request.headers.remove("Sec-WebSocket-Extensions"sv);
     request.headers.set("Upgrade"sv, "websocket"sv);
     request.headers.set("Connection"sv, "Upgrade"sv);
     request.headers.set("Sec-WebSocket-Key"sv, out.key);
-    request.headers.set("Sec-WebSocket-Version"sv, "13"sv);
-
-    if (options.subprotocols.empty())
-    {
-        request.headers.remove("Sec-WebSocket-Protocol"sv);
-    }
-    else
-    {
-        std::string offered;
-        for (const auto& protocol : options.subprotocols)
-        {
-            if (!offered.empty()) offered.append(", "sv);
-            offered.append(protocol);
-        }
-        request.headers.set("Sec-WebSocket-Protocol"sv, std::move(offered));
-    }
-
-    if (!options.origin.empty()) request.headers.set("Origin"sv, options.origin);
     return out;
+}
+
+http::client_request make_http2_request(const url& target, const connect_options& options)
+{
+    auto request    = base_request(target, options);
+    request.method  = http::request_method::CONNECT;
+    request.version = {.major = 2, .minor = 0};
+
+    // the stream says it all (RFC 8441, section 5): HTTP/2 sends no Upgrade nor Connection, and there's no key.
+    request.headers.remove("Upgrade"sv);
+    request.headers.remove("Connection"sv);
+    request.headers.remove("Sec-WebSocket-Key"sv);
+    return request;
 }
 
 std::expected<std::string_view, std::error_code>
 check_response(const http::client_response& response, std::string_view key, std::span<const std::string> offered)
 {
-    if (response.status_code != http::status::SWITCHING_PROTOCOLS) return failure(errc::bad_status);
-    if (!upgrades(response.headers)) return failure(errc::not_websocket);
-    if (only_value(response.headers, "Sec-WebSocket-Accept"sv) != accept_key(key)) return failure(errc::bad_accept);
+    if (response.version.major == 2)
+    {
+        // over HTTP/2, any 2xx (RFC 8441, section 5), without Upgrade, Connection nor accept: the stream's the proof
+        // that the server took it.
+        if (!http::status_is_success(response.status_code)) return failure(errc::bad_status);
+    }
+    else
+    {
+        if (response.status_code != http::status::SWITCHING_PROTOCOLS) return failure(errc::bad_status);
+        if (!upgrades(response.headers)) return failure(errc::not_websocket);
+        if (only_value(response.headers, "Sec-WebSocket-Accept"sv) != accept_key(key)) return failure(errc::bad_accept);
+    }
     if (!response.headers.get_list("Sec-WebSocket-Extensions"sv).empty()) return failure(errc::bad_extension);
 
     if (!response.headers.get("Sec-WebSocket-Protocol"sv)) return ""sv;

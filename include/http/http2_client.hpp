@@ -4,6 +4,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -102,6 +103,42 @@ struct origin_set
     [[nodiscard]] std::optional<bool> checked_for(std::string_view host) const noexcept;
 };
 
+class http2_client_connection;
+
+// http2_tunnel is a client's stream once a 2xx has answered its extended CONNECT (see
+// http2_client_connection::open_tunnel()): it holds the stream, whose tunnel get() is, and the connection, as a
+// response's body does, so the connection stays open while it's held (the pool's drain waiting for it, as for a body
+// being read; the pool, and the client, may go first). Destroying it is done with the stream: reset (CANCEL), unless
+// both sides have ended it, or it's failed.
+class http2_tunnel
+{
+public:
+    http2_tunnel(std::shared_ptr<http2_client_connection> conn, std::shared_ptr<http2_client_stream> stream) noexcept
+        : conn{std::move(conn)}
+        , stream{std::move(stream)}
+    {}
+
+    http2_tunnel(http2_tunnel&&) noexcept            = default;
+    http2_tunnel& operator=(http2_tunnel&&) noexcept = delete;
+    http2_tunnel(const http2_tunnel&)                = delete;
+    http2_tunnel& operator=(const http2_tunnel&)     = delete;
+    ~http2_tunnel();
+
+    [[nodiscard]] stream_tunnel& get() const noexcept { return *stream->tunnel; }
+
+private:
+    std::shared_ptr<http2_client_connection> conn; // none, once moved from
+    std::shared_ptr<http2_client_stream>     stream;
+};
+
+// tunnel_response is the response to an extended CONNECT (see http2_client_connection::open_tunnel()): its head
+// (HTTP/2's: its status and fields, without a body), and for a 2xx, the tunnel.
+struct tunnel_response
+{
+    client_response             head;
+    std::optional<http2_tunnel> tunnel;
+};
+
 // owned_connection holds what an http2_client_connection owns, before its base (which refers to the connection) is
 // made.
 struct owned_connection
@@ -160,9 +197,12 @@ public:
     // start runs the connection, as one of the scheduler's tasks, returning false if the scheduler's stopping.
     bool start();
 
-    // reserve reserves a stream for a request, which its send() takes, if the connection's open and has one free
-    // (counting those reserved already), returning whether it did. Without one, send() may fail with refused_stream.
-    [[nodiscard]] bool reserve();
+    // reserve reserves a stream for a request, which its send() (or open_tunnel()) takes, if the connection's open and
+    // has one free (counting those reserved already), returning whether it did. Without one, send() may fail with
+    // refused_stream. With extended_connect (for open_tunnel()), only if the server's SETTINGS have said
+    // ENABLE_CONNECT_PROTOCOL = 1 (RFC 8441, section 3: not before, so not while they're still to come; and it can't be
+    // taken back).
+    [[nodiscard]] bool reserve(bool extended_connect = false);
 
     // idle is whether it has no streams open, nor any reserved.
     [[nodiscard]] bool idle();
@@ -194,6 +234,18 @@ public:
     // streams that are full-duplex).
     coro::task<std::expected<client_response, std::error_code>> send(client_request& request,
                                                                      send_state*     state = nullptr);
+
+    // open_tunnel opens a stream for request as an extended CONNECT (RFC 8441), asking to tunnel protocol over it (e.g.
+    // "websocket"): :method CONNECT, :protocol, and request's :scheme, :authority, :path and fields (as send() sends
+    // them), without END_STREAM; then it waits for the response's head, within response_header_timeout, skipping
+    // informational responses. A 2xx opens the tunnel (RFC 8441, section 5): the stream's DATA both ways is the
+    // tunnel's (see stream_tunnel), its own read timeout off (the tunnel's own replaces it), its write timeout kept
+    // (io_timeout). Any other response's stream is done with (reset, unless both sides have ended it). It takes the
+    // stream reserve(true) reserved, whatever happens. request.stop cancels it until the head has come, as send()'s;
+    // the tunnel's stop is its user's (stream_tunnel::set_stop_token()). It fails as send() does: e.g. with
+    // refused_stream (in http2::category()) if the server didn't process it, so it may be opened elsewhere.
+    coro::task<std::expected<tunnel_response, std::error_code>> open_tunnel(const client_request& request,
+                                                                            std::string_view      protocol);
 
     // close ends the connection (GOAWAY), failing the streams still open.
     void close();
@@ -276,9 +328,14 @@ private:
     // open opens a stream for request, sending its head, holding the lock: unless its stop was requested (failing
     // with std::errc::operation_canceled). Either way, it takes the stream reserved for it, if there was one.
     // ends_after is how much DATA ends the stream, if that's known (no trailers follow): 0 ends it with the head, more
-    // with the body's last DATA frame (see http2_stream_base::data_left); none leaves it to end_request().
-    std::expected<std::shared_ptr<http2_client_stream>, std::error_code> open(const client_request&      request,
-                                                                              std::optional<std::size_t> ends_after);
+    // with the body's last DATA frame (see http2_stream_base::data_left); none leaves it to end_request(). A protocol
+    // makes it an extended CONNECT's (see open_tunnel()), sending :protocol.
+    std::expected<std::shared_ptr<http2_client_stream>, std::error_code>
+    open(const client_request& request, std::optional<std::size_t> ends_after, std::string_view protocol = {});
+
+    // not_opened is what a request whose stream open() didn't open comes to (holding the lock, which it releases): the
+    // stream reserved for it is free, for another request, or for the connection to be idle.
+    void not_opened(std::unique_lock<connection_mutex>& lock);
 
     // body_result is what sending a request's body came to: why it stopped short, if it did; and whether that's the
     // body's fault (it failed, or was shorter than its Content-Length), rather than the stream's.

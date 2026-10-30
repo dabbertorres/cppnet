@@ -225,6 +225,13 @@ namespace detail
         coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
         connect_apart(const std::string& scheme, std::string host, std::string port, std::stop_token stop);
 
+        // reserve_tunnel reserves a stream for an extended CONNECT (RFC 8441: e.g. a WebSocket's) on one of host's own
+        // HTTP/2 connections (never another host's, as coalescing would have it) whose server has said it allows them,
+        // and that has a stream free (see http2_client_connection::reserve()), returning it; or none, if there's no
+        // such connection: it never connects, nor waits for a stream.
+        std::shared_ptr<http2_client_connection>
+        reserve_tunnel(const std::string& scheme, const std::string& host, const std::string& port);
+
         [[nodiscard]] const client_options& options() const noexcept { return config; }
 
         [[nodiscard]] io::scheduler* get_scheduler() const noexcept { return scheduler; }

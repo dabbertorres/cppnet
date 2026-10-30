@@ -177,6 +177,10 @@ public:
     // abort resets the stream (CANCEL), failing it with std::errc::connection_aborted.
     void abort() noexcept override;
 
+    // end ends this side of the stream (END_STREAM: RFC 8441, section 5, has an orderly TCP close as END_STREAM), after
+    // what's been flushed, unless it's ended or failed: nothing's sent after it. Not holding the lock, which it takes.
+    void end() noexcept;
+
     // check_wait is what a read that has nothing to read comes to before it waits (holding the lock): an error if it's
     // not to wait (stopped, or past its deadline or timeout: timeout_at is when its timeout passes, which it sets the
     // first time); none otherwise, having set when the timer's to wake it (wake_at), if ever.

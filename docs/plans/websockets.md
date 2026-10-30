@@ -7,7 +7,7 @@ Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29;
 the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6). The server's close reaching a WebSocket whose peer
 never lets its reads wait, fixed (2026-10-29; see Fixed after stage 6). Stage 7, extended CONNECT in the session, done
 (2026-10-29; see Learned in stage 7). Stage 8, WebSockets over HTTP/2 on the server, done (2026-10-29; see Learned in
-stage 8).
+stage 8). Stage 9, WebSockets over HTTP/2 in the client, done (2026-10-30; see Learned in stage 9).
 
 ## Goal
 
@@ -361,12 +361,17 @@ aren't followed (Decided question 14). `connect_options::stop` covers connecting
 connection). A response other than 101 fails with `bad_status`; a 101 whose accept, subprotocol or extensions are
 wrong fails too (RFC 6455 4.1: the client MUST fail the connection).
 
-Over HTTP/2 (a later stage): when the client's pool has an HTTP/2 connection to the host whose peer sent
-ENABLE_CONNECT_PROTOCOL = 1 (and `connect_options::http2`, off by default at first), `connect()` opens an extended
-CONNECT stream on it instead (`http2_client_connection::open_tunnel(request)`, internal: the request head without
-END_STREAM, `:protocol`, the stream's `read_timeout` off, its reader and `stream_writer` as the tunnel, a reset on
-`abort()`); otherwise as above. RFC 8441 forbids extended CONNECT before the setting arrives, so a connection still
-waiting for the server's first SETTINGS isn't used.
+Over HTTP/2 (stage 9; decided by the user, 2026-10-30): when the client's pool has an HTTP/2 connection to the
+WebSocket's host whose peer's SETTINGS have arrived saying ENABLE_CONNECT_PROTOCOL = 1, with a stream free, and
+`connect_options::http2` is on (**on by default**, as browsers have it; it applies only where the server has advertised
+the setting, which cppnet's server does by default), `connect()` opens an extended CONNECT stream on it instead
+(`http2_client_connection::open_tunnel(request)`, internal: the request head without END_STREAM, `:protocol`, the
+stream's `read_timeout` off, its reader and `stream_writer` as the tunnel, a reset on `abort()`). **Without a usable
+HTTP/2 connection, HTTP/1.1 on a connection of its own**, as above (Chrome's rule): the client never connects through
+the pool to find out, and RFC 8441 forbids extended CONNECT before the setting arrives, so a connection still waiting
+for the server's first SETTINGS isn't used. (Measured in stage 8: Chrome 156 uses HTTP/2 only on a connection it has
+already; Firefox 143 connects offering h2.) **Only the WebSocket host's own connections**: never a coalesced one, even
+with `client_options::http2_coalescing` on, so there's no 421 path.
 
 ## Costs
 
@@ -383,7 +388,9 @@ waiting for the server's first SETTINGS isn't used.
   scratch, the request and response, the watcher's frame), the handler's frame, and the connection's state (one
   allocation: the session with its 125-byte control buffer, a pending pong's 125 bytes, the close reason, the write
   turn's notifier and the tunnel: under 1 KiB). Over HTTP/2, the stream (as any request's), the state, and the tunnel's
-  two 4 KiB buffers. The client: the connection, two 16 KiB buffers, and the state.
+  two 4 KiB buffers. The client: the connection, two 16 KiB buffers, and the state; over HTTP/2 (stage 9), a stream of
+  the client's connection (as a request's), its tunnel's two 4 KiB buffers, the transport that holds it (one
+  allocation), and the state.
 - **Per message**: nothing allocated by `read_message()` into a buffer with room, nor by writes; masking and unmasking
   are a pass of XOR a word at a time (the client's a copy, into the writer's buffer), UTF-8 validation a pass over a
   text message's bytes (ASCII 8 at a time). `bench_websocket` (stage 6) measures messages a second and allocations a
@@ -1043,6 +1050,140 @@ waiting for the server's first SETTINGS isn't used.
 - Not done: a `bench_websocket` case over HTTP/2, as cppnet's client can't open one until stage 9; Autobahn, whose
   `fuzzingclient` speaks HTTP/1.1 only.
 
+## Learned in stage 9
+
+- The user's decisions (2026-10-30), recorded in The client above: `connect_options::http2` on by default; without a
+  usable HTTP/2 connection, HTTP/1.1 on a connection of its own (Chrome's rule; it never connects through the pool to
+  find out); and only the WebSocket host's own connections, never a coalesced one.
+- Which connection: `connection_pool::reserve_tunnel(scheme, host, port)` looks only at the host's own key's HTTP/2
+  connections (so coalescing never applies, and there's no 421 path), and takes the first whose
+  `reserve(extended_connect = true)` works: `reserve()`'s checks (not ending, no GOAWAY either way, a stream free
+  counting those reserved) plus `session.peer_settings().enable_connect_protocol`, which is false until the server's
+  SETTINGS have come, so one whose SETTINGS are still to come isn't used (RFC 8441 3), and can't be withdrawn once 1
+  (stage 7), so the reservation can't be refused for it later. A connection with no stream free isn't waited for: the
+  WebSocket goes over HTTP/1.1 apart, as it would with no HTTP/2 connection at all. Waiting (as
+  `strict_max_concurrent_streams` would for a request) could hold a WebSocket's open for as long as other WebSockets
+  live, which a request's short stream wouldn't; and browsers fall back the same way (Chrome uses HTTP/2 only where it
+  has a stream). The stream lives as long as the WebSocket does, so it holds one of the server's MAX_CONCURRENT_STREAMS
+  slots all that while (the server counts it against `http2_max_concurrent_streams` too).
+- `http2_client_connection::open_tunnel(request, protocol)` (internal): `open()` gained `protocol`, sent as `:protocol`
+  right after `:method` (the client's session refuses it before the server's 1, stage 7, which the reservation has
+  checked); the head goes without END_STREAM and without a known length (`data_left` none: a tunnel's DATA has none).
+  Then it waits for the head as `wait_for_head()` does, but simpler: interim responses are dropped as they come (the
+  stream doesn't want them), `response_header_timeout` through the stream's read deadline (the timer resets it,
+  `timed_out`), and `request.stop` cancels it until the head (a `canceler`, as `send()`'s). A 2xx (RFC 8441 5: any)
+  makes the stream a tunnel under the lock: `read_timeout` off and `read_deadline` cleared (the WebSocket's idle timeout
+  replaces it, as on the server), its `stream_tunnel` (stage 8's, with no closing token: a client has no server closing
+  around it), handed out in an `http2_tunnel` that holds the stream and the connection, as `http2_response_body` holds a
+  response's; its write timeout stays `io_timeout`, the WebSocket's write timeout over HTTP/1.1 too. Any other status is
+  returned without a tunnel, and the stream's done with (`done()`: reset, CANCEL, unless both sides ended it). A
+  `refused_stream` the server sent before processing the request (or the connection refusing to open the stream, e.g.
+  after a GOAWAY that came meanwhile) is passed on as is, and `connect()` then goes over HTTP/1.1 instead, as `send()`
+  retries such a request elsewhere; one after processing becomes `cancel`, as in `wait_for_head()`. `send()`'s path for
+  a stream that wasn't opened became `not_opened()`, shared.
+- The request's fields: `make_http2_request()`, beside `make_request()` (both from `base_request()`: the caller's
+  headers, Sec-WebSocket-Extensions dropped, Version 13, the subprotocols on one line, Origin): CONNECT, version 2, and
+  no Upgrade, Connection nor Sec-WebSocket-Key, even the caller's (the first two `append_fields()` drops anyway, as
+  connection-specific; the key would mean nothing). The caller's Host becomes `:authority`, as the HTTP client's does
+  for any request. `check_response()` got an HTTP/2 form, as `check_request()` did in stage 8: for a response whose
+  version is 2, any 2xx, without Upgrade, Connection or an accept (the key's ignored), and the extension and subprotocol
+  checks as over HTTP/1.1; anything else `bad_status`.
+- The transport: the client's connection state owned a `client_tunnel` (its own connection); it now owns a
+  `client_transport` (an internal base with a virtual destructor, `get()` for the tunnel and `close_sent()`), either the
+  `client_tunnel` (HTTP/1.1, as before) or a `stream_transport` (HTTP/2: the `http2_tunnel`, whose `get()` is the
+  stream's `stream_tunnel`). Still the state's first member, so it goes last: the connection closed, or the stream done
+  with (and, with it, the client's hold on the pool's connection).
+- Who closes: RFC 8441 5 has END_STREAM as an orderly TCP close, and RFC 6455 7.1.1 has the server close TCP first, so
+  that the client doesn't hold TIME_WAIT. A stream has no TIME_WAIT, and stage 8's server resets a stream
+  (RST_STREAM(NO_ERROR)) whose client hasn't ended its side when the handler returns, which it does right after the
+  close handshake. So the client ends its side of the stream as soon as its close has gone (whichever side closed
+  first): `write_replies_or_release()`, letting the wire go after a flush with this side's close sent, tells the
+  transport `close_sent()`, which over HTTP/2 is `stream_tunnel::end()` (an empty DATA with END_STREAM, after the
+  close's DATA, usually in the same round of the writer's) and over HTTP/1.1 nothing. Nothing can be sent after this
+  side's close anyway (the session refuses it). Then `await_end()` waits, as over HTTP/1.1, for the server's end of the
+  transport, which on a stream is its END_STREAM (the stream's reader returns the end of the stream), within
+  `close_timeout`: the server sends it when its handler returns, so the wait is short, and the WebSocket's then
+  destroyed with both sides ended, so `done()` resets nothing. The tests check (with a scripted server) that the
+  client's END_STREAM follows its close before the server answers, and that no RST_STREAM ever comes. Destroyed before
+  then, or without a close, the stream is reset (CANCEL), as a WebSocket's TCP connection would be cut.
+- Lifetime: the `http2_tunnel` holds the connection (a `shared_ptr`), so it stays open while the WebSocket lives, as a
+  response's body being read keeps it: the pool doesn't count it idle (it has a stream), so doesn't reap or evict it,
+  and the pool's destruction (the `http::client` going first) drains it (GOAWAY, then it ends once its last stream is
+  done). Its callbacks hold the pool weakly, so they do nothing once it's gone. Tested: the client destroyed with a
+  WebSocket open, which echoes and closes cleanly after (with ASan).
+- The connection's failures reach the WebSocket as on the server: the base's `on_stream_reset()` makes a tunnel's reset
+  `connection_reset` and the connection's end fails its streams (`connection_aborted`), both `abnormal_closure` (1006);
+  the server's END_STREAM without a close is the end of the stream, 1006 too. A GOAWAY from the server doesn't end the
+  streams it has: the WebSocket goes on, and the connection ends with it. The server's `close()` reaches it as its 1001
+  (stage 8's going away, through the stream), and its `abort()` as a reset (1006).
+- `connect_options::stop` covers the stream's opening (`open()` checks it, sending nothing if it's stopped already, the
+  reservation given back), the head (the canceler resets the stream, CANCEL), and, kept, the WebSocket (the tunnel's
+  `set_stop_token()` and `abort()`, which resets the stream, CANCEL: stage 8's).
+- Departures: none from the user's decisions. One addition to the plan's list: falling back to HTTP/1.1 when the
+  stream's refused before the server processed it (REFUSED_STREAM, or the connection's GOAWAY racing the reservation),
+  as the HTTP client retries such a request; a stream the server did process isn't retried.
+- `bench_websocket` (Release, two workers, best of five runs, three runs alike) gained the same loads over HTTP/2: a
+  second client with prior knowledge, whose GET makes the connection the WebSocket's stream then shares (cleartext).
+  Stage 6's HTTP/1.1 numbers, measured again beside them, haven't moved.
+
+  | Messages                     | HTTP/1.1, time per message | HTTP/2      | HTTP/1.1, allocations | HTTP/2 |
+  |------------------------------|----------------------------|-------------|-----------------------|--------|
+  | 16 B text, one at a time     | 27.4 to 27.9 us            | 51 to 56 us | 4.00                  | 12.9   |
+  | 16 B text, in flight         | 4.1 us                     | 1.0 to 1.1 us | 0.37                | 0.13   |
+  | 64 KiB binary, one at a time | 115 to 119 us              | 222 to 263 us | 10.0                | 83.7   |
+  | 64 KiB binary, in flight     | 46 us (1.36 GiB/s)         | 165 to 178 us (about 370 MiB/s) | 7.4 | 77.3 |
+
+  One at a time, HTTP/2 costs a round trip about twice HTTP/1.1's: each message's frames go through the stream's
+  writer, the connection's writer task and its reader task on each side (a hand-over per task, where HTTP/1.1's socket
+  is read and written by the WebSocket's own task), and its allocations are those tasks' waits. Small messages in
+  flight go four times faster: the connection's writer gathers many messages' DATA into each write, and its reader
+  takes many in each read, where HTTP/1.1 writes each message's frame with a write of its own. Large messages are
+  three to four times slower, with about 80 allocations each: a 64 KiB message goes through the tunnel's 4 KiB buffers
+  (stage 8's choice for the server, which the client shares) as 16 writes and reads each way, each through the
+  stream's flow control (a stream window of 64 KiB, given back as it's read), many of them waiting. Not traced further;
+  larger tunnel buffers for the client, or writing large payloads past the buffer, are what to look at if WebSockets
+  over HTTP/2 carry large messages in practice.
+- Tests: `test/websocket/client_http2.cpp` (`[websocket][client][http2]`, 20 test cases): against cppnet's server over
+  cleartext with prior knowledge, a GET first so the client has the connection: echo (a 300 KB message, a streamed one),
+  the request as the server presents it (GET, `protocol`, the caller's fields, no key, Upgrade or extensions), a GET
+  beside the WebSocket and after its close, all on one connection; HTTP/1.1 apart with `connect_options::http2` off, a
+  server not advertising the setting, and no connection yet (and HTTP/2 with all of them on); no stream free
+  (`http2_max_concurrent_streams` 1: a second WebSocket over HTTP/1.1, a third over HTTP/2 again once the first's
+  handler has ended); a connection whose server's SETTINGS haven't come (a listener that reads only the client's
+  preface: the WebSocket connects again, over HTTP/1.1); a 403 (another origin) as `bad_status`, the connection going
+  on; the server's `close()` (1001) and `abort()` (1006); stop before the stream's opened (nothing sent) and during a
+  read (the server sees 1006, the connection goes on); the `http::client` destroyed while the WebSocket's open; a quiet
+  stream past the client's `io_timeout`. Against a scripted server (`test::h2_client` as the server, allowing extended
+  CONNECT): the request's pseudo-headers and fields; a 103 skipped; frames both ways (the client's masked); the client's
+  END_STREAM after its close, whichever side closed first, before the server's answer if the client's went first; no
+  RST_STREAM from the client, even once it's destroyed; refusals (404, 302, a subprotocol or an extension not offered)
+  resetting the stream (CANCEL); `response_header_timeout` and stop during the handshake (CANCEL); REFUSED_STREAM
+  falling back to HTTP/1.1 on a second connection, but not once the server has answered (a 103 first: `cancel`); the
+  connection's end, a reset and an END_STREAM without a close, each 1006. `test/tls/server.cpp`'s
+  `[tls][http][client][http2][websocket]` (wss:// as a stream of the connection a GET made with ALPN h2: echo, the
+  close, one connection), `test/tls/client_coalescing.cpp`'s `[websocket]` (with coalescing on, and a.test's connection
+  listing b.test's origin, a WebSocket to b.test goes over HTTP/1.1 to b.test's own server; one to a.test on a.test's
+  connection), and `test/websocket/handshake.cpp`'s `make_http2_request()` and `check_response()`'s HTTP/2 form.
+- Stress: the new tests, 400 times eight at a time, found one race in a test (the scripted server recorded every frame
+  once the first had come, and the client's close sometimes came with its message), fixed at its source (it records the
+  first only); and one slow test (10 s: a GET whose connection the scripted server never answered was sent again on a
+  new connection, as a request dropped before any response is, so the test waited for it), which now stops the GET. Then
+  400 out of 400 runs of the new tests passed, eight at a time, and 400 out of 400 of the stage 8 server's
+  `[http2][websocket]` and `[http2][tunnel]` tests with the existing `[websocket][client]` ones (61 test cases a run).
+- Each new rule and path was broken alone (19 breaks), and the tests failed for every one but three: the pool looking
+  only at the host's own connections (the coalescing test), `connect_options::http2`, the setting checked by
+  `reserve(true)` (a server not advertising it, and SETTINGS not come), `:protocol` sent, the stream's read timeout off
+  (the `io_timeout` test), `response_header_timeout` (hangs, which the run's time limit shows), stop until the head,
+  REFUSED_STREAM's fallback, and not after the server's processed it (caught once the 103 test was added for it), the
+  key and Upgrade left out of the request, `check_response()`'s HTTP/2 form and its extension check, the END_STREAM
+  after the close (`close_sent()` not told, and told but ending nothing: the scripted server waits for it), and
+  `http2_tunnel` not done with its stream (the third WebSocket, which needs the stream back, goes over HTTP/1.1). Not
+  caught: a tunnel made for a non-2xx too (`check_response()` refuses the response anyway, and the stream's reset either
+  way); `stream_tunnel::end()` not marking the stream ended (the session ends it all the same, and resets nothing on a
+  stream both sides have closed, so `done()`'s reset sends nothing); `not_opened()` skipped in `open_tunnel()` (only the
+  connection's idle bookkeeping and the pool's wakeup, which nothing waits on here; the stop-before-opening test runs
+  the path).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -1074,8 +1215,9 @@ Each a pull request, mergeable and tested alone, in this order:
    `server_request::protocol`, the presentation of extended CONNECT (Decided question 11),
    `http2_stream_ops::open_tunnel`, the stream's interruptible read; `test::h2_client`'s extended CONNECT; browsers by
    hand. Last of the server's: it changes what every HTTP/2 server advertises.
-9. **WebSockets over HTTP/2, the client.** `http2_client_connection::open_tunnel()`, `connect_options::http2`, the
-   pool's check of the peer's setting; tests against cppnet's server.
+9. **WebSockets over HTTP/2, the client.** Done (2026-10-30; see Learned in stage 9).
+   `http2_client_connection::open_tunnel()`, `connect_options::http2`, the pool's check of the peer's setting; tests
+   against cppnet's server.
 10. **An optional Autobahn workflow** (Decided question 16): a `workflow_dispatch` (and weekly) job on
     `ubuntu-26.04`, outside the matrix and the required `build`, running both suites in Docker against the examples
     and failing on a case that isn't OK or NON-STRICT.

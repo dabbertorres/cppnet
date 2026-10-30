@@ -558,3 +558,84 @@ TEST_CASE("check_response refuses what the client must fail", "[websocket][hands
     REQUIRE_FALSE(chosen.has_value());
     CHECK(chosen.error() == tc.expect);
 }
+
+TEST_CASE("make_http2_request makes a client's handshake as an extended CONNECT",
+          "[websocket][handshake][client][http2]")
+{
+    const auto target = net::url::parse("http://server.example.com:8080/chat?room=1"sv);
+    REQUIRE(target.has_value());
+
+    net::websocket::connect_options options{
+        .subprotocols = {"v2.chat", "chat"},
+        .origin       = "https://app.example.com"
+    };
+    options.headers.set("Authorization"sv, "Bearer x"sv);
+    options.headers.set("Upgrade"sv, "h2c"sv);
+    options.headers.set("Connection"sv, "Upgrade"sv);
+    options.headers.set("Sec-WebSocket-Key"sv, example_key);
+    options.headers.set("Sec-WebSocket-Extensions"sv, "permessage-deflate"sv);
+
+    const auto req = ws::make_http2_request(*target, options);
+    CHECK(req.method == http::request_method::CONNECT);
+    CHECK(req.version == http::protocol_version{.major = 2, .minor = 0});
+    CHECK(req.uri.build() == target->build());
+    CHECK(req.headers.get("Sec-WebSocket-Version"sv) == "13"sv);
+    CHECK(req.headers.get("Sec-WebSocket-Protocol"sv) == "v2.chat, chat"sv);
+    CHECK(req.headers.get("Origin"sv) == "https://app.example.com"sv);
+    CHECK(req.headers.get("Authorization"sv) == "Bearer x"sv);
+    for (const auto name : {"Upgrade"sv, "Connection"sv, "Sec-WebSocket-Key"sv, "Sec-WebSocket-Extensions"sv})
+        CHECK_FALSE(req.headers.get(name).has_value());
+    CHECK_FALSE(req.body);
+
+    // without options, nor subprotocols nor an origin.
+    const auto plain = ws::make_http2_request(*target, {});
+    CHECK_FALSE(plain.headers.get("Sec-WebSocket-Protocol"sv).has_value());
+    CHECK_FALSE(plain.headers.get("Origin"sv).has_value());
+}
+
+TEST_CASE("check_response takes an HTTP/2 server's 2xx, and refuses what the client must fail",
+          "[websocket][handshake][client][http2]")
+{
+    struct test_case
+    {
+        std::string_view    name;
+        http::status        status = http::status::OK;
+        field_list          fields{};
+        std::optional<errc> expect{};
+        std::string_view    chosen{};
+    };
+
+    auto tc = GENERATE(
+        test_case{.name = "200, without Upgrade, Connection or an accept"},
+        test_case{.name = "any 2xx", .status = http::status::NO_CONTENT},
+        test_case{.name = "a subprotocol offered", .fields = {{"Sec-WebSocket-Protocol", "chat"}}, .chosen = "chat"},
+        test_case{.name = "101", .status = http::status::SWITCHING_PROTOCOLS, .expect = errc::bad_status},
+        test_case{.name = "302", .status = http::status::FOUND, .expect = errc::bad_status},
+        test_case{.name = "403", .status = http::status::FORBIDDEN, .expect = errc::bad_status},
+        test_case{.name   = "an extension",
+                  .fields = {{"Sec-WebSocket-Extensions", "permessage-deflate"}},
+                  .expect = errc::bad_extension},
+        test_case{.name   = "a subprotocol not offered",
+                  .fields = {{"Sec-WebSocket-Protocol", "mqtt"}},
+                  .expect = errc::bad_subprotocol});
+
+    CAPTURE(tc.name);
+
+    http::client_response res;
+    res.version     = {.major = 2, .minor = 0};
+    res.status_code = tc.status;
+    for (const auto& [name, value] : tc.fields) res.headers.add(name, value);
+
+    // the key isn't looked at (HTTP/2 has none).
+    const auto chosen = ws::check_response(res, {}, std::vector<std::string>{"v2.chat", "chat"});
+    if (tc.expect)
+    {
+        REQUIRE_FALSE(chosen.has_value());
+        CHECK(chosen.error() == *tc.expect);
+    }
+    else
+    {
+        REQUIRE(chosen.has_value());
+        CHECK(*chosen == tc.chosen);
+    }
+}

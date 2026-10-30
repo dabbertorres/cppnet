@@ -271,10 +271,11 @@ coro::task<> http2_client_connection::run_owned(std::shared_ptr<http2_client_con
     if (self->on.closed) self->on.closed(*self);
 }
 
-bool http2_client_connection::reserve()
+bool http2_client_connection::reserve(bool extended_connect)
 {
     std::scoped_lock lock{mu};
     if (ending() || peer_goaway || draining || !session.can_open_stream(reserved)) return false;
+    if (extended_connect && !session.peer_settings().enable_connect_protocol) return false;
 
     ++reserved;
     idle_from.reset();
@@ -325,17 +326,7 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
             // whatever it is.
             if (state != nullptr) state->unsent = opened.error() == http2::error_code::refused_stream;
 
-            // the stream that was reserved for it is free (for another request, or to be idle).
-            if (idle_now())
-            {
-                idle_from = io::clock::now();
-                wake_timer();
-            }
-            maybe_end();
-            lock.unlock();
-
-            wake_writer();
-            if (on.freed) on.freed();
+            not_opened(lock);
             co_return std::unexpected(opened.error());
         }
         stream = std::move(*opened);
@@ -379,8 +370,103 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
     co_return resp;
 }
 
-std::expected<std::shared_ptr<http2_client_stream>, std::error_code>
-http2_client_connection::open(const client_request& request, std::optional<std::size_t> ends_after)
+void http2_client_connection::not_opened(std::unique_lock<connection_mutex>& lock)
+{
+    if (idle_now())
+    {
+        idle_from = io::clock::now();
+        wake_timer();
+    }
+    maybe_end();
+    lock.unlock();
+
+    wake_writer();
+    if (on.freed) on.freed();
+}
+
+coro::task<std::expected<tunnel_response, std::error_code>>
+http2_client_connection::open_tunnel(const client_request& request, std::string_view protocol)
+{
+    std::shared_ptr<http2_client_stream> stream;
+    {
+        std::unique_lock lock{mu};
+        auto             opened = open(request, std::nullopt, protocol);
+        if (!opened.has_value())
+        {
+            not_opened(lock);
+            co_return std::unexpected(opened.error());
+        }
+        stream = std::move(*opened);
+    }
+    wake_writer();
+
+    // the stream is done with unless the tunnel takes it: whether the response isn't a 2xx, the request fails, or this
+    // coroutine is destroyed while it waits.
+    const auto id    = stream->id;
+    bool       taken = false;
+    // NOTE: done() checks on.freed before calling it, and only throws if it can't allocate, when terminating is fine.
+    // NOLINTNEXTLINE(bugprone-exception-escape)
+    util::defer release{[this, id, &taken] noexcept
+                        {
+                            if (!taken) done(id);
+                        }};
+
+    // canceled until the response's head, as send() is. Destroyed before done(), not holding the lock.
+    std::optional<stop_registration> on_stop;
+    if (request.stop.stop_possible()) on_stop.emplace(request.stop, canceler{.conn = this, .id = id});
+
+    tunnel_response out;
+    while (true)
+    {
+        std::uint64_t seen = 0;
+        {
+            std::scoped_lock lock{mu};
+            auto&            s = *stream;
+
+            // (its informational responses are dropped as they come: the stream doesn't want them.)
+            if (s.head_received)
+            {
+                out.head.version     = {.major = 2, .minor = 0};
+                out.head.status_code = s.status_code;
+                out.head.headers     = std::move(s.headers);
+
+                // the stream's a tunnel (RFC 8441, section 5): its reads wait as long as the protocol's quiet (whose
+                // own timeout, if it has one, is the tunnel's), and what it received meanwhile is the tunnel's first.
+                if (status_is_success(s.status_code))
+                {
+                    s.read_timeout = std::chrono::milliseconds::zero();
+                    s.read_deadline.reset();
+                    s.tunnel = std::make_unique<stream_tunnel>(s, std::stop_token{});
+                }
+                break;
+            }
+
+            if (s.failure)
+            {
+                // a stream the server didn't process may be opened again (e.g. on another connection).
+                auto err = s.failure;
+                if (err == http2::error_code::refused_stream && s.processed)
+                    err = make_error_code(http2::error_code::cancel);
+                co_return std::unexpected(err);
+            }
+
+            seen = s.changed.value();
+            arm_deadline(s.read_deadline, options.response_header_timeout);
+        }
+
+        (void)co_await stream->changed.wait(seen);
+    }
+
+    if (stream->tunnel != nullptr)
+    {
+        out.tunnel.emplace(shared_from_this(), std::move(stream));
+        taken = true;
+    }
+    co_return out;
+}
+
+std::expected<std::shared_ptr<http2_client_stream>, std::error_code> http2_client_connection::open(
+    const client_request& request, std::optional<std::size_t> ends_after, std::string_view protocol)
 {
     // the stream reserved for it (if it was), whether or not it can be opened.
     if (reserved > 0) --reserved;
@@ -400,6 +486,7 @@ http2_client_connection::open(const client_request& request, std::optional<std::
     // the pseudo-headers first (RFC 9113, section 8.3.1).
     auto& fields = stream->fields;
     fields.push_back({.name = ":method", .value = method_string(request.method)});
+    if (!protocol.empty()) fields.push_back({.name = ":protocol", .value = protocol});
     fields.push_back({.name = ":scheme", .value = is_tls(conn) ? "https" : "http"});
     fields.push_back({.name = ":authority", .value = stream->authority});
     fields.push_back({.name = ":path", .value = stream->path});
@@ -692,6 +779,12 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
     // NOTE: made without the lock, as it registers stop's callback, which takes it.
     resp.body = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream), request.stop);
     co_return resp;
+}
+
+// NOLINTNEXTLINE(bugprone-exception-escape): done() only throws if it can't allocate, when terminating is fine.
+http2_tunnel::~http2_tunnel()
+{
+    if (conn != nullptr) conn->done(stream->id);
 }
 
 void http2_client_connection::done(http2::stream_id id)

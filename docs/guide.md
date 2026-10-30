@@ -1003,7 +1003,7 @@ if (!conn) co_return;   // e.g. websocket::errc::bad_status: the server didn't s
 std::string message;
 auto type = co_await conn->read_message(message);
 
-(void)co_await conn->close();   // waits for the server's close, then for it to end TCP
+(void)co_await conn->close();   // waits for the server's close, then for it to end TCP (or the stream)
 ```
 
 - **The connection:** `ws://` and `wss://` (and `http://` and `https://`, the same) are spoken over HTTP/1.1, on a
@@ -1011,10 +1011,19 @@ auto type = co_await conn->read_message(message);
   only `http/1.1` with ALPN, so a server that speaks HTTP/2 agrees on HTTP/1.1). `connect_options::headers` go with the
   handshake (e.g. `Authorization`, a `Cookie`), `subprotocols` are offered (`conn->subprotocol()` is the one chosen, or
   empty), and `origin` is sent as `Origin` (programs needn't; browsers do).
+- **Over HTTP/2:** if the client already has an HTTP/2 connection to the URL's host (and port, and scheme: e.g. from
+  a request to the same server), whose server has said it allows WebSockets over it (RFC 8441's
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`, which cppnet's server sends by default), with a stream free, the WebSocket is an
+  extended CONNECT's stream of that connection instead, beside the client's requests (`connect_options::http2`, on by
+  default, as in browsers). Otherwise it's over HTTP/1.1, as above: `connect()` never connects, nor waits for a stream,
+  just to find out (as Chrome; nor does it use a connection whose server's settings haven't come yet), and never takes
+  another host's connection, even with `client_options::http2_coalescing`. The stream holds the connection open, as a
+  response's body being read does: the `http::client` may go first.
 - **The handshake fails** (`websocket::errc`) for a response that isn't the server's switching: `bad_status` for
-  anything but 101 (Switching Protocols), redirects included (they aren't followed, as browsers don't), `bad_accept`,
-  `bad_subprotocol` (one that wasn't offered) or `bad_extension` (none is offered); or as connecting does (e.g.
-  `std::errc::timed_out`, a TLS error). `url` and `options` are copied before `connect()` returns.
+  anything but 101 (Switching Protocols), or over HTTP/2 a 2xx, redirects included (they aren't followed, as browsers
+  don't), `bad_accept` (HTTP/1.1's), `bad_subprotocol` (one that wasn't offered) or `bad_extension` (none is offered);
+  or as connecting does (e.g. `std::errc::timed_out`, a TLS error). `url` and `options` are copied before `connect()`
+  returns.
 - **Stopping:** `connect_options::stop` covers connecting, the handshake and the WebSocket, as `accept_options::stop`
   does a server's (`std::errc::operation_canceled`).
 - **Reading, writing, limits and how it ended** are as on the server (`connect_options::connection`, the same
@@ -1022,7 +1031,9 @@ auto type = co_await conn->read_message(message);
   can't predict), into the connection's buffer: the data written isn't changed.
 - **Closing:** once the close handshake is done (its own `close()`, or a read of the server's close, answered), the
   client waits for the server to end TCP, as RFC 6455 has the server do, for up to `close_timeout`; then the
-  connection ends with its destruction.
+  connection ends with its destruction. Over HTTP/2, where a stream's END_STREAM is TCP's orderly end, the client ends
+  its side of the stream as soon as its close has gone, then waits for the server's END_STREAM the same way; a
+  WebSocket destroyed before then (or without a close) resets its stream, and the connection goes on.
 
 `example/websocket-echo` is an echo server (the one Autobahn's TestSuite's `fuzzingclient` tests), and
 `example/websocket-autobahn` a client that runs the TestSuite's `fuzzingserver` cases, echoing their messages.

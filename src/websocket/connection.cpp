@@ -27,6 +27,8 @@
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/http11.hpp"
+#include "http/http2.hpp"
+#include "http/http2_client.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/tunnel.hpp"
@@ -91,10 +93,30 @@ namespace net::websocket::detail
 namespace
 {
 
+    // client_transport is what a client's connection is over, which it owns: its tunnel (get()), over a connection of
+    // its own (HTTP/1.1) or a stream of the client's (HTTP/2), ended when it's destroyed.
+    class client_transport
+    {
+    public:
+        client_transport()                                   = default;
+        client_transport(const client_transport&)            = delete;
+        client_transport& operator=(const client_transport&) = delete;
+        client_transport(client_transport&&)                 = delete;
+        client_transport& operator=(client_transport&&)      = delete;
+        virtual ~client_transport()                          = default;
+
+        [[nodiscard]] virtual http::detail::tunnel& get() noexcept = 0;
+
+        // close_sent is told once this side's close has gone, after which nothing's sent (perhaps more than once).
+        virtual void close_sent() noexcept = 0;
+    };
+
     // client_tunnel is a client's connection (see connect()), as a tunnel: the WebSocket's own, with buffers of its own
     // (16 KiB each way, as a server's connection has), whose reader holds what the server sent after its handshake's
     // response.
-    class client_tunnel final : public http::detail::tunnel
+    class client_tunnel final
+        : public http::detail::tunnel
+        , public client_transport
     {
     public:
         static constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
@@ -109,7 +131,7 @@ namespace
         client_tunnel& operator=(const client_tunnel&) = delete;
         client_tunnel(client_tunnel&&)                 = delete;
         client_tunnel& operator=(client_tunnel&&)      = delete;
-        ~client_tunnel()                               = default;
+        ~client_tunnel() override                      = default;
 
         [[nodiscard]] io::buffered_reader& reader() noexcept override { return in; }
         [[nodiscard]] io::buffered_writer& writer() noexcept override { return out; }
@@ -141,10 +163,37 @@ namespace
         // socket is the TCP connection (under TLS's, if it's TLS), for its timeouts.
         [[nodiscard]] tcp_socket& socket() noexcept { return http::detail::socket_of(*conn); }
 
+        [[nodiscard]] http::detail::tunnel& get() noexcept override { return *this; }
+
+        // nothing: RFC 6455 (section 7.1.1) has the server end TCP first, which the client waits for (see await_end()).
+        void close_sent() noexcept override {}
+
     private:
         std::unique_ptr<http::detail::connection> conn;
         io::buffered_reader                       in;
         io::buffered_writer                       out;
+    };
+
+    // stream_transport is a client's stream of an HTTP/2 connection of the client's, which an extended CONNECT opened
+    // (RFC 8441), as a tunnel (see http::detail::stream_tunnel): the connection goes on with the client's requests
+    // beside it, and holding the stream keeps it open.
+    class stream_transport final : public client_transport
+    {
+    public:
+        explicit stream_transport(http::detail::http2_tunnel&& t) noexcept
+            : held{std::move(t)}
+        {}
+
+        [[nodiscard]] http::detail::tunnel& get() noexcept override { return held.get(); }
+
+        // this side of the stream ends (END_STREAM), as RFC 8441 (section 5) has an orderly TCP close: with nothing to
+        // wait out (no TIME_WAIT, as TCP's has for whoever closes first), at once, so the server's stream ends cleanly
+        // once the server's done (its handler returns, the close handshake done), rather than being reset for a side
+        // the client left open. The client waits for the server's end all the same (see await_end()).
+        void close_sent() noexcept override { held.get().end(); }
+
+    private:
+        http::detail::http2_tunnel held;
     };
 
 }
@@ -170,13 +219,13 @@ namespace
 // transport's stop token, canceling its waits, with a callback (cancel()) for the rest.
 struct connection_state
 {
-    // A server's state is over its connection's tunnel (t), a client's over its own (own, which it keeps: t is it).
-    connection_state(http::detail::tunnel&            t,
-                     std::unique_ptr<client_tunnel>&& own,
-                     role                             r,
-                     const connection_options&        options,
-                     std::string_view                 protocol,
-                     std::stop_token                  stop)
+    // A server's state is over its connection's tunnel (t), a client's over its own (own, which it keeps: t is its).
+    connection_state(http::detail::tunnel&               t,
+                     std::unique_ptr<client_transport>&& own,
+                     role                                r,
+                     const connection_options&           options,
+                     std::string_view                    protocol,
+                     std::stop_token                     stop)
         : owned{std::move(own)}
         , tunnel{t}
         , scheduler{tunnel.get_scheduler()}
@@ -216,13 +265,13 @@ struct connection_state
         tunnel.set_read_deadline(std::nullopt);
     }
 
-    // open makes a client's connection, over its own tunnel, once the handshake is done.
-    static connection open(std::unique_ptr<client_tunnel> own,
-                           const connection_options&      options,
-                           std::string_view               protocol,
-                           std::stop_token                stop)
+    // open makes a client's connection, over its own transport, once the handshake is done.
+    static connection open(std::unique_ptr<client_transport> own,
+                           const connection_options&         options,
+                           std::string_view                  protocol,
+                           std::stop_token                   stop)
     {
-        auto& t = *own;
+        auto& t = own->get();
         return connection{
             std::make_unique<connection_state>(t, std::move(own), role::client, options, protocol, std::move(stop))};
     }
@@ -956,11 +1005,20 @@ struct connection_state
     bool write_replies_or_release()
     {
         control_frames frames;
+        bool           close_gone = false; // this side's close has gone (with what's just been flushed, perhaps)
         {
             std::scoped_lock lock{mu};
             take_replies(frames);
-            if (frames.size == 0) wire_busy = false;
+            if (frames.size == 0)
+            {
+                wire_busy  = false;
+                close_gone = sess.state() == close_state::close_sent || sess.state() == close_state::closed;
+            }
         }
+
+        // a client's transport is told (each time the wire's let go after it, as nothing's sent then but what's
+        // refused).
+        if (close_gone && owned != nullptr) owned->close_sent();
 
         if (frames.size != 0)
         {
@@ -1218,8 +1276,8 @@ struct connection_state
         }
     }
 
-    // NOTE: first, so it's destroyed last (ending a client's connection), once nothing uses it.
-    std::unique_ptr<client_tunnel> owned; // a client's tunnel: none for a server's, which is its connection's
+    // NOTE: first, so it's destroyed last (ending a client's connection, or stream), once nothing uses it.
+    std::unique_ptr<client_transport> owned; // a client's transport: none for a server's, its connection's or stream's
 
     http::detail::tunnel&              tunnel;
     io::scheduler*                     scheduler;
@@ -1419,18 +1477,56 @@ namespace
         return endpoint{.target = std::move(*parsed), .port = std::move(port)};
     }
 
+    // failure is what opening a WebSocket failed with: once stop's been requested, that, whatever its cancellation
+    // caused (e.g. a TLS read cut short).
+    std::unexpected<std::error_code> failure(const connect_options& options, std::error_code err)
+    {
+        if (options.stop.stop_requested()) err = std::make_error_code(std::errc::operation_canceled);
+        return std::unexpected(err);
+    }
+
+    // open_stream opens a WebSocket over a stream of conn (an HTTP/2 connection of the client's, whose server allows
+    // extended CONNECT, with a stream reserved for it), as an extended CONNECT (RFC 8441, section 5): the request's
+    // head is written with io_timeout and its response read within response_header_timeout, as over HTTP/1.1, and stop
+    // ends both, then the WebSocket.
+    task<std::expected<connection, std::error_code>> open_stream(
+        std::shared_ptr<http::detail::http2_client_connection> conn, const endpoint& where, connect_options& options)
+    {
+        auto request = detail::make_http2_request(where.target, options);
+        request.stop = options.stop;
+
+        auto opened = co_await conn->open_tunnel(request, "websocket"sv);
+        if (!opened.has_value()) co_return failure(options, opened.error());
+
+        // NOTE: a stream that isn't the WebSocket's (refused here) is done with as the response goes: reset, unless
+        //       both sides have ended it. Only a 2xx, which check_response() requires, opened the tunnel.
+        const auto chosen = detail::check_response(opened->head, {}, options.subprotocols);
+        auto&      tunnel = opened->tunnel;
+        if (!chosen.has_value() || !tunnel.has_value())
+            co_return failure(options, chosen.error_or(make_error_code(errc::bad_status)));
+        if (options.stop.stop_requested()) co_return failure(options, {});
+
+        auto own = std::make_unique<detail::stream_transport>(std::move(*tunnel));
+        co_return connection_state::open(std::move(own), options.connection, *chosen, std::move(options.stop));
+    }
+
     // open connects to where, and opens a WebSocket over the connection (see connect()).
     // NOTE: everything by value, as connect() returns its task rather than awaiting it.
     task<std::expected<connection, std::error_code>>
     open(std::shared_ptr<http::detail::connection_pool> pool, endpoint where, connect_options options)
     {
-        // once stop's been requested, that's what it failed with, whatever its cancellation caused (e.g. a TLS read
-        // cut short).
-        const auto fail = [&options](std::error_code err)
+        const auto fail = [&options](std::error_code err) { return failure(options, err); };
+
+        // over HTTP/2, on a connection the client has to the host whose server allows it, with a stream free; or, if
+        // there's none (as Chrome does), or the stream's refused before the server's looked at it, over HTTP/1.1.
+        if (options.http2)
         {
-            if (options.stop.stop_requested()) err = std::make_error_code(std::errc::operation_canceled);
-            return std::unexpected(err);
-        };
+            if (auto shared = pool->reserve_tunnel(where.target.scheme, where.target.host, where.port))
+            {
+                auto opened = co_await open_stream(std::move(shared), where, options);
+                if (opened.has_value() || opened.error() != http::http2::error_code::refused_stream) co_return opened;
+            }
+        }
 
         auto conn = co_await pool->connect_apart(where.target.scheme, where.target.host, where.port, options.stop);
         if (!conn.has_value()) co_return fail(conn.error());

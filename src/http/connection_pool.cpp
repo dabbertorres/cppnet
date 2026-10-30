@@ -461,6 +461,20 @@ std::shared_ptr<http2_client_connection> connection_pool::available_http2(const 
     return nullptr;
 }
 
+std::shared_ptr<http2_client_connection>
+connection_pool::reserve_tunnel(const std::string& scheme, const std::string& host, const std::string& port)
+{
+    std::scoped_lock lock{mu};
+    const auto       it = hosts.find(make_key(scheme, host, port));
+    if (it == hosts.end()) return nullptr;
+
+    for (const auto& c : it->second.http2)
+    {
+        if (c->reserve(true)) return c;
+    }
+    return nullptr;
+}
+
 coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
 connection_pool::connect_apart(const std::string& scheme, std::string host, std::string port, std::stop_token stop)
 {

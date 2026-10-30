@@ -59,6 +59,11 @@ struct client_handshake
 // connect_options::headers), the subprotocols offered (on one line) and the origin, if there are any.
 [[nodiscard]] client_handshake make_request(const url& target, const connect_options& options);
 
+// make_http2_request makes a client's handshake request for target over HTTP/2 (RFC 8441, section 5), an extended
+// CONNECT whose :protocol is the HTTP/2 client's to send (see http2_client_connection::open_tunnel()): CONNECT, HTTP/2,
+// options' headers and then the handshake's, as make_request()'s, but without Upgrade, Connection or a key.
+[[nodiscard]] http::client_request make_http2_request(const url& target, const connect_options& options);
+
 // check_response checks a server's response to a handshake that sent key and offered the subprotocols offered,
 // returning the subprotocol the server chose (a view of its headers; empty for none). It fails with:
 // - bad_status, for a status other than 101 (Switching Protocols): redirects aren't followed, as browsers don't;
@@ -66,7 +71,10 @@ struct client_handshake
 // - bad_accept, unless Sec-WebSocket-Accept is one line, accept_key(key) exactly;
 // - bad_extension, for any extension in Sec-WebSocket-Extensions (none was offered);
 // - bad_subprotocol, for a Sec-WebSocket-Protocol that isn't one line, one of offered (exactly).
-// RFC 6455 (section 4.1) has the client fail the connection for any of them.
+// RFC 6455 (section 4.1) has the client fail the connection for any of them. Over HTTP/2 (response.version 2), the
+// response to an extended CONNECT (RFC 8441, section 5): any 2xx accepts, without Upgrade, Connection or an accept
+// (key is ignored), so it fails with bad_status for any other status, and as over HTTP/1.1 for the extensions and the
+// subprotocol.
 [[nodiscard]] std::expected<std::string_view, std::error_code>
 check_response(const http::client_response& response, std::string_view key, std::span<const std::string> offered);
 

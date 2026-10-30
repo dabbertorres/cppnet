@@ -47,6 +47,7 @@
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "url.hpp"
+#include "websocket/websocket.hpp"
 
 namespace http  = net::http;
 namespace http2 = net::http::http2;
@@ -186,6 +187,22 @@ serve(net::io::scheduler* sched, net::listener listener, served* state, std::vec
     http::router r;
     r.GET("/", answer(state));
     r.POST("/", answer(state));
+
+    // a WebSocket, recorded as "ws", its host and its HTTP version, read until it ends.
+    r.GET("/ws",
+          [state](http::server_request& req, http::response_writer& rw) -> task<void>
+          {
+              auto conn = co_await net::websocket::accept(req, rw);
+              if (!conn.has_value()) co_return;
+              {
+                  std::scoped_lock lock{state->mu};
+                  state->hosts.push_back(std::format("ws {} HTTP/{}", req.host, req.version.major));
+              }
+
+              std::string message;
+              while ((co_await conn->read_message(message)).has_value())
+              {}
+          });
 
     http::server_config cfg;
     if (!as.cleartext) cfg.tls = server_with(pki().names_chain, pki().names_key);
@@ -334,6 +351,51 @@ TEST_CASE("with coalescing on, a request goes on another host's HTTP/2 connectio
     CHECK(b_seen.count("b.test") == 0);
     CHECK(out.open == 1);
     CHECK(out.b_open == 0);
+}
+
+TEST_CASE("a WebSocket goes on its own host's HTTP/2 connection, never another host's that would coalesce a request",
+          "[tls][http][client][http2][coalescing][websocket]")
+{
+    dns::resolver resolver{names()};
+    served        a_seen;
+    served        b_seen;
+
+    net::io::scheduler sched{make_pool()};
+    auto               la       = listen(&sched);
+    auto               lb       = listen(&sched);
+    const auto         pa       = la.local_port();
+    const auto         pb       = lb.local_port();
+    const auto         a_server = serve(&sched, std::move(la), &a_seen, {origin("a.test", pa), origin("b.test", pb)});
+    const auto         b_server = serve(&sched, std::move(lb), &b_seen, {});
+
+    http::client client{&sched, options_for(&resolver, true)};
+
+    // a.test's connection lists b.test's origin, so a request to b.test would go on it; a WebSocket to b.test goes over
+    // HTTP/1.1 to b.test's own server instead (it has no HTTP/2 connection of its own), and one to a.test on a.test's.
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+        lines.emplace_back(co_await warm_up(client, "a.test", pa) ? "warmed" : "not warmed");
+
+        for (const auto& url : {std::format("wss://b.test:{}/ws", pb), std::format("wss://a.test:{}/ws", pa)})
+        {
+            auto conn = co_await net::websocket::connect(client, url);
+            if (!conn.has_value())
+            {
+                lines.push_back("connect: " + conn.error().message());
+                continue;
+            }
+            lines.emplace_back(co_await conn->close() ? "close failed" : "closed");
+        }
+
+        lines.push_back(std::format("open={}", client.stats().open));
+        co_return lines;
+    };
+
+    CHECK(sched.run_to_completion(test()) == std::vector<std::string>{"warmed", "closed", "closed", "open=1"});
+    CHECK(b_seen.count("ws b.test HTTP/1") == 1);
+    CHECK(a_seen.count("ws a.test HTTP/2") == 1);
+    CHECK(a_seen.count("ws b.test HTTP/2") == 0);
 }
 
 TEST_CASE("a request isn't coalesced without ORIGIN, with coalescing off, for an origin not listed, without verifying "

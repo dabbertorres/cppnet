@@ -1504,6 +1504,80 @@ TEST_CASE("a WebSocket client opens wss:// over HTTP/1.1, from a server that wou
     CHECK(ends == std::vector<std::string>{"1000"});
 }
 
+TEST_CASE("a WebSocket client opens wss:// as a stream of its HTTP/2 connection (ALPN h2)",
+          "[tls][http][client][http2][websocket]")
+{
+    namespace ws = net::websocket;
+
+    std::mutex               mu;
+    std::vector<std::string> ends;
+    net::io::scheduler       sched{make_pool()};
+
+    // a request first (agreeing on h2 with ALPN), whose connection the WebSocket then shares.
+    auto r = https_server::router();
+    r.GET("/ws",
+          [&](http::server_request& req, http::response_writer& rw) -> task<void>
+          {
+              auto conn = co_await ws::accept(req, rw);
+              if (!conn.has_value()) co_return;
+
+              std::string message;
+              while (true)
+              {
+                  const auto type = co_await conn->read_message(message);
+                  if (!type.has_value())
+                  {
+                      std::scoped_lock lock{mu};
+                      ends.push_back(std::format("HTTP/{} {}",
+                                                 req.version.major,
+                                                 static_cast<int>(*ws::close_code_of(type.error()))));
+                      co_return;
+                  }
+                  if (co_await conn->write_message(*type, message)) co_return;
+              }
+          });
+    https_server server{&sched, tls_config(), std::move(r)};
+
+    http::client client{&sched, trusting_options()};
+
+    const std::string large(100'000, 'x');
+
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+
+        auto got = co_await client.get("https://localhost:" + server.port() + "/");
+        if (!got.has_value()) co_return std::vector<std::string>{"get: " + got.error().message()};
+        lines.push_back(std::format("HTTP/{}", got->version.major));
+        (void)co_await net::io::read_all(*got->body);
+
+        auto conn = co_await ws::connect(client, "wss://localhost:" + server.port() + "/ws");
+        if (!conn.has_value())
+        {
+            lines.push_back("connect: " + conn.error().message());
+            co_return lines;
+        }
+
+        std::string message;
+        for (const auto& sent : {std::string{"hello"}, large})
+        {
+            (void)co_await conn->write_message(ws::message_type::binary, sent);
+            const auto read = co_await conn->read_message(message);
+            if (!read.has_value()) lines.push_back(read.error().message());
+            else lines.emplace_back(message == sent ? "echoed" : "differs");
+        }
+
+        const auto closed = co_await conn->close();
+        lines.push_back("close: " + (closed ? closed.message() : "ok"));
+        lines.push_back(std::format("pooled: {}", client.stats().open));
+        co_return lines;
+    };
+
+    CHECK(sched.run_to_completion(test())
+          == std::vector<std::string>{"HTTP/2", "echoed", "echoed", "close: ok", "pooled: 1"});
+    CHECK(ends == std::vector<std::string>{"HTTP/2 1000"});
+}
+
 TEST_CASE("a WebSocket over an HTTP/2 stream of an HTTPS connection (ALPN h2) echoes, and goes away when the server "
           "closes",
           "[tls][http][server][http2][websocket]")
