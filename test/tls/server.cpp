@@ -1308,3 +1308,109 @@ TEST_CASE("a WebSocket over HTTPS echoes, and closes with the close handshake, t
     // the server's close_notify, not the TCP stream cut short.
     CHECK(err == net::io::errc::end_of_stream);
 }
+
+TEST_CASE("a WebSocket over HTTPS pings when idle, and goes away when the server closes",
+          "[tls][http][server][websocket]")
+{
+    namespace ws = net::websocket;
+    using test::websocket::client_frame;
+    using ws::detail::opcode;
+
+    std::mutex               mu;
+    std::vector<std::string> ends;
+    net::io::scheduler       sched{make_pool()};
+
+    // whether the client stays quiet until the server pings (then answers, and closes), or the server closes: either
+    // way, a read of the TLS stream is interrupted (timing out) and goes on.
+    const bool server_closes = GENERATE(false, true);
+    CAPTURE(server_closes);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.connection = {.idle_timeout = 400ms}});
+                   if (!conn.has_value()) co_return;
+
+                   std::string message;
+                   while (true)
+                   {
+                       const auto type = co_await conn->read_message(message);
+                       if (!type.has_value())
+                       {
+                           const auto       code = ws::close_code_of(type.error());
+                           std::scoped_lock lock{mu};
+                           ends.push_back(code ? std::format("{} {}",
+                                                             static_cast<int>(*code),
+                                                             ws::from_peer(type.error()) ? "peer" : "sent")
+                                               : type.error().message());
+                           co_return;
+                       }
+                       if (co_await conn->write_message(*type, message)) co_return;
+                   }
+               });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    const auto test = [&] -> task<std::pair<std::vector<std::string>, std::error_code>>
+    {
+        std::vector<std::string> frames;
+
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
+        if (!conn.has_value()) co_return std::pair{frames, conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"http/1.1"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{frames, s.error()};
+
+        test::websocket::raw_peer peer{*s, *s};
+        (void)co_await peer.send(test::websocket::handshake());
+        if (auto head = co_await peer.read_head(); !head.has_value()) co_return std::pair{frames, head.error()};
+
+        (void)co_await peer.send(client_frame(opcode::text, "hello"sv));
+        auto echoed = co_await peer.read_frame();
+        if (!echoed.has_value()) co_return std::pair{frames, echoed.error()};
+        frames.push_back(echoed->text());
+
+        if (server_closes) server.close();
+
+        auto next = co_await peer.read_frame();
+        if (!next.has_value()) co_return std::pair{frames, next.error()};
+        frames.push_back(next->header.op == opcode::close
+                             ? std::format("close:{}", static_cast<int>(next->close().code))
+                             : std::format("ping:{}", next->text()));
+
+        // the pong (whose read goes on), and the close; or the answer to the server's close.
+        if (!server_closes)
+        {
+            (void)co_await peer.send(
+                test::websocket::join(client_frame(opcode::pong, ""sv),
+                                      test::websocket::close_frame(ws::close_code::normal_closure)));
+        }
+        else
+        {
+            (void)co_await peer.send(test::websocket::close_frame(ws::close_code::going_away));
+        }
+
+        auto [rest, err] = co_await peer.read_until_end();
+        for (const auto& f : rest) frames.push_back(std::format("close:{}", static_cast<int>(f.close().code)));
+
+        if (server_closes) co_await server.join();
+        co_return std::pair{frames, err};
+    };
+
+    const auto [frames, err] = sched.run_to_completion(test());
+    CAPTURE(err.message());
+    CHECK(frames
+          == (server_closes ? std::vector<std::string>{"hello", "close:1001"}
+                            : std::vector<std::string>{"hello", "ping:", "close:1000"}));
+
+    // the server's close_notify, not the TCP stream cut short.
+    CHECK(err == net::io::errc::end_of_stream);
+
+    std::scoped_lock lock{mu};
+    CHECK(ends == std::vector<std::string>{server_closes ? "1001 sent" : "1000 peer"});
+}

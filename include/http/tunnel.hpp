@@ -36,6 +36,12 @@ public:
     // their timeout (the server's write_timeout).
     virtual void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept = 0;
 
+    // set_read_deadline limits how long reads may wait altogether: once it has passed, a read that has to wait fails
+    // with std::errc::timed_out, having read nothing (until the deadline's changed), or not, if none (as to begin
+    // with). It applies to a read that's waiting already too, and may be set from any thread (e.g. to interrupt a read
+    // without canceling the writes, as the stop token would).
+    virtual void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept = 0;
+
     // set_stop_token makes a read or write that waits end when stop is requested, failing with
     // std::errc::operation_canceled: a canceled read has read nothing, so the next one reads what it would have. A
     // default-constructed token (as to begin with) removes it.

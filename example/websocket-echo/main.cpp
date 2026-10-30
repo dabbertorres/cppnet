@@ -1,6 +1,7 @@
 // websocket-echo accepts WebSockets on port 9001 (Autobahn's TestSuite's), at /, and echoes each message back
-// whole, until the client closes, or SIGINT or SIGTERM: then it closes the server, and waits for its WebSockets to end,
-// for up to 10 seconds, before it stops them. Messages may be up to 16 MiB.
+// whole, until the client closes, or SIGINT or SIGTERM: then it closes the server, which tells each WebSocket it's
+// going away (a close with 1001, as each is reading), and waits for them to end (their clients answering, or not within
+// close_timeout, 5 seconds), for up to 10 seconds, before it stops them. Messages may be up to 16 MiB.
 //
 // --port <port> listens on another port. With --cert <chain.pem> --key <key.pem> (if built with TLS), it serves wss://,
 // with that certificate chain and key.
@@ -61,7 +62,8 @@ task<> echo(const http::server_request& req, http::response_writer& resp)
     std::string message;
     while (true)
     {
-        // the client's close ends the read (answered already), as does a failure (the client told why, if it was its).
+        // the client's close ends the read (answered already), as does a failure (the client told why, if it was its),
+        // and the server's close (going away, once the client has answered).
         const auto type = co_await conn->read_message(message);
         if (!type.has_value())
         {
@@ -172,8 +174,7 @@ int main(int argc, char** argv)
 
     spdlog::info("exiting...");
 
-    // stop accepting, then wait for the WebSockets to end (nothing tells them to yet: each ends when its client
-    // closes).
+    // stop accepting, then wait for the WebSockets to end: their reads close them, going away.
     server.close();
     scheduler.run_to_completion(drain(&scheduler, &server, std::chrono::seconds{10}));
 

@@ -3,7 +3,7 @@
 Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
 Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2). Stage 3, switching
 an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3). Stage 4, accepting WebSockets, done (2026-10-29; see
-Learned in stage 4).
+Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29; see Learned in stage 5).
 
 ## Goal
 
@@ -637,6 +637,74 @@ waiting for the server's first SETTINGS isn't used.
   write times out (the abort is what ends that read). The peer's close not answered hangs rather than fails, which the
   run's time limit shows.
 
+## Learned in stage 5
+
+- The API, where the plan left it open: `idle_timeout` is in `connection_options` (60 s; 0 off), as `close_timeout` is;
+  `stop` is in `accept_options`, not `connection_options`, as the client's `connect_options::stop` (stage 6) covers its
+  handshake as well as the connection, so each side has its own. A token without a stop state (the default) means
+  `req.stop`, so `abort()` and `http::timeout` on the route reach the WebSocket without the handler passing anything.
+- **A departure: the server's `close()` interrupts reads with a read deadline, not the transport's stop token.** The
+  socket's stop token cancels writes as well as reads, so a write waiting when `close()` came (a server streaming to a
+  slow client) would fail with `operation_canceled`, part of a frame sent (over TLS, a `write_failure`, sticky), and
+  the 1001 could never go: the WebSocket would end abnormally on every graceful shutdown that caught it writing. So
+  `tunnel` has `set_read_deadline()` (the socket's read deadline, which applies to a read already waiting and may be set
+  from any thread, as the server's `abandon_watch()` uses it), and the WebSocket registers a `std::stop_callback` on
+  `closing()` once, at `accept()`, setting a deadline of now. A read whose wait times out (having read nothing, so
+  nothing's lost) asks `closing().stop_requested()`; if so, it unregisters the callback (waiting for it, if it's being
+  made) before it takes the deadline off, so the callback can't set it again after, and goes away. No
+  `util::linked_stop_source` is needed: `stop` alone is the transport's stop token. A read timing out over TLS leaves the
+  stream as it was (as a canceled one does), which the TLS test checks.
+- Going away is a failure set through `set_failure(sent(going_away))`, so its close is left pending as a protocol
+  failure's is, and sent as a reply (by the read if the wire's free, or by the write holding it, after its frame), and
+  writers waiting see the failure at once. Then the read reads on for the peer's close (`read_close()`, within
+  `close_timeout` from then) and returns `sent(going_away)` whether the peer answered or not (then the connection's
+  aborted), as everything does after it; `close()` afterwards returns no error if the handshake finished, or the failure
+  if it didn't. A close of this side's already under way (`close_sent`) isn't disturbed: a read takes the deadline off
+  and reads on, and so does `read_close()` itself, `close()`'s own timeout bounding both.
+- Only a read that has to wait notices: a message that's buffered already is read first, and a WebSocket that isn't
+  reading at all hears nothing until it next reads (the deadline stays set until then). A WebSocket accepted after
+  `close()` (its request already being served) gets its 101, and goes away at its first read that waits: the callback
+  runs as it's registered.
+- `stop`: the transport's stop token cancels the socket's waits (reads and writes), and a callback (`cancel()`) fails the
+  connection with `operation_canceled` unless it has failed already (so a stop after a clean close, or after the peer's
+  close, changes nothing), wakes the writers waiting for their turn (a whole message waiting behind a streamed one whose
+  writer is idle waits on nothing the token reaches), and aborts the tunnel. close()'s wait for another reader needs
+  nothing more: the reader's read is canceled, and letting the read side go tells `close()`. The connection's
+  destructor unregisters both callbacks and puts the tunnel's stop token, read timeout and read deadline back as it
+  found them, for the server's end of the connection (whose TLS close_notify shouldn't be canceled by `req.stop`).
+- The server's `abort()` callback now requests stop on the handlers' source before it shuts the reading side, so a
+  WebSocket's read reports `operation_canceled` rather than racing the end of the stream to `abnormal_closure` (stage
+  4's abort test expected 1006; now it's `operation_canceled`). The race didn't show locally (the old order passed 60
+  runs of the test out of 60: the stream's end has to go through the event loop to a worker, which the inline callback
+  beats), so the change is for what the order guarantees.
+- The idle timeout: half of it is the tunnel's read timeout, set once by the connection (and put back after
+  `read_close()`'s own). `drive()` sends a wait that fails to `wait_failed()`, a coroutine of its own, so a read that
+  doesn't time out has no frame more; `idle_pinged` is set by the ping and cleared by any bytes read (the fill's, or the
+  direct read of a large frame's, which also times out with some read: then the ping goes as well). The ping has no
+  payload, and is a reply as the pong is (`take_replies()` frames the pong, the ping, then the close). A peer that
+  answers but says nothing else is pinged every half.
+- Allocations: the stage 4 probe (`bench_request`'s counting, the peer on a blocking socket), Release, interleaved
+  before and after: 1000 buffered messages, 0.001 allocations per `read_message()` and none per `write_message()`,
+  before and after; read and echo one at a time, 4.011 to 4.012 per read before and 4.013 to 4.014 after (and 4.003 to
+  4.004 over 4000 rounds), none per write: two or three allocations once per WebSocket (the read timeout's timer nodes,
+  which the scheduler then reuses, presumably), and nothing per read.
+- Tests (`test/websocket/server.cpp`'s `[idle]`, `[cancel]` and `[going-away]`, and an idle and a going-away case over
+  TLS in `test/tls/server.cpp`) assert order and outcomes, with lower bounds only for the idle timing (from before the
+  request) and `close_timeout`. 25 runs in a row of the new tests, and 30 more six at a time, all passed. Each rule and
+  path was broken alone (19 breaks: the ping, the idle reset by the fill and by the direct read, the second half
+  failing, 0 as off, the deadline taken off, the callback's deadline, the 1001 sent, the peer's close read for, the
+  state checked, `read_close()` reading on, `wait_failed()`'s check of closing, the tunnel's deadline, the ping framed,
+  `cancel()` waking the turn and keeping an earlier failure, `req.stop` as the default, the transport's stop token, and
+  the abort callback's order), and the tests failed for every one but the last (above); the second half never failing
+  hangs rather than fails (the peer is pinged for ever), which the run's time limit shows. Not observable, so not
+  tested: `cancel()`'s abort (every write flushes, so nothing's left to drop, and an abort shuts only the reading side),
+  the destructor putting the tunnel back, `read_close()` putting the idle timeout back (nothing reads after it), and
+  the callback unregistered before the deadline's taken off (a race).
+- Autobahn's `fuzzingclient` against `example/websocket-echo` (Release), sections 1-7 and 9, as in stage 4: 300 cases,
+  297 OK and 3 INFORMATIONAL (7.1.6, 7.13.1, 7.13.2), none NON-STRICT or FAILED; section 9 in 9.9 s (the run 16.5 s). By
+  hand, a WebSocket open to the example when it gets SIGTERM receives a close with 1001 at once, and the example exits
+  as soon as it's answered.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -656,7 +724,7 @@ Each a pull request, mergeable and tested alone, in this order:
    whole and streamed, writing, the write turn, control replies, the close handshake, close codes as errors),
    `max_message`, `example/websocket-echo`, the guide's section; the server tests above but timeouts and `close()`.
    Autobahn's `fuzzingclient` by hand, in the pull request.
-5. **Timeouts and the server's close.** `idle_timeout` and keep-alive pings, `close_timeout`, `stop`, `close()`'s 1001
+5. **Timeouts and the server's close.** Done (2026-10-29; see Learned in stage 5). `idle_timeout` and keep-alive pings, `close_timeout`, `stop`, `close()`'s 1001
    (`tunnel::closing()`, the socket's token); their tests. Split from 4 as they touch the server's lifecycle and are
    tested with time.
 6. **The client over HTTP/1.1.** `websocket::connect()`, masking, its tests, `bench_websocket`; Autobahn's

@@ -943,6 +943,22 @@ router.GET("/echo",
   reading, for up to `accept_options::connection.close_timeout` (5 s): then it aborts the connection. A connection
   destroyed (e.g. its handler returning) without a close aborts it, so the client sees it end without one. Once the
   handler returns, the server ends the TCP connection, as RFC 6455 has the server do.
+- **The server's `close()`:** a WebSocket that's reading is told the server's going away: the read that's waiting (or
+  the next one that has to wait: a message already buffered is read first) sends a close with
+  `close_code::going_away` (1001), reads on for the client's close for up to `close_timeout` (then aborts), and returns
+  `websocket::sent(close_code::going_away)`; a `close()` of the handler's own that's under way finishes instead. So
+  `server.close()` then `join()` drains WebSockets as it does requests, as long as they read; one that isn't reading
+  hears nothing until it next reads (`abort()` ends it whatever it's doing).
+- **Idle WebSockets:** while a read waits, `accept_options::connection.idle_timeout` (60 s; 0 turns it off) bounds how
+  long the client may say nothing: at half of it, the read pings the client (whose pong, or anything else, starts the
+  wait over), and at the end of it, the WebSocket fails with `std::errc::timed_out` and is aborted. The pings also keep
+  proxies (e.g. nginx's 60 s `proxy_read_timeout`) from closing a WebSocket that's quiet. Reads do the timing (there's
+  no task or timer per WebSocket), so it only applies while a task reads, which it must anyway.
+- **Stopping:** `accept_options::stop` ends the WebSocket: whatever waits (a read, a write, `close()`) fails with
+  `std::errc::operation_canceled`, and the connection is aborted. By default it's the request's `req.stop`, so the
+  server's `abort()` ends a WebSocket, and `http::timeout` on its route bounds the whole WebSocket (not just the
+  handshake): put a WebSocket's route outside it, or give `accept()` a token of its own, for one that should outlive the
+  route's timeout.
 - **How it ended:** an error, as everything else: the client's close, as its code (`err == close_code::going_away`;
   `conn->close_reason()` is its reason), from the read that received it; a close the server sent for what the client
   did wrong (`websocket::sent(close_code::protocol_error)`, `invalid_payload` for text that isn't UTF-8,
@@ -952,7 +968,8 @@ router.GET("/echo",
   `io::status_condition::closed`. Once a WebSocket has failed, everything returns the same failure; writing after the
   server's close has gone fails with `std::errc::broken_pipe`.
 - **Limits:** a WebSocket holds its HTTP connection, so it counts against `max_connections` until its handler returns,
-  `join()` waits for it, and `abort()` ends it (its reads fail with `abnormal_closure`). `instrument::http_metrics` and
+  `join()` waits for it, and `abort()` ends it (through `req.stop`, its reads and writes failing with
+  `std::errc::operation_canceled`; with a `stop` of its own, its reads find the connection's end, `abnormal_closure`). `instrument::http_metrics` and
   `http_tracing` see the 101 as the response's status, and the whole WebSocket as the request's duration.
 
 `example/websocket-echo` is an echo server (the one Autobahn's TestSuite tests).

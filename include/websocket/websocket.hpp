@@ -6,6 +6,7 @@
 #include <expected>
 #include <memory>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -46,9 +47,17 @@ struct connection_options
     // (streamed too): past it, the connection fails with sent(close_code::message_too_big), telling the peer.
     std::uint64_t max_message = std::uint64_t{1} << 20;
 
-    // close_timeout is how long close() waits for the peer's close, once it has sent its own: then it aborts the
-    // connection.
+    // close_timeout is how long close() waits for the peer's close, once it has sent its own (and a read does, once
+    // the server's close() has made it send one: see connection): then it aborts the connection.
     std::chrono::milliseconds close_timeout = std::chrono::seconds{5};
+
+    // idle_timeout is how long a read may wait with nothing received: once half of it has passed, the read pings the
+    // peer (whose pong, or anything else it sends, starts the wait over), and if the other half passes too, the peer
+    // is taken for gone: the connection fails with std::errc::timed_out, and is aborted. The pings also keep what's in
+    // between (e.g. a proxy, such as nginx, whose proxy_read_timeout is 60 s) from closing a WebSocket that's quiet.
+    // 0 turns it off. Reads do the timing, with no task or timer of their own: so it applies only while the
+    // application reads, as it must anyway, for the peer's pings and close to be answered.
+    std::chrono::milliseconds idle_timeout = std::chrono::seconds{60};
 };
 
 // accept_options are how a server accepts a WebSocket's handshake.
@@ -75,6 +84,12 @@ struct accept_options
 
     // connection is the connection's limits.
     connection_options connection{};
+
+    // stop ends the WebSocket once stop is requested: whatever waits (a read, a write, close()) fails with
+    // std::errc::operation_canceled, as everything does after it, and the connection is aborted (the peer sees it end
+    // without a close). A token without a stop state (as by default) means the request's (req.stop), so the server's
+    // abort(), and http::timeout on the WebSocket's route (which then bounds the whole WebSocket), end it.
+    std::stop_token stop{};
 };
 
 // connect_options are how a client opens a WebSocket.
@@ -149,9 +164,16 @@ private:
 // Its failures are how it ended (see websocket/error.hpp): the peer's close, as its code (e.g. close_code::going_away;
 // close_reason() is its reason), from the read that received it; a close this side sent for what the peer did wrong
 // (e.g. sent(close_code::protocol_error)); abnormal_closure if the connection ended without a close; or the transport's
-// error (e.g. a write's std::errc::timed_out, past the server's write_timeout). Once it has failed, every operation
-// returns the same failure. Writing after this side's close has been sent fails with std::errc::broken_pipe (as
-// io::status_condition::closed matches).
+// error (e.g. a write's std::errc::timed_out, past the server's write_timeout; and see connection_options::idle_timeout
+// and accept_options::stop). Once it has failed, every operation returns the same failure. Writing after this side's
+// close has been sent fails with std::errc::broken_pipe (as io::status_condition::closed matches).
+//
+// The server's close() ends a WebSocket that's reading: the read that's waiting (or the next that has to wait) sends a
+// close saying going_away (1001), then reads on for the peer's close (dropping messages that come before it), for up
+// to connection_options::close_timeout (then aborting the connection), and returns sent(close_code::going_away), as
+// everything does after it. A WebSocket whose own close() is under way finishes that instead. One that isn't reading
+// isn't told until it next reads (a message buffered already is read first). So the server's close() then join()
+// drain the WebSockets that are reading.
 //
 // A server's connection is its handler's until the handler returns: it mustn't outlive the handler's call, which ends
 // the HTTP connection. Destroying it without a close (sent by close(), or as the reply to the peer's) aborts it: the

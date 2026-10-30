@@ -1,6 +1,6 @@
 // Accepting WebSockets (websocket::accept() and connection), against a scripted client (test/websocket/raw_peer.hpp):
 // the handshake and its refusals, messages read and written whole and streamed, control frames, the close handshake,
-// failures, and how the connection ends.
+// failures, how the connection ends, the idle timeout's pings, stopping, and the server's close().
 #include "http/server.hpp"
 
 #include <algorithm>
@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,6 +31,7 @@
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
+#include "http/timeout.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
@@ -151,6 +153,26 @@ std::unique_ptr<http::server> make_server(net::io::scheduler* sched, http::route
     auto server = std::make_unique<http::server>(sched, std::move(router), cfg);
     REQUIRE(sched->spawn(server->serve()));
     return server;
+}
+
+// raise sets word to value, waking whoever waits for it.
+void raise(net::io::scheduler* sched, std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    word.store(value);
+    sched->notify_all(word);
+}
+
+// reach waits for word to reach value, for up to 10 s (so a test that goes wrong fails, rather than hangs), returning
+// whether it did.
+task<bool> reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    const auto deadline = net::io::clock::now() + 10s;
+    while (true)
+    {
+        const auto seen = word.load();
+        if (seen >= value) co_return true;
+        if (co_await sched->wait_on(word, seen, deadline)) co_return false;
+    }
 }
 
 // echo accepts a WebSocket and echoes its messages whole, until a read or write fails, which it records.
@@ -952,7 +974,7 @@ TEST_CASE("a WebSocket handler that returns without closing aborts the connectio
     CHECK(result.err == net::io::errc::end_of_stream);
 }
 
-TEST_CASE("aborting the server ends a WebSocket's read", "[websocket][server][cancel]")
+TEST_CASE("aborting the server ends a WebSocket's read, canceled", "[websocket][server][cancel]")
 {
     record             out;
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
@@ -983,8 +1005,13 @@ TEST_CASE("aborting the server ends a WebSocket's read", "[websocket][server][ca
     const auto result = sched.run_to_completion(client());
     CHECK(result.frames.empty());
     CHECK(result.err == net::io::errc::end_of_stream);
+
+    // through the request's token, which is the WebSocket's stop by default: then the reading side's shut.
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
     CHECK(out.get()
-          == std::vector<std::string>{"read: 1006 peer reason=", "then write: 1006 peer", "then close: 1006 peer"});
+          == std::vector<std::string>{"read: " + canceled + " reason=",
+                                      "then write: " + canceled,
+                                      "then close: " + canceled});
 }
 
 TEST_CASE("a WebSocket counts against max_connections until its handler returns", "[websocket][server][limits]")
@@ -1521,4 +1548,772 @@ TEST_CASE("a WebSocket's writes to a peer that doesn't read fail at the server's
 
     sched.run_to_completion(client());
     CHECK(out.get() == std::vector<std::string>{"write timed out: true", "then: true", "read: true"});
+}
+
+TEST_CASE("an idle WebSocket pings the peer at half its idle_timeout, and fails at its end",
+          "[websocket][server][idle]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.idle_timeout = 400ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    struct times
+    {
+        net::io::clock::duration ping{};
+        net::io::clock::duration end{};
+    };
+
+    const auto client = [&] -> task<std::pair<peer_result, times>>
+    {
+        peer_result result;
+        times       took;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return std::pair{result, took};
+
+        // from before the request, so the server's first read began after.
+        const auto start = net::io::clock::now();
+        raw_peer   peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // the ping, which isn't answered.
+        auto ping = co_await peer.read_frame();
+        if (!ping.has_value()) co_return std::pair{result, took};
+        took.ping = net::io::clock::now() - start;
+        result.frames.push_back(std::move(*ping));
+
+        auto [rest, err] = co_await peer.read_until_end();
+        took.end         = net::io::clock::now() - start;
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+        co_return std::pair{result, took};
+    };
+
+    const auto [result, took] = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"ping:"});
+    CHECK(took.ping >= 200ms);
+
+    // aborted: the connection ends without a close.
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(took.end >= 400ms);
+
+    const auto timed_out = std::make_error_code(std::errc::timed_out).message();
+    CHECK(out.get()
+          == std::vector<std::string>{"read: " + timed_out + " reason=",
+                                      "then write: " + timed_out,
+                                      "then close: " + timed_out});
+}
+
+TEST_CASE("a WebSocket's idle wait starts over with a pong, or anything the peer sends", "[websocket][server][idle]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the peer answers the ping with its pong, or with a message.
+    const bool message = GENERATE(false, true);
+    CAPTURE(message);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.idle_timeout = 400ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<std::pair<peer_result, net::io::clock::duration>>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return std::pair{result, net::io::clock::duration{}};
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        auto ping = co_await peer.read_frame();
+        if (!ping.has_value()) co_return std::pair{result, net::io::clock::duration{}};
+        result.frames.push_back(std::move(*ping));
+
+        // without the answer, the server would end the connection when the other half passes, rather than ping again
+        // a half after it.
+        const auto answered = net::io::clock::now();
+        (void)co_await peer.send(message ? client_frame(opcode::text, "here"sv) : client_frame(opcode::pong, ""sv));
+
+        const auto frames = message ? 2 : 1;
+        for (int i = 0; i < frames; ++i)
+        {
+            auto f = co_await peer.read_frame();
+            if (!f.has_value()) break;
+            result.frames.push_back(std::move(*f));
+        }
+        const auto again = net::io::clock::now() - answered;
+
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+        co_return std::pair{result, again};
+    };
+
+    const auto [result, again] = sched.run_to_completion(client());
+    CHECK(summaries(result.frames)
+          == (message ? std::vector<std::string>{"ping:", "text:here", "ping:"}
+                      : std::vector<std::string>{"ping:", "ping:"}));
+    CHECK(again >= 200ms);
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get().front() == "read: " + std::make_error_code(std::errc::timed_out).message() + " reason=");
+}
+
+TEST_CASE("a WebSocket's idle wait starts over as a large frame trickles in", "[websocket][server][idle]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.idle_timeout = 400ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    // a frame larger than the connection's buffer is read straight into the message, once what's buffered is taken:
+    // the idle timeout times those reads as any.
+    const std::string large(std::size_t{64} * 1'024, 'x');
+    const auto        frame = client_frame(opcode::text, large);
+    const auto        half  = frame.size() / 2;
+
+    const auto client = [&] -> task<std::pair<peer_result, bool>>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return std::pair{result, false};
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // the frame's first part, a ping for the wait after it, then the next part, and a ping again after that (the
+        // connection would have ended there, without the part).
+        const auto bytes = std::span{frame};
+        (void)co_await peer.send(bytes.first(1'024));
+        for (const auto& [from, to] : {
+                 std::pair{std::size_t{1'024},         half},
+                 std::pair{              half, frame.size()}
+        })
+        {
+            auto ping = co_await peer.read_frame();
+            if (!ping.has_value()) co_return std::pair{result, false};
+            result.frames.push_back(std::move(*ping));
+            (void)co_await peer.send(bytes.subspan(from, to - from));
+        }
+
+        auto echoed = co_await peer.read_frame();
+        if (!echoed.has_value()) co_return std::pair{result, false};
+        const bool same = echoed->text() == large;
+
+        (void)co_await peer.send(close_frame(ws::close_code::normal_closure));
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+        co_return std::pair{result, same};
+    };
+
+    const auto [result, same] = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"ping:", "ping:", "close:1000"});
+    CHECK(same);
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get().front() == "read: 1000 peer reason=");
+}
+
+TEST_CASE("a WebSocket whose idle_timeout is 0 waits as long as the peer's quiet", "[websocket][server][idle]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.idle_timeout = 0ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        (void)co_await sched.sleep_until(net::io::clock::now() + 300ms);
+        (void)co_await peer.send(
+            join(client_frame(opcode::text, "late"sv), close_frame(ws::close_code::normal_closure)));
+
+        auto [frames, err] = co_await peer.read_until_end();
+        result.frames      = std::move(frames);
+        result.err         = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:late", "close:1000"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get().front() == "read: 1000 peer reason=");
+}
+
+TEST_CASE("stopping a WebSocket's stop token cancels its read, and aborts it", "[websocket][server][cancel]")
+{
+    record             out;
+    std::stop_source   stop;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether stop's requested before the handler accepts, or as the WebSocket reads.
+    const bool before = GENERATE(false, true);
+    CAPTURE(before);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               {
+                   if (before) stop.request_stop();
+                   return echo(req, rw, out, {.stop = stop.get_token()});
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        if (!before)
+        {
+            (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+            stop.request_stop();
+        }
+
+        auto [frames, err] = co_await peer.read_until_end();
+        result.frames      = std::move(frames);
+        result.err         = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(result.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(result.frames.empty());
+    CHECK(result.err == net::io::errc::end_of_stream);
+
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
+    CHECK(out.get()
+          == std::vector<std::string>{"read: " + canceled + " reason=",
+                                      "then write: " + canceled,
+                                      "then close: " + canceled});
+}
+
+TEST_CASE("stopping a WebSocket's stop token after its close handshake changes nothing", "[websocket][server][cancel]")
+{
+    record             out;
+    std::stop_source   stop;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.stop = stop.get_token()});
+                   if (!conn.has_value()) co_return;
+
+                   std::string message;
+                   out.add("read: " + describe((co_await conn->read_message(message)).error_or(std::error_code{})));
+
+                   stop.request_stop();
+                   out.add("then write: " + describe(co_await conn->write_message(ws::message_type::text, "x"sv)));
+                   out.add("then close: " + describe(co_await conn->close()));
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto result = sched.run_to_completion(run_peer(&sched,
+                                                         server->local_port(),
+                                                         test::websocket::handshake(),
+                                                         close_frame(ws::close_code::normal_closure)));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1000"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get() == std::vector<std::string>{"read: 1000 peer", "then write: 1000 peer", "then close: ok"});
+}
+
+TEST_CASE("stopping a WebSocket's stop token cancels its writes", "[websocket][server][cancel]")
+{
+    record                     out;
+    std::stop_source           stop;
+    std::atomic<std::uint64_t> started = 0;
+    std::atomic<std::uint64_t> whole   = 0;
+    std::atomic<std::uint64_t> done    = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the write waits for the peer (which doesn't read), or for its turn, behind a message written a frame at a
+    // time whose writer is idle.
+    const bool for_turn = GENERATE(false, true);
+    CAPTURE(for_turn);
+
+    http::router router;
+    router.GET(
+        "/ws",
+        [&](http::server_request& req, http::response_writer& rw) -> task<void>
+        {
+            auto conn = co_await ws::accept(req, rw, {.stop = stop.get_token()});
+            if (!conn.has_value()) co_return;
+
+            if (!for_turn)
+            {
+                raise(&sched, started);
+                const std::string message(1 << 20, 'x');
+                std::error_code   err;
+                for (int i = 0; i < 1'000 && !err; ++i)
+                    err = co_await conn->write_message(ws::message_type::binary, message);
+                out.add("write: " + describe(err));
+            }
+            else
+            {
+                auto streamed = co_await conn->begin_message(ws::message_type::text);
+                if (!streamed.has_value()) co_return;
+                (void)co_await streamed->write("part"sv);
+
+                (void)sched.spawn(
+                    [](ws::connection* conn, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* whole)
+                        -> task<void>
+                    {
+                        out->add("whole: " + describe(co_await conn->write_message(ws::message_type::text, "whole"sv)));
+                        raise(sched, *whole);
+                    }(&*conn, &out, &sched, &whole));
+                raise(&sched, started);
+
+                if (!co_await reach(&sched, whole)) out.add("the whole message's write wasn't woken");
+                out.add("end: " + describe(co_await streamed->end_message()));
+            }
+
+            out.add("then: " + describe(co_await conn->ping()));
+            raise(&sched, done);
+        });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<std::error_code>
+    {
+        auto conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return conn.error();
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        (void)co_await peer.read_head();
+
+        // the write's waiting by then; and the client reads nothing until it has failed, so nothing else ends it.
+        (void)co_await reach(&sched, started);
+        (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
+        stop.request_stop();
+        if (!co_await reach(&sched, done)) out.add("the handler didn't finish");
+
+        auto [frames, err] = co_await peer.read_until_end();
+        co_return err;
+    };
+
+    const auto err = sched.run_to_completion(client());
+    CHECK(err == net::io::errc::end_of_stream);
+
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
+    CHECK(out.get()
+          == (for_turn ? std::vector<std::string>{"whole: " + canceled, "end: " + canceled, "then: " + canceled}
+                       : std::vector<std::string>{"write: " + canceled, "then: " + canceled}));
+}
+
+TEST_CASE("stopping a WebSocket's stop token cancels its close", "[websocket][server][cancel]")
+{
+    record                     out;
+    std::stop_source           stop;
+    std::atomic<std::uint64_t> finished = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether close() reads for the peer's close itself, or waits for another task that's reading.
+    const bool other_reads = GENERATE(false, true);
+    CAPTURE(other_reads);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn =
+                       co_await ws::accept(req, rw, {.connection = {.close_timeout = 5s}, .stop = stop.get_token()});
+                   if (!conn.has_value()) co_return;
+
+                   if (other_reads)
+                   {
+                       (void)sched.spawn(
+                           [](ws::connection*             conn,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* finished) -> task<void>
+                           {
+                               std::string message;
+                               const auto  read = co_await conn->read_message(message);
+                               out->add("reader: " + describe(read.error_or(std::error_code{})));
+                               raise(sched, *finished);
+                           }(&*conn, &out, &sched, &finished));
+
+                       // the reader's waiting by then: one read at a time.
+                       (void)co_await sched.sleep_until(net::io::clock::now() + 20ms);
+                       std::string other;
+                       const auto  busy = co_await conn->read_message(other);
+                       if (busy.error_or(std::error_code{}) != std::errc::device_or_resource_busy)
+                           out.add("the reader wasn't reading");
+                   }
+
+                   out.add("close: " + describe(co_await conn->close()));
+                   if (other_reads && !co_await reach(&sched, finished)) out.add("the reader didn't finish");
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // the close, which isn't answered: stop ends close()'s wait for it.
+        auto close = co_await peer.read_frame();
+        if (!close.has_value()) co_return result;
+        result.frames.push_back(std::move(*close));
+        stop.request_stop();
+
+        auto [frames, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), frames.begin(), frames.end());
+        result.err = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1000"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+
+    // the reader's end, and close()'s, in either order.
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
+    auto       lines    = out.get();
+    std::ranges::sort(lines);
+    CHECK(lines
+          == (other_reads ? std::vector<std::string>{"close: " + canceled, "reader: " + canceled}
+                          : std::vector<std::string>{"close: " + canceled}));
+}
+
+TEST_CASE("http::timeout on a WebSocket's route ends the WebSocket at its deadline", "[websocket][server][cancel]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.use(http::timeout{&sched, 500ms});
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // it echoes until the deadline; then it ends, without a 503 (the 101 was the response).
+        (void)co_await peer.send(client_frame(opcode::text, "hi"sv));
+        auto [frames, err] = co_await peer.read_until_end();
+        result.frames      = std::move(frames);
+        result.err         = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(result.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
+    CHECK(out.get()
+          == std::vector<std::string>{"read: " + canceled + " reason=",
+                                      "then write: " + canceled,
+                                      "then close: " + canceled});
+}
+
+TEST_CASE("the server's close tells a reading WebSocket it's going away, and join() waits for the close handshake",
+          "[websocket][server][close][going-away]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> joined = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // an echo, after which the handler reads again.
+        (void)co_await peer.send(client_frame(opcode::text, "hi"sv));
+        for (int i = 0; i < 2; ++i)
+        {
+            if (i == 1)
+            {
+                server->close();
+                (void)sched.spawn(
+                    [](http::server* server, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined)
+                        -> task<void>
+                    {
+                        co_await server->join();
+                        out->add("joined");
+                        raise(sched, *joined);
+                    }(server.get(), &out, &sched, &joined));
+            }
+
+            auto f = co_await peer.read_frame();
+            if (!f.has_value()) co_return result;
+            result.frames.push_back(std::move(*f));
+        }
+
+        // join() waits for the answer.
+        (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+        out.add("answering");
+        (void)co_await peer.send(close_frame(ws::close_code::going_away));
+
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+
+        if (!co_await reach(&sched, joined)) out.add("join() didn't return");
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi", "close:1001"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+
+    // the read reports the close it sent; the handshake's done, so close() has nothing to do.
+    CHECK(out.get()
+          == std::vector<std::string>{"answering",
+                                      "read: 1001 sent reason=",
+                                      "then write: 1001 sent",
+                                      "then close: ok",
+                                      "joined"});
+}
+
+TEST_CASE("the server's close gives up on a WebSocket's peer that doesn't answer within close_timeout",
+          "[websocket][server][close][going-away]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.close_timeout = 300ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<std::pair<peer_result, net::io::clock::duration>>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return std::pair{result, net::io::clock::duration{}};
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // the close, which isn't answered: the server aborts the connection close_timeout after it.
+        const auto closed = net::io::clock::now();
+        server->close();
+        auto [frames, err] = co_await peer.read_until_end();
+        const auto took    = net::io::clock::now() - closed;
+        result.frames      = std::move(frames);
+        result.err         = err;
+
+        co_await server->join();
+        co_return std::pair{result, took};
+    };
+
+    const auto [result, took] = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1001"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(took >= 300ms);
+    CHECK(out.get()
+          == std::vector<std::string>{"read: 1001 sent reason=", "then write: 1001 sent", "then close: 1001 sent"});
+}
+
+TEST_CASE("a WebSocket that isn't reading when the server closes goes away at its next read",
+          "[websocket][server][close][going-away]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> ready = 0;
+    std::atomic<std::uint64_t> go    = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the server closes before the handler accepts, or after.
+    const bool before = GENERATE(false, true);
+    CAPTURE(before);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   if (before)
+                   {
+                       raise(&sched, ready);
+                       if (!co_await reach(&sched, go)) co_return;
+                   }
+
+                   auto conn = co_await ws::accept(req, rw);
+                   if (!conn.has_value()) co_return;
+
+                   if (!before)
+                   {
+                       raise(&sched, ready);
+                       if (!co_await reach(&sched, go)) co_return;
+                   }
+
+                   std::string message;
+                   const auto  read = co_await conn->read_message(message);
+                   out.add("read: " + describe(read.error_or(std::error_code{})));
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        if (!before) result.head = (co_await peer.read_head()).value_or("");
+
+        (void)co_await reach(&sched, ready);
+        server->close();
+
+        if (!before)
+        {
+            // nothing's said until the handler reads.
+            conn->set_read_deadline(net::io::clock::now() + 200ms);
+            const auto quiet = co_await peer.read_frame();
+            if (quiet.error_or(std::error_code{}) != std::errc::timed_out) out.add("a frame came before the read");
+            conn->set_read_deadline(std::nullopt);
+        }
+
+        raise(&sched, go);
+        if (before) result.head = (co_await peer.read_head()).value_or("");
+
+        auto close = co_await peer.read_frame();
+        if (!close.has_value()) co_return result;
+        result.frames.push_back(std::move(*close));
+
+        (void)co_await peer.send(close_frame(ws::close_code::going_away));
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(result.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1001"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get() == std::vector<std::string>{"read: 1001 sent"});
+}
+
+TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
+          "[websocket][server][close][going-away]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> finished = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether close() reads for the peer's close itself, or waits for another task that's reading.
+    const bool other_reads = GENERATE(false, true);
+    CAPTURE(other_reads);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.connection = {.close_timeout = 5s}});
+                   if (!conn.has_value()) co_return;
+
+                   if (other_reads)
+                   {
+                       (void)sched.spawn(
+                           [](ws::connection*             conn,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* finished) -> task<void>
+                           {
+                               std::string message;
+                               const auto  read = co_await conn->read_message(message);
+                               out->add("reader: " + describe(read.error_or(std::error_code{})));
+                               raise(sched, *finished);
+                           }(&*conn, &out, &sched, &finished));
+                       (void)co_await sched.sleep_until(net::io::clock::now() + 20ms);
+                   }
+
+                   out.add("close: " + describe(co_await conn->close(ws::close_code{4000})));
+                   if (other_reads && !co_await reach(&sched, finished)) out.add("the reader didn't finish");
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<peer_result>
+    {
+        peer_result result;
+        auto        conn = co_await connect(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        raw_peer peer{*conn, *conn};
+        (void)co_await peer.send(test::websocket::handshake());
+        result.head = (co_await peer.read_head()).value_or("");
+
+        // the handler's close is waiting for the answer as the server closes: then the answer comes.
+        auto close = co_await peer.read_frame();
+        if (!close.has_value()) co_return result;
+        result.frames.push_back(std::move(*close));
+
+        server->close();
+        (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+        (void)co_await peer.send(close_frame(ws::close_code{4001}));
+
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:4000"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+
+    auto lines = out.get();
+    std::ranges::sort(lines);
+    CHECK(lines
+          == (other_reads ? std::vector<std::string>{"close: ok", "reader: 4001 peer"}
+                          : std::vector<std::string>{"close: ok"}));
 }

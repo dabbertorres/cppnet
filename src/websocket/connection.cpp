@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -53,11 +54,13 @@ std::error_code transport_failure(std::error_code err) noexcept
 
 std::error_code invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
 
-// control_frames are control frames to send (the replies to the peer's ping and close), encoded: at most a pong and a
-// close.
+// control_frames are control frames to send (the replies to the peer's ping and close, and the idle timeout's ping),
+// encoded: at most a pong, a ping without a payload, and a close.
 struct control_frames
 {
-    std::array<std::byte, 2 * (net::websocket::detail::max_header_size + net::websocket::detail::max_control_payload)>
+    std::array<std::byte,
+               (2 * (net::websocket::detail::max_header_size + net::websocket::detail::max_control_payload))
+                   + net::websocket::detail::max_header_size>
                 bytes{};
     std::size_t size = 0;
 
@@ -88,16 +91,79 @@ namespace net::websocket::detail
 // message written a frame at a time (begin_message()) holds the message turn (message_open) until it ends, which whole
 // messages wait for too, but control frames don't. Whoever waits for either waits on turn. A read's replies don't wait:
 // if the wire's busy, they're left pending, for its holder to send before it lets go (write_replies_or_release()).
+//
+// Timeouts and stopping cost reads nothing until they come: the idle timeout is half of it as the transport's read
+// timeout, whose expiry a read takes for the time to ping (wait_failed()); the server's close() sets a read deadline of
+// now (interrupt), which a read that waits (or the next) finds the same way, interrupting only reads (the transport's
+// stop token would cancel writes too, cutting a frame short); and stop is the transport's stop token, canceling its
+// waits, with a callback (cancel()) for the rest.
 struct connection_state
 {
-    connection_state(http::detail::tunnel& t, role r, const connection_options& options, std::string_view protocol)
+    connection_state(http::detail::tunnel&     t,
+                     role                      r,
+                     const connection_options& options,
+                     std::string_view          protocol,
+                     std::stop_token           stop)
         : tunnel{t}
         , scheduler{t.get_scheduler()}
         , close_timeout{options.close_timeout}
+        , idle_wait{half_of(options.idle_timeout)}
         , subprotocol{protocol}
         , sess{r, limits{.max_message = options.max_message}}
         , turn{scheduler->pool()}
-    {}
+        , closing{t.closing()}
+    {
+        tunnel.set_read_timeout(idle_wait);
+
+        // NOTE: last, as they may run at once (if stop's been requested already), and use the rest.
+        if (stop.stop_possible())
+        {
+            tunnel.set_stop_token(stop);
+            on_stop.emplace(std::move(stop), canceler{this});
+        }
+        if (closing.stop_possible()) on_closing.emplace(closing, interrupt{this});
+    }
+
+    connection_state(const connection_state&)            = delete;
+    connection_state& operator=(const connection_state&) = delete;
+    connection_state(connection_state&&)                 = delete;
+    connection_state& operator=(connection_state&&)      = delete;
+
+    // the tunnel's left as it was found, for the server's end of the connection.
+    ~connection_state()
+    {
+        // NOTE: the callbacks first, waiting for one being made, as they use the tunnel.
+        on_stop.reset();
+        on_closing.reset();
+
+        tunnel.set_stop_token({});
+        tunnel.set_read_timeout(std::nullopt);
+        tunnel.set_read_deadline(std::nullopt);
+    }
+
+    // half_of is half of an idle timeout, as a read's timeout; none, if it's 0.
+    static std::optional<io::clock::duration> half_of(std::chrono::milliseconds idle_timeout) noexcept
+    {
+        if (idle_timeout <= std::chrono::milliseconds::zero()) return std::nullopt;
+        return std::chrono::duration_cast<io::clock::duration>(idle_timeout) / 2;
+    }
+
+    // interrupt is the server's close()'s callback: reads wait no more, failing with std::errc::timed_out having read
+    // nothing (see take_closing()).
+    struct interrupt
+    {
+        connection_state* state;
+
+        void operator()() const noexcept { state->tunnel.set_read_deadline(io::clock::now()); }
+    };
+
+    // canceler is stop's callback.
+    struct canceler
+    {
+        connection_state* state;
+
+        void operator()() const noexcept { state->cancel(); }
+    };
 
     // message_reader is the connection's message(): the message next_message() began.
     class message_reader final : public io::reader
@@ -440,10 +506,80 @@ struct connection_state
         return failed;
     }
 
+    // cancel fails the connection with std::errc::operation_canceled, as stop has been requested (unless it has failed
+    // already), waking whoever waits for a turn, and aborts it. The transport's waits are canceled by its own stop
+    // token (so a read ends, letting the read side go, for close() if it's waiting for that).
+    void cancel() noexcept
+    {
+        {
+            std::scoped_lock lock{mu};
+            if (failed) return;
+            failed = std::make_error_code(std::errc::operation_canceled);
+        }
+
+        turn.notify();
+        tunnel.abort();
+    }
+
+    // take_closing is whether the server's close() is why a read's wait timed out (interrupt): if so, it takes the read
+    // deadline off, once the callback can't set it any more, so reads wait again. Only the read side's holder calls it.
+    bool take_closing() noexcept
+    {
+        if (!on_closing || !closing.stop_requested()) return false;
+
+        // NOTE: unregistered (waiting for it, if it's being made on another thread) before the deadline's taken off, so
+        //       it can't set it again after.
+        on_closing.reset();
+        tunnel.set_read_deadline(std::nullopt);
+        return true;
+    }
+
+    // wait_failed is what a read's wait failing with err, having read nothing, comes to (holding the read side): the
+    // server's close() sends this side's close (going away) and reads for the peer's; the first half of the idle
+    // timeout passing pings the peer, and the second, with nothing received since, fails the connection; anything else
+    // fails it too. It returns the error the read ends with, or none, for it to go on.
+    coro::task<std::error_code> wait_failed(std::error_code err)
+    {
+        if (err != std::errc::timed_out) co_return fail_transport(err);
+
+        if (take_closing())
+        {
+            bool going_away = false;
+            {
+                std::scoped_lock lock{mu};
+                if (failed) co_return failed;
+
+                // a close under way (close()'s) goes on as it was.
+                if (sess.state() == close_state::open)
+                {
+                    set_failure(sent(close_code::going_away));
+                    going_away = true;
+                }
+            }
+            if (!going_away) co_return std::error_code{};
+
+            // writers waiting see the failure; the close goes as a reply (left to a write in progress, if there is
+            // one), and then the peer's is read for, as close() does.
+            turn.notify();
+            (void)co_await send_replies();
+            co_return co_await read_close(io::clock::now() + close_timeout);
+        }
+
+        if (!idle_wait || std::exchange(idle_pinged, true)) co_return fail_transport(err);
+
+        {
+            std::scoped_lock lock{mu};
+            ping_pending = true;
+        }
+        co_return co_await send_replies();
+    }
+
     // drive finishes a read (holding the read side, which it lets go): it reads toward g until it's reached (no error)
     // or the connection fails (its failure), reading more and sending replies as pump() asks, starting from what it
     // last said; then it returns what finish makes of that, and the target. One coroutine, for a read that has to wait.
+    // NOTE: its reads inline, rather than in helpers, which would be coroutines of their own (a frame each).
     template<typename Finish>
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     auto drive(goal g, target t, pumped step, Finish finish)
         -> coro::task<std::invoke_result_t<Finish, std::error_code, const target&>>
     {
@@ -479,6 +615,7 @@ struct connection_state
                 auto       read = co_await reader.read(into);
                 if (read.count > 0)
                 {
+                    idle_pinged = false;
                     if (auto bad = payload(into.first(read.count)))
                     {
                         step = fail_reading(bad);
@@ -486,17 +623,33 @@ struct connection_state
                     }
                     dest_filled += read.count;
                 }
-                if (read.err) ended = read.err;
-            }
-            else if (const auto before = reader.size(); auto failed_fill = co_await reader.fill())
-            {
-                // what was read with the failure is read first.
-                if (reader.size() == before)
+
+                if (read.err == std::errc::timed_out)
                 {
-                    err = fail_transport(failed_fill);
-                    break;
+                    err = co_await wait_failed(read.err);
+                    if (err) break;
                 }
-                ended = failed_fill;
+                else if (read.err)
+                {
+                    ended = read.err;
+                }
+            }
+            else
+            {
+                const auto before      = reader.size();
+                const auto failed_fill = co_await reader.fill();
+                if (reader.size() != before) idle_pinged = false;
+
+                // what was read with the failure is read first.
+                if (failed_fill && reader.size() == before)
+                {
+                    err = co_await wait_failed(failed_fill);
+                    if (err) break;
+                }
+                else if (failed_fill)
+                {
+                    ended = failed_fill;
+                }
             }
 
             step = pump(g, t);
@@ -668,14 +821,19 @@ struct connection_state
         return false;
     }
 
-    // take_replies frames the replies pending into frames (a pong, then a close): those the session refuses, as this
-    // side's close has gone, are dropped. Must be called holding mu.
+    // take_replies frames the replies pending into frames (a pong, the idle timeout's ping, then a close): those the
+    // session refuses, as this side's close has gone, are dropped. Must be called holding mu.
     void take_replies(control_frames& frames)
     {
         if (std::exchange(pong_pending, false))
         {
             const auto payload = std::span{pong}.first(pong_size);
             if (auto header = sess.frame_for(opcode::pong, true, payload.size())) frames.append(*header, payload);
+        }
+
+        if (std::exchange(ping_pending, false))
+        {
+            if (auto header = sess.frame_for(opcode::ping, true, 0)) frames.append(*header, {});
         }
 
         if (std::exchange(close_pending, false))
@@ -812,7 +970,7 @@ struct connection_state
     coro::task<std::error_code> read_close(io::clock::time_point deadline)
     {
         auto&       reader = tunnel.reader();
-        util::defer no_timeout{[this] noexcept { tunnel.set_read_timeout(std::nullopt); }};
+        util::defer idle{[this] noexcept { tunnel.set_read_timeout(idle_wait); }};
 
         target t;
         while (true)
@@ -838,7 +996,12 @@ struct connection_state
 
                 if (const auto before = reader.size(); auto err = co_await reader.fill())
                 {
-                    if (reader.size() == before) co_return fail_transport(err);
+                    if (reader.size() == before)
+                    {
+                        // the server's close(): this side's close has gone (or is going) already, so it reads on.
+                        if (err == std::errc::timed_out && take_closing()) break;
+                        co_return fail_transport(err);
+                    }
                     ended = err;
                 }
                 break;
@@ -847,10 +1010,11 @@ struct connection_state
         }
     }
 
-    http::detail::tunnel&     tunnel;
-    io::scheduler*            scheduler;
-    std::chrono::milliseconds close_timeout;
-    std::string               subprotocol;
+    http::detail::tunnel&              tunnel;
+    io::scheduler*                     scheduler;
+    std::chrono::milliseconds          close_timeout;
+    std::optional<io::clock::duration> idle_wait; // half the idle timeout, the reads' timeout; none if it's off
+    std::string                        subprotocol;
 
     // the session, and what both sides share: the write side's turns, the replies pending, and the failure.
     std::mutex      mu;
@@ -863,6 +1027,7 @@ struct connection_state
     opcode        message_op    = opcode::text;
     std::uint64_t message_count = 0; // of messages written a frame at a time: the current one's, for its writer
     bool          pong_pending  = false;
+    bool          ping_pending  = false; // the idle timeout's
     bool          close_pending = false;
     std::uint8_t  pong_size     = 0;
     std::uint8_t  close_size    = 0;
@@ -886,7 +1051,8 @@ struct connection_state
     message_type         type       = message_type::text;
     std::span<std::byte> dest{}; // whole: the current frame's place in the message
     std::size_t          dest_filled = 0;
-    std::error_code      ended{}; // what failed the transport's last read, which read some first
+    std::error_code      ended{};             // what failed the transport's last read, which read some first
+    bool                 idle_pinged = false; // half the idle timeout passed, and nothing's been received since
 
     std::array<std::byte, max_control_payload> scratch{};
 
@@ -895,6 +1061,12 @@ struct connection_state
     std::size_t                        reason_size = 0;
 
     message_reader stream{this};
+
+    // the server's close(), and stop: their callbacks (see interrupt and cancel()).
+    // NOTE: last, so they're destroyed first (the destructor unregisters them before then anyway).
+    std::stop_token                              closing;
+    std::optional<std::stop_callback<interrupt>> on_closing;
+    std::optional<std::stop_callback<canceler>>  on_stop;
 };
 
 coro::task<io::result> connection_state::message_reader::read(std::span<std::byte> data)
@@ -1044,8 +1216,11 @@ accept(const http::server_request& req, http::response_writer& rw, const accept_
     auto switched = co_await http::detail::switch_protocols(rw, fields);
     if (!switched.has_value()) co_return std::unexpected(switched.error());
 
-    co_return connection{
-        std::make_unique<connection_state>(**switched, detail::role::server, options.connection, subprotocol)};
+    co_return connection{std::make_unique<connection_state>(**switched,
+                                                            detail::role::server,
+                                                            options.connection,
+                                                            subprotocol,
+                                                            options.stop.stop_possible() ? options.stop : req.stop)};
 }
 
 connection::connection(std::unique_ptr<detail::connection_state> state) noexcept

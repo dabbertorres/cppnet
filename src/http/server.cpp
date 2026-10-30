@@ -482,16 +482,18 @@ struct server::connection_state
         }
     };
 
-    // abort_now is abort()'s callback: it shuts the connection's reading side, whatever it's doing, and stops its
-    // handlers' token.
+    // abort_now is abort()'s callback: it stops its handlers' token, and shuts the connection's reading side, whatever
+    // it's doing.
     struct abort_now
     {
         connection_state* state;
 
         void operator()() const noexcept
         {
-            detail::socket_of(*state->conn).shutdown_read();
+            // NOTE: the token first, so a handler reading (e.g. a WebSocket's) finds why it ended (canceled) before it
+            //       finds the end of the stream.
             state->stop.request_stop();
+            detail::socket_of(*state->conn).shutdown_read();
         }
     };
 
@@ -705,6 +707,11 @@ struct server::connection_state
         void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept override
         {
             detail::socket_of(*state->conn).set_read_timeout(timeout);
+        }
+
+        void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept override
+        {
+            detail::socket_of(*state->conn).set_read_deadline(deadline);
         }
 
         // NOTE: over TLS, the socket's token is the stream's (see tls::stream::set_stop_token()).
