@@ -1,7 +1,7 @@
 // bench_notifier compares coro::notifier with io::scheduler::wait_on() for waking one coroutine from another, as an
 // HTTP/2 connection's streams and writer would: pairs of coroutines take turns, each bumping a count the other waits
 // on, with many pairs at once (as streams on many connections). A notifier has its own lock; every wait_on() and
-// notify shares the scheduler's (see docs/plans/http2.md).
+// notify shares the scheduler's.
 //
 // It reports ns per hand-off (one coroutine waking the other), best of 5, by worker threads and pairs.
 //

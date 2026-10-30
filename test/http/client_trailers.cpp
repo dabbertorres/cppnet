@@ -42,9 +42,9 @@
 #include "url.hpp"
 #include "util/string_util.hpp"
 
-// The client's trailers (docs/plans/http2.md, stage 5, part 5): a response's, which client_response::trailers() has
-// once its body's been read to its end, and a request's, which client_request::make_trailers fills once its body's
-// been read, over HTTP/1.1 and HTTP/2, against cppnet's server (part 4), or a server the test plays.
+// The client's trailers: a response's, which client_response::trailers() has once its body's been read to its end, and
+// a request's, which client_request::make_trailers fills once its body's been read, over HTTP/1.1 and HTTP/2, against
+// cppnet's server, or a server the test plays.
 namespace
 {
 

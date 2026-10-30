@@ -8,9 +8,8 @@
 #include "http/http2.hpp"
 #include "http/priority.hpp"
 
-// HTTP/2's scheduling of streams' DATA by their priority (RFC 9218; docs/plans/http2.md, stage 5's tenth part: the
-// server's responses; and stage 6's seventh: the client's request bodies), without I/O: which of the streams waiting to
-// send DATA sends the next frame. Not for applications.
+// HTTP/2's scheduling of streams' DATA by their priority (RFC 9218: the server's responses, and the client's request
+// bodies), without I/O: which of the streams waiting to send DATA sends the next frame. Not for applications.
 namespace net::http::detail
 {
 
@@ -54,7 +53,7 @@ private:
     scheduler_node* next = nullptr;
 };
 
-// http2_scheduler orders the streams that wait to send DATA (Decided questions 20 and 21 of stage 5, Go's):
+// http2_scheduler orders the streams that wait to send DATA (as Go's server does):
 // - the most urgent level (urgency 0 first) with a stream that's ready (as next()'s caller says: it has a window) goes
 //   first; less urgent ones wait until it has none ready, as RFC 9218 recommends (section 10 leaves starvation of the
 //   less urgent to the server's judgment, and Go lets them starve too);

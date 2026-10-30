@@ -15,8 +15,8 @@
 #include "ipv6_addr.hpp"
 
 // DNS messages (RFC 1035, section 4, and EDNS(0)'s OPT record, RFC 6891): what the native resolver is built from, not
-// for applications (see docs/plans/dns-resolver.md). Only what looking up addresses needs: A, AAAA and CNAME records'
-// data are decoded, and other records are skipped.
+// for applications. Only what looking up addresses needs: A, AAAA and CNAME records' data are decoded, and other
+// records are skipped.
 //
 // Names are text: their labels joined by dots, without a final dot ("" is the root), in the case they were sent in. A
 // label may hold any octet but a dot (which couldn't be told from the dots between labels; host names have none).

@@ -26,8 +26,6 @@
 // HelloRetryRequest; it now sends both (as Go and Chrome do), which saves that round trip: within these runs' noise
 // over loopback (where a round trip costs little, and the client made both shares before too), but a network's round
 // trip per handshake, resumed or not. The CPU time includes the pool's threads spinning as they wait for each other.
-//
-// See docs/plans/tls.md, "Learned in stage 4".
 #include <algorithm>
 #include <array>
 #include <chrono>

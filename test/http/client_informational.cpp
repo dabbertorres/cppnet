@@ -45,8 +45,7 @@
 #include "tcp.hpp"
 #include "url.hpp"
 
-// The client's interim (1xx) responses (client_request::on_informational), over HTTP/1.1 and HTTP/2: the HTTP/2 plan's
-// stage 5, second part.
+// The client's interim (1xx) responses (client_request::on_informational), over HTTP/1.1 and HTTP/2.
 namespace
 {
 

@@ -512,8 +512,9 @@ bool rewind_body(net::http::client_request& request)
 // - without its expectation, at once, if it expected 100 (Continue) and had a 417 before its body was sent: on the same
 //   connection, as a 417 says nothing of it;
 // - on a connection of its own host's, if it was coalesced onto another host's and had a 421 (Misdirected Request), and
-//   has no body, or get_body to read it again (docs/plans/http2.md, Decided question 40); the 421 is discarded (as a
-//   redirect's is).
+//   has no body, or get_body to read it again (that 421 is the pool's doing, so the pool undoes it; one on the
+//   request's own host's connection is returned, as another connection there would likely reach the same server); the
+//   421 is discarded (as a redirect's is).
 net::coro::task<sent>
 send_http2(net::http::detail::connection_pool::lease leased, net::http::client_request& request, bool first)
 {

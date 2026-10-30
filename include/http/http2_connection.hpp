@@ -35,7 +35,7 @@
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
 
-// What HTTP/2's server and client connections share (see docs/plans/http2.md): not for applications.
+// What HTTP/2's server and client connections share: not for applications.
 namespace net::http::detail
 {
 
@@ -174,10 +174,10 @@ public:
     bool            ended = false; // this side has sent END_STREAM
     std::error_code failure;       // reset, timed out, or the connection ended (see fail_stream())
 
-    // What's left to send of a body whose length is known, if its last DATA frame ends the stream (docs/plans/http2.md,
-    // stage 6's first part): set as the head's sent (a response's Content-Length, or a request's), unless trailers are
-    // to follow. The frame that brings it to 0 carries END_STREAM, and the stream's then ended. None: something else
-    // ends it (the head, trailers, or an empty DATA frame).
+    // What's left to send of a body whose length is known, if its last DATA frame ends the stream (rather than an empty
+    // DATA frame after it, 9 bytes more): set as the head's sent (a response's Content-Length, or a request's), unless
+    // trailers are to follow. The frame that brings it to 0 carries END_STREAM, and the stream's then ended. None:
+    // something else ends it (the head, trailers, or an empty DATA frame).
     std::optional<std::size_t> data_left;
 
     // The stop source of the stream's handler's token (server_request::stop): the server's streams have one, the
@@ -262,8 +262,7 @@ public:
 
     // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
     // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
-    // from the client's signals, a client's from its request's Priority field (docs/plans/http2.md, stage 6's eighth
-    // part), then client_response::set_priority() (its ninth).
+    // from the client's signals, a client's from its request's Priority field, then client_response::set_priority().
     http2_scheduler send_order;
 
     // write_state is how far a stream's write has gone, from one step to the next.
@@ -285,12 +284,11 @@ public:
 
     // step_write takes a step of a stream's write of data (taking the lock), as far as it can go without waiting.
     //
-    // A write (a server's response, docs/plans/http2.md, stage 5's tenth part, Decided question 21; or a client's
-    // request body, stage 6's seventh part, Decided question 33) is submitted to the session at once, a frame at a
-    // time, while less than max_ahead of DATA waits for the writer (or is being written), no stream waits in the
-    // scheduler, and the output's under max_output: so a connection whose streams don't contend for it pays nothing
-    // for the scheduler. Otherwise (or for what doesn't fit, or has no window), the stream waits in the scheduler with
-    // the rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
+    // A write (a server's response, or a client's request body) is submitted to the session at once, a frame at a time,
+    // while less than max_ahead of DATA waits for the writer (or is being written), no stream waits in the scheduler,
+    // and the output's under max_output: so a connection whose streams don't contend for it pays nothing for the
+    // scheduler. Otherwise (or for what doesn't fit, or has no window), the stream waits in the scheduler with the
+    // rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
     // stream's end (an empty DATA, or trailers) still follows its data, and only max_ahead of DATA (and what's in the
     // socket's buffers) is past reordering.
     //
@@ -390,15 +388,15 @@ private:
 
     // write_loop is the writer: each round, it takes the session's output (see take_output()) and writes it, until the
     // connection's ending and what's left is written; then it shuts the connection down. With waits_writable (with
-    // TCP_NOTSENT_LOWAT set: docs/plans/http2.md, stage 6's fourth and eighth parts), a round after one that wrote
-    // first waits for the connection to be writable (wait_for_socket()): what's written but not yet sent under the
-    // mark. So fill() frames only when the socket can take more, and meanwhile streams' writes queue (past
-    // max_ahead) for their turns: what's past reordering is the mark (in the kernel) and a round (in the writer's
-    // hands), not the send buffer. Control frames wait with the DATA: TCP would deliver them after what the kernel
-    // holds anyway. A wait that fails ends the connection as a write that fails does (the socket's write deadline,
-    // timeout and stop token apply to it as to a write). wrote_at is when the writer's back from a round's write (and
-    // its wait), so a stream waiting its turn is put off (see waiting_turn()) while the writer's rounds come within
-    // its write timeout of each other: one held up longer by the socket fails anyway, its wait timing out.
+    // TCP_NOTSENT_LOWAT set), a round after one that wrote first waits for the connection to be writable
+    // (wait_for_socket()): what's written but not yet sent under the mark. So fill() frames only when the socket can
+    // take more, and meanwhile streams' writes queue (past max_ahead) for their turns: what's past reordering is the
+    // mark (in the kernel) and a round (in the writer's hands), not the send buffer. Control frames wait with the DATA:
+    // TCP would deliver them after what the kernel holds anyway. A wait that fails ends the connection as a write that
+    // fails does (the socket's write deadline, timeout and stop token apply to it as to a write). wrote_at is when the
+    // writer's back from a round's write (and its wait), so a stream waiting its turn is put off (see waiting_turn())
+    // while the writer's rounds come within its write timeout of each other: one held up longer by the socket fails
+    // anyway, its wait timing out.
     coro::task<> write_loop();
 
     // wait_for_socket waits until the connection is writable: with the writable hook, if it's set.

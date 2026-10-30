@@ -16,7 +16,7 @@
 #include "http/router.hpp"
 #include "io/scheduler.hpp"
 
-// HTTP/2 in http::server (see docs/plans/http2.md): the server's, and response_writer's, not for applications.
+// HTTP/2 in http::server: the server's, and response_writer's, not for applications.
 namespace net::http::detail
 {
 
@@ -37,8 +37,8 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
 extern const http2_stream_ops http2_ops;
 
 // stream_priority is the priority of the HTTP/2 stream a request (its handler's) came on, as the server has it now
-// (see docs/plans/http2.md, Priorities), or nullopt if it didn't come over HTTP/2 (or its body was replaced). For
-// tests.
+// (from the request, the client's PRIORITY_UPDATEs and the response's Priority field), or nullopt if it didn't come
+// over HTTP/2 (or its body was replaced). For tests.
 [[nodiscard]] std::optional<priority> stream_priority(const server_request& req);
 
 // wait_queued_streams waits until at least n streams of the HTTP/2 connection a request came on wait in its scheduler

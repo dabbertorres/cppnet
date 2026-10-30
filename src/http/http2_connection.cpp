@@ -867,8 +867,8 @@ void http2_connection_base::fill()
             // connection's, if the socket takes what it's framed at once, would be back sooner. So the round ends
             // here, and the turn's held, for hold_turn at most, so a writer that's slower (e.g. reading what it sends
             // from elsewhere) doesn't hold the connection up for long. (Without it, a handler writing a frame at a time
-            // got about half the connection when it was more urgent than all the others: learned in stage 5's tenth
-            // part.) A stream whose last DATA this was has nothing more to write.
+            // got about half the connection when it was more urgent than all the others.) A stream whose last DATA
+            // this was has nothing more to write.
             if (!s.ended && hold_turn_of(s)) break;
         }
         else

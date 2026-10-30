@@ -352,8 +352,7 @@ void rebase(std::string_view& s, const char* from, const char* from_end, const c
 }
 
 // indexed_by_default is whether indexing::automatic indexes a field named name, unless it's never indexed or too large:
-// not those that change from one message to the next, nghttp2's list (docs/plans/http2.md, Decided question 13 of
-// stage 5).
+// not those that change from one message to the next, which would push out of the table what repeats (nghttp2's list).
 bool indexed_by_default(std::string_view name) noexcept
 {
     return name != ":path" && name != "age" && name != "content-length" && name != "etag" && name != "if-modified-since"

@@ -1,7 +1,6 @@
-// The client's HTTP/2 request bodies through its connection's scheduler (docs/plans/http2.md, stage 6, parts 7 and 8):
-// a body's write goes at once while nothing contends, and otherwise waits in the scheduler for its turn, by its
-// request's Priority field (read as RFC 9218 says; u=3 incremental without one), so bodies sent at once without one
-// share the connection a frame each.
+// The client's HTTP/2 request bodies through its connection's scheduler: a body's write goes at once while nothing
+// contends, and otherwise waits in the scheduler for its turn, by its request's Priority field (read as RFC 9218 says;
+// u=3 incremental without one), so bodies sent at once without one share the connection a frame each.
 //
 // To make the order the scheduler's alone, the server the test plays (test::h2_client) holds the connection's window
 // shut: a first request's body (the plug) uses up the 65535 bytes a connection starts with, which the server doesn't
@@ -727,9 +726,9 @@ TEST_CASE("an HTTP/2 request reprioritized while its body waits takes its new tu
     sched.run_to_completion(test(&sched, &outcomes));
 }
 
-// TCP_NOTSENT_LOWAT on the client's HTTP/2 connections (docs/plans/http2.md, stage 6's eighth part), as on the
-// server's: set on each HTTP/2 connection's socket (not on HTTP/1.1's), and the writer waiting for the socket to take
-// more before each round, so that the bodies it frames are in the scheduler's order up to the last moment.
+// TCP_NOTSENT_LOWAT on the client's HTTP/2 connections, as on the server's: set on each HTTP/2 connection's socket (not
+// on HTTP/1.1's), and the writer waiting for the socket to take more before each round, so that the bodies it frames
+// are in the scheduler's order up to the last moment.
 
 TEST_CASE("the client sets TCP_NOTSENT_LOWAT on its HTTP/2 connections, not on HTTP/1.1's",
           "[http][http2][client][notsent-lowat]")

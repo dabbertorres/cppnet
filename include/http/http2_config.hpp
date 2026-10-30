@@ -12,8 +12,8 @@
 #include "io/io.hpp"
 
 // HTTP/2's settings and limits: what the server's and client's configurations hold, without HTTP/2's internals (its
-// framing, session and connections, see docs/plans/http2.md), which the public headers (http/server.hpp,
-// http/client.hpp) don't include. Not for applications.
+// framing, session and connections), which the public headers (http/server.hpp, http/client.hpp) don't include. Not for
+// applications.
 namespace net::http::http2
 {
 
@@ -64,9 +64,9 @@ struct session_config
     };
 
     // The most this side's HPACK encoder's dynamic table may hold: it uses the smaller of this and the peer's
-    // SETTINGS_HEADER_TABLE_SIZE (docs/plans/http2.md, Decided question 15 of stage 5). 4096 is the setting's initial
-    // value, and Go's, nghttp2's and h2's cap: a larger table would cost memory per connection, and a longer search
-    // per field, for fields few connections repeat. 0 indexes nothing (the first block then says so).
+    // SETTINGS_HEADER_TABLE_SIZE. 4096 is the setting's initial value, and Go's, nghttp2's and h2's cap: a larger table
+    // would cost memory per connection, and a longer search per field, for fields few connections repeat. 0 indexes
+    // nothing (the first block then says so).
     std::uint32_t encoder_table_size = 4'096;
 
     // The connection's receive window, raised from its initial 65535 with a WINDOW_UPDATE: how much the peer may send

@@ -96,16 +96,16 @@ struct client_options
     bool strict_max_concurrent_streams = false;
 
     // Whether a request to an https origin whose host has no HTTP/2 connection with a stream free may take a stream of
-    // another host's (connection coalescing; docs/plans/http2.md, stage 6), rather than connecting: one whose server
-    // has said, with an ORIGIN frame (RFC 8336), that it's authoritative for the request's origin, and whose
-    // certificate is valid for its host, checked as a new connection's handshake would check it (once per host and
-    // connection). Never over cleartext, nor with tls.insecure_skip_verification (nothing then says whose a server
-    // is); and only by ORIGIN, never by addresses. Off by default: such a request's host isn't resolved, so whoever
-    // holds a certificate valid for its name (mis-issued, or with a stolen key) could take its requests without being
-    // on the way to its server, by listing its origin (RFC 8336, section 4: the client checks neither Certificate
-    // Transparency nor revocation); and a client that sends requests others choose (e.g. webhooks) alongside its own
-    // credentialed ones would let such a server have both. A 421 (Misdirected Request) to a request sent so removes its
-    // origin from the connection's set, and has it sent again on a connection of its own host's (see client::send()).
+    // another host's (connection coalescing), rather than connecting: one whose server has said, with an ORIGIN frame
+    // (RFC 8336), that it's authoritative for the request's origin, and whose certificate is valid for its host,
+    // checked as a new connection's handshake would check it (once per host and connection). Never over cleartext, nor
+    // with tls.insecure_skip_verification (nothing then says whose a server is); and only by ORIGIN, never by
+    // addresses. Off by default: such a request's host isn't resolved, so whoever holds a certificate valid for its
+    // name (mis-issued, or with a stolen key) could take its requests without being on the way to its server, by
+    // listing its origin (RFC 8336, section 4: the client checks neither Certificate Transparency nor revocation); and
+    // a client that sends requests others choose (e.g. webhooks) alongside its own credentialed ones would let such a
+    // server have both. A 421 (Misdirected Request) to a request sent so removes its origin from the connection's set,
+    // and has it sent again on a connection of its own host's (see client::send()).
     bool http2_coalescing = false;
 
     // The TCP_NOTSENT_LOWAT set on each HTTP/2 connection's socket (over TLS, the TCP socket's; not on HTTP/1.x's,

@@ -8,9 +8,9 @@ namespace net::http
 {
 
 // priority is an HTTP response's priority (RFC 9218): what a request's Priority field asks for, and what a response's
-// may change. HTTP/2's server sends responses by it (docs/plans/http2.md, Priorities); a client asks for one with
-// the request's field, e.g. req.headers.set("Priority", to_string({.urgency = 1})), and a handler sets its response's
-// the same way (e.g. {.urgency = 7} for a bulk download), which the client also gets.
+// may change. HTTP/2's server sends responses by it; a client asks for one with the request's field, e.g.
+// req.headers.set("Priority", to_string({.urgency = 1})), and a handler sets its response's the same way (e.g.
+// {.urgency = 7} for a bulk download), which the client also gets.
 struct priority
 {
     std::uint8_t urgency     = 3;     // 0 (most urgent) to 7 (background)

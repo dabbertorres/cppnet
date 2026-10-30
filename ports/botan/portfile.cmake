@@ -46,10 +46,10 @@ vcpkg_list(SET configure_arguments
 vcpkg_list(SET pkgconfig_requires)
 
 # cppnet: only the modules cppnet uses (with their dependencies, which configure.py adds), rather than all of Botan:
-# about half its sources. See docs/plans/tls.md ("Trimming Botan"). cppnet's TLS policy offers only these (whichever
-# Botan it's built against), so a missing one fails its tests (test/tls/stream.cpp's handshakes per group, cipher suite
-# and kind of certificate) rather than a handshake in the field. Botan looks some algorithms up by name when they run
-# (e.g. a signature's padding or hash), which configure.py can't see, so those are named here too.
+# about half its sources. cppnet's TLS policy offers only these (whichever Botan it's built against), so a missing one
+# fails its tests (test/tls/stream.cpp's handshakes per group, cipher suite and kind of certificate) rather than a
+# handshake in the field. Botan looks some algorithms up by name when they run (e.g. a signature's padding or hash),
+# which configure.py can't see, so those are named here too.
 vcpkg_list(SET cppnet_modules
     # TLS 1.2 and 1.3, and 1.3's hybrid post-quantum key exchange (X25519MLKEM768, and Botan's P-256 and P-384 hybrids).
     tls12

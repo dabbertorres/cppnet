@@ -1,6 +1,6 @@
-// TCP_NOTSENT_LOWAT on the server's HTTP/2 connections (docs/plans/http2.md, stage 6's fourth part): set on each
-// HTTP/2 connection's socket (not on HTTP/1.1's), and the writer waiting for the socket to take more before each round,
-// so that what it frames is in the scheduler's order up to the last moment.
+// TCP_NOTSENT_LOWAT on the server's HTTP/2 connections: set on each HTTP/2 connection's socket (not on HTTP/1.1's), and
+// the writer waiting for the socket to take more before each round, so that what it frames is in the scheduler's order
+// up to the last moment.
 //
 // What the kernel holds depends on its tuning, so the writer's waits are tested through the server's hook
 // (server_config::http2_writable), which holds the connection "unwritable" as the test says.

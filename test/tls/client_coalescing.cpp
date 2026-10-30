@@ -1,11 +1,10 @@
-// The HTTP/2 client's connection coalescing (RFC 8336; docs/plans/http2.md, stage 6's twelfth part): with
-// client_options::http2_coalescing, a request whose host has no connection free takes a stream of another host's whose
-// server listed the request's origin in ORIGIN, and whose certificate is valid for its host; and a 421 to a request
-// sent so has it sent again on a connection of its own host's. The servers are on loopback, with a certificate for
-// a.test, b.test, *.w.test and 127.0.0.1; a resolver whose hosts table names a.test, b.test and x.w.test 127.0.0.1 (and
-// nothing else) finds them. Each host has a server of its own, on a port of its own, so which server a request reached
-// says which connection it went on: b.test's own server, or another host's whose ORIGIN listed b.test's origin (its
-// port being b.test's server's).
+// The HTTP/2 client's connection coalescing (RFC 8336): with client_options::http2_coalescing, a request whose host has
+// no connection free takes a stream of another host's whose server listed the request's origin in ORIGIN, and whose
+// certificate is valid for its host; and a 421 to a request sent so has it sent again on a connection of its own
+// host's. The servers are on loopback, with a certificate for a.test, b.test, *.w.test and 127.0.0.1; a resolver whose
+// hosts table names a.test, b.test and x.w.test 127.0.0.1 (and nothing else) finds them. Each host has a server of its
+// own, on a port of its own, so which server a request reached says which connection it went on: b.test's own server,
+// or another host's whose ORIGIN listed b.test's origin (its port being b.test's server's).
 #include <atomic>
 #include <chrono>
 #include <cstddef>

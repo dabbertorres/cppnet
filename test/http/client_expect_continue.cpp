@@ -41,8 +41,8 @@
 #include "url.hpp"
 #include "util/defer.hpp"
 
-// The client's Expect: 100-continue (client_options::expect_continue_timeout): over HTTP/1.1, the HTTP/2 plan's stage
-// 6, fifth part; over HTTP/2, its sixth (at the end).
+// The client's Expect: 100-continue (client_options::expect_continue_timeout): over HTTP/1.1, then over HTTP/2 (at the
+// end).
 namespace
 {
 
@@ -706,7 +706,7 @@ TEST_CASE("an HTTP/1.1 request that doesn't wait for 100 sends its body with its
     CHECK(log.seen().empty() == test.body.empty()); // no interim response; the body read, if there's one
 }
 
-// Over HTTP/2 (the HTTP/2 plan's stage 6, sixth part).
+// Over HTTP/2.
 namespace
 {
 

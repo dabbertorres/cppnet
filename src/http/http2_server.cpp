@@ -87,8 +87,8 @@ namespace
         return formatted;
     }
 
-    // The request's fields that bear on its priority (docs/plans/http2.md, Decided question 19 of stage 5), as bits:
-    // Priority (the client signals priorities), and Via, Forwarded or X-Forwarded-For (the client is an intermediary).
+    // The request's fields that bear on its priority, as bits: Priority (the client signals priorities), and Via,
+    // Forwarded or X-Forwarded-For (the client is an intermediary).
     constexpr std::uint8_t priority_field = 1;
     constexpr std::uint8_t via_proxy      = 2;
 
@@ -245,11 +245,11 @@ namespace
         bool                                                                peer_goaway  = false;
         bool                                                                aborted      = false; // stop_handlers()
 
-        // What the client has shown of priorities (Decided question 19 of stage 5, Go's): whether it's signalled one
-        // (a request's Priority field, or a PRIORITY_UPDATE), so a request without one is RFC 9218's default (u=3,
-        // not incremental) rather than unprioritized; and whether it's an intermediary (a request with Via, Forwarded
-        // or X-Forwarded-For), whose requests' Priority fields are ignored (they're its clients', which shouldn't
-        // order each other's: RFC 9218, section 13.1), though its PRIORITY_UPDATEs aren't. Both stick.
+        // What the client has shown of priorities (as Go's server tracks it): whether it's signalled one (a request's
+        // Priority field, or a PRIORITY_UPDATE), so a request without one is RFC 9218's default (u=3, not incremental)
+        // rather than unprioritized; and whether it's an intermediary (a request with Via, Forwarded or
+        // X-Forwarded-For), whose requests' Priority fields are ignored (they're its clients', which shouldn't order
+        // each other's: RFC 9218, section 13.1), though its PRIORITY_UPDATEs aren't. Both stick.
         bool priority_aware      = false;
         bool behind_intermediary = false;
 
@@ -273,8 +273,8 @@ namespace
                 return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(stream.failure));
 
             // the final response's Priority field is merged into the stream's: its parameters replace the request's,
-            // and those it doesn't have are left as they were (RFC 9218, section 8, as nghttpx and h2o do: Decided
-            // question 23 of stage 5). A field of several lines is joined in a string of its own, as that's rare.
+            // and those it doesn't have are left as they were (RFC 9218, section 8, as nghttpx and h2o do). A field of
+            // several lines is joined in a string of its own, as that's rare.
             if (stream.prioritized && !status_is_information(resp.status_code))
             {
                 if (const auto lines = resp.headers.get_all("priority"sv))
@@ -288,7 +288,8 @@ namespace
 
             // a response to HEAD has no body (nor trailers), whatever its head says. One without a body ends with its
             // head, and one with a Content-Length with its last DATA, unless it has trailers (or declares them) by
-            // now, which end the stream instead (Decided question 26 of stage 6): ones set later are dropped.
+            // now, which end the stream instead (so the response is complete with its last byte, rather than when the
+            // handler returns): ones set later are dropped.
             const bool final    = !status_is_information(resp.status_code);
             const bool trailing = !resp.trailers.empty() || resp.headers.get_all("Trailer"sv).has_value();
             const bool end      = final && (stream.head_request || (body_length == std::size_t{0} && !trailing));
@@ -394,10 +395,9 @@ namespace
         abort_token = abort;
         std::stop_callback on_abort{abort, [this] noexcept { stop_handlers(); }};
 
-        // ORIGIN (RFC 8336; docs/plans/http2.md, stage 6's tenth part), right after the session's opening (its
-        // SETTINGS, and the connection's WINDOW_UPDATE), before anything's received: over TLS only, as clients ignore
-        // it over cleartext. (The origins were checked when the server was made, so it can't fail but after a
-        // connection error, which there can't be yet.)
+        // ORIGIN (RFC 8336), right after the session's opening (its SETTINGS, and the connection's WINDOW_UPDATE),
+        // before anything's received: over TLS only, as clients ignore it over cleartext. (The origins were checked
+        // when the server was made, so it can't fail but after a connection error, which there can't be yet.)
         if (!options.origins.empty() && is_tls(conn))
         {
             std::scoped_lock lock{mu};
@@ -932,10 +932,9 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
                          std::stop_token            stop,
                          std::stop_token            abort)
 {
-    // TCP_NOTSENT_LOWAT (docs/plans/http2.md, stage 6's fourth part), now that it's HTTP/2: the kernel then holds
-    // little more than what's in flight, and the writer waits for it to take more before framing more, so what's past
-    // the scheduler's reordering is the mark and a round. (Not on HTTP/1.x's connections, whose responses aren't
-    // reordered: it would only cost them wakeups.)
+    // TCP_NOTSENT_LOWAT, now that it's HTTP/2: the kernel then holds little more than what's in flight, and the writer
+    // waits for it to take more before framing more, so what's past the scheduler's reordering is the mark and a round.
+    // (Not on HTTP/1.x's connections, whose responses aren't reordered: it would only cost them wakeups.)
     bool marked = false;
     if (options.notsent_lowat > 0)
     {

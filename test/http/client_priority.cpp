@@ -1,6 +1,6 @@
-// Reprioritizing a request in flight (docs/plans/http2.md, stage 6, part 9): client_response::set_priority() sends the
-// server a PRIORITY_UPDATE for the response's stream, over HTTP/2, which cppnet's server takes as the stream's priority
-// (read by its handler with detail::stream_priority()); over HTTP/1.1, and once the response has ended, it can't.
+// Reprioritizing a request in flight: client_response::set_priority() sends the server a PRIORITY_UPDATE for the
+// response's stream, over HTTP/2, which cppnet's server takes as the stream's priority (read by its handler with
+// detail::stream_priority()); over HTTP/1.1, and once the response has ended, it can't.
 #include <expected>
 #include <format>
 #include <memory>

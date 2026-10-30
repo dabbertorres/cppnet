@@ -1,6 +1,6 @@
-// The server's HTTP/2 responses sent by their priorities (docs/plans/http2.md, stage 5, part 10): streams whose writes
-// contend for the connection wait in its scheduler, which sends the most urgent first, non-incremental ones one at a
-// time by stream id, and incremental ones a frame each in turn.
+// The server's HTTP/2 responses sent by their priorities: streams whose writes contend for the connection wait in its
+// scheduler, which sends the most urgent first, non-incremental ones one at a time by stream id, and incremental ones a
+// frame each in turn.
 //
 // To make the order the scheduler's alone, the client holds the connection's window shut: a first response (the plug)
 // uses up the 65535 bytes a connection starts with, which the client never gives back; the responses under test then
@@ -407,7 +407,7 @@ TEST_CASE("HTTP/2 responses of clients that never signal priorities take turns",
                                         server.port(),
                                         [](h2_client& c) -> task<>
                                         {
-                                            // u=3 incremental (Decided question 19 of stage 5): round-robin.
+                                            // u=3 incremental (a client that hasn't signalled priorities): round-robin.
                                             const std::array responses{
                                                 response{.name = "a", .size = 2 * frame},
                                                 response{.name = "b", .size = 2 * frame},
@@ -554,9 +554,8 @@ TEST_CASE("HTTP/2 responses with a Content-Length end with their last DATA frame
                                         server.port(),
                                         [](h2_client& c) -> task<>
                                         {
-                                            // framed by the writer, in turns: each one's last frame ends its stream
-                                            // (docs/plans/http2.md, stage 6's first part), with no empty DATA frame
-                                            // after it; one of a frame and a half too.
+                                            // framed by the writer, in turns: each one's last frame ends its stream,
+                                            // with no empty DATA frame after it; one of a frame and a half too.
                                             const std::array responses{
                                                 response{.name = "a",   .size = 3 * frame, .priority = "u=3, i"},
                                                 response{.name = "b",   .size = 2 * frame, .priority = "u=3, i"},

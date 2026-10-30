@@ -1,5 +1,5 @@
-// The server's trailers (docs/plans/http2.md, stage 5, part 4): a request's, which handlers read once they've read its
-// body, and a response's, which response_writer::trailers() sends after its body, over HTTP/1.1 and HTTP/2.
+// The server's trailers: a request's, which handlers read once they've read its body, and a response's, which
+// response_writer::trailers() sends after its body, over HTTP/1.1 and HTTP/2.
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -479,7 +479,7 @@ TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[h
                                             CHECK(r8.trailers == expected);
 
                                             // set after its head, undeclared: dropped, as its last DATA ended the
-                                            // stream (Decided question 26 of stage 6).
+                                            // stream.
                                             const auto& r9 = c.responses[late];
                                             CHECK(r9.body == "hello");
                                             CHECK(r9.ended_by_data == 5U);

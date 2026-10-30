@@ -21,7 +21,7 @@
 
 // HTTP/2's protocol, without I/O: a session is fed what's read from the connection (receive()), told what the
 // application sends (submit_headers(), submit_data(), ...), and gives what's to be written (take_output()). It's
-// what HTTP/2's server and client are built from (see docs/plans/http2.md), not for applications.
+// what HTTP/2's server and client are built from, not for applications.
 //
 // A session isn't thread-safe: its user serializes calls into it.
 namespace net::http::http2

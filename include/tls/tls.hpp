@@ -25,7 +25,8 @@
 #include "tls/certificate.hpp"
 #include "tls/version.hpp"
 
-// TLS (with Botan, which stays private: see docs/plans/tls.md). Only built if NET_HAS_TLS is defined.
+// TLS (with Botan, which stays private: cppnet's API has its own options, and no Botan types). Only built if
+// NET_HAS_TLS is defined.
 namespace net::tls
 {
 
@@ -132,15 +133,15 @@ namespace detail
     [[nodiscard]] bool verifies(const stream& s) noexcept;
 
     // verify_for verifies the server's certificate chain, as s's handshake received it, for host (a DNS name, or an IP
-    // address without brackets), as a handshake connecting to host would verify it (docs/plans/http2.md, Decided
-    // question 37): the chain against the context's trust store, under its policy, valid now (by the stream's clock),
-    // and the certificate for host. For a connection taking requests for another host than its own (RFC 9113, section
-    // 9.1.1: "any checks that the client would perform when forming a new TLS connection for the host"). It fails with
-    // why, as the handshake would (in verification_category()), or with std::errc::invalid_argument for a stream that
-    // doesn't verify (see verifies()), or an empty host. It may be called from any thread, as the stream's reads and
-    // writes go on: it costs what a handshake's verification does (signatures). With at, the chain's verified as it is
-    // then rather than now: the tests' way to check validity periods (a certificate expired, or not yet valid) without
-    // waiting for one, as a client context has no clock to set.
+    // address without brackets), as a handshake connecting to host would verify it: the chain against the context's
+    // trust store, under its policy, valid now (by the stream's clock), and the certificate for host. For a connection
+    // taking requests for another host than its own (RFC 9113, section 9.1.1: "any checks that the client would perform
+    // when forming a new TLS connection for the host"). It fails with why, as the handshake would (in
+    // verification_category()), or with std::errc::invalid_argument for a stream that doesn't verify (see verifies()),
+    // or an empty host. It may be called from any thread, as the stream's reads and writes go on: it costs what a
+    // handshake's verification does (signatures). With at, the chain's verified as it is then rather than now: the
+    // tests' way to check validity periods (a certificate expired, or not yet valid) without waiting for one, as a
+    // client context has no clock to set.
     [[nodiscard]] std::error_code verify_for(const stream&                                        s,
                                              std::string_view                                     host,
                                              std::optional<std::chrono::system_clock::time_point> at = std::nullopt);

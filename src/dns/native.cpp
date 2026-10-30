@@ -313,7 +313,7 @@ net::coro::task<std::error_code> exchange_udp(net::udp_socket&           sock,
         }
         else if (msg->header.rcode == dns::rcode::format_error && q.edns)
         {
-            // a server that doesn't know EDNS(0): asked again without it (Decided question 7).
+            // a server that doesn't know EDNS(0): asked again without it.
             q.edns = false;
             if (auto err = co_await send_udp(sock, q, ex); err) co_return err;
         }

@@ -1,9 +1,9 @@
-// The HTTP/2 client's Origin Sets (RFC 8336; docs/plans/http2.md, stage 6's eleventh part): each connection over TLS
-// keeps one, from the server's ORIGIN frames, which the server the tests play (test::h2_client, in its server role over
-// a TLS stream with a certificate for a.test, b.test, *.w.test and 127.0.0.1) sends; and the server's certificate
-// checked for each origin's host before the connection's taken to be authoritative for it. What a set has is seen
-// through authoritative_for(), which the pool asks, for origins whose hosts the certificate has (an origin it doesn't
-// have is never authoritative, in the set or not).
+// The HTTP/2 client's Origin Sets (RFC 8336): each connection over TLS keeps one, from the server's ORIGIN frames,
+// which the server the tests play (test::h2_client, in its server role over a TLS stream with a certificate for a.test,
+// b.test, *.w.test and 127.0.0.1) sends; and the server's certificate checked for each origin's host before the
+// connection's taken to be authoritative for it. What a set has is seen through authoritative_for(), which the pool
+// asks, for origins whose hosts the certificate has (an origin it doesn't have is never authoritative, in the set or
+// not).
 #include <atomic>
 #include <chrono>
 #include <cstddef>

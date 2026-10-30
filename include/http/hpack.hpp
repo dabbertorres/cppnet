@@ -10,8 +10,7 @@
 #include <system_error>
 #include <vector>
 
-// HPACK (RFC 7541): HTTP/2's header compression. It's what HTTP/2 is built from, not for applications (see
-// docs/plans/http2.md).
+// HPACK (RFC 7541): HTTP/2's header compression. It's what HTTP/2 is built from, not for applications.
 namespace net::http::hpack
 {
 
@@ -49,13 +48,12 @@ inline constexpr std::size_t default_max_list_size = std::size_t{64} * 1'024;
 // dynamic_table holds the fields an encoder or decoder has indexed, newest first, evicting the oldest to stay within
 // its maximum size (RFC 7541, section 4).
 //
-// Its storage is made once rather than per field (docs/plans/http2.md, Decided question 16 of stage 5): the fields'
-// text is appended to one buffer, oldest first, and moved to the buffer's front when it reaches the end (the buffer
-// being up to twice the maximum size, what's moved is at most the maximum size, for as much appended); and each field
-// is a fixed-size entry in a ring (its text's offset, its name's and value's lengths and hashes), of which there are
-// at most a 32nd of the maximum size. Both grow, by doubling, only as the fields need them, up to those bounds: a
-// table nothing's added to allocates nothing, and one whose maximum size is large (a peer's SETTINGS) holds only what
-// it's given.
+// Its storage is made once rather than per field: the fields' text is appended to one buffer, oldest first, and moved
+// to the buffer's front when it reaches the end (the buffer being up to twice the maximum size, what's moved is at most
+// the maximum size, for as much appended); and each field is a fixed-size entry in a ring (its text's offset, its
+// name's and value's lengths and hashes), of which there are at most a 32nd of the maximum size. Both grow, by
+// doubling, only as the fields need them, up to those bounds: a table nothing's added to allocates nothing, and one
+// whose maximum size is large (a peer's SETTINGS) holds only what it's given.
 class dynamic_table
 {
 public:
@@ -206,15 +204,14 @@ private:
     std::string value_buffer;
 };
 
-// indexing is what an encoder adds to its dynamic table (docs/plans/http2.md, "HPACK's dynamic table, for the
-// encoder", and Decided questions 13 and 14 of stage 5).
+// indexing is what an encoder adds to its dynamic table.
 enum class indexing : std::uint8_t
 {
     // none adds nothing: a field the static table has is encoded as its index (unless it's never indexed, whose
     // representation must say so), and others as literals without indexing (or never indexed), with the static table's
     // index for the name, if it has the name. Only what field::never_indexed says is never indexed. What HTTP/2's
-    // sessions did until they indexed (docs/plans/http2.md, part 7 of stage 5): kept for the tests and fuzz_hpack,
-    // which check representations and decoding without the table.
+    // sessions did until they indexed: kept for the tests and fuzz_hpack, which check representations and decoding
+    // without the table.
     none,
 
     // automatic adds what's likely to repeat, nghttp2's way (what HTTP/2's sessions do): everything but

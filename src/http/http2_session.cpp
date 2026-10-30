@@ -894,7 +894,7 @@ std::error_code session::on_priority_update(const frame_header&        h,
     if (local_goaway.has_value() && id > *local_goaway && it == streams.end()) return {};
 
     // a closed stream's is ignored (e.g. a client reprioritizing a response that ended meanwhile), but counted, so
-    // a flood of them can't go on for free (Decided question 22 of stage 5).
+    // a flood of them can't go on for free.
     if (it == streams.end() && !idle) return glitch(now);
 
     // a value that doesn't parse is ignored too, rather than the stream's error (Go's) or the connection's (RFC 9218

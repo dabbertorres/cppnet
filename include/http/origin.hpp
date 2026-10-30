@@ -5,8 +5,8 @@
 #include <string_view>
 #include <system_error>
 
-// https origins, as HTTP/2's ORIGIN frame lists them (RFC 8336; docs/plans/http2.md, stage 6's tenth and eleventh
-// parts): the server's http2_origins, and the client's Origin Sets. Not for applications.
+// https origins, as HTTP/2's ORIGIN frame lists them (RFC 8336): the server's http2_origins, and the client's Origin
+// Sets. Not for applications.
 namespace net::http::detail
 {
 

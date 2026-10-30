@@ -346,11 +346,12 @@ namespace detail
     // response_writer doesn't depend on HTTP/2's server (as it doesn't on HTTP/1.1's encoder).
     struct http2_stream_ops
     {
-        // send_head sends a response's head, returning the writer for its body. body_length is the body's length,
-        // if the head gives it (its Content-Length, or 0 for a status without content): the stream ends with the head
-        // if it's 0, and with the body's last DATA frame otherwise, unless trailers (or a Trailer field) are set by
-        // then, which end it instead (docs/plans/http2.md, Decided question 26). None for a body of unknown length,
-        // which finish() ends, and for an interim response.
+        // send_head sends a response's head, returning the writer for its body. body_length is the body's length, if
+        // the head gives it (its Content-Length, or 0 for a status without content): the stream ends with the head if
+        // it's 0, and with the body's last DATA frame otherwise, unless trailers (or a Trailer field) are set by then,
+        // which end it instead (so the response is complete with its last byte, rather than when the handler returns;
+        // trailers set later are dropped). None for a body of unknown length, which finish() ends, and for an interim
+        // response.
         coro::task<response_encoder_result> (*send_head)(http2_stream&              stream,
                                                          const server_response&     resp,
                                                          std::optional<std::size_t> body_length);

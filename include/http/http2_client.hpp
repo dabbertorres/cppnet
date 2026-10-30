@@ -29,7 +29,7 @@
 #include "http/response.hpp"
 #include "io/scheduler.hpp"
 
-// HTTP/2 in http::client (see docs/plans/http2.md): the client's pool's, not for applications.
+// HTTP/2 in http::client: the client's pool's, not for applications.
 namespace net::http::detail
 {
 
@@ -78,9 +78,8 @@ public:
     std::string               path;
 };
 
-// origin_set is an HTTP/2 connection's Origin Set (RFC 8336, section 2.3; docs/plans/http2.md, stage 6's eleventh
-// part), once the server's first ORIGIN frame has initialized it, and what's known of its certificate for each of its
-// hosts. It's guarded by the connection's lock.
+// origin_set is an HTTP/2 connection's Origin Set (RFC 8336, section 2.3), once the server's first ORIGIN frame has
+// initialized it, and what's known of its certificate for each of its hosts. It's guarded by the connection's lock.
 struct origin_set
 {
     // How many origins it keeps: those past it are ignored (RFC 8336 sets no limit).
@@ -120,8 +119,8 @@ class http2_client_connection final
 public:
     // closed is called (with the connection) once it has ended; freed whenever a stream is done (so another may be
     // sent); origins_known (with the connection) once its Origin Set's been initialized (see below), by the
-    // server's first ORIGIN frame, not holding the connection's lock: for the pool's coalescing (docs/plans/http2.md,
-    // stage 6's twelfth part), which finds the connections with origin sets through it.
+    // server's first ORIGIN frame, not holding the connection's lock: for the pool's coalescing, which finds the
+    // connections with origin sets through it.
     struct callbacks
     {
         std::function<void(http2_client_connection&)> closed;
@@ -188,11 +187,11 @@ public:
     // std::errc::operation_canceled, and the connection goes on. Stopped before the stream's opened, nothing's sent.
     //
     // A request expecting 100 (Continue) (see detail::expects_continue(), with the options' expect_continue_timeout)
-    // sends its head without ending the stream, then waits before sending its body (docs/plans/http2.md, stage 6's
-    // sixth part): a 100, or none within the timeout, sends it; another interim response is passed on, and the wait
-    // goes on. A final response first, above 299, has the body never sent (the stream's reset once the response is
-    // done with, unless the server's reset it), and a 417 says so in state (expectation_failed); a 2xx goes on waiting
-    // for the timeout, then sends it (as Go's client does, for streams that are full-duplex).
+    // sends its head without ending the stream, then waits before sending its body: a 100, or none within the timeout,
+    // sends it; another interim response is passed on, and the wait goes on. A final response first, above 299, has the
+    // body never sent (the stream's reset once the response is done with, unless the server's reset it), and a 417 says
+    // so in state (expectation_failed); a 2xx goes on waiting for the timeout, then sends it (as Go's client does, for
+    // streams that are full-duplex).
     coro::task<std::expected<client_response, std::error_code>> send(client_request& request,
                                                                      send_state*     state = nullptr);
 
@@ -208,29 +207,31 @@ public:
     void done(http2::stream_id id);
 
     // reprioritize changes a request's priority once its response's head has come (client_response::set_priority(),
-    // through its body; docs/plans/http2.md, stage 6's ninth part): it sends the server a PRIORITY_UPDATE for the
-    // stream (only if it changes what the stream last said: see http2::session::submit_priority_update()), and moves
-    // the request's body in the connection's scheduler, should it still be waiting there. It returns false, doing
-    // nothing, once the response has ended (or failed), or the stream's done with. It takes the lock.
+    // through its body): it sends the server a PRIORITY_UPDATE for the stream (only if it changes what the stream last
+    // said: see http2::session::submit_priority_update()), and moves the request's body in the connection's scheduler,
+    // should it still be waiting there. It returns false, doing nothing, once the response has ended (or failed), or
+    // the stream's done with. It takes the lock.
     bool reprioritize(http2::stream_id id, priority p);
 
-    // The connection's Origin Set (RFC 8336; docs/plans/http2.md, stage 6's eleventh part): what the server's ORIGIN
-    // frames say it's authoritative for, for the pool's coalescing (its twelfth part). Over TLS only, with the server's
-    // certificate verified (not with insecure_skip_verification, as nothing then says the server is anyone's), it's
-    // initialized by the server's first ORIGIN frame, with the connection's own origin and the frame's entries; later
-    // frames add to it. Each entry is parsed as an https origin, normalized (see parse_origin()), and ignored if it
-    // doesn't parse (RFC 8336: "If parsing fails, the field MUST be ignored"; an origin of another scheme too, as http
-    // requests never go over TLS). It keeps at most origin_set::max_origins, ignoring the rest.
+    // The connection's Origin Set (RFC 8336): what the server's ORIGIN frames say it's authoritative for, for the
+    // pool's coalescing. Over TLS only, with the server's certificate verified (not with insecure_skip_verification, as
+    // nothing then says the server is anyone's), it's initialized by the server's first ORIGIN frame, with the
+    // connection's own origin and the frame's entries; later frames add to it. Each entry is parsed as an https origin,
+    // normalized (see parse_origin()), and ignored if it doesn't parse (RFC 8336: "If parsing fails, the field MUST be
+    // ignored"; an origin of another scheme too, as http requests never go over TLS). It keeps at most
+    // origin_set::max_origins, ignoring the rest.
 
     // authoritative_for is whether the connection may take requests for origin (an https origin, as parse_origin()
     // reads it) by its Origin Set: it's initialized and has the origin, and the server's certificate is valid for its
-    // host, as a new connection's handshake would check it (tls::detail::verify_for(), Decided question 37): checked
-    // the first time a host's asked for, without the lock (it costs what a handshake's verification does), then
-    // remembered. False without an initialized set: coalescing is by ORIGIN only (Decided question 35).
+    // host, as a new connection's handshake would check it (tls::detail::verify_for(): RFC 9113 asks for every check a
+    // new connection's would make, which also catches a certificate that's expired since the handshake): checked the
+    // first time a host's asked for, without the lock (it costs what a handshake's verification does), then remembered.
+    // False without an initialized set: coalescing is by ORIGIN only, never by addresses, so the server says what it
+    // serves rather than the pool guessing from where hosts resolve.
     [[nodiscard]] bool authoritative_for(std::string_view origin);
 
     // remove_origin removes origin from the Origin Set (RFC 8336's MUST, when a request for it gets 421 (Misdirected
-    // Request): see Decided question 40), if it's there. The connection's own may be removed too.
+    // Request)), if it's there. The connection's own may be removed too.
     void remove_origin(std::string_view origin);
 
     // cancel fails a request's stream with std::errc::operation_canceled (unless it's failed already), and resets it

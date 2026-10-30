@@ -1,6 +1,5 @@
-// ORIGIN on the server (docs/plans/http2.md, stage 6's tenth part): server_config::http2_origins, read as https
-// origins (and normalized) when the server's made, and never sent over cleartext. What's sent over TLS, and the
-// certificate's check, are test/tls/server.cpp's.
+// ORIGIN on the server: server_config::http2_origins, read as https origins (and normalized) when the server's made,
+// and never sent over cleartext. What's sent over TLS, and the certificate's check, are test/tls/server.cpp's.
 #include <algorithm>
 #include <chrono>
 #include <expected>

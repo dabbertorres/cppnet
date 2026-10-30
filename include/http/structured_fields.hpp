@@ -13,9 +13,9 @@
 
 // Structured Fields (RFC 9651): the syntax newer HTTP fields' values are written in (e.g. Priority's, RFC 9218): Lists,
 // Dictionaries and Items, of Integers, Decimals, Strings, Tokens, Byte Sequences, Booleans, Dates and Display Strings,
-// with parameters. Only parsing, for the fields the library reads itself (see docs/plans/http2.md, Priorities): it's
-// what those are built on (e.g. parse_priority(), in http/priority.hpp), not for applications. sf, as the RFC's
-// grammar names its rules (sf-list, sf-dictionary, sf-item).
+// with parameters. Only parsing, for the fields the library reads itself: it's what those are built on (e.g.
+// parse_priority(), in http/priority.hpp), not for applications. sf, as the RFC's grammar names its rules (sf-list,
+// sf-dictionary, sf-item).
 //
 // Parsing reports what it finds as views of the field's value, so nothing's allocated: a member's item as its type and
 // its text or number, and its parameters, and an inner list's items, as views of their text, which the parser has

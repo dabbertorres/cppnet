@@ -1,7 +1,7 @@
-// How the server's HTTP/2 responses end (docs/plans/http2.md, stage 6, part 1): one with a Content-Length ends with
-// its last DATA frame (END_STREAM on it), rather than with an empty DATA frame after it, whether its writes go at once
-// or wait for the connection's writer; one without a body with its head; and one without a Content-Length as before,
-// with an empty DATA frame (or its trailers) once the handler has returned.
+// How the server's HTTP/2 responses end: one with a Content-Length ends with its last DATA frame (END_STREAM on it),
+// rather than with an empty DATA frame after it, whether its writes go at once or wait for the connection's writer; one
+// without a body with its head; and one without a Content-Length with an empty DATA frame (or its trailers) once the
+// handler has returned.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>

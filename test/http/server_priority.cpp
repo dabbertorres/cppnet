@@ -1,6 +1,7 @@
-// The server's HTTP/2 streams' priorities (docs/plans/http2.md, stage 5, part 9): from the request's Priority field (or
-// the connection's default, Decided question 19), then PRIORITY_UPDATE frames, then the response's Priority field,
-// recorded but not yet acted on, so the tests read them with detail::stream_priority().
+// The server's HTTP/2 streams' priorities: from the request's Priority field (or the connection's default: round-robin
+// until the client signals priorities, and the field ignored behind an intermediary), then PRIORITY_UPDATE frames, then
+// the response's Priority field, which the tests read with detail::stream_priority() (how they order the responses is
+// test/http/server_scheduling.cpp's).
 #include <array>
 #include <atomic>
 #include <chrono>

@@ -163,13 +163,12 @@ namespace
         return length;
     }
 
-    // body_priority is a request body's priority in the connection's scheduler (docs/plans/http2.md, stage 6's eighth
-    // part): its request's Priority field (RFC 9218's signal of the response's priority, which a caller marking a
-    // request, e.g. u=7 for a background one, means for its upload too), read as the server reads it, over RFC 9218's
-    // default (u=3, not incremental: what the field leaves out, or all of it if it doesn't parse); without the field,
-    // u=3 incremental, as the server takes a client that never signals, so bodies sent at once without it share the
-    // connection a frame each. A field of several lines is joined (as the server does) in a string of its own, as
-    // that's rare.
+    // body_priority is a request body's priority in the connection's scheduler, which is its request's Priority field
+    // (RFC 9218's signal of the response's priority, which a caller marking a request, e.g. u=7 for a background one,
+    // means for its upload too), read as the server reads it, over RFC 9218's default (u=3, not incremental: what the
+    // field leaves out, or all of it if it doesn't parse); without the field, u=3 incremental, as the server takes a
+    // client that never signals, so bodies sent at once without it share the connection a frame each. A field of
+    // several lines is joined (as the server does) in a string of its own, as that's rare.
     priority body_priority(const headers& fields)
     {
         using namespace std::string_view_literals;
@@ -245,10 +244,9 @@ http2_client_connection::http2_client_connection(io::scheduler*              sch
                                                  callbacks                   on,
                                                  std::string                 origin)
     : owned_connection{.owned = std::move(conn), .log = spdlog::default_logger()}
-    // TCP_NOTSENT_LOWAT (docs/plans/http2.md, stage 6's eighth part), as the server sets it, now that it's HTTP/2: the
-    // kernel then holds little more than what's in flight, and the writer waits for it to take more before framing
-    // more, so what's past the scheduler's reordering of request bodies is the mark and a round. (The writable hook is
-    // only used while the mark's set.)
+    // TCP_NOTSENT_LOWAT, as the server sets it, now that it's HTTP/2: the kernel then holds little more than what's in
+    // flight, and the writer waits for it to take more before framing more, so what's past the scheduler's reordering
+    // of request bodies is the mark and a round. (The writable hook is only used while the mark's set.)
     , http2_connection_base{scheduler,
                             *owned,
                             http2::role::client,
@@ -550,9 +548,9 @@ http2_client_connection::await_continue(http2_client_stream& stream, const clien
                 continue;
             }
 
-            // a final response first, above 299 (Decided question 31, Go's rule): the body's not sent, the server
-            // having refused the request (e.g. 413 Content Too Large), or the expectation (417, which the request may
-            // be sent again for, without it: Decided question 32).
+            // a final response first, above 299 (Go's rule): the body's not sent, the server having refused the request
+            // (e.g. 413 Content Too Large), or the expectation (417, which the request may be sent again for, without
+            // it).
             if (s.head_received && static_cast<std::uint16_t>(s.status_code) > 299)
             {
                 stop_awaiting(s);

@@ -13,13 +13,12 @@
 //   request and its response come to each way (frames, HPACK's blocks and all), counted by a relay between another
 //   client and the server, in a run of their own: for what HPACK's dynamic table saves. And several streams at once,
 //   each a larger response (written in pieces, as a file's served), so they contend for the connection: for what the
-//   server's scheduling of their DATA costs (see docs/plans/http2.md, Priorities). And the other way: several request
-//   bodies at once from cppnet's client, which contend for the connection in the client's scheduler
-//   (docs/plans/http2.md, stage 6's seventh part).
+//   server's scheduling of their DATA by priority costs. And the other way: several request bodies at once from
+//   cppnet's client, which contend for the connection in the client's scheduler.
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
-// costs (see docs/plans/middleware.md), with the metrics' own work; and with the metrics on the route instead (use()),
-// with each router: for what middleware on routes costs. And through http::timeout on the route, pipelined and over a
-// socket, with a deadline that never comes: for what its timer costs.
+// costs, with the metrics' own work; and with the metrics on the route instead (use()), with each router: for what
+// middleware on routes costs. And through http::timeout on the route, pipelined and over a socket, with a deadline that
+// never comes: for what its timer costs.
 #include "http/request.hpp"
 
 #include <algorithm>

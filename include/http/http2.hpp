@@ -11,7 +11,7 @@
 
 #include "http/http2_config.hpp"
 
-// HTTP/2's framing (RFC 9113): what HTTP/2's session is built from, not for applications (see docs/plans/http2.md).
+// HTTP/2's framing (RFC 9113): what HTTP/2's session is built from, not for applications.
 namespace net::http::http2
 {
 
