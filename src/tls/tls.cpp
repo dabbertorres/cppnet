@@ -1306,13 +1306,151 @@ struct connection
         }
     }
 
-    // wait_writable waits until the socket's writable (see socket::wait_writable()), as a flush: once no flush is in
-    // progress, taking the flush on while it waits, so it never waits alongside one of the socket's writes (whichever
-    // came second would fail with std::errc::device_or_resource_busy), nor does a read's reply (which leaves what it
-    // emitted to it, as to any flush in progress). What's queued by the time it's writable is written before it
-    // returns (the flush's, so its failure is the stream's).
+    // write_turn is a write's place in the stream's order of writes (and close_notify's, in shutdown()), taken when
+    // it's called, so that writes that go a batch at a time (see write_batched()) go in the order they were called,
+    // each whole, rather than in the order their tasks run. It ends once (end(), or when it's destroyed: e.g. with a
+    // write's task destroyed before it was awaited), letting the next take its turn.
+    class write_turn
+    {
+    public:
+        write_turn(connection* c, std::uint64_t ticket) noexcept
+            : c{c}
+            , ticket{ticket}
+        {}
+
+        write_turn(write_turn&& other) noexcept
+            : c{std::exchange(other.c, nullptr)}
+            , ticket{other.ticket}
+        {}
+
+        write_turn(const write_turn&)            = delete;
+        write_turn& operator=(const write_turn&) = delete;
+        write_turn& operator=(write_turn&&)      = delete;
+        ~write_turn() { end(); }
+
+        // wait waits for its turn (as a flush does, on flushed: ending a turn notifies it).
+        coro::task<> wait() const
+        {
+            while (true)
+            {
+                std::uint64_t seen = 0;
+                {
+                    std::scoped_lock lock{c->mu};
+                    if (c->turn_now == ticket) co_return;
+                    seen = c->flushed.value();
+                }
+                (void)co_await c->flushed.wait(seen);
+            }
+        }
+
+        // NOLINTNEXTLINE(bugprone-exception-escape): locking a std::mutex doesn't throw, but for a broken one.
+        void end() noexcept
+        {
+            if (c == nullptr) return;
+            std::exchange(c, nullptr)->end_turn(ticket);
+        }
+
+    private:
+        connection*   c;
+        std::uint64_t ticket;
+    };
+
+    // take_turn takes the next turn among writes (holding mu).
+    write_turn take_turn() noexcept { return write_turn{this, turns_given++}; }
+
+    // writes_waiting is whether any write (or close_notify) has a turn that hasn't ended (holding mu).
+    [[nodiscard]] bool writes_waiting() const noexcept { return turn_now != turns_given; }
+
+    // end_turn ends ticket's turn: the next one's, and those after it ended already, if it was the stream's; noted, to
+    // be skipped when it comes, if not.
+    void end_turn(std::uint64_t ticket) noexcept
+    {
+        {
+            std::scoped_lock lock{mu};
+            if (ticket == turn_now)
+            {
+                ++turn_now;
+                while (turns_skipped.erase(turn_now) > 0) ++turn_now;
+            }
+            else
+            {
+                turns_skipped.insert(ticket);
+            }
+        }
+        flushed.notify();
+    }
+
+    // write_batched writes data, once it's its turn, a batch at a time: each encrypted, then flushed before the next,
+    // so a large write holds a batch's ciphertext at most, and starts going at once; it holds the turn until it's done,
+    // so no other write's data comes between its batches. A small write called while others have turns comes here too,
+    // to wait for its own. It returns as stream::write() does.
+    coro::task<io::result> write_batched(std::span<const std::byte> data, write_turn turn)
+    {
+        co_await turn.wait();
+
+        std::size_t sent = 0;
+        do
+        {
+            std::uint64_t   target = 0;
+            std::error_code err;
+            {
+                std::scoped_lock lock{mu};
+                const auto       batch = data.subspan(sent, std::min(write_batch, data.size() - sent));
+                err                    = send_locked(batch);
+                sent += batch.size();
+                target = emitted;
+            }
+            if (err) co_return io::result{.err = err};
+
+            // the last batch's flush needn't hold the turn: the next write's data follows it in the flush queue.
+            if (sent == data.size()) turn.end();
+            if (err = co_await flush(target, true); err) co_return io::result{.err = err};
+        }
+        while (sent < data.size());
+        co_return io::result{.count = data.size()};
+    }
+
+    // send_locked has the channel encrypt data (holding mu), returning why it couldn't: the stream's failure, a
+    // write's, or its end.
+    // NOLINTNEXTLINE(readability-make-member-function-const): what it emits changes the stream.
+    std::error_code send_locked(std::span<const std::byte> data)
+    {
+        if (failure) return failure;
+        if (write_failure) return write_failure;
+        if (channel->is_closed_for_writing()) return make_error_code(io::errc::end_of_stream);
+
+        try
+        {
+            channel->send(std::span{reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
+        }
+        catch (const std::exception&)
+        {
+            return make_error_code(errc::protocol_error);
+        }
+        return {};
+    }
+
+    // wait_writable waits until the socket's writable (see socket::wait_writable()), as a flush: once the writes that
+    // go a batch at a time called before it are done, and no flush is in progress, taking the flush on while it waits,
+    // so it never waits alongside one of the socket's writes (whichever came second would fail with
+    // std::errc::device_or_resource_busy), nor does a read's reply (which leaves what it emitted to it, as to any flush
+    // in progress). What's queued by the time it's writable is written before it returns (the flush's, so its failure
+    // is the stream's).
     coro::task<io::result> wait_writable()
     {
+        // after the writes called before it whose batches are under way (see write_batched()): until they're done, the
+        // stream can't take more of its own.
+        std::optional<write_turn> turn;
+        {
+            std::scoped_lock lock{mu};
+            if (writes_waiting()) turn.emplace(take_turn());
+        }
+        if (turn.has_value())
+        {
+            co_await turn->wait();
+            turn->end();
+        }
+
         while (true)
         {
             std::uint64_t seen = 0;
@@ -1504,6 +1642,13 @@ struct connection
     bool                      flushing      = false;
     std::size_t               flush_waiters = 0;
     std::error_code           write_failure; // a write that failed, which may have sent part of a record
+
+    // How much of a write is encrypted at once (see write_batched()); and the turns of writes that go so (see
+    // write_turn): how many have been given, whose it is, and those that ended before it was theirs.
+    static constexpr std::size_t write_batch = std::size_t{64} * 1'024;
+    std::uint64_t                turns_given = 0;
+    std::uint64_t                turn_now    = 0;
+    std::set<std::uint64_t>      turns_skipped;
 
     // notified when a flush has written some, or stopped.
     coro::notifier flushed;
@@ -1835,25 +1980,25 @@ coro::task<io::result> stream::read(std::span<std::byte> data)
 
 coro::task<io::result> stream::write(std::span<const std::byte> data)
 {
-    std::uint64_t target = 0;
+    std::optional<std::uint64_t>                  target;
+    std::optional<detail::connection::write_turn> turn;
     {
         std::scoped_lock lock{conn->mu};
-        if (conn->failure) return coro::ready_task<io::result>(io::result{.err = conn->failure});
-        if (conn->write_failure) return coro::ready_task<io::result>(io::result{.err = conn->write_failure});
-        if (conn->channel->is_closed_for_writing())
-            return coro::ready_task<io::result>(io::result{.err = make_error_code(io::errc::end_of_stream)});
 
-        try
+        // usually, a write is a batch at most, and no other has a turn: it's encrypted at once.
+        if (data.size() <= detail::connection::write_batch && !conn->writes_waiting())
         {
-            conn->channel->send(std::span{reinterpret_cast<const std::uint8_t*>(data.data()), data.size()});
+            if (auto err = conn->send_locked(data)) return coro::ready_task<io::result>(io::result{.err = err});
+            target = conn->emitted;
         }
-        catch (const std::exception&)
+        else
         {
-            return coro::ready_task<io::result>(io::result{.err = make_error_code(errc::protocol_error)});
+            turn.emplace(conn->take_turn());
         }
-
-        target = conn->emitted;
     }
+
+    // a larger one goes a batch at a time, in its turn (see write_batched()), as one called while others have turns.
+    if (turn.has_value()) return conn->write_batched(data, std::move(*turn));
 
     // NOTE: a coroutine of its own (rather than this one), so the lock above is released before it suspends.
     const auto written = data.size();
@@ -1861,13 +2006,22 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
     {
         if (auto err = co_await conn->flush(target, true); err) co_return io::result{.err = err};
         co_return io::result{.count = written};
-    }(conn.get(), target, written);
+    }(conn.get(), *target, written);
 }
 
 coro::task<io::result> stream::wait_writable() { return conn->wait_writable(); }
 
 coro::task<std::error_code> stream::shutdown()
 {
+    // close_notify follows the writes called before it, in its turn, if they have turns: rather than come between a
+    // write's batches.
+    std::optional<detail::connection::write_turn> turn;
+    {
+        std::scoped_lock lock{conn->mu};
+        if (conn->writes_waiting()) turn.emplace(conn->take_turn());
+    }
+    if (turn.has_value()) co_await turn->wait();
+
     std::uint64_t target = 0;
     {
         std::scoped_lock lock{conn->mu};
@@ -1883,6 +2037,7 @@ coro::task<std::error_code> stream::shutdown()
 
         target = conn->emitted;
     }
+    if (turn.has_value()) turn->end();
 
     // what's queued, and close_notify, go first.
     auto err = co_await conn->flush(target, true);

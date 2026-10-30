@@ -2165,3 +2165,222 @@ TEST_CASE("public servers agree on the hybrid post-quantum key exchange", "[tls]
 
     CHECK(sched.run_to_completion(client(&sched, host)) == "ok");
 }
+
+namespace
+{
+
+// pattern is size bytes that differ from one to the next (starting from first), so a piece out of place shows.
+std::string pattern(std::size_t size, char first = 'a')
+{
+    std::string out(size, '\0');
+    for (std::size_t i = 0; i < size; ++i) out[i] = static_cast<char>(first + static_cast<char>(i % 23));
+    return out;
+}
+
+// reading_server reads everything until close_notify into read, then finishes done (with how the read ended).
+auto reading_server(std::string* read, server_outcome* done)
+{
+    return [read, done](tls::stream& s) -> task<>
+    {
+        auto [got, err] = co_await read_to_end(s);
+        *read           = std::move(got);
+        done->finish(err);
+        co_await s.close();
+    };
+}
+
+// await_write awaits a write on a task of its own, finishing done with its result's error (and keeping it in res).
+task<> await_write(task<net::io::result> write, net::io::result* res, server_outcome* done)
+{
+    *res = co_await std::move(write);
+    done->finish(res->err);
+}
+
+}
+
+TEST_CASE("large writes go a batch at a time, and arrive whole", "[tls][write][batches]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    std::string    server_read;
+    server_outcome server_done{.sched = &sched, .err = {}};
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   reading_server(&server_read, &server_done))));
+
+    // a batch exactly (64 KiB), just over one, several and some, and many: each awaited before the next.
+    const std::vector<std::string> writes{pattern(std::size_t{64} * 1'024, 'a'),
+                                          pattern((std::size_t{64} * 1'024) + 1, 'b'),
+                                          pattern((std::size_t{3} * 64 * 1'024) + 12'345, 'c'),
+                                          pattern((std::size_t{5} * 1'024 * 1'024) + 7, 'd'),
+                                          pattern(3, 'e')};
+
+    const auto client = [](net::io::scheduler*             sched,
+                           std::uint16_t                   port,
+                           const std::vector<std::string>* writes,
+                           server_outcome*                 server_done) -> task<std::vector<net::io::result>>
+    {
+        std::vector<net::io::result> results;
+        auto                         s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value()) co_return results;
+
+        for (const auto& w : *writes) results.push_back(co_await s->write(std::as_bytes(std::span{w})));
+        (void)co_await s->shutdown();
+        co_await server_done->wait();
+        co_await s->close();
+        co_return results;
+    };
+
+    const auto results = sched.run_to_completion(client(&sched, listener.local_port(), &writes, &server_done));
+
+    REQUIRE(results.size() == writes.size());
+    std::string all;
+    for (std::size_t i = 0; i < writes.size(); ++i)
+    {
+        CAPTURE(i, results[i].err.message());
+        CHECK_FALSE(results[i].err);
+        CHECK(results[i].count == writes[i].size());
+        all += writes[i];
+    }
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+    CHECK(server_read.size() == all.size());
+    const bool same = server_read == all;
+    CHECK(same);
+}
+
+TEST_CASE("writes go in the order they were called, each whole, whatever order their tasks run in",
+          "[tls][write][batches]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    std::string    server_read;
+    server_outcome server_done{.sched = &sched, .err = {}};
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   reading_server(&server_read, &server_done))));
+
+    // two large writes, and a small one called after them (which waits its turn too), their tasks run last first.
+    const auto first  = pattern((std::size_t{2} * 1'024 * 1'024) + 3, 'a');
+    const auto second = pattern((std::size_t{1} * 1'024 * 1'024) + 5, 'n');
+    const auto third  = pattern(10, 'A');
+
+    struct outcome
+    {
+        net::io::result first;
+        net::io::result second;
+        net::io::result third;
+        std::error_code shutdown;
+    };
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           const std::string*  first,
+                           const std::string*  second,
+                           const std::string*  third,
+                           server_outcome*     server_done) -> task<outcome>
+    {
+        outcome out;
+        auto    s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value())
+        {
+            out.shutdown = s.error();
+            co_return out;
+        }
+
+        auto write_first  = s->write(std::as_bytes(std::span{*first}));
+        auto write_second = s->write(std::as_bytes(std::span{*second}));
+        auto write_third  = s->write(std::as_bytes(std::span{*third}));
+
+        server_outcome first_done{.sched = sched, .err = {}};
+        server_outcome second_done{.sched = sched, .err = {}};
+        server_outcome third_done{.sched = sched, .err = {}};
+        // NOTE: spawned outside REQUIRE, whose expression is in a loop (which moving from the tasks in can't be).
+        const bool spawned_third  = sched->spawn(await_write(std::move(write_third), &out.third, &third_done));
+        const bool spawned_second = sched->spawn(await_write(std::move(write_second), &out.second, &second_done));
+        const bool spawned_first  = sched->spawn(await_write(std::move(write_first), &out.first, &first_done));
+        REQUIRE(spawned_first);
+        REQUIRE(spawned_second);
+        REQUIRE(spawned_third);
+
+        // close_notify goes after all three.
+        out.shutdown = co_await s->shutdown();
+        co_await first_done.wait();
+        co_await second_done.wait();
+        co_await third_done.wait();
+        co_await server_done->wait();
+        co_await s->close();
+        co_return out;
+    };
+
+    const auto out =
+        sched.run_to_completion(client(&sched, listener.local_port(), &first, &second, &third, &server_done));
+
+    CAPTURE(out.first.err.message(), out.second.err.message(), out.third.err.message(), out.shutdown.message());
+    CHECK(out.first.count == first.size());
+    CHECK(out.second.count == second.size());
+    CHECK(out.third.count == third.size());
+    CHECK_FALSE(out.shutdown);
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+    CHECK(server_read.size() == first.size() + second.size() + third.size());
+    const bool in_order = server_read == first + second + third;
+    CHECK(in_order);
+}
+
+TEST_CASE("a write whose task is destroyed before it's awaited leaves its turn to the next", "[tls][write][batches]")
+{
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    std::string    server_read;
+    server_outcome server_done{.sched = &sched, .err = {}};
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   reading_server(&server_read, &server_done))));
+
+    const auto first   = pattern((std::size_t{1} * 1'024 * 1'024) + 1, 'a');
+    const auto dropped = pattern((std::size_t{1} * 1'024 * 1'024) + 2, 'n');
+    const auto last    = pattern(5, 'A');
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           const std::string*  first,
+                           const std::string*  dropped,
+                           const std::string*  last,
+                           server_outcome*     server_done) -> task<std::pair<net::io::result, net::io::result>>
+    {
+        auto s = co_await connect_to(sched, port, trusting_client(), "localhost");
+        if (!s.has_value()) co_return std::pair{net::io::result{.err = s.error()}, net::io::result{}};
+
+        // the first's turn is first, the dropped one's second (ended before it comes: skipped), the last's third.
+        auto write_first = s->write(std::as_bytes(std::span{*first}));
+        {
+            auto never_awaited = s->write(std::as_bytes(std::span{*dropped}));
+        }
+        net::io::result first_res;
+        server_outcome  first_done{.sched = sched, .err = {}};
+        const bool      spawned = sched->spawn(await_write(std::move(write_first), &first_res, &first_done));
+        REQUIRE(spawned);
+
+        const auto last_res = co_await s->write(std::as_bytes(std::span{*last}));
+        co_await first_done.wait();
+        (void)co_await s->shutdown();
+        co_await server_done->wait();
+        co_await s->close();
+        co_return std::pair{first_res, last_res};
+    };
+
+    const auto [first_res, last_res] =
+        sched.run_to_completion(client(&sched, listener.local_port(), &first, &dropped, &last, &server_done));
+
+    CAPTURE(first_res.err.message(), last_res.err.message());
+    CHECK(first_res.count == first.size());
+    CHECK(last_res.count == last.size());
+    CHECK(server_read.size() == first.size() + last.size());
+    const bool in_order = server_read == first + last;
+    CHECK(in_order);
+}

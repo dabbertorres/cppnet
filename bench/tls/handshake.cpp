@@ -26,18 +26,27 @@
 // HelloRetryRequest; it now sends both (as Go and Chrome do), which saves that round trip: within these runs' noise
 // over loopback (where a round trip costs little, and the client made both shares before too), but a network's round
 // trip per handshake, resumed or not. The CPU time includes the pool's threads spinning as they wait for each other.
+//
+// Then large writes (alone with "writes" as its argument): over one connection, the server writes 256 MiB in writes of
+// 16 KiB to 16 MiB, which the client reads; per write, the time, the allocations (both sides'), and the most the heap
+// held meanwhile through operator new (over what it held before: Botan's own secure allocations aren't counted). A
+// write over 64 KiB is encrypted and sent a batch at a time, so the peak stays about 360 KiB whatever its size (a
+// 16 MiB write's was 48 MiB when it was encrypted whole); about 420 MiB/s, the encryption's pace, for every size.
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <optional>
 #include <print>
 #include <random>
@@ -48,6 +57,12 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#ifdef __APPLE__
+#    include <malloc/malloc.h>
+#else
+#    include <malloc.h>
+#endif
 
 #include <botan/asn1_obj.h>
 #include <botan/ec_group.h>
@@ -69,6 +84,51 @@
 #include "tcp.hpp"
 #include "tls/tls.hpp"
 #include "tls/version.hpp"
+
+// NOLINTBEGIN(misc-new-delete-overloads,cppcoreguidelines-no-malloc,cppcoreguidelines-avoid-non-const-global-variables,readability-inconsistent-declaration-parameter-name):
+// counting allocations, and the bytes they hold, by replacing these.
+namespace
+{
+
+// the heap allocations so far, on any thread; the bytes held now, and the most held since peak was last reset.
+std::atomic<std::size_t> allocations = 0;
+std::atomic<std::size_t> held        = 0;
+std::atomic<std::size_t> peak        = 0;
+
+// NOLINTNEXTLINE(misc-const-correctness): glibc's malloc_usable_size() takes a void*.
+std::size_t size_of(void* p)
+{
+#ifdef __APPLE__
+    return malloc_size(p);
+#else
+    return malloc_usable_size(p);
+#endif
+}
+
+}
+
+void* operator new(std::size_t size)
+{
+    allocations.fetch_add(1, std::memory_order::relaxed);
+    void* p = std::malloc(size);
+    if (p == nullptr) throw std::bad_alloc{};
+
+    const auto now  = held.fetch_add(size_of(p), std::memory_order::relaxed) + size_of(p);
+    auto       most = peak.load(std::memory_order::relaxed);
+    while (now > most && !peak.compare_exchange_weak(most, now, std::memory_order::relaxed))
+    {}
+    return p;
+}
+
+void operator delete(void* p) noexcept
+{
+    if (p == nullptr) return;
+    held.fetch_sub(size_of(p), std::memory_order::relaxed);
+    std::free(p);
+}
+
+void operator delete(void* p, std::size_t /*size*/) noexcept { operator delete(p); }
+// NOLINTEND(misc-new-delete-overloads,cppcoreguidelines-no-malloc,cppcoreguidelines-avoid-non-const-global-variables,readability-inconsistent-declaration-parameter-name)
 
 namespace
 {
@@ -330,10 +390,128 @@ cost measure(net::tls::server_options options, const net::tls::client_options& c
     return out;
 }
 
+// writes is what a run of large writes cost: time and allocations per write, and the most the heap held meanwhile
+// (over what it held before; through operator new: Botan's own secure allocations aren't counted).
+struct writes
+{
+    double      us_per_write     = -1;
+    double      mib_per_second   = 0;
+    double      allocs_per_write = 0;
+    std::size_t peak_bytes       = 0;
+};
+
+// total is how much each run of writes sends, whatever their size.
+constexpr std::size_t total_written = std::size_t{256} << 20;
+
+// write_all_of has the server's stream write count writes of size bytes each, once the client raises go (to 2).
+task<> write_all_of(net::io::scheduler*         sched,
+                    net::listener*              listener,
+                    net::tls::server_context    ctx,
+                    std::size_t                 size,
+                    std::size_t                 count,
+                    std::atomic<std::uint64_t>* go)
+{
+    auto accepted = co_await listener->accept();
+    if (!accepted.has_value()) co_return;
+    nodelay(*accepted);
+
+    auto s = co_await net::tls::stream::accept(std::move(*accepted), ctx, net::io::clock::now() + 5s);
+    if (!s.has_value()) co_return;
+
+    // (made before the client measures: go is 1 once it is, and the client raises it to 2.)
+    const std::vector<std::byte> data(size, std::byte{'x'});
+    go->store(1);
+    sched->notify_all(*go);
+    while (go->load() < 2) (void)co_await sched->wait_on(*go, 1);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if ((co_await s->write(data)).err)
+        {
+            std::println(stderr, "a write failed");
+            break;
+        }
+    }
+    co_await s->close();
 }
 
-int main()
+// read_writes connects, raises go to 2 once the server's ready (1), and reads what the server writes, measuring it.
+task<writes> read_writes(net::io::scheduler*         sched,
+                         std::uint16_t               port,
+                         net::tls::client_context    ctx,
+                         std::size_t                 size,
+                         std::size_t                 count,
+                         std::atomic<std::uint64_t>* go)
 {
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+    if (!conn.has_value()) co_return writes{};
+    nodelay(*conn);
+
+    auto s = co_await net::tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
+    if (!s.has_value()) co_return writes{};
+
+    std::vector<std::byte> buffer(std::size_t{64} * 1'024);
+    while (go->load() < 1) (void)co_await sched->wait_on(*go, 0);
+    const auto start_held = held.load();
+    peak.store(start_held);
+    const auto at    = allocations.load();
+    const auto start = std::chrono::steady_clock::now();
+
+    go->store(2);
+    sched->notify_all(*go);
+
+    std::size_t got = 0;
+    while (got < size * count)
+    {
+        const auto res = co_await s->read(buffer);
+        got += res.count;
+        if (res.err) break;
+    }
+
+    const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    if (got != size * count) co_return writes{};
+    co_return writes{
+        .us_per_write     = elapsed / static_cast<double>(count),
+        .mib_per_second   = static_cast<double>(got) / elapsed * 1e6 / (1'024.0 * 1'024.0),
+        .allocs_per_write = static_cast<double>(allocations.load() - at) / static_cast<double>(count),
+        .peak_bytes       = peak.load() - start_held,
+    };
+}
+
+// measure_writes is a run of writes of size bytes (best of 3, by time; the largest peak of the 3).
+writes measure_writes(const net::tls::server_options& server, const net::tls::client_options& client, std::size_t size)
+{
+    auto sctx = net::tls::server_context::make(server);
+    auto cctx = net::tls::client_context::make(client);
+    if (!sctx.has_value() || !cctx.has_value()) return {};
+
+    writes out;
+    for (int round = 0; round < 3; ++round)
+    {
+        net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+        auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
+        if (!listener.has_value()) return {};
+
+        const auto                 count = total_written / size;
+        std::atomic<std::uint64_t> go    = 0;
+        if (!sched.spawn(write_all_of(&sched, &*listener, *sctx, size, count, &go))) return {};
+
+        const auto w = sched.run_to_completion(read_writes(&sched, listener->local_port(), *cctx, size, count, &go));
+        if (w.us_per_write < 0) return {};
+        const auto most = std::max(out.peak_bytes, w.peak_bytes);
+        if (out.us_per_write < 0 || w.us_per_write < out.us_per_write) out = w;
+        out.peak_bytes = most;
+    }
+    return out;
+}
+
+}
+
+int main(int argc, char** argv)
+{
+    // (only the large writes, with "writes".)
+    const auto args         = std::span{argv, static_cast<std::size_t>(argc)};
+    const bool writes_alone = args.size() > 1 && std::string_view{args[1]} == "writes";
+
     const auto dir =
         std::filesystem::temp_directory_path() / ("cppnet-bench-tls-" + std::to_string(std::random_device{}()));
     std::filesystem::create_directories(dir);
@@ -376,16 +554,41 @@ int main()
     // NOTE: each "time / CPU time", in us.
     const auto show = [](cost c) { return std::format("{:.0f} / {:.0f}", c.wall, c.cpu); };
 
-    std::println("{:<24} {:>18} {:>18} {:>18}", "server key", "full, no tickets", "full", "resumed");
-    for (const auto& s : setups)
+    if (!writes_alone)
     {
-        const auto without = measure(s.server, s.client, mode::full_without_tickets);
-        const auto full    = measure(s.server, s.client, mode::full);
-        const auto resumed = measure(s.server, s.client, mode::resumed);
-        std::println("{:<24} {:>18} {:>18} {:>18}", s.name, show(without), show(full), show(resumed));
+        std::println("{:<24} {:>18} {:>18} {:>18}", "server key", "full, no tickets", "full", "resumed");
+        for (const auto& s : setups)
+        {
+            const auto without = measure(s.server, s.client, mode::full_without_tickets);
+            const auto full    = measure(s.server, s.client, mode::full);
+            const auto resumed = measure(s.server, s.client, mode::resumed);
+            std::println("{:<24} {:>18} {:>18} {:>18}", s.name, show(without), show(full), show(resumed));
+        }
+
+        std::println("{:<24} {:>18}", "TCP alone", show(measure_tcp()));
     }
 
-    std::println("{:<24} {:>18}", "TCP alone", show(measure_tcp()));
+    // large writes: the server writes 256 MiB in writes of each size, the client reads it (ECDSA, TLS 1.3).
+    std::println("\n{:<14} {:>14} {:>12} {:>18} {:>14}",
+                 "write size",
+                 "us per write",
+                 "MiB/s",
+                 "allocs per write",
+                 "peak KiB");
+    for (const std::size_t size : {std::size_t{16} << 10,
+                                   std::size_t{64} << 10,
+                                   std::size_t{256} << 10,
+                                   std::size_t{1} << 20,
+                                   std::size_t{16} << 20})
+    {
+        const auto w = measure_writes(setups[0].server, setups[0].client, size);
+        std::println("{:<14} {:>14.1f} {:>12.0f} {:>18.2f} {:>14}",
+                     std::format("{} KiB", size >> 10),
+                     w.us_per_write,
+                     w.mib_per_second,
+                     w.allocs_per_write,
+                     w.peak_bytes >> 10);
+    }
 
     std::filesystem::remove_all(dir);
 }

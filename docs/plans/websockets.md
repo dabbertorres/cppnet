@@ -1251,6 +1251,42 @@ The fixes:
   too (one at a time 116 to 98 us, in flight 45 to 38). A read larger than the buffer that meets the end now returns
   what it read with `end_of_stream` (as a socket's does), where reading in pieces had returned it without, the end
   left to the next read; `test/io/buffered_reader.cpp`'s first test changed for it.
+- Passing a large write through whole meant `tls::stream::write()` got it whole too, and encrypted all of it at once
+  under the stream's lock: a 16 MiB write held about 48 MiB of ciphertext and Botan's buffers, and sent nothing until
+  it was all encrypted (a review found it). So `tls::stream` now encrypts and flushes a write larger than 64 KiB a batch
+  at a time (`write_batched()`): what a write promises is kept (it returns once all of it has gone, a failure part-way
+  is sticky, the socket's limits apply to each batch's flush, a read's replies still go at once, between batches), and
+  writes still go whole, in the order they were called: a write that goes in batches takes a turn (`write_turn`, a
+  ticket taken when it's called), and a write called while any has a turn takes one and waits for it, as do
+  `shutdown()`'s close_notify and `wait_writable()`; a turn ends once, also when its write's task is destroyed before
+  it's awaited (skipped when it comes). A small write with no turns waiting goes as before, without a coroutine more.
+  `bench_tls writes` (new: the server writes 256 MiB in writes of each size, over loopback, ECDSA, TLS 1.3; three
+  runs of each build, interleaved; peak is what the heap held through `operator new` over what it held before, so
+  Botan's own secure allocations aren't in it):
+
+  | Write size | Before: us per write | After       | Before: allocations | After  | Before: peak | After   |
+  |------------|----------------------|-------------|---------------------|--------|--------------|---------|
+  | 16 KiB     | 37.1 to 40.1         | 38.3 to 38.5| 10.8                | 10.8   | 166 KiB      | 166 KiB |
+  | 64 KiB     | 144 to 158           | 145 to 154  | 28.3                | 28.3   | 357 KiB      | 357 KiB |
+  | 256 KiB    | 584 to 648           | 580 to 619  | 98.3                | 114    | 935 KiB      | 360 KiB |
+  | 1 MiB      | 2441 to 2553         | 2364 to 2475| 378                 | 454    | 3.2 MiB      | 357 KiB |
+  | 16 MiB     | 47174 to 52007       | 37640 to 39397 | 5978             | 7250   | 48 MiB       | 360 KiB |
+
+  The batch size was measured: 16, 64 and 256 KiB took the same time (about 420 MiB/s, the encryption's pace on this
+  laptop), with 1.8, 1.2 and 1.04 times the unbatched allocations for large writes, and peaks of about 140 KiB, 350 KiB
+  and 900 KiB over a 16 MiB write: 64 KiB is a few TLS records a batch, and a fifth more allocations than one batch.
+  Tests: `test/tls/stream.cpp`'s `[tls][write][batches]` (writes of a batch, just over one, several and odd sizes,
+  and 5 MiB, arriving whole; two large writes and a small one, called in order and their tasks run last first, arriving
+  in call order, each whole, close_notify after; a write whose task is destroyed unawaited, its turn skipped), and the
+  existing slow-peer, stop-token and `wait_writable()` tests, whose 12 MiB writes now go in batches (timing out under
+  the write timeout and the deadline, failing the writes after it, and the wait waiting for the write's batches).
+  Breaks: a turn's wait not waiting (3 tests fail), the skipped turn not noted, nor stepped past, nor ended by a
+  destroyed task (each hangs, which the run's time limit shows), close_notify not taking a turn (2 fail), a small write
+  not waiting for turns (2 fail), and `wait_writable()` not taking a turn (its test fails in 4 runs of 6: without the
+  turn, the wait comes between the write's batches or during one's flush, by timing). Not caught: no batches at all
+  (the data arrives the same; only memory and time show it, which `bench_tls writes` does). Stress: the
+  `[tls][write]`, `[tls][wait-writable]`, `[tls][stop]` and slow-peer tests with wss:// over TLS, 400 runs eight at a
+  time (13 test cases a run): 400 passed.
 
 What a peer can make the other side hold: a tunnel that isn't read holds up to 256 KiB of what was sent to it (64 KiB
 before), in a vector that may be twice that while it's held. The server's connection window still bounds all its
