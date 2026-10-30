@@ -1,5 +1,6 @@
 #include "http/response.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -8,7 +9,6 @@
 #include <format>
 #include <optional>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -82,7 +82,7 @@ status parse_status(std::string_view str) noexcept
 response_writer::response_writer(io::writer*                writer,
                                  server_response*           base,
                                  response_encoder           encode,
-                                 const std::stop_token*     close_after,
+                                 const std::atomic_bool*    close_after,
                                  const detail::switch_hook* switching)
     : resp{
           base
@@ -176,8 +176,8 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
     // the server's closing, or the client waits for a 100 Continue it won't get before it sends the body (which then
     // may never come): the connection closes after this response, if it's the final one, which says so (replacing
     // e.g. keep-alive). An interim response says nothing of it: the 100 is still owed after one.
-    const bool closing =
-        (h1.close_after != nullptr && h1.close_after->stop_requested()) || continuation != continue_state::none;
+    const bool closing = (h1.close_after != nullptr && h1.close_after->load(std::memory_order::relaxed))
+                      || continuation != continue_state::none;
     if (!interim && closing && !resp->headers.has_token("Connection"sv, "close"sv))
         resp->headers.set("Connection"sv, "close"sv);
 

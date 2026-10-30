@@ -343,11 +343,13 @@ void server::close()
 
 void server::abort()
 {
-    close();
-
     // the handlers' tokens, and HTTP/1.x requests in progress, which close() lets finish (see serve_requests()).
+    // NOTE: before close(), so what both reach sees the abort first: e.g. a WebSocket's read, which close() would
+    //       otherwise wake (on another thread) to send a close saying going away, before abort()'s cancellation came.
     // NOTE: holding no lock: the callbacks run here, and handlers' are anyone's.
     aborting.request_stop();
+
+    close();
 }
 
 coro::task<> server::join()
@@ -477,6 +479,7 @@ struct server::connection_state
 
         void operator()() const noexcept
         {
+            state->closes.store(true, std::memory_order::relaxed);
             if (state->current.exchange(phase::closing, std::memory_order::acq_rel) == phase::idle)
                 detail::socket_of(*state->conn).shutdown_read();
         }
@@ -490,8 +493,12 @@ struct server::connection_state
 
         void operator()() const noexcept
         {
-            // NOTE: the token first, so a handler reading (e.g. a WebSocket's) finds why it ended (canceled) before it
-            //       finds the end of the stream.
+            // NOTE: the response says the connection closes (whether or not close()'s callback has come yet), before
+            //       the token's stopped, so a handler stopped by it (responding, e.g. 503) sees that (relaxed: the stop
+            //       token's request and look at it order them).
+            // NOTE: the token before the reading side, so a handler reading (e.g. a WebSocket's) finds why it ended
+            //       (canceled) before it finds the end of the stream.
+            state->closes.store(true, std::memory_order::relaxed);
             state->stop.request_stop();
             detail::socket_of(*state->conn).shutdown_read();
         }
@@ -500,7 +507,7 @@ struct server::connection_state
     // serve_http1 readies the connection to serve HTTP/1.x requests (once it isn't HTTP/2): its handlers' stop source,
     // which abort() stops (as does the connection ending, or the client leaving: see the watch, below), abort()'s
     // callback, and the watcher.
-    // NOTE: not before, as close() (which abort() calls first) ends a connection waiting for HTTP/2's preface anyway,
+    // NOTE: not before, as close() (which abort() calls too) ends a connection waiting for HTTP/2's preface anyway,
     //       and an HTTP/2 connection needs no source of its own.
     void serve_http1(const std::stop_token& aborting)
     {
@@ -794,8 +801,9 @@ struct server::connection_state
     }
 
     // end_request is whether to wait for the next request, once one is done: not if the client, or the handler, asked
-    // for the connection to close after the response (or the server's close() did: see response_writer's
-    // close_after); nor if close() was called after the response's head was sent, which closes it all the same.
+    // for the connection to close after the response (or the server's close() or abort() did: see response_writer's
+    // close_after); nor if close() was called after the response's head was sent, which closes it all the same (as
+    // abort() does, by shutting the reading side).
     bool end_request() noexcept
     {
         if (has_close(resp.headers)) return false;
@@ -824,9 +832,11 @@ struct server::connection_state
     // the socket's read timeout (body_read_timeout), which a watch's read goes without.
     std::optional<io::clock::duration> read_timeout;
 
-    // the server's close(), which responses check, to say the connection closes after them.
+    // the server's close(); and whether it or abort() has come, which responses check, to say the connection closes
+    // after them (see response_writer's close_after).
     std::stop_token    closing;
     std::atomic<phase> current = phase::idle;
+    std::atomic_bool   closes  = false;
 
     // the source of the handlers' tokens (server_request::stop): one for the connection's requests, as a request can
     // only be canceled by the connection ending. None until serve_http1().
@@ -1047,7 +1057,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
         io::discard_writer no_body;
         start_response(state, no_body);
 
-        response_writer rw{&state.writer, &resp, http11::response_encode, &state.closing, &state.switching};
+        response_writer rw{&state.writer, &resp, http11::response_encode, &state.closes, &state.switching};
 
         // the client may wait for 100 Continue before it sends the body: it's sent when the handler first reads it.
         if (expected == detail::expectation::continue_100 && body_to_come(req))

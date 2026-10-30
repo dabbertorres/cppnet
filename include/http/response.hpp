@@ -1,12 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -364,13 +364,13 @@ namespace detail
 struct response_writer
 {
 public:
-    // An HTTP/1.x response, whose head encoder writes to writer. Once close_after (if given) is stopped, a final
-    // response not yet sent says the connection closes after it (Connection: close): the server's close() does that.
+    // An HTTP/1.x response, whose head encoder writes to writer. Once close_after (if given) is set, a final response
+    // not yet sent says the connection closes after it (Connection: close): the server's close() and abort() set it.
     // switching (if given) is the connection's, for detail::switch_protocols().
     response_writer(io::writer*                writer,
                     server_response*           base,
                     response_encoder           encoder,
-                    const std::stop_token*     close_after = nullptr,
+                    const std::atomic_bool*    close_after = nullptr,
                     const detail::switch_hook* switching   = nullptr);
 
     // An HTTP/2 response, on stream.
@@ -500,7 +500,7 @@ private:
     {
         io::writer*                writer;
         response_encoder           encode;
-        const std::stop_token*     close_after;
+        const std::atomic_bool*    close_after;
         const detail::switch_hook* switching;
         http11::chunked_writer     chunked{nullptr};
         bool                       chunked_open = false;
