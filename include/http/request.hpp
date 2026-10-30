@@ -177,6 +177,12 @@ struct server_request
     // The host the request is for: from the target, if it has one, otherwise the Host header.
     std::string host{};
 
+    // The protocol an HTTP/2 extended CONNECT (RFC 8441) asks to tunnel over its stream, as its :protocol said:
+    // "websocket", the one the server takes (another is answered 501 Not Implemented, without a handler). Such a
+    // request is presented as GET (method), with its :authority as Host if it has none, so one route serves a WebSocket
+    // over either version (see websocket::accept()). Empty for every other request.
+    std::string protocol{};
+
     // The TLS version the request's connection agreed on, if it came over TLS (HTTPS), or tls::version::none if it
     // didn't (always, in builds without TLS): e.g. tls_version != tls::version::none for building absolute URLs, or
     // Secure cookies.
@@ -190,8 +196,10 @@ struct server_request
     std::shared_ptr<const std::vector<tls::certificate>> peer_certificates{};
 
     // stop is stopped once the request is no longer wanted: over HTTP/2, when the client resets its stream, the stream
-    // times out, or its connection ends; over HTTP/1.1, when its connection ends; and for either, when the server is
-    // aborted (abort(), its destructor, or the scheduler's request_stop(); not close(), which lets requests finish).
+    // times out, or its connection ends (but not once the stream's a tunnel, e.g. a WebSocket's, whose reads and writes
+    // find its end, as a switched HTTP/1.1 connection's do); over HTTP/1.1, when its connection ends; and for either,
+    // when the server is aborted (abort(), its destructor, or the scheduler's request_stop(); not close(), which lets
+    // requests finish).
     // Canceling is cooperative: nothing is ended for the handler, which learns of it by checking
     // stop.stop_requested() (e.g. between the steps of a long computation), by registering a std::stop_callback (which
     // must be quick, and not block: it runs on whichever thread stopped it, e.g. the connection's reader), or by
@@ -262,6 +270,7 @@ struct server_request
         headers.clear();
         trailers.clear();
         host.clear();
+        protocol.clear();
         route = {};
         path_values.clear();
         path_value_storage.clear();

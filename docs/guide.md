@@ -612,7 +612,8 @@ scheduler.spawn(server.serve());
 
   An HTTP/1.0 client gets none (it doesn't know them: `send()` then returns a writer that drops what's written).
   `status::SWITCHING_PROTOCOLS` can't be sent (`std::system_error`, `std::errc::not_supported`): a 101 goes only with a
-  connection that really switches, which accepting a WebSocket does (see WebSockets). A request with `Expect:
+  connection that really switches, which accepting a WebSocket does (see WebSockets); nor can a 2xx answer an HTTP/2
+  WebSocket's extended CONNECT (`req.protocol` set), for the same reason. A request with `Expect:
   100-continue`, whose client may wait before it sends the body, gets a 100 (Continue) from the server when the handler
   first reads the body, unless the handler has sent its own 100 or the final response by then (as Go's server: another
   interim response, e.g. a 103, doesn't stop it); a handler that answers without reading it (e.g. a 413, for a body too
@@ -919,7 +920,20 @@ router.GET("/echo",
   `websocket/error.hpp`); the connection then serves the next request as usual. Otherwise it sends 101 (Switching
   Protocols), with what the handler put in `resp.headers()` (e.g. a `Set-Cookie`), and the connection is the
   WebSocket's. `accept_options::subprotocols` are the server's, most preferred first: the first the client offers is
-  chosen (`conn->subprotocol()`). Only HTTP/1.1 so far (a request over HTTP/2 gets 400).
+  chosen (`conn->subprotocol()`).
+- **Over HTTP/2:** a browser whose connection to the server is HTTP/2 opens a WebSocket on a stream of it (RFC 8441's
+  extended CONNECT), as the server advertises (`server_config::http2_websockets`, on by default; off, browsers open
+  an HTTP/1.1 connection for it instead). The server presents the request as a GET with `req.protocol` set to
+  `"websocket"` (empty for every other request), so the same route serves both versions, and `accept()` answers it with
+  200 rather than 101: the WebSocket is then the request's stream, beside the connection's other requests. It's the same
+  `connection`, with the same timeouts, stopping and closing (the server's `close()`'s 1001 too); it counts against
+  `http2_max_concurrent_streams` until its handler returns, which ends the stream, and the stream's own read timeout
+  (`body_read_timeout`) doesn't apply, as `idle_timeout` does the timing. A client resetting the stream, or ending it
+  without a close, ends the WebSocket as the TCP connection ending would (`abnormal_closure`). Another `:protocol` is
+  answered 501 without a handler, and one with a `Content-Length` other than 0 (a CONNECT has no content) 400. A handler
+  that doesn't accept a WebSocket can't answer its request with a 2xx, which the browser would take for the WebSocket
+  accepted: `resp.send()` throws (`std::errc::not_supported`, and the client gets a 500 if the handler lets it go), and
+  a handler that returns without answering has the stream reset.
 - **Origins:** browsers send cookies with WebSocket handshakes from any site, so a page elsewhere could open one with
   its visitor's cookies (cross-site WebSocket hijacking). A request whose `Origin` isn't the request's own host and
   port is refused (403 Forbidden), unless it matches `accept_options::origins` (e.g. `"*.example.com"`,
@@ -971,7 +985,8 @@ router.GET("/echo",
 - **Limits:** a WebSocket holds its HTTP connection, so it counts against `max_connections` until its handler returns,
   `join()` waits for it, and `abort()` ends it (through `req.stop`, its reads and writes failing with
   `std::errc::operation_canceled`; with a `stop` of its own, its reads find the connection's end, `abnormal_closure`). `instrument::http_metrics` and
-  `http_tracing` see the 101 as the response's status, and the whole WebSocket as the request's duration.
+  `http_tracing` see the 101 (or HTTP/2's 200) as the response's status, the method as GET either way, and the whole
+  WebSocket as the request's duration.
 
 A client opens a WebSocket with `websocket::connect(client, url, options)`, given an `http::client` whose configuration
 it takes (its resolver, `connect_timeout` and `attempt_delay`, its TLS options for `wss://`, `response_header_timeout`

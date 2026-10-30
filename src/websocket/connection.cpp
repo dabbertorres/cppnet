@@ -244,7 +244,8 @@ struct connection_state
         {
             // NOTE: relaxed, as the flag says nothing of other memory: take_closing() unregisters this callback, which
             //       waits for it to return, before it touches the deadline. Set before the deadline, so a read that the
-            //       deadline wakes sees it (the deadline's set under the socket's lock, which the wake goes through).
+            //       deadline wakes sees it (the deadline's set under the transport's lock, the socket's or the HTTP/2
+            //       connection's, which the wake goes through).
             state->server_closing.store(true, std::memory_order::relaxed);
             state->tunnel.set_read_deadline(io::clock::now());
         }
@@ -1501,10 +1502,14 @@ accept(const http::server_request& req, http::response_writer& rw, const accept_
 
     const auto subprotocol = detail::select_subprotocol(options.subprotocols, req.headers);
 
+    // over HTTP/2, the stream's 200 says it all (RFC 8441, section 5): no Upgrade, Connection nor accept.
     http::headers fields;
-    fields.set("Upgrade"sv, "websocket"sv);
-    fields.set("Connection"sv, "Upgrade"sv);
-    fields.set("Sec-WebSocket-Accept"sv, detail::accept_key(*key));
+    if (req.version.major != 2)
+    {
+        fields.set("Upgrade"sv, "websocket"sv);
+        fields.set("Connection"sv, "Upgrade"sv);
+        fields.set("Sec-WebSocket-Accept"sv, detail::accept_key(*key));
+    }
     if (!subprotocol.empty()) fields.set("Sec-WebSocket-Protocol"sv, subprotocol);
 
     auto switched = co_await http::detail::switch_protocols(rw, fields);

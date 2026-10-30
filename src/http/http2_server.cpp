@@ -50,6 +50,7 @@
 #include "io/writer.hpp"
 #include "tcp.hpp"
 #include "tls/certificate.hpp"
+#include "util/string_util.hpp"
 
 namespace net::http::detail
 {
@@ -106,6 +107,71 @@ namespace
         }
     }
 
+    // present_extended_connect presents an extended CONNECT (RFC 8441) as the request its protocol's handshake is over
+    // HTTP/1.1, so one route serves it over either version: a WebSocket's (:protocol "websocket", in any case, as RFC
+    // 9110, section 7.8, compares protocol names) as GET, with protocol set, and its :authority as Host if it has none
+    // (as an HTTP/1.1 request would have it: e.g. for the WebSocket's origin check). It returns the status to refuse it
+    // with, if it's refused: 501 (Not Implemented) for another protocol, as for an unknown method; and 400 (Bad
+    // Request) for a Content-Length other than 0. A CONNECT request has no content (RFC 9110, section 9.3.6): its
+    // stream's DATA is the WebSocket's, which the session doesn't hold to a length; so a length other than 0 means a
+    // sender that believes a body follows where none does, the disagreement request smuggling exploits, and the handler
+    // mustn't take it for the body's. 0 says only what's true: it passes as it is, a GET without a body (as the
+    // HTTP/1.1 handshake allows it). Repeated values were checked by the session already: they agree.
+    std::optional<status>
+    present_extended_connect(server_request& req, std::string_view protocol, std::string_view authority)
+    {
+        if (!util::equal_ignore_case(protocol, "websocket"sv)) return status::NOT_IMPLEMENTED;
+        if (req.headers.get_all("content-length"sv).has_value() && req.headers.get_content_length() != std::size_t{0})
+            return status::BAD_REQUEST;
+
+        req.method = request_method::GET;
+        req.protocol.assign(protocol);
+        if (!req.headers.get_all("host"sv).has_value()) req.headers.add("host"sv, authority);
+        return std::nullopt;
+    }
+
+    // request_head is what a request's pseudo-header fields say, and the priority signals among its fields (see
+    // priority_signal_of()).
+    struct request_head
+    {
+        std::string_view method;
+        std::string_view path;
+        std::string_view authority;
+        std::string_view protocol; // an extended CONNECT's (the session takes :protocol only on one)
+        std::uint8_t     signals = 0;
+    };
+
+    // take_fields takes a request's header block: its fields into req's headers (a cookie that came in pieces joined,
+    // for HTTP/1's semantics: RFC 9113, section 8.2.3), and what its pseudo-header fields say.
+    request_head take_fields(server_request& req, std::span<const hpack::field> fields)
+    {
+        request_head head;
+        std::string  cookie;
+        for (const auto& f : fields)
+        {
+            if (f.name.starts_with(':'))
+            {
+                if (f.name == ":method") head.method = f.value;
+                else if (f.name == ":path") head.path = f.value;
+                else if (f.name == ":authority") head.authority = f.value;
+                else if (f.name == ":protocol") head.protocol = f.value;
+                continue;
+            }
+
+            if (f.name != "cookie")
+            {
+                req.headers.add(f.name, f.value);
+                head.signals |= priority_signal_of(f.name);
+                continue;
+            }
+
+            if (!cookie.empty()) cookie += "; ";
+            cookie += f.value;
+        }
+        if (!cookie.empty()) req.headers.set("cookie"sv, std::move(cookie));
+        return head;
+    }
+
     // unprioritized is a stream's priority when the client hasn't said: RFC 9218's urgency, but incremental, so that
     // such streams share the connection (round-robin, as they did before priorities) rather than go one at a time.
     constexpr priority unprioritized{.urgency = 3, .incremental = true};
@@ -122,6 +188,10 @@ public:
     server_response resp;
 
     bool head_request = false;
+
+    // the request was an extended CONNECT (RFC 8441) presented as GET (see start_stream()): a final 2xx would open its
+    // tunnel, which only open_tunnel() sends.
+    bool extended_connect = false;
 
     // the request expects 100 Continue before its client sends the body, which is to come (see run_stream()).
     bool expects_continue = false;
@@ -171,6 +241,9 @@ namespace
         {}
 
         coro::task<> serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort);
+
+        // closing is the server's close() token (serve()'s stop), for the streams' tunnels.
+        [[nodiscard]] const std::stop_token& closing() const noexcept { return closing_token; }
 
     protected:
         // the session's events, and the base's hooks: protected, as they're declared.
@@ -229,7 +302,8 @@ namespace
 
         const http2_options&   options;
         const request_handler& handler;
-        std::stop_token        abort_token; // the server's abort(), for each request (set by serve(), before streams)
+        std::stop_token        abort_token;   // the server's abort(), for each request (set by serve(), before streams)
+        std::stop_token        closing_token; // the server's close(), for each tunnel (set by serve(), before streams)
 
         // the client's certificates, for each request (made once, if it sent any).
         std::shared_ptr<const std::vector<tls::certificate>> peer_certs;
@@ -263,45 +337,57 @@ namespace
         coro::async_scope handlers; // the streams' handlers
     };
 
+    // submit_head submits a head of resp's on stream, ending it if end says (holding the lock).
+    std::error_code submit_head(http2_stream& stream, const server_response& resp, bool end)
+    {
+        auto& c = *stream.conn;
+
+        // the final response's Priority field is merged into the stream's: its parameters replace the request's, and
+        // those it doesn't have are left as they were (RFC 9218, section 8, as nghttpx and h2o do). A field of several
+        // lines is joined in a string of its own, as that's rare.
+        if (stream.prioritized && !status_is_information(resp.status_code))
+        {
+            if (const auto lines = resp.headers.get_all("priority"sv))
+            {
+                std::string joined;
+                c.send_order.update(
+                    stream,
+                    parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined), stream.current_priority()));
+            }
+        }
+
+        stream.status_text = std::to_string(static_cast<int>(resp.status_code));
+        stream.fields.clear();
+        stream.fields.push_back({.name = ":status", .value = stream.status_text});
+        if (auto err = append_fields(resp.headers, stream.names, stream.fields)) return err;
+        return c.session.submit_headers(stream.id, stream.fields, end);
+    }
+
     coro::task<std::expected<io::writer*, std::error_code>>
     http2_send_head(http2_stream& stream, const server_response& resp, std::optional<std::size_t> body_length)
     {
+        using result = std::expected<io::writer*, std::error_code>;
+
         auto& c = *stream.conn;
         {
             std::scoped_lock lock{c.mu};
-            if (stream.failure)
-                return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(stream.failure));
+            if (stream.failure) return coro::ready_task<result>(std::unexpected(stream.failure));
 
-            // the final response's Priority field is merged into the stream's: its parameters replace the request's,
-            // and those it doesn't have are left as they were (RFC 9218, section 8, as nghttpx and h2o do). A field of
-            // several lines is joined in a string of its own, as that's rare.
-            if (stream.prioritized && !status_is_information(resp.status_code))
-            {
-                if (const auto lines = resp.headers.get_all("priority"sv))
-                {
-                    std::string joined;
-                    c.send_order.update(stream,
-                                        parse_priority(sf::join_lines({lines->begin(), lines->end()}, joined),
-                                                       stream.current_priority()));
-                }
-            }
+            // a 2xx to an extended CONNECT says its tunnel's open (RFC 8441, section 5), which only open_tunnel() does:
+            // a handler that doesn't know the protocol (e.g. a GET route's, which doesn't know WebSockets) mustn't
+            // seem to accept it.
+            const bool final = !status_is_information(resp.status_code);
+            if (final && stream.extended_connect && status_is_success(resp.status_code))
+                return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::not_supported)));
 
             // a response to HEAD has no body (nor trailers), whatever its head says. One without a body ends with its
             // head, and one with a Content-Length with its last DATA, unless it has trailers (or declares them) by
             // now, which end the stream instead (so the response is complete with its last byte, rather than when the
             // handler returns): ones set later are dropped.
-            const bool final    = !status_is_information(resp.status_code);
             const bool trailing = !resp.trailers.empty() || resp.headers.get_all("Trailer"sv).has_value();
             const bool end      = final && (stream.head_request || (body_length == std::size_t{0} && !trailing));
 
-            stream.status_text = std::to_string(static_cast<int>(resp.status_code));
-            stream.fields.clear();
-            stream.fields.push_back({.name = ":status", .value = stream.status_text});
-            if (auto err = append_fields(resp.headers, stream.names, stream.fields))
-                return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(err));
-
-            if (auto err = c.session.submit_headers(stream.id, stream.fields, end))
-                return coro::ready_task<std::expected<io::writer*, std::error_code>>(std::unexpected(err));
+            if (auto err = submit_head(stream, resp, end)) return coro::ready_task<result>(std::unexpected(err));
 
             if (end) stream.ended = true;
             else if (final && !trailing) stream.data_left = body_length;
@@ -309,7 +395,37 @@ namespace
 
         c.wake_writer();
         io::writer* body = stream.ended ? static_cast<io::writer*>(&stream.discard) : &stream.writer;
-        return coro::ready_task<std::expected<io::writer*, std::error_code>>(body);
+        return coro::ready_task<result>(body);
+    }
+
+    std::expected<tunnel*, std::error_code>
+    http2_open_tunnel(http2_stream& stream, server_response& resp, fields_view fields)
+    {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): a server's stream is a server connection's.
+        auto&   c      = static_cast<http2_server_connection&>(*stream.conn);
+        tunnel* opened = nullptr;
+        {
+            std::scoped_lock lock{c.mu};
+            if (stream.failure) return std::unexpected(stream.failure);
+            if (!stream.extended_connect) return std::unexpected(std::make_error_code(std::errc::not_supported));
+
+            // 200, which RFC 8441 (section 5) and browsers expect; the head doesn't end the stream, whose DATA is the
+            // tunnel's from now on.
+            resp.status_code = status::OK;
+            put_fields(resp.headers, fields);
+            if (auto err = submit_head(stream, resp, false)) return std::unexpected(err);
+
+            // the stream's own read timeout would reset it whenever the protocol's quiet: the tunnel's (e.g. a
+            // WebSocket's idle timeout, which pings) replaces it. Its write timeout stays: a peer that doesn't read
+            // can't hold a write longer.
+            stream.read_timeout = std::chrono::milliseconds::zero();
+            stream.read_deadline.reset();
+            stream.tunnel = std::make_unique<stream_tunnel>(stream, c.closing());
+            opened        = stream.tunnel.get();
+        }
+
+        c.wake_writer();
+        return opened;
     }
 
     coro::task<io::result> http2_finish(http2_stream& stream)
@@ -329,10 +445,13 @@ namespace
             if (!stream.ended)
             {
                 // the trailers end the stream, if there are any it can send; an empty DATA frame does otherwise. If
-                // one can't be sent, nothing is, and the stream's left to be reset.
+                // one can't be sent, nothing is, and the stream's left to be reset. A tunnel has none (only DATA may
+                // follow its head: RFC 9113, section 8.5).
                 stream.fields.clear();
-                if (auto err =
-                        append_fields(stream.resp.trailers, stream.names, stream.fields, field_section::trailers))
+                if (stream.tunnel != nullptr && !stream.resp.trailers.empty())
+                    c.get_logger().debug("dropped the trailers set on HTTP/2 stream {}'s tunnel", stream.id);
+                else if (auto err =
+                             append_fields(stream.resp.trailers, stream.names, stream.fields, field_section::trailers))
                     return coro::ready_task<io::result>(io::result{.err = err});
 
                 stream.ended = true;
@@ -354,7 +473,8 @@ namespace
 
 }
 
-const http2_stream_ops http2_ops{.send_head = http2_send_head, .finish = http2_finish};
+const http2_stream_ops http2_ops{
+    .send_head = http2_send_head, .finish = http2_finish, .open_tunnel = http2_open_tunnel};
 
 std::optional<priority> stream_priority(const server_request& req)
 {
@@ -380,7 +500,9 @@ namespace
     coro::task<>
     http2_server_connection::serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort)
     {
-        // close() (stop) ends the connection gracefully.
+        // close() (stop) ends the connection gracefully; and the streams' tunnels, by themselves (e.g. a WebSocket's
+        // close, going away), which the drain then waits for, as for any stream.
+        closing_token = stop;
         std::stop_callback on_stop{stop,
                                    [this] noexcept
                                    {
@@ -569,56 +691,39 @@ namespace
         auto  stream = std::make_unique<http2_stream>(this, id, pool);
         auto& req    = stream->req;
 
-        std::string_view method;
-        std::string_view path;
-        std::string_view authority;
-        std::string      cookie;
-        std::uint8_t     signals = 0;
-
-        for (const auto& f : fields)
-        {
-            if (f.name.starts_with(':'))
-            {
-                if (f.name == ":method") method = f.value;
-                else if (f.name == ":path") path = f.value;
-                else if (f.name == ":authority") authority = f.value;
-                continue;
-            }
-
-            if (f.name != "cookie")
-            {
-                req.headers.add(f.name, f.value);
-                signals |= priority_signal_of(f.name);
-                continue;
-            }
-
-            // a cookie may arrive in pieces, joined for HTTP/1's semantics (RFC 9113, section 8.2.3).
-            if (!cookie.empty()) cookie += "; ";
-            cookie += f.value;
-        }
-        if (!cookie.empty()) req.headers.set("cookie"sv, std::move(cookie));
+        const auto head = take_fields(req, fields);
 
         // (before the request may be refused below: what its fields show of the client counts all the same.)
         // (the stream isn't the scheduler's yet: its priority's just set.)
-        send_order.update(*stream, request_priority(req, signals));
+        send_order.update(*stream, request_priority(req, head.signals));
         stream->prioritized = options.priorities;
 
-        req.method = parse_method(method);
+        req.method = parse_method(head.method);
         if (req.method == request_method::NONE)
         {
             refuse(id, status::NOT_IMPLEMENTED, end_stream);
             return nullptr;
         }
 
+        if (!head.protocol.empty())
+        {
+            if (const auto refused = present_extended_connect(req, head.protocol, head.authority))
+            {
+                refuse(id, *refused, end_stream);
+                return nullptr;
+            }
+            stream->extended_connect = true;
+        }
+
         // CONNECT's target is :authority (RFC 9113, section 8.5).
-        const auto target = req.method == request_method::CONNECT ? authority : path;
+        const auto target = req.method == request_method::CONNECT ? head.authority : head.path;
         if (parse_request_target(req.method, target, req.target))
         {
             refuse(id, status::BAD_REQUEST, end_stream);
             return nullptr;
         }
 
-        const auto host = authority.empty() ? req.headers.get("host"sv).value_or(""sv) : authority;
+        const auto host = head.authority.empty() ? req.headers.get("host"sv).value_or(""sv) : head.authority;
         if (!host.empty())
         {
             auto parsed = parse_host(host);
@@ -749,6 +854,9 @@ namespace
         // a response cut short isn't finished (which would end it as if it were complete), but reset.
         const bool complete = co_await respond_after(*stream, rw, failure);
 
+        // a tunnel's stop callback takes the lock, under which the stream's destroyed: it's removed first.
+        if (stream->tunnel != nullptr) stream->tunnel->set_stop_token({});
+
         {
             std::scoped_lock lock{mu};
 
@@ -825,7 +933,8 @@ namespace
             }
             else if (!rw.sent())
             {
-                if (stopped) co_return false;
+                // (an empty 200 would open an extended CONNECT's tunnel, only to end it: it's reset instead.)
+                if (stopped || stream.extended_connect) co_return false;
                 co_await rw.send(status::OK, 0);
             }
 

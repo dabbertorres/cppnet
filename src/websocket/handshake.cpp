@@ -184,8 +184,17 @@ std::string accept_key(std::string_view key)
 
 std::expected<std::string_view, std::error_code> check_request(const http::server_request& req)
 {
-    // NOTE: an HTTP/2 handshake (an extended CONNECT) needs the request's :protocol, which server_request doesn't have
-    //       yet: until it does, it isn't one.
+    // over HTTP/2, an extended CONNECT (RFC 8441, section 5), which the server presents as GET with its :protocol: it
+    // has no Upgrade, Connection nor key (the stream's the proof that the server took it).
+    if (req.version.major == 2)
+    {
+        if (req.method != http::request_method::GET
+            || !util::equal_ignore_case(std::string_view{req.protocol}, "websocket"sv) || has_body(req.headers))
+            return failure(errc::not_websocket);
+        if (only_value(req.headers, "Sec-WebSocket-Version"sv) != "13"sv) return failure(errc::bad_version);
+        return ""sv;
+    }
+
     if (req.version.major != 1 || req.version.minor < 1) return failure(errc::not_websocket);
     if (req.method != http::request_method::GET || has_body(req.headers) || !upgrades(req.headers))
         return failure(errc::not_websocket);

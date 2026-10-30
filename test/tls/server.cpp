@@ -40,7 +40,9 @@
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
 #include "http/h2_client.hpp"
+#include "http/h2_tunnels.hpp"
 #include "http/headers.hpp"
+#include "http/hpack.hpp"
 #include "http/http.hpp"
 #include "http/http2.hpp"
 #include "http/request.hpp"
@@ -1500,4 +1502,128 @@ TEST_CASE("a WebSocket client opens wss:// over HTTP/1.1, from a server that wou
     CHECK(sched.run_to_completion(test())
           == std::vector<std::string>{"untrusted", "echoed", "echoed", "close: ok", "pooled: 0"});
     CHECK(ends == std::vector<std::string>{"1000"});
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream of an HTTPS connection (ALPN h2) echoes, and goes away when the server "
+          "closes",
+          "[tls][http][server][http2][websocket]")
+{
+    namespace ws = net::websocket;
+    using test::websocket::client_frame;
+    using ws::detail::opcode;
+
+    std::mutex               mu;
+    std::vector<std::string> ends;
+    net::io::scheduler       sched{make_pool()};
+
+    // whether the client closes, or the server's close() has the WebSocket go away (its read interrupted, waiting).
+    const bool server_closes = GENERATE(false, true);
+    CAPTURE(server_closes);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw);
+                   if (!conn.has_value()) co_return;
+
+                   std::string message;
+                   while (true)
+                   {
+                       const auto type = co_await conn->read_message(message);
+                       if (!type.has_value())
+                       {
+                           const auto       code = ws::close_code_of(type.error());
+                           std::scoped_lock lock{mu};
+                           ends.push_back(std::format("{} {} over TLS: {}",
+                                                      code ? static_cast<int>(*code) : 0,
+                                                      ws::from_peer(type.error()) ? "peer" : "sent",
+                                                      req.tls_version != tls::version::none));
+                           co_return;
+                       }
+                       if (co_await conn->write_message(*type, message)) co_return;
+                   }
+               });
+
+    https_server server{&sched, tls_config(), std::move(router)};
+
+    const auto test = [&] -> task<std::pair<std::vector<std::string>, std::error_code>>
+    {
+        std::vector<std::string> frames;
+        std::error_code          ended;
+
+        auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", server.port());
+        if (!conn.has_value()) co_return std::pair{frames, conn.error()};
+
+        auto s = co_await tls::stream::connect(std::move(*conn),
+                                               trusting_client({"h2"}),
+                                               "localhost",
+                                               net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{frames, s.error()};
+        if (s->alpn() != "h2") co_return std::pair{std::vector<std::string>{"ALPN: " + std::string{s->alpn()}}, ended};
+
+        const std::string large(100'000, 'x');
+        co_await test::with_tunnels(
+            &sched,
+            &*s,
+            &*s,
+            &s->socket(),
+            [&](test::h2_tunnels& t) -> task<>
+            {
+                const std::vector<net::http::hpack::field> fields{
+                    {.name = "sec-websocket-version", .value = "13"}
+                };
+                auto id = co_await t.open("/ws", "websocket", fields);
+                if (!id.has_value()) co_return;
+                const auto head = co_await t.response(*id);
+                if (!head.has_value()) co_return;
+                frames.push_back("status:" + head->status);
+
+                test::h2_tunnels::stream  stream{&t, *id};
+                test::websocket::raw_peer peer{stream, stream};
+                (void)co_await peer.send(test::websocket::join(client_frame(opcode::text, "hello"sv),
+                                                               client_frame(opcode::ping, "p"sv),
+                                                               client_frame(opcode::binary, large)));
+                for (int i = 0; i < 3; ++i)
+                {
+                    auto f = co_await peer.read_frame();
+                    if (!f.has_value()) co_return;
+                    frames.push_back(f->payload.size() == large.size() ? "large" : f->text());
+                }
+
+                if (server_closes)
+                {
+                    server.server.close();
+                    auto close = co_await peer.read_frame();
+                    if (!close.has_value()) co_return;
+                    frames.push_back(std::format("close:{}", static_cast<int>(close->close().code)));
+                    (void)co_await peer.send(test::websocket::close_frame(ws::close_code::going_away));
+                }
+                else
+                {
+                    (void)co_await peer.send(test::websocket::close_frame(ws::close_code::normal_closure));
+                }
+
+                auto [rest, err] = co_await peer.read_until_end();
+                for (const auto& f : rest) frames.push_back(std::format("close:{}", static_cast<int>(f.close().code)));
+                ended = err;
+
+                if (server_closes) co_await server.server.join();
+            });
+
+        co_await s->close();
+        co_return std::pair{frames, ended};
+    };
+
+    const auto [frames, err] = sched.run_to_completion(test());
+    CAPTURE(err.message());
+    CHECK(frames
+          == (server_closes ? std::vector<std::string>{"status:200", "hello", "p", "large", "close:1001"}
+                            : std::vector<std::string>{"status:200", "hello", "p", "large", "close:1000"}));
+
+    // the server ended the stream.
+    CHECK(err == net::io::errc::end_of_stream);
+
+    std::scoped_lock lock{mu};
+    CHECK(ends == std::vector<std::string>{server_closes ? "1001 sent over TLS: true" : "1000 peer over TLS: true"});
 }

@@ -358,7 +358,20 @@ namespace detail
 
         // finish ends the stream's response, if it hasn't been.
         coro::task<io::result> (*finish)(http2_stream& stream);
+
+        // open_tunnel answers the stream's extended CONNECT (RFC 8441) with 200 and resp's headers, fields replacing
+        // those of the same names (see put_fields()), without ending the stream, and returns the stream as a tunnel:
+        // the DATA that follows, both ways, is the protocol's. It fails, sending nothing and leaving resp as it was,
+        // with std::errc::not_supported if the stream's request wasn't an extended CONNECT, and with the stream's
+        // failure if it has failed (e.g. reset).
+        std::expected<tunnel*, std::error_code> (*open_tunnel)(http2_stream&    stream,
+                                                               server_response& resp,
+                                                               fields_view      fields);
     };
+
+    // put_fields puts fields in headers, replacing those of the same names, for a response that switches (or opens a
+    // tunnel): which has no content, so no Content-Length nor Transfer-Encoding either.
+    void put_fields(headers& to, fields_view fields);
 }
 
 // response_writer presents an interface for building a server_response to request handlers.
@@ -406,9 +419,12 @@ public:
     // writer that drops what's written. status::SWITCHING_PROTOCOLS can't be sent (std::system_error, with
     // std::errc::not_supported): it would tell an HTTP/1.1 client the connection had switched, which only switching it
     // does (as what speaks the other protocol does, e.g. WebSockets; see switched()), and HTTP/2 has no 101 (RFC 9113,
-    // section 8.6). A request that expects 100 Continue gets one from the server, when the handler first reads its
-    // body, unless the handler sent its own 100 or the final response before (another interim response doesn't count;
-    // see expect_continue()).
+    // section 8.6). Nor can a 2xx answer an HTTP/2 extended CONNECT (server_request::protocol set, e.g. a WebSocket's),
+    // for the same reason (std::system_error, with std::errc::not_supported): it would tell the client the tunnel is
+    // open (RFC 8441, section 5), so a handler that doesn't know the protocol can't seem to accept it (it gets a 500
+    // instead, if it lets the exception go). A request that expects 100 Continue gets one from the server, when the
+    // handler first reads its body, unless the handler sent its own 100 or the final response before (another interim
+    // response doesn't count; see expect_continue()).
     //
     // NOTE: when the encoder finishes without a coroutine (e.g. the head fits in the connection's buffer), so does
     //       send(), which then throws when it's called, rather than when it's awaited.
@@ -436,7 +452,8 @@ public:
     [[nodiscard]] bool sent() const noexcept { return final_sent; }
 
     // switched is whether the response was a 101 (Switching Protocols), after which the connection was the handler's,
-    // speaking another protocol (e.g. WebSocket), until the handler returned. It counts as sent too.
+    // speaking another protocol (e.g. WebSocket), until the handler returned; or, over HTTP/2, the 2xx that opened an
+    // extended CONNECT's tunnel, after which the stream was. It counts as sent too.
     [[nodiscard]] bool switched() const noexcept { return tunneled; }
 
     // expect_continue is the server's: the request expects 100 (Continue) before its client sends the body (Expect:

@@ -96,6 +96,13 @@ struct server_config
     // with 421 (status::MISDIRECTED_REQUEST), which has the client send it on a connection of its own.
     std::vector<std::string> http2_origins{};
 
+    // Whether HTTP/2 connections take WebSockets (RFC 8441): the server advertises ENABLE_CONNECT_PROTOCOL, and a
+    // client (a browser) may then open a WebSocket as an extended CONNECT on a stream of the connection it has, rather
+    // than a connection of its own. The handler sees it as GET, with server_request::protocol "websocket", so the route
+    // that accepts WebSockets over HTTP/1.1 (websocket::accept()) serves them over HTTP/2 too. Off, clients use
+    // HTTP/1.1 for WebSockets (browsers open another connection).
+    bool http2_websockets = true;
+
     std::shared_ptr<spdlog::logger> logger = spdlog::default_logger();
 
 #ifdef NET_HAS_TLS

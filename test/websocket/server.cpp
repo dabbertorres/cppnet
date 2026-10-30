@@ -30,6 +30,11 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "http/h2_client.hpp"
+#include "http/h2_tunnels.hpp"
+#include "http/hpack.hpp"
+#include "http/http.hpp"
+#include "http/http2.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/router.hpp"
@@ -2551,4 +2556,1362 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
     CHECK(lines
           == (other_reads ? std::vector<std::string>{"close: ok", "reader: 4001 peer"}
                           : std::vector<std::string>{"close: ok"}));
+}
+
+// ---- over HTTP/2: a WebSocket on an extended CONNECT's stream (RFC 8441)
+
+namespace
+{
+
+namespace hpack = net::http::hpack;
+namespace http2 = net::http::http2;
+
+using test::h2_tunnels;
+
+// ws_fields are a WebSocket's extended CONNECT's fields, beyond its pseudo-header fields: its version (RFC 8441,
+// section 5), then extra.
+std::vector<hpack::field> ws_fields(std::vector<hpack::field> extra = {})
+{
+    extra.insert(extra.begin(), hpack::field{.name = "sec-websocket-version", .value = "13"});
+    return extra;
+}
+
+// h2_result is what a WebSocket's client over HTTP/2 saw: the response's head, the frames, and how the stream ended.
+struct h2_result
+{
+    std::string                                      status;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::vector<received_frame>                      frames;
+    std::error_code                                  err;
+};
+
+// field_of is a response's field's value, or "(none)".
+std::string field_of(const h2_result& r, std::string_view name)
+{
+    for (const auto& [n, v] : r.headers)
+    {
+        if (n == name) return v;
+    }
+    return "(none)";
+}
+
+task<std::expected<net::tcp_socket, std::error_code>> connect_h2(net::io::scheduler* sched, std::uint16_t port)
+{
+    return net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+}
+
+// over_h2 connects with HTTP/2 (prior knowledge), opens a WebSocket at /ws with an extended CONNECT with fields, waits
+// for the response's head, and, if it's 200, runs steps (the client's part, over the stream) with the result to fill;
+// otherwise, the result's err is the stream's reset, if it was.
+// NOTE: fields by value, as the task outlives the caller's expression.
+template<typename Steps>
+task<h2_result> over_h2(net::io::scheduler* sched, std::uint16_t port, std::vector<hpack::field> fields, Steps steps)
+{
+    h2_result result;
+    auto      conn = co_await connect_h2(sched, port);
+    if (!conn.has_value())
+    {
+        result.err = conn.error();
+        co_return result;
+    }
+
+    co_await test::with_tunnels(sched,
+                                &*conn,
+                                &*conn,
+                                &*conn,
+                                [&](h2_tunnels& t) -> task<>
+                                {
+                                    auto id = co_await t.open("/ws", "websocket", fields);
+                                    if (!id.has_value())
+                                    {
+                                        result.err = id.error();
+                                        co_return;
+                                    }
+
+                                    const auto head = co_await t.response(*id);
+                                    if (!head.has_value()) co_return;
+                                    result.status  = head->status;
+                                    result.headers = head->headers;
+                                    result.err     = head->reset;
+                                    if (head->status != "200") co_return;
+
+                                    h2_tunnels::stream s{&t, *id};
+                                    raw_peer           peer{s, s};
+                                    co_await steps(t, *id, peer, result);
+                                });
+    co_return result;
+}
+
+// exchange sends frames (piece bytes per write, or at once) from a task of its own, as the server's echoes may wait for
+// the peer to read before it reads on, and reads what comes back until the stream ends, into result.
+task<>
+exchange(net::io::scheduler* sched, raw_peer& peer, std::vector<std::byte> frames, std::size_t piece, h2_result& result)
+{
+    std::atomic<std::uint64_t> sent   = 0;
+    const auto                 sender = [](raw_peer*                   peer,
+                                           std::span<const std::byte>  frames,
+                                           std::size_t                 piece,
+                                           net::io::scheduler*         sched,
+                                           std::atomic<std::uint64_t>* sent) -> task<void>
+    {
+        (void)co_await peer->send(frames, piece);
+        raise(sched, *sent);
+    };
+    if (!sched->spawn(sender(&peer, frames, piece, sched, &sent))) sent.store(1);
+
+    auto [received, err] = co_await peer.read_until_end();
+    result.frames.insert(result.frames.end(), received.begin(), received.end());
+    result.err = err;
+
+    // the sender's done with the stream (its last write may fail, once the server has reset it).
+    while (sent.load() == 0) (void)co_await sched->wait_on(sent, 0);
+}
+
+// steps_sending is a client's part that sends frames (piece bytes per write) and reads until the stream ends.
+auto steps_sending(net::io::scheduler* sched, std::vector<std::byte> frames, std::size_t piece = 0)
+{
+    return [sched,
+            frames = std::move(frames),
+            piece](h2_tunnels& /*t*/, http2::stream_id /*id*/, raw_peer& peer, h2_result& result) -> task<>
+    { co_await exchange(sched, peer, frames, piece, result); };
+}
+
+}
+
+TEST_CASE("an HTTP/2 server advertises extended CONNECT for WebSockets, unless http2_websockets is off",
+          "[websocket][server][http2]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const bool on = GENERATE(true, false);
+    CAPTURE(on);
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router), {.http2_websockets = on});
+
+    struct seen
+    {
+        bool        settings   = false;
+        bool        advertised = false;
+        std::string opened; // what the client's session made of an extended CONNECT
+        std::string status;
+        std::string body;
+    };
+
+    const auto client = [&] -> task<seen>
+    {
+        seen result;
+        auto conn = co_await connect_h2(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        test::h2_client c{&*conn, &*conn, &*conn};
+        result.settings   = co_await c.settings();
+        result.advertised = c.s.peer_settings().enable_connect_protocol;
+
+        auto id = c.extended_connect("/ws", "websocket", ws_fields());
+        if (!id.has_value())
+        {
+            result.opened = id.error().message();
+            co_return result;
+        }
+        result.opened = "sent";
+
+        // the close, sent with the request: the server answers it, and ends the stream.
+        const auto close = close_frame(ws::close_code::normal_closure);
+        c.send(*id, std::string_view{reinterpret_cast<const char*>(close.data()), close.size()}, false);
+        (void)co_await c.wait_for(*id);
+        result.status = c.responses[*id].status;
+        result.body   = c.responses[*id].body;
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(result.settings);
+    CHECK(result.advertised == on);
+    if (on)
+    {
+        CHECK(result.opened == "sent");
+        CHECK(result.status == "200");
+        CHECK(result.body == "\x88\x02\x03\xe8"); // the close's echo: 1000
+    }
+    else
+    {
+        // the client's session doesn't send one the server hasn't said it takes.
+        CHECK(result.opened == std::make_error_code(std::errc::invalid_argument).message());
+    }
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream echoes messages, answering pings between fragments, on the GET route",
+          "[websocket][server][http2]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the client sends its frames at once, or a byte (a DATA frame) at a time.
+    const std::size_t piece = GENERATE(0, 1);
+    CAPTURE(piece);
+
+    // the route that serves WebSockets over HTTP/1.1: an extended CONNECT is GET to it.
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   out.add(std::format("{} HTTP/{} protocol={} host={}",
+                                       http::method_string(req.method),
+                                       req.version.major,
+                                       req.protocol,
+                                       req.headers.get("Host"sv).value_or("(none)")));
+                   co_await echo(req, rw, out);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const std::array<std::byte, 5> binary{std::byte{0x00},
+                                          std::byte{0x01},
+                                          std::byte{0x41},
+                                          std::byte{0x7f},
+                                          std::byte{0xff}};
+    const auto                     frames = join(client_frame(opcode::text, "hello"sv),
+                                                 client_frame(opcode::binary, binary),
+                                                 client_frame(opcode::text, "frag"sv, false),
+                                                 client_frame(opcode::ping, "p1"sv),
+                                                 client_frame(opcode::continuation, "men"sv, false),
+                                                 client_frame(opcode::ping, "p2"sv),
+                                                 client_frame(opcode::pong, "unsolicited"sv),
+                                                 client_frame(opcode::continuation, "ted"sv),
+                                                 client_frame(opcode::text, ""sv),
+                                                 close_frame(ws::close_code::normal_closure, "bye"));
+
+    // over HTTP/2, then over HTTP/1.1, to the same route.
+    const auto client = [&] -> task<std::pair<h2_result, peer_result>>
+    {
+        auto over2 = co_await over_h2(&sched, server->local_port(), ws_fields(), steps_sending(&sched, frames, piece));
+        auto over1 = co_await run_peer(&sched,
+                                       server->local_port(),
+                                       test::websocket::handshake(),
+                                       close_frame(ws::close_code::normal_closure));
+        co_return std::pair{std::move(over2), std::move(over1)};
+    };
+    const auto [result, http1] = sched.run_to_completion(client());
+
+    CHECK(result.status == "200");
+    CHECK(field_of(result, "sec-websocket-accept") == "(none)");
+    CHECK(field_of(result, "sec-websocket-protocol") == "(none)");
+    CHECK(field_of(result, "content-length") == "(none)");
+    CHECK(summaries(result.frames)
+          == std::vector<std::string>{"text:hello",
+                                      "binary:" + as_text(binary),
+                                      "pong:p1",
+                                      "pong:p2",
+                                      "text:fragmented",
+                                      "text:",
+                                      "close:1000"});
+
+    // the handler returned once the close handshake was done: the server ended the stream.
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(http1.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+    CHECK(out.get()
+          == std::vector<std::string>{"GET HTTP/2 protocol=websocket host=localhost",
+                                      "read: 1000 peer reason=bye",
+                                      "then write: 1000 peer",
+                                      "then close: ok",
+                                      "GET HTTP/1 protocol= host=x",
+                                      "read: 1000 peer reason=",
+                                      "then write: 1000 peer",
+                                      "then close: ok"});
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream echoes messages of each length form", "[websocket][server][http2]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // around the lengths' edges, past the tunnel's buffers and the stream's window, and the limit.
+    const std::size_t size       = GENERATE(0, 125, 126, 4'096, 65'535, 65'536, 300'000, std::size_t{1} << 20);
+    const bool        fragmented = GENERATE(false, true);
+    CAPTURE(size, fragmented);
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router));
+
+    std::string text(size, '\0');
+    for (std::size_t i = 0; i < size; ++i) text[i] = static_cast<char>('a' + (i % 26));
+    std::vector<std::byte> binary(size);
+    for (std::size_t i = 0; i < size; ++i) binary[i] = static_cast<std::byte>(i * 7);
+
+    std::vector<std::byte> frames;
+    if (fragmented)
+    {
+        const auto third = size / 3;
+        frames           = join(client_frame(opcode::text, std::string_view{text}.substr(0, third), false),
+                                client_frame(opcode::continuation, std::string_view{text}.substr(third, third), false),
+                                client_frame(opcode::continuation, std::string_view{text}.substr(2 * third)),
+                                client_frame(opcode::binary, std::span{binary}.first(third), false),
+                                client_frame(opcode::continuation, std::span{binary}.subspan(third)));
+    }
+    else
+    {
+        frames = join(client_frame(opcode::text, text), client_frame(opcode::binary, binary));
+    }
+    frames = join(frames, close_frame(ws::close_code::normal_closure));
+
+    const auto result =
+        sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps_sending(&sched, frames)));
+    CAPTURE(result.err.message(), out.get());
+
+    REQUIRE(result.frames.size() == 3);
+    CHECK(result.frames[0].header.op == opcode::text);
+    CHECK(result.frames[0].text() == text);
+    CHECK(result.frames[1].header.op == opcode::binary);
+    CHECK(result.frames[1].payload == binary);
+    CHECK(summary(result.frames[2]) == "close:1000");
+    CHECK(result.err == net::io::errc::end_of_stream);
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream streams messages in and out", "[websocket][server][http2][stream]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw);
+                   if (!conn.has_value()) co_return;
+
+                   // the first message, read 7 bytes at a time, each written back as a frame of a message of its own.
+                   const auto type = co_await conn->next_message();
+                   if (!type.has_value()) co_return;
+
+                   auto writer = co_await conn->begin_message(*type);
+                   if (!writer.has_value()) co_return;
+
+                   std::array<std::byte, 7> piece{};
+                   while (true)
+                   {
+                       const auto read = co_await read_full(conn->message(), piece);
+                       if (read.count > 0) (void)co_await writer->write(std::span{piece}.first(read.count));
+                       if (read.err) break;
+                   }
+                   out.add("end: " + describe(co_await writer->end_message()));
+
+                   std::string message;
+                   const auto  closed = co_await conn->read_message(message);
+                   out.add("closed: " + describe(closed.error_or(std::error_code{})));
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto frames = join(client_frame(opcode::text, "abcdefghij"sv, false),
+                             client_frame(opcode::ping, "x"sv),
+                             client_frame(opcode::continuation, "klmnopqrst"sv),
+                             close_frame(ws::close_code::going_away));
+
+    const auto result =
+        sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps_sending(&sched, frames)));
+
+    CHECK(
+        summaries(result.frames)
+        == std::vector<std::string>{"text+:abcdefg", "pong:x", "cont+:hijklmn", "cont+:opqrst", "cont:", "close:1001"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get() == std::vector<std::string>{"end: ok", "closed: 1001 peer"});
+}
+
+TEST_CASE("a WebSocket's 200 over HTTP/2 says what the handshake agreed, and checks the origin as over HTTP/1.1",
+          "[websocket][server][http2][handshake]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the client offers subprotocols, of which the server chooses its own first; and whether it sends its own
+    // origin (the request's :authority, as Host).
+    const bool offers = GENERATE(false, true);
+    const bool origin = GENERATE(false, true);
+    CAPTURE(offers, origin);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   rw.headers().set("Set-Cookie"sv, "a=b"sv);
+
+                   auto conn = co_await ws::accept(req,
+                                                   rw,
+                                                   {
+                                                       .subprotocols = {"chat.v2", "chat"}
+                   });
+                   if (!conn.has_value()) co_return;
+                   out.add(std::format("subprotocol={}", conn->subprotocol()));
+
+                   std::string message;
+                   (void)co_await conn->read_message(message);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    std::vector<hpack::field> extra{
+        {.name = "sec-websocket-extensions", .value = "permessage-deflate"}
+    };
+    if (offers)
+    {
+        extra.push_back({.name = "sec-websocket-protocol", .value = "chat, x"});
+        extra.push_back({.name = "sec-websocket-protocol", .value = "chat.v2"});
+    }
+    if (origin) extra.push_back({.name = "origin", .value = "http://localhost"});
+
+    const auto result =
+        sched.run_to_completion(over_h2(&sched,
+                                        server->local_port(),
+                                        ws_fields(std::move(extra)),
+                                        steps_sending(&sched, close_frame(ws::close_code::normal_closure))));
+
+    CHECK(result.status == "200");
+    CHECK(field_of(result, "set-cookie") == "a=b");
+    CHECK(field_of(result, "sec-websocket-protocol") == (offers ? "chat.v2" : "(none)"));
+    CHECK(field_of(result, "sec-websocket-accept") == "(none)");
+    CHECK(field_of(result, "sec-websocket-extensions") == "(none)");
+    CHECK(field_of(result, "upgrade") == "(none)");
+    CHECK(field_of(result, "connection") == "(none)");
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1000"});
+    CHECK(out.get() == std::vector<std::string>{offers ? "subprotocol=chat.v2" : "subprotocol="});
+}
+
+TEST_CASE("a refused WebSocket over HTTP/2 is answered, and the connection goes on",
+          "[websocket][server][http2][handshake]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    struct test_case
+    {
+        std::string_view                                           name;
+        std::string_view                                           protocol; // none: an ordinary GET
+        std::vector<hpack::field>                                  fields;
+        std::string_view                                           status;
+        std::optional<ws::errc>                                    why; // why the handler refused it, if it was called
+        std::vector<std::pair<std::string_view, std::string_view>> response_fields{};
+        std::optional<http2::error_code>                           reset{}; // the stream's, with no response
+    };
+
+    const auto tc = GENERATE_REF(
+        test_case{
+            .name     = "not an extended CONNECT",
+            .protocol = "",
+            .fields   = ws_fields(),
+            .status   = "400",
+            .why      = ws::errc::not_websocket,
+    },
+        test_case{
+            .name     = "another protocol",
+            .protocol = "webtransport",
+            .fields   = ws_fields(),
+            .status   = "501",
+            .why      = std::nullopt,
+        },
+        test_case{
+            .name     = "a Content-Length of 1",
+            .protocol = "websocket",
+            .fields   = ws_fields({{.name = "content-length", .value = "1"}}),
+            .status   = "400",
+            .why      = std::nullopt,
+        },
+        test_case{
+            .name     = "a large Content-Length",
+            .protocol = "websocket",
+            .fields   = ws_fields({{.name = "content-length", .value = "1048576"}}),
+            .status   = "400",
+            .why      = std::nullopt,
+        },
+        test_case{
+            .name     = "Content-Lengths of 0 and 1",
+            .protocol = "websocket",
+            .fields   = ws_fields({{.name = "content-length", .value = "0"}, {.name = "content-length", .value = "1"}}),
+            .status   = "",
+            .why      = std::nullopt,
+            .reset    = http2::error_code::protocol_error,
+        },
+        test_case{
+            .name            = "another version",
+            .protocol        = "websocket",
+            .fields          = {{.name = "sec-websocket-version", .value = "8"}},
+            .status          = "426",
+            .why             = ws::errc::bad_version,
+            .response_fields = {{"sec-websocket-version", "13"}, {"upgrade", "(none)"}},
+        },
+        test_case{
+            .name     = "another origin",
+            .protocol = "websocket",
+            .fields   = ws_fields({{.name = "origin", .value = "http://elsewhere.example"}}),
+            .status   = "403",
+            .why      = ws::errc::origin_refused,
+        });
+    CAPTURE(tc.name);
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    router.GET("/plain",
+               [](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto* body = co_await rw.send(http::status::OK, 5);
+                   (void)co_await net::io::write_all(*body, "plain"sv);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    struct seen
+    {
+        std::optional<test::h2_client::response> refused;
+        std::optional<test::h2_client::response> plain;
+    };
+
+    const auto client = [&] -> task<seen>
+    {
+        seen result;
+        auto conn = co_await connect_h2(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        co_await test::with_tunnels(&sched,
+                                    &*conn,
+                                    &*conn,
+                                    &*conn,
+                                    [&](h2_tunnels& t) -> task<>
+                                    {
+                                        http2::stream_id id = 0;
+                                        if (tc.protocol.empty())
+                                        {
+                                            id = t.request("GET", "/ws");
+                                        }
+                                        else
+                                        {
+                                            auto opened = co_await t.open("/ws", tc.protocol, tc.fields);
+                                            if (!opened.has_value()) co_return;
+                                            id = *opened;
+                                        }
+                                        result.refused = co_await t.done(id);
+
+                                        const auto plain = t.request("GET", "/plain");
+                                        result.plain     = co_await t.done(plain);
+                                    });
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    REQUIRE(result.refused.has_value());
+    CHECK(result.refused->status == tc.status);
+    if (tc.reset) CHECK(result.refused->reset == *tc.reset);
+    for (const auto& [name, value] : tc.response_fields) CHECK(test::header(*result.refused, name) == value);
+
+    REQUIRE(result.plain.has_value());
+    CHECK(result.plain->status == "200");
+    CHECK(result.plain->body == "plain");
+
+    if (!tc.why) CHECK(out.get().empty());
+    else CHECK(out.get() == std::vector<std::string>{"refused: " + make_error_code(*tc.why).message()});
+}
+
+TEST_CASE("an HTTP/2 extended CONNECT isn't accepted by a handler that doesn't know WebSockets",
+          "[websocket][server][http2][handshake]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+
+    // a 2xx throws: let go, the server answers 500.
+    router.GET("/ok",
+               [](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto* body = co_await rw.send(http::status::OK, 2);
+                   (void)co_await net::io::write_all(*body, "ok"sv);
+               });
+
+    // caught, the handler may answer otherwise; an interim response is no 2xx.
+    router.GET("/caught",
+               [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   (void)co_await rw.send(http::status::EARLY_HINTS);
+                   try
+                   {
+                       (void)co_await rw.send(http::status::NO_CONTENT);
+                   }
+                   catch (const std::system_error& e)
+                   {
+                       out.add(std::format("204: {} sent={}", e.code() == std::errc::not_supported, rw.sent()));
+                   }
+                   (void)co_await rw.send(http::status::NOT_FOUND, 0);
+               });
+
+    // no response at all: the server's empty 200 can't go either, and the stream's reset.
+    router.GET("/silent",
+               [](http::server_request& /*req*/, http::response_writer& /*rw*/) -> task<void> { co_return; });
+
+    // a plain GET over HTTP/2 isn't held to it.
+    router.GET("/plain",
+               [](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto* body = co_await rw.send(http::status::OK, 5);
+                   (void)co_await net::io::write_all(*body, "plain"sv);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto client = [&] -> task<std::vector<std::optional<test::h2_client::response>>>
+    {
+        std::vector<std::optional<test::h2_client::response>> result;
+        auto                                                  conn = co_await connect_h2(&sched, server->local_port());
+        if (!conn.has_value()) co_return result;
+
+        co_await test::with_tunnels(&sched,
+                                    &*conn,
+                                    &*conn,
+                                    &*conn,
+                                    [&](h2_tunnels& t) -> task<>
+                                    {
+                                        for (const auto* path : {"/ok", "/caught", "/silent"})
+                                        {
+                                            auto id = co_await t.open(path, "websocket", ws_fields());
+                                            if (!id.has_value()) co_return;
+                                            result.push_back(co_await t.done(*id));
+                                        }
+                                        result.push_back(co_await t.done(t.request("GET", "/plain")));
+                                    });
+        co_return result;
+    };
+
+    const auto result = sched.run_to_completion(client());
+    REQUIRE(result.size() == 4);
+    for (const auto& r : result) REQUIRE(r.has_value());
+
+    CHECK(result[0]->status == "500");
+    CHECK(result[1]->status == "404");
+    REQUIRE(result[1]->interims.size() == 1);
+    CHECK(result[1]->interims[0].status == "103");
+    CHECK(result[2]->status.empty());
+    CHECK(result[2]->reset == http2::error_code::internal_error);
+    CHECK(result[3]->status == "200");
+    CHECK(result[3]->body == "plain");
+    CHECK(out.get() == std::vector<std::string>{"204: true sent=false"});
+}
+
+TEST_CASE("a WebSocket over HTTP/2 closes either way, and its stream's end or reset is its transport's",
+          "[websocket][server][http2][close]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> finished = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    enum class ending : std::uint8_t
+    {
+        server_closes, // the handler closes, the client answers
+        client_ends,   // the client ends its side of the stream (END_STREAM), without a close
+        client_resets, // the client resets the stream (CANCEL), as a browser dropping a WebSocket does
+        no_close,      // the handler returns without closing: the WebSocket's aborted
+    };
+    const auto how = GENERATE(ending::server_closes, ending::client_ends, ending::client_resets, ending::no_close);
+    CAPTURE(how);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   {
+                       auto conn = co_await ws::accept(req, rw);
+                       if (!conn.has_value()) co_return;
+
+                       (void)co_await conn->write_message(ws::message_type::text, "hi"sv);
+                       if (how == ending::server_closes)
+                       {
+                           out.add("close: " + describe(co_await conn->close(ws::close_code{4000}, "done")));
+                       }
+                       else if (how != ending::no_close)
+                       {
+                           std::string message;
+                           const auto  read = co_await conn->read_message(message);
+                           out.add("read: " + describe(read.error_or(std::error_code{})));
+                       }
+                   }
+
+                   // (the WebSocket's gone by then.)
+                   raise(&sched, finished);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto steps = [&](h2_tunnels& t, http2::stream_id id, raw_peer& peer, h2_result& result) -> task<>
+    {
+        auto hi = co_await peer.read_frame();
+        if (!hi.has_value()) co_return;
+        result.frames.push_back(std::move(*hi));
+
+        switch (how)
+        {
+        case ending::server_closes:
+        {
+            auto close = co_await peer.read_frame();
+            if (!close.has_value()) co_return;
+            result.frames.push_back(std::move(*close));
+            (void)co_await peer.send(close_frame(ws::close_code{4001}, "ok"));
+            break;
+        }
+        case ending::client_ends: t.end(id); break;
+        case ending::client_resets: t.reset(id, http2::error_code::cancel); break;
+        case ending::no_close: break;
+        }
+
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+
+        // (a client that reset its stream reads nothing more of it, so the handler's end is waited for, before the
+        // scheduler's stop would cancel it.)
+        if (!co_await reach(&sched, finished)) out.add("the handler didn't finish");
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    switch (how)
+    {
+    case ending::server_closes:
+        CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi", "close:4000 done"});
+        CHECK(result.err == net::io::errc::end_of_stream);
+        CHECK(out.get() == std::vector<std::string>{"close: ok"});
+        break;
+
+    case ending::client_ends:
+        // the transport's end without a close: the WebSocket fails, aborting (resetting) the stream.
+        CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi"});
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(out.get() == std::vector<std::string>{"read: 1006 peer"});
+        break;
+
+    case ending::client_resets:
+        CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi"});
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(out.get() == std::vector<std::string>{"read: 1006 peer"});
+        break;
+
+    case ending::no_close:
+        // what was written, but no close: the stream's reset.
+        CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi"});
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(out.get().empty());
+        break;
+    }
+}
+
+TEST_CASE("an idle WebSocket over HTTP/2 pings at half its idle_timeout and fails at its end, with no stream timeout",
+          "[websocket][server][http2][idle]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the client answers: a pong starts the wait over (and the stream's body_read_timeout, which would have
+    // reset it, doesn't apply), or nothing does.
+    const bool answers = GENERATE(false, true);
+    CAPTURE(answers);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.idle_timeout = 400ms}}); });
+    auto server = make_server(&sched, std::move(router), {.body_read_timeout = 1s});
+
+    struct times
+    {
+        net::io::clock::duration ping{};
+        net::io::clock::duration end{};
+    };
+    times                      took;
+    net::io::clock::time_point start;
+
+    const auto steps = [&](h2_tunnels& /*t*/, http2::stream_id /*id*/, raw_peer& peer, h2_result& result) -> task<>
+    {
+        auto ping = co_await peer.read_frame();
+        if (!ping.has_value()) co_return;
+        took.ping = net::io::clock::now() - start;
+        result.frames.push_back(std::move(*ping));
+
+        if (answers)
+        {
+            // pongs for 1.5 s (past the stream's own read timeout), then a message, and the close.
+            while (net::io::clock::now() - start < 1500ms)
+            {
+                (void)co_await peer.send(client_frame(opcode::pong, ""sv));
+                auto next = co_await peer.read_frame();
+                if (!next.has_value()) co_return;
+                result.frames.push_back(std::move(*next));
+            }
+            (void)co_await peer.send(
+                join(client_frame(opcode::text, "late"sv), close_frame(ws::close_code::normal_closure)));
+        }
+
+        auto [rest, err] = co_await peer.read_until_end();
+        took.end         = net::io::clock::now() - start;
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+    };
+
+    // from before the request, so the server's first read began after.
+    const auto client = [&] -> task<h2_result>
+    {
+        start = net::io::clock::now();
+        co_return co_await over_h2(&sched, server->local_port(), ws_fields(), steps);
+    };
+
+    const auto result = sched.run_to_completion(client());
+    CHECK(took.ping >= 200ms);
+
+    if (answers)
+    {
+        REQUIRE(result.frames.size() >= 5);
+        for (std::size_t i = 0; i + 2 < result.frames.size(); ++i) CHECK(summary(result.frames[i]) == "ping:");
+        CHECK(summary(result.frames[result.frames.size() - 2]) == "text:late");
+        CHECK(summary(result.frames.back()) == "close:1000");
+        CHECK(result.err == net::io::errc::end_of_stream);
+        CHECK(took.end >= 1500ms);
+    }
+    else
+    {
+        // aborted: the stream's reset.
+        CHECK(summaries(result.frames) == std::vector<std::string>{"ping:"});
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(took.end >= 400ms);
+
+        const auto timed_out = std::make_error_code(std::errc::timed_out).message();
+        CHECK(out.get()
+              == std::vector<std::string>{"read: " + timed_out + " reason=",
+                                          "then write: " + timed_out,
+                                          "then close: " + timed_out});
+    }
+}
+
+TEST_CASE("aborting the server, or a WebSocket's stop token, cancels it over HTTP/2, resetting its stream",
+          "[websocket][server][http2][cancel]")
+{
+    // NOTE: before the scheduler, as the handler uses them.
+    record                     out;
+    std::stop_source           stop;
+    std::atomic<std::uint64_t> done = 0;
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    enum class canceling : std::uint8_t
+    {
+        abort,      // the server's abort(), through req.stop
+        read_stop,  // the WebSocket's own stop token, while a read waits
+        write_stop, // the WebSocket's own stop token, while a write waits for the stream's window
+    };
+    const auto how = GENERATE(canceling::abort, canceling::read_stop, canceling::write_stop);
+    CAPTURE(how);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   ws::accept_options options;
+                   if (how != canceling::abort) options.stop = stop.get_token();
+                   auto conn = co_await ws::accept(req, rw, options);
+                   if (!conn.has_value()) co_return;
+
+                   if (how == canceling::write_stop)
+                   {
+                       // more than the stream's window, which the client doesn't give back.
+                       const std::string large(std::size_t{256} * 1'024, 'x');
+                       out.add("write: " + describe(co_await conn->write_message(ws::message_type::text, large)));
+                   }
+                   else
+                   {
+                       std::string message;
+                       const auto  read = co_await conn->read_message(message);
+                       out.add("read: " + describe(read.error_or(std::error_code{})));
+                   }
+                   out.add(std::format("stream's token stopped: {}", req.stop.stop_requested()));
+                   raise(&sched, done);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto steps = [&](h2_tunnels& t, http2::stream_id id, raw_peer& /*peer*/, h2_result& result) -> task<>
+    {
+        // the read, or the write, is waiting by then.
+        (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+        if (how == canceling::abort) server->abort();
+        else stop.request_stop();
+
+        const auto ended = co_await t.done(id);
+        if (ended.has_value()) result.err = ended->reset;
+        if (!co_await reach(&sched, done)) out.add("the handler didn't finish");
+        if (how == canceling::abort) co_await server->join();
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    CHECK(result.err == http2::error_code::cancel);
+
+    const auto canceled = std::make_error_code(std::errc::operation_canceled).message();
+    switch (how)
+    {
+    case canceling::abort:
+        CHECK(out.get() == std::vector<std::string>{"read: " + canceled, "stream's token stopped: true"});
+        break;
+    case canceling::read_stop:
+        CHECK(out.get() == std::vector<std::string>{"read: " + canceled, "stream's token stopped: false"});
+        break;
+    case canceling::write_stop:
+        CHECK(out.get() == std::vector<std::string>{"write: " + canceled, "stream's token stopped: false"});
+        break;
+    }
+}
+
+TEST_CASE("the server's close tells a WebSocket over HTTP/2 it's going away, and join() waits for the close handshake",
+          "[websocket][server][http2][close][going-away]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> joined = 0;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // whether the client answers; if not, the WebSocket's aborted at close_timeout.
+    const bool answers = GENERATE(true, false);
+    CAPTURE(answers);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.close_timeout = 300ms}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    net::io::clock::duration to_end{};
+    bool                     goaway = false;
+
+    const auto steps = [&](h2_tunnels& t, http2::stream_id /*id*/, raw_peer& peer, h2_result& result) -> task<>
+    {
+        (void)co_await peer.send(client_frame(opcode::text, "hi"sv));
+        auto echoed = co_await peer.read_frame();
+        if (!echoed.has_value()) co_return;
+        result.frames.push_back(std::move(*echoed));
+
+        const auto closed = net::io::clock::now();
+        server->close();
+        (void)sched.spawn(
+            [](http::server* server, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined)
+                -> task<void>
+            {
+                co_await server->join();
+                out->add("joined");
+                raise(sched, *joined);
+            }(server.get(), &out, &sched, &joined));
+
+        auto close = co_await peer.read_frame();
+        if (!close.has_value()) co_return;
+        result.frames.push_back(std::move(*close));
+
+        if (answers)
+        {
+            // join() waits for the answer.
+            (void)co_await sched.sleep_until(net::io::clock::now() + 100ms);
+            out.add("answering");
+            (void)co_await peer.send(close_frame(ws::close_code::going_away));
+        }
+
+        auto [rest, err] = co_await peer.read_until_end();
+        to_end           = net::io::clock::now() - closed;
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+
+        if (!co_await reach(&sched, joined)) out.add("join() didn't return");
+        goaway = t.goaway_received();
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi", "close:1001"});
+    CHECK(goaway);
+
+    if (answers)
+    {
+        CHECK(result.err == net::io::errc::end_of_stream);
+        CHECK(out.get()
+              == std::vector<std::string>{"answering",
+                                          "read: 1001 sent reason=",
+                                          "then write: 1001 sent",
+                                          "then close: ok",
+                                          "joined"});
+    }
+    else
+    {
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(to_end >= 300ms);
+        CHECK(out.get()
+              == std::vector<std::string>{"read: 1001 sent reason=",
+                                          "then write: 1001 sent",
+                                          "then close: 1001 sent",
+                                          "joined"});
+    }
+}
+
+TEST_CASE("the server's close reaches a WebSocket over HTTP/2 whose peer never lets its reads wait",
+          "[websocket][server][http2][close][going-away][busy]")
+{
+    record                     out;
+    std::atomic<std::uint64_t> joined = 0;
+    flow                       sending;
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const auto shape   = GENERATE(busy_shape::messages, busy_shape::streamed, busy_shape::empty_parts);
+    const bool answers = GENERATE(true, false);
+    CAPTURE(shape, answers);
+
+    const auto close_timeout = answers ? std::chrono::milliseconds{5s} : std::chrono::milliseconds{300ms};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(
+                       req,
+                       rw,
+                       {
+                           .connection = {.max_message = std::uint64_t{1} << 62, .close_timeout = close_timeout}
+                   });
+                   if (!conn.has_value()) co_return;
+
+                   std::error_code err;
+                   if (shape == busy_shape::streamed)
+                   {
+                       const auto type = co_await conn->next_message();
+                       err             = type.error_or(std::error_code{});
+                       std::array<std::byte, 4'096> buf{};
+                       while (!err) err = (co_await conn->message().read(buf)).err;
+                   }
+                   else
+                   {
+                       std::string message;
+                       while (!err) err = (co_await conn->read_message(message)).error_or(std::error_code{});
+                   }
+                   out.add("read: " + describe(err));
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    net::io::clock::duration to_end{};
+    net::io::clock::duration to_join{};
+
+    const auto steps = [&](h2_tunnels& /*t*/, http2::stream_id /*id*/, raw_peer& peer, h2_result& result) -> task<>
+    {
+        std::vector<std::byte> batch;
+        switch (shape)
+        {
+        case busy_shape::messages: batch = batch_of(client_frame(opcode::text, "hello"sv)); break;
+        case busy_shape::streamed:
+        {
+            (void)co_await peer.send(client_frame(opcode::binary, "first"sv, false));
+            const std::vector<std::byte> part(4'096, std::byte{'x'});
+            batch = batch_of(client_frame(opcode::continuation, part, false));
+            break;
+        }
+        case busy_shape::empty_parts:
+            (void)co_await peer.send(client_frame(opcode::text, "first"sv, false));
+            batch = batch_of(client_frame(opcode::continuation, ""sv, false));
+            break;
+        }
+
+        if (!sched.spawn(send_nonstop(&peer, std::move(batch), &sched, &sending))) co_return;
+
+        // the server's reads are under way, and behind.
+        if (co_await reach(&sched, sending.sent, std::uint64_t{1} << 20))
+        {
+            const auto closed = net::io::clock::now();
+            server->close();
+            (void)sched.spawn(
+                [](http::server* server, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined)
+                    -> task<void>
+                {
+                    co_await server->join();
+                    out->add("joined");
+                    raise(sched, *joined);
+                }(server.get(), &out, &sched, &joined));
+
+            auto close = co_await peer.read_frame();
+            if (close.has_value())
+            {
+                result.frames.push_back(std::move(*close));
+                if (answers)
+                {
+                    raise(&sched, sending.stop);
+                    if (co_await reach(&sched, sending.done))
+                    {
+                        out.add("answering");
+                        (void)co_await peer.send(close_frame(ws::close_code::going_away));
+                    }
+                }
+
+                auto [rest, err] = co_await peer.read_until_end();
+                to_end           = net::io::clock::now() - closed;
+                result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+                result.err = err;
+
+                if (!co_await reach(&sched, joined)) out.add("join() didn't return");
+                to_join = net::io::clock::now() - closed;
+            }
+        }
+
+        // the sender's done with the stream before it goes (its writes fail, once the server has ended it).
+        raise(&sched, sending.stop);
+        if (!co_await reach(&sched, sending.done)) out.add("the sender didn't stop");
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"close:1001"});
+
+    if (answers)
+    {
+        CHECK(result.err == net::io::errc::end_of_stream);
+        CHECK(to_join < close_timeout);
+        CHECK(out.get() == std::vector<std::string>{"answering", "read: 1001 sent", "joined"});
+    }
+    else
+    {
+        // a peer that sends on is cut off at close_timeout, however much it sends: the stream's reset.
+        CHECK(result.err == http2::error_code::cancel);
+        CHECK(to_end >= close_timeout);
+        CHECK(out.get() == std::vector<std::string>{"read: 1001 sent", "joined"});
+    }
+}
+
+TEST_CASE("the server's close reaches a WebSocket over HTTP/2 whose peer never reads, at close_timeout",
+          "[websocket][server][http2][close][going-away][busy]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.connection = {.close_timeout = 300ms}});
+                   if (!conn.has_value()) co_return;
+
+                   // a writer, writing until a write fails: the client never reads, so it soon waits for the window.
+                   std::atomic<std::uint64_t> wrote = 0;
+                   (void)sched.spawn(
+                       [](ws::connection*             conn,
+                          record*                     out,
+                          net::io::scheduler*         sched,
+                          std::atomic<std::uint64_t>* wrote) -> task<void>
+                       {
+                           const std::string message(std::size_t{16} * 1'024, 'x');
+                           std::error_code   err;
+                           while (!err) err = co_await conn->write_message(ws::message_type::text, message);
+                           out->add("write: " + describe(err));
+                           raise(sched, *wrote);
+                       }(&*conn, &out, &sched, &wrote));
+
+                   std::string message;
+                   const auto  read = co_await conn->read_message(message);
+                   out.add("read: " + describe(read.error_or(std::error_code{})));
+                   if (!co_await reach(&sched, wrote)) out.add("the writer didn't stop");
+               });
+
+    // a write_timeout longer than the test, so it's close_timeout that ends the WebSocket.
+    auto server = make_server(&sched, std::move(router), {.write_timeout = 30s});
+
+    net::io::clock::duration to_join{};
+
+    const auto steps = [&](h2_tunnels& t, http2::stream_id id, raw_peer& /*peer*/, h2_result& result) -> task<>
+    {
+        // the stream's window is used up by then.
+        (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
+
+        const auto closed = net::io::clock::now();
+        server->close();
+        co_await server->join();
+        to_join = net::io::clock::now() - closed;
+
+        const auto ended = co_await t.done(id);
+        if (ended.has_value()) result.err = ended->reset;
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    CHECK(to_join >= 300ms);
+    CHECK(to_join < 5s);
+    CHECK(result.err == http2::error_code::cancel);
+
+    // the 1001 couldn't go (the writer held the stream, waiting for the window): the close's read timed out, which
+    // aborted the WebSocket, failing the write too.
+    auto lines = out.get();
+    std::ranges::sort(lines);
+    CHECK(lines == std::vector<std::string>{"read: 1001 sent", "write: 1001 sent"});
+}
+
+TEST_CASE("a WebSocket over HTTP/2 counts against http2_max_concurrent_streams until its handler returns",
+          "[websocket][server][http2][limits]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    router.GET("/plain",
+               [](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto* body = co_await rw.send(http::status::OK, 5);
+                   (void)co_await net::io::write_all(*body, "plain"sv);
+               });
+    auto server = make_server(&sched, std::move(router), {.http2_max_concurrent_streams = 1});
+
+    struct seen
+    {
+        bool                                     open_while_ws = true;
+        bool                                     open_after    = false;
+        std::optional<test::h2_client::response> plain;
+    };
+    seen saw;
+
+    const auto steps = [&](h2_tunnels& t, http2::stream_id id, raw_peer& peer, h2_result& result) -> task<>
+    {
+        // the WebSocket's stream is open: the server allows no other.
+        (void)co_await peer.send(client_frame(opcode::text, "hi"sv));
+        auto echoed = co_await peer.read_frame();
+        if (!echoed.has_value()) co_return;
+        result.frames.push_back(std::move(*echoed));
+        saw.open_while_ws = t.can_open();
+
+        (void)co_await peer.send(close_frame(ws::close_code::normal_closure));
+        auto [rest, err] = co_await peer.read_until_end();
+        result.frames.insert(result.frames.end(), rest.begin(), rest.end());
+        result.err = err;
+
+        // once it's ended both ways, another may open.
+        t.end(id);
+        (void)co_await t.done(id);
+        saw.open_after = t.can_open();
+        if (saw.open_after) saw.plain = co_await t.done(t.request("GET", "/plain"));
+    };
+
+    const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:hi", "close:1000"});
+    CHECK_FALSE(saw.open_while_ws);
+    CHECK(saw.open_after);
+    REQUIRE(saw.plain.has_value());
+    CHECK(saw.plain->status == "200");
+}
+
+TEST_CASE("WebSockets and requests share an HTTP/2 connection", "[websocket][server][http2]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    router.GET("/plain",
+               [](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto* body = co_await rw.send(http::status::OK, 5);
+                   (void)co_await net::io::write_all(*body, "plain"sv);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    constexpr int sockets = 3;
+
+    const auto client = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+        auto                     conn = co_await connect_h2(&sched, server->local_port());
+        if (!conn.has_value()) co_return lines;
+
+        co_await test::with_tunnels(
+            &sched,
+            &*conn,
+            &*conn,
+            &*conn,
+            [&](h2_tunnels& t) -> task<>
+            {
+                std::vector<http2::stream_id> ids;
+                for (int i = 0; i < sockets; ++i)
+                {
+                    auto id = co_await t.open("/ws", "websocket", ws_fields());
+                    if (!id.has_value()) co_return;
+                    ids.push_back(*id);
+                }
+
+                // each WebSocket echoes its own, in rounds, with requests between them.
+                std::vector<std::unique_ptr<h2_tunnels::stream>> streams;
+                std::vector<std::unique_ptr<raw_peer>>           peers;
+                for (const auto id : ids)
+                {
+                    streams.push_back(std::make_unique<h2_tunnels::stream>(&t, id));
+                    peers.push_back(std::make_unique<raw_peer>(*streams.back(), *streams.back()));
+                }
+
+                for (int round = 0; round < 3; ++round)
+                {
+                    for (int i = 0; i < sockets; ++i)
+                        (void)co_await peers[i]->send(
+                            client_frame(opcode::text, std::format("ws{} round{}", i, round)));
+
+                    const auto plain = co_await t.done(t.request("GET", "/plain"));
+                    lines.push_back(std::format("plain: {}", plain.has_value() ? plain->body : "none"));
+
+                    for (int i = sockets - 1; i >= 0; --i)
+                    {
+                        auto f = co_await peers[i]->read_frame();
+                        lines.push_back(f.has_value() ? summary(*f) : "failed: " + f.error().message());
+                    }
+                }
+
+                for (int i = 0; i < sockets; ++i)
+                {
+                    (void)co_await peers[i]->send(close_frame(ws::close_code::normal_closure));
+                    auto [frames, err] = co_await peers[i]->read_until_end();
+                    lines.push_back(std::format("ws{}: {} {}",
+                                                i,
+                                                summaries(frames).empty() ? "" : summaries(frames).back(),
+                                                err == net::io::errc::end_of_stream));
+                }
+            });
+        co_return lines;
+    };
+
+    const auto               lines = sched.run_to_completion(client());
+    std::vector<std::string> want;
+    for (int round = 0; round < 3; ++round)
+    {
+        want.emplace_back("plain: plain");
+        for (int i = sockets - 1; i >= 0; --i) want.push_back(std::format("text:ws{} round{}", i, round));
+    }
+    for (int i = 0; i < sockets; ++i) want.push_back(std::format("ws{}: close:1000 true", i));
+    CHECK(lines == want);
+}
+
+TEST_CASE("an HTTP/2 extended CONNECT with Content-Length: 0 is a WebSocket's, a GET without a body",
+          "[websocket][server][http2][handshake]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // one line, or two that agree.
+    const int lines = GENERATE(1, 2);
+    CAPTURE(lines);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   const auto length = req.headers.get_content_length();
+                   out.add(std::format("content-length={}", length ? std::to_string(*length) : "(none)"));
+                   co_await echo(req, rw, out);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const std::vector<hpack::field> extra(static_cast<std::size_t>(lines), {.name = "content-length", .value = "0"});
+
+    const auto result = sched.run_to_completion(over_h2(
+        &sched,
+        server->local_port(),
+        ws_fields(extra),
+        steps_sending(&sched,
+                      join(client_frame(opcode::text, "hello"sv), close_frame(ws::close_code::normal_closure)))));
+
+    CHECK(result.status == "200");
+    CHECK(summaries(result.frames) == std::vector<std::string>{"text:hello", "close:1000"});
+    CHECK(result.err == net::io::errc::end_of_stream);
+    CHECK(out.get()
+          == std::vector<std::string>{"content-length=0",
+                                      "read: 1000 peer reason=",
+                                      "then write: 1000 peer",
+                                      "then close: ok"});
 }

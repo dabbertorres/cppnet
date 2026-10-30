@@ -289,6 +289,17 @@ coro::task<std::error_code> response_writer::send_continue()
     co_return co_await flush(h1.writer);
 }
 
+void detail::put_fields(headers& to, fields_view fields)
+{
+    to.remove("Content-Length"sv);
+    to.remove("Transfer-Encoding"sv);
+    for (const auto& [name, values] : fields)
+    {
+        to.remove(name);
+        for (const auto& value : values) to.add(name, std::string_view{value});
+    }
+}
+
 coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_protocols(response_writer& rw,
                                                                                      fields_view      fields)
 {
@@ -296,16 +307,31 @@ coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_proto
 
     if (rw.final_sent) throw std::logic_error{"the response was already sent"};
 
-    // HTTP/2 has no 101 (RFC 9113, section 8.6), and switches a stream with an extended CONNECT instead.
-    const auto* h1     = std::get_if<response_writer::http11_backend>(&rw.backend);
+    // NOTE: checked before the connection is touched, so that a failure leaves the handler to respond as it would.
+    const auto valid = [&] { return valid_fields(fields) && valid_fields(rw.resp->headers); };
+
+    // HTTP/2 has no 101 (RFC 9113, section 8.6): an extended CONNECT's stream is opened as a tunnel with a 2xx instead
+    // (RFC 8441, section 5), which needs no coroutine, as the head's submitted to the connection's writer.
+    if (const auto* h2 = std::get_if<response_writer::http2_backend>(&rw.backend))
+    {
+        if (!valid())
+            return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+
+        auto opened = h2->ops->open_tunnel(*h2->stream, *rw.resp, fields);
+        if (opened.has_value())
+        {
+            rw.final_sent = true;
+            rw.tunneled   = true;
+        }
+        return coro::ready_task<result>(opened);
+    }
+
+    const auto& h1     = std::get<response_writer::http11_backend>(rw.backend);
     const bool  http10 = rw.resp->version.major == 1 && rw.resp->version.minor == 0;
-    if (h1 == nullptr || h1->switching == nullptr || http10)
+    if (h1.switching == nullptr || http10)
         return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::not_supported)));
 
-    // NOTE: checked before the connection is touched, so that a failure leaves the handler to respond as it would.
-    if (!valid_fields(fields) || !valid_fields(rw.resp->headers))
-        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
-
+    if (!valid()) return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
     return rw.switch_to(fields);
 }
 
@@ -323,13 +349,7 @@ coro::task<std::expected<detail::tunnel*, std::error_code>> response_writer::swi
 
     // a 101 has no content (RFC 9110, section 15.2).
     resp->status_code = status::SWITCHING_PROTOCOLS;
-    resp->headers.remove("Content-Length"sv);
-    resp->headers.remove("Transfer-Encoding"sv);
-    for (const auto& [name, values] : fields)
-    {
-        resp->headers.remove(name);
-        for (const auto& value : values) resp->headers.add(name, std::string_view{value});
-    }
+    detail::put_fields(resp->headers, fields);
 
     auto encoded = co_await h1.encode(h1.writer, *resp);
     if (!encoded.has_value()) co_return std::unexpected(encoded.error());

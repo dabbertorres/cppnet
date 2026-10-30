@@ -1,6 +1,7 @@
 #include "websocket/handshake.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -147,7 +148,9 @@ TEST_CASE("check_request refuses what isn't a WebSocket handshake", "[websocket]
     },
         test_case{.name = "CONNECT", .expect = errc::not_websocket, .method = http::request_method::CONNECT},
         test_case{.name = "HTTP/1.0", .expect = errc::not_websocket, .version = {.major = 1, .minor = 0}},
-        test_case{.name = "HTTP/2, for now", .expect = errc::not_websocket, .version = {.major = 2, .minor = 0}},
+        test_case{.name    = "HTTP/2, not an extended CONNECT",
+                  .expect  = errc::not_websocket,
+                  .version = {.major = 2, .minor = 0}},
         test_case{.name = "no Upgrade", .changes = {{"Upgrade", ""}}, .expect = errc::not_websocket},
         test_case{.name = "another Upgrade", .changes = {{"Upgrade", "h2c"}}, .expect = errc::not_websocket},
         test_case{.name    = "Upgrade, not a token of it",
@@ -201,6 +204,56 @@ TEST_CASE("check_request refuses what isn't a WebSocket handshake", "[websocket]
     const auto key = ws::check_request(req);
     REQUIRE_FALSE(key.has_value());
     CHECK(key.error() == tc.expect);
+}
+
+TEST_CASE("check_request takes an HTTP/2 extended CONNECT, as the server presents it", "[websocket][handshake][http2]")
+{
+    struct test_case
+    {
+        std::string_view name;
+        std::string_view protocol = "websocket";
+        field_list       fields{
+            {"Sec-WebSocket-Version", "13"}
+        };
+        std::optional<errc>  expect{};
+        http::request_method method = http::request_method::GET;
+    };
+
+    auto tc = GENERATE(
+        test_case{
+            .name = "taken, without a key, Upgrade or Connection"
+    },
+        test_case{.name = "the protocol in any case", .protocol = "WebSocket"},
+        test_case{.name   = "a Content-Length of 0",
+                  .fields = {{"Sec-WebSocket-Version", "13"}, {"Content-Length", "0"}}},
+        test_case{.name = "another protocol", .protocol = "webtransport", .expect = errc::not_websocket},
+        test_case{.name = "no protocol", .protocol = "", .expect = errc::not_websocket},
+        test_case{.name = "not GET", .expect = errc::not_websocket, .method = http::request_method::CONNECT},
+        test_case{.name   = "a body",
+                  .fields = {{"Sec-WebSocket-Version", "13"}, {"Content-Length", "5"}},
+                  .expect = errc::not_websocket},
+        test_case{.name = "no version", .fields = {}, .expect = errc::bad_version},
+        test_case{.name = "version 8", .fields = {{"Sec-WebSocket-Version", "8"}}, .expect = errc::bad_version});
+
+    CAPTURE(tc.name);
+
+    http::server_request req;
+    req.method   = tc.method;
+    req.version  = {.major = 2, .minor = 0};
+    req.protocol = tc.protocol;
+    for (const auto& [name, value] : tc.fields) req.headers.add(name, value);
+
+    const auto key = ws::check_request(req);
+    if (tc.expect)
+    {
+        REQUIRE_FALSE(key.has_value());
+        CHECK(key.error() == *tc.expect);
+    }
+    else
+    {
+        REQUIRE(key.has_value());
+        CHECK(key->empty());
+    }
 }
 
 TEST_CASE("select_subprotocol takes the server's first that the client offers", "[websocket][handshake]")

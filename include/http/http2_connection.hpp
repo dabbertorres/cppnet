@@ -30,6 +30,9 @@
 #include "http/http2_config.hpp"
 #include "http/http2_scheduler.hpp"
 #include "http/http2_session.hpp"
+#include "http/tunnel.hpp"
+#include "io/buffered_reader.hpp"
+#include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
@@ -135,6 +138,78 @@ private:
     http2_stream_base* stream;
 };
 
+// stream_tunnel is a stream once it's a tunnel (see http/tunnel.hpp): once a 2xx has answered its extended CONNECT
+// (RFC 8441), its DATA both ways is the tunnel's protocol's (e.g. a WebSocket's), read and written through buffers of
+// 4 KiB each way over the stream's own reader and writer (so frame headers and small messages are gathered, and large
+// payloads go through). A read that waits is limited by the tunnel's own timeout and deadline, and canceled by its stop
+// token, failing having read nothing while the stream goes on (as a socket's would), where the stream's own timeouts
+// reset it: stream_reader::read() asks check_wait() before each wait, and the connection's timer wakes it at wake_at.
+//
+// A stream's tunnel is its stream's: made once (holding the connection's lock), and destroyed with it, holding the lock
+// too, so its stop token (see set_stop_token()) must be removed before then, as its callback takes the lock.
+class stream_tunnel final : public tunnel
+{
+public:
+    // closing is the server's close() token (none for a client's).
+    stream_tunnel(http2_stream_base& stream, std::stop_token closing);
+
+    stream_tunnel(const stream_tunnel&)            = delete;
+    stream_tunnel& operator=(const stream_tunnel&) = delete;
+    stream_tunnel(stream_tunnel&&)                 = delete;
+    stream_tunnel& operator=(stream_tunnel&&)      = delete;
+    ~stream_tunnel()                               = default;
+
+    [[nodiscard]] io::buffered_reader& reader() noexcept override { return in; }
+    [[nodiscard]] io::buffered_writer& writer() noexcept override { return out; }
+
+    void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept override;
+    void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept override;
+
+    // set_stop_token registers a callback on stop (removing the last's first, which waits for it if it's being made,
+    // so it's called without the connection's lock) that marks the tunnel stopped and wakes the stream's waits, which
+    // then fail (std::errc::operation_canceled): a read that has to wait, and a write that waits for its turn or the
+    // windows (with what it sent before; see http2_connection_base::step_write()).
+    void set_stop_token(std::stop_token stop) noexcept override;
+
+    [[nodiscard]] std::stop_token closing() const noexcept override { return closing_token; }
+    [[nodiscard]] io::scheduler*  get_scheduler() const noexcept override;
+
+    // abort resets the stream (CANCEL), failing it with std::errc::connection_aborted.
+    void abort() noexcept override;
+
+    // check_wait is what a read that has nothing to read comes to before it waits (holding the lock): an error if it's
+    // not to wait (stopped, or past its deadline or timeout: timeout_at is when its timeout passes, which it sets the
+    // first time); none otherwise, having set when the timer's to wake it (wake_at), if ever.
+    std::error_code check_wait(std::optional<io::clock::time_point>& timeout_at);
+
+    // Guarded by the connection's lock: when the timer's to wake a read that's waiting (its deadline, or its timeout's
+    // end), and whether stop's been requested.
+    std::optional<io::clock::time_point> wake_at;
+    bool                                 stopped = false;
+
+private:
+    // stopper is the stop token's callback.
+    struct stopper
+    {
+        stream_tunnel* tunnel;
+
+        void operator()() const noexcept;
+    };
+
+    http2_stream_base& stream;
+    std::stop_token    closing_token;
+
+    // Guarded by the connection's lock.
+    std::optional<io::clock::time_point> deadline;
+    std::optional<io::clock::duration>   timeout;
+
+    stream_reader       raw_in;
+    io::buffered_reader in;
+    io::buffered_writer out;
+
+    std::optional<std::stop_callback<stopper>> on_stop;
+};
+
 // http2_stream_base is what a stream's reader and writer use: what it's received, and how it's ended. Its fields are
 // guarded by its connection's lock. It's a scheduler_node (its connection schedules its streams' DATA by priority): its
 // priority, and its place among the streams waiting to send.
@@ -200,6 +275,9 @@ public:
     // so it never touches the span once the write has returned.
     std::span<const std::byte> sending;
     std::size_t                sending_done = 0;
+
+    // The stream's tunnel, once it's one (see stream_tunnel): its reads' limits and stop, which stream_reader checks.
+    std::unique_ptr<stream_tunnel> tunnel;
 
     // notified whenever any of the above changes, or the stream's (or connection's) window grows.
     coro::notifier changed;
@@ -302,11 +380,18 @@ public:
     // lock): telling the timer, if it's sooner than it knew.
     void arm_deadline(std::optional<io::clock::time_point>& deadline, std::chrono::milliseconds timeout);
 
+    // wake_timer_at tells the timer of a time it's to act at (holding the lock): e.g. a tunnel's read's wake_at.
+    void wake_timer_at(io::clock::time_point at);
+
     // get_logger is the connection's logger (e.g. for what its streams' heads and ends drop).
     [[nodiscard]] spdlog::logger& get_logger() const noexcept { return logger; }
 
+    // get_scheduler is the scheduler the connection waits on (e.g. for its tunnels' users).
+    [[nodiscard]] io::scheduler* get_scheduler() const noexcept { return scheduler; }
+
     // fail_stream fails s with err, unless it has failed already (holding the lock), queuing its stop source (if it
-    // has one) for stop_pending() to stop. Waking its waits is the caller's.
+    // has one, and it isn't a tunnel, whose user finds its failure in its reads and writes) for stop_pending() to stop.
+    // Waking its waits is the caller's.
     //
     // Stop sources are never stopped holding the lock: std::stop_source::request_stop() runs the callbacks registered
     // on it inline, and they're anyone's (the handler's, a scheduler wait's, ...), taking locks of their own. So each

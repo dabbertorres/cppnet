@@ -45,6 +45,11 @@ namespace
     // How much is read from the connection at once.
     constexpr std::size_t read_size = std::size_t{32} * 1'024;
 
+    // How much a stream's tunnel buffers each way (see stream_tunnel): the stream has buffers of its own (what's
+    // received, and the connection's output), so this only gathers small writes (e.g. a WebSocket's frame header and a
+    // short message) into one DATA frame, and small reads out of the stream's lock.
+    constexpr std::size_t tunnel_buffer_size = std::size_t{4} * 1'024;
+
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
 
@@ -142,6 +147,46 @@ template std::error_code append_fields(const trailer_fields&      from,
                                        std::vector<hpack::field>& fields,
                                        field_section              section);
 
+namespace
+{
+
+    // take_received takes what a stream's received into data, as much as fits, giving the peer back as much window
+    // (holding the lock), and returns how much it took.
+    std::size_t take_received(http2_stream_base& s, std::span<std::byte> data)
+    {
+        // (a tunnel's read that waited has its time: the timer needn't wake it.)
+        if (s.tunnel != nullptr) s.tunnel->wake_at.reset();
+
+        const auto n = std::min(data.size(), s.received.size() - s.received_start);
+        std::ranges::copy(std::span{s.received}.subspan(s.received_start, n), data.begin());
+        s.received_start += n;
+        if (s.received_start == s.received.size())
+        {
+            s.received.clear();
+            s.received_start = 0;
+        }
+        else if (s.received_start >= s.received.size() / 2)
+        {
+            // a reader that never catches up mustn't keep all it's read: what's left moves to the front, so the buffer
+            // holds at most about twice the stream's window.
+            s.received.erase(s.received.begin(), s.received.begin() + static_cast<std::ptrdiff_t>(s.received_start));
+            s.received_start = 0;
+        }
+
+        // the peer may send as much more.
+        s.conn->session.consume(s.id, n);
+        return n;
+    }
+
+    // tunnel_wait is what a read with nothing to read comes to before it waits (holding the lock): for a tunnel, see
+    // stream_tunnel::check_wait(); otherwise, nothing.
+    std::error_code tunnel_wait(http2_stream_base& s, std::optional<io::clock::time_point>& timeout_at)
+    {
+        return s.tunnel != nullptr ? s.tunnel->check_wait(timeout_at) : std::error_code{};
+    }
+
+}
+
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 {
     if (at_start && !data.empty()) [[unlikely]]
@@ -151,6 +196,9 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
     }
 
     auto& c = *stream->conn;
+
+    // a tunnel's read timeout's end, once the read waits (see stream_tunnel::check_wait()).
+    std::optional<io::clock::time_point> timeout_at;
     while (true)
     {
         std::uint64_t seen   = 0;
@@ -163,26 +211,8 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 
             if (s.received_start < s.received.size())
             {
-                took = true;
-                n    = std::min(data.size(), s.received.size() - s.received_start);
-                std::ranges::copy(std::span{s.received}.subspan(s.received_start, n), data.begin());
-                s.received_start += n;
-                if (s.received_start == s.received.size())
-                {
-                    s.received.clear();
-                    s.received_start = 0;
-                }
-                else if (s.received_start >= s.received.size() / 2)
-                {
-                    // a reader that never catches up mustn't keep all it's read: what's left moves to the front, so
-                    // the buffer holds at most about twice the stream's window.
-                    s.received.erase(s.received.begin(),
-                                     s.received.begin() + static_cast<std::ptrdiff_t>(s.received_start));
-                    s.received_start = 0;
-                }
-
-                // the peer may send as much more.
-                c.session.consume(s.id, n);
+                took   = true;
+                n      = take_received(s, data);
                 output = c.session.has_output();
             }
             else
@@ -193,6 +223,9 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
                     co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
                 }
                 if (s.failure) co_return io::result{.err = s.failure};
+
+                // a tunnel's read that's stopped, or out of time, fails having read nothing: the stream goes on.
+                if (const auto err = tunnel_wait(s, timeout_at)) co_return io::result{.err = err};
 
                 seen = s.changed.value();
                 c.arm_deadline(s.read_deadline, s.read_timeout);
@@ -277,7 +310,8 @@ http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byt
 
     write_step      step;
     std::error_code failed; // submitting failed
-    bool            output = false;
+    bool            output   = false;
+    bool            canceled = false; // a tunnel's stopped write, which would have to wait
     {
         std::scoped_lock lock{mu};
 
@@ -287,6 +321,13 @@ http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byt
             // or the stream's failed (which took it out).
             if (s.failure) return done(state.written + s.sending_done, s.failure);
             if (!s.queued()) return done(data.size());
+
+            // a tunnel's stopped write goes no further: the writer mustn't touch its span once it's returned.
+            if (s.tunnel != nullptr && s.tunnel->stopped)
+            {
+                send_order.remove(s);
+                return done(state.written + s.sending_done, std::make_error_code(std::errc::operation_canceled));
+            }
             return wait_for(s.changed);
         }
 
@@ -297,8 +338,12 @@ http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byt
         if (send_order.empty() && session.output_size() <= max_output) failed = submit_at_once(s, data, state);
         if (!failed && state.written < data.size())
         {
-            queue_rest(s, data, state);
-            step = wait_for(s.changed);
+            canceled = s.tunnel != nullptr && s.tunnel->stopped;
+            if (!canceled)
+            {
+                queue_rest(s, data, state);
+                step = wait_for(s.changed);
+            }
         }
 
         output = session.has_output();
@@ -309,6 +354,11 @@ http2_connection_base::step_write(http2_stream_base& s, std::span<const std::byt
         // the handler's token, which its own callbacks may be registered on, so it's after unlocking.
         stop_pending();
         return done(state.written, failed);
+    }
+    if (canceled)
+    {
+        if (output) writer_wakeup.notify();
+        return done(state.written, std::make_error_code(std::errc::operation_canceled));
     }
 
     // (a write that's queued has the writer frame it, whether or not there's output yet.)
@@ -366,6 +416,92 @@ std::expected<std::size_t, std::error_code> http2_connection_base::submit_body(h
 
 io::handle stream_writer::native_handle() const noexcept { return stream->conn->native_handle(); }
 
+stream_tunnel::stream_tunnel(http2_stream_base& stream, std::stop_token closing)
+    : stream{stream}
+    , closing_token{std::move(closing)}
+    , raw_in{&stream}
+    , in{&raw_in, tunnel_buffer_size}
+    , out{&stream.writer, tunnel_buffer_size}
+{}
+
+void stream_tunnel::set_read_timeout(std::optional<io::clock::duration> t) noexcept
+{
+    // (the next wait's: as a socket's, a read already waiting keeps the timeout it began with.)
+    std::scoped_lock lock{stream.conn->mu};
+    timeout = t;
+}
+
+void stream_tunnel::set_read_deadline(std::optional<io::clock::time_point> d) noexcept
+{
+    {
+        std::scoped_lock lock{stream.conn->mu};
+        deadline = d;
+    }
+
+    // a read that's waiting looks again (see check_wait()), whichever thread this is.
+    stream.changed.notify();
+}
+
+void stream_tunnel::set_stop_token(std::stop_token stop) noexcept
+{
+    // NOTE: without the lock, which the callback takes: removing it waits for it, if it's being made elsewhere.
+    on_stop.reset();
+    {
+        std::scoped_lock lock{stream.conn->mu};
+        stopped = false;
+    }
+
+    // (made at once, if stop's been requested already.)
+    if (stop.stop_possible()) on_stop.emplace(std::move(stop), stopper{this});
+}
+
+void stream_tunnel::stopper::operator()() const noexcept
+{
+    // NOTE: the flag's guarded by the connection's lock, which the waits check it under, so it needs no ordering of its
+    //       own; and this runs on whichever thread stops the token, never holding the lock (see fail_stream()).
+    auto& s = tunnel->stream;
+    {
+        std::scoped_lock lock{s.conn->mu};
+        tunnel->stopped = true;
+    }
+    s.changed.notify();
+}
+
+io::scheduler* stream_tunnel::get_scheduler() const noexcept { return stream.conn->get_scheduler(); }
+
+void stream_tunnel::abort() noexcept
+{
+    auto& c = *stream.conn;
+    {
+        std::scoped_lock lock{c.mu};
+        if (!stream.failure)
+        {
+            c.fail_stream(stream, std::make_error_code(std::errc::connection_aborted));
+            c.session.reset(stream.id, http2::error_code::cancel);
+        }
+    }
+
+    stream.changed.notify();
+    c.wake_writer();
+}
+
+std::error_code stream_tunnel::check_wait(std::optional<io::clock::time_point>& timeout_at)
+{
+    wake_at.reset();
+    if (stopped) return std::make_error_code(std::errc::operation_canceled);
+
+    const auto now = io::clock::now();
+    if (!timeout_at.has_value() && timeout.has_value()) timeout_at = now + *timeout;
+
+    auto until = deadline;
+    if (timeout_at.has_value() && (!until.has_value() || *timeout_at < *until)) until = timeout_at;
+    if (until.has_value() && *until <= now) return std::make_error_code(std::errc::timed_out);
+
+    wake_at = until;
+    if (until.has_value()) stream.conn->wake_timer_at(*until);
+    return {};
+}
+
 http2_connection_base::http2_connection_base(io::scheduler*               scheduler,
                                              connection&                  conn,
                                              http2::role                  side,
@@ -410,8 +546,18 @@ void http2_connection_base::fail_stream(http2_stream_base& s, std::error_code er
     // the writer mustn't touch the span of a write that's returning.
     send_order.remove(s);
 
+    // a tunnel's user finds its failure in its reads and writes, as a connection's would (e.g. the peer's reset as the
+    // transport's end, or a write's timeout), rather than as its handler's token's (which the server's abort() stops
+    // still).
+    if (s.tunnel != nullptr) return;
+
     // NOTE: a copy (sharing its state, so not allocating), as the stream may be gone once it's stopped.
     if (s.stop.stop_possible() && !s.stop.stop_requested()) to_stop.push_back(s.stop);
+}
+
+void http2_connection_base::wake_timer_at(io::clock::time_point at)
+{
+    if (!timer_target.has_value() || at < *timer_target) wake_timer();
 }
 
 void http2_connection_base::stop_pending()
@@ -583,7 +729,11 @@ void http2_connection_base::on_stream_reset(http2::stream_id id, std::error_code
     // can't say.
     if (err == http2::error_code::no_error) err = std::make_error_code(std::errc::connection_reset);
 
+    // a tunnel's reset is the end of its transport, cut short, as a TCP connection's reset is (whatever the code: e.g.
+    // a browser's CANCEL when it drops a WebSocket), for what speaks its protocol.
     auto& s = *it->second;
+    if (s.tunnel != nullptr) err = std::make_error_code(std::errc::connection_reset);
+
     fail_stream(s, err);
     s.changed.notify();
 }
@@ -793,6 +943,13 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
             if (!next.has_value() || *deadline < *next) next = deadline;
             return false;
         };
+
+        // a tunnel's read that's waiting is woken once its time's up, and fails then, the stream going on.
+        if (s->tunnel != nullptr && expired(s->tunnel->wake_at))
+        {
+            s->tunnel->wake_at.reset();
+            s->changed.notify();
+        }
 
         // a write that's waiting its turn, while the writer writes others', isn't held up by the peer: its deadline's
         // put off to its timeout from when the writer last wrote.

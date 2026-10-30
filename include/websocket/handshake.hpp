@@ -31,8 +31,9 @@ inline constexpr std::string_view guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 //   Transfer-Encoding), or without the token websocket in Upgrade, or upgrade in Connection (lists, ignoring case);
 // - bad_version, unless Sec-WebSocket-Version is one line, 13 (the server answers 426, saying 13);
 // - bad_key, unless Sec-WebSocket-Key is one line, of 16 bytes in base64 (strictly: 24 characters, padded, canonical).
-// HTTP/2's handshake (RFC 8441's extended CONNECT, which server_request can't express yet: it has no :protocol) isn't
-// one yet: a request over HTTP/2 fails with not_websocket.
+// Over HTTP/2, the handshake is an extended CONNECT (RFC 8441, section 5), which the server presents as GET with
+// protocol "websocket" (in any case): it has no key (an empty view is returned), nor Upgrade or Connection; it fails
+// with not_websocket for any other request (or a body), and with bad_version as over HTTP/1.1.
 [[nodiscard]] std::expected<std::string_view, std::error_code> check_request(const http::server_request& req);
 
 // select_subprotocol is the first of the server's subprotocols that the request's Sec-WebSocket-Protocol offers (a

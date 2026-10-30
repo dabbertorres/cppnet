@@ -224,6 +224,36 @@ struct h2_client final : http2::session_events
         return id;
     }
 
+    // extended_connect opens a stream with an extended CONNECT (RFC 8441) for path, asking to tunnel protocol over it
+    // (with fields, if any), not ending it unless end says. The session sends one only once the server's SETTINGS
+    // have said ENABLE_CONNECT_PROTOCOL (see settings()), and otherwise fails with what it refused it for.
+    std::expected<http2::stream_id, std::error_code> extended_connect(std::string_view path,
+                                                                      std::string_view protocol = "websocket",
+                                                                      std::span<const hpack::field> fields = {},
+                                                                      bool                          end    = false)
+    {
+        auto id = s.open_stream();
+        if (!id.has_value()) return id;
+
+        std::vector<hpack::field> head{
+            {   .name = ":method",   .value = "CONNECT"},
+            { .name = ":protocol",    .value = protocol},
+            {   .name = ":scheme",      .value = "http"},
+            {.name = ":authority", .value = "localhost"},
+            {     .name = ":path",        .value = path}
+        };
+        head.insert(head.end(), fields.begin(), fields.end());
+        if (auto err = s.submit_headers(*id, head, end)) return std::unexpected(err);
+        return id;
+    }
+
+    // settings pumps until the server's first SETTINGS have come (e.g. before an extended CONNECT), returning whether
+    // they did.
+    net::coro::task<bool> settings()
+    {
+        return pump([this] { return s.has_peer_settings(); });
+    }
+
     // send_trailers ends a stream with trailers, once its body (if any) has all been sent.
     void send_trailers(http2::stream_id id, std::span<const hpack::field> fields)
     {

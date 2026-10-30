@@ -17,9 +17,10 @@ namespace net::http::detail
 {
 
 // tunnel is a connection's bytes once it has switched protocols: what the peer sends after the request, and what's
-// sent to it after the 101 (Switching Protocols). It's its connection's (so far, a server's HTTP/1.1 connection's; an
-// HTTP/2 stream's and a client's connection's are to come), valid while the handler that switched it runs: once that
-// returns, the connection ends. One task reads it at a time, and one writes it at a time.
+// sent to it after the 101 (Switching Protocols); or an HTTP/2 stream's, once a 2xx has answered its extended CONNECT
+// (RFC 8441), its DATA both ways. A server's is its connection's (or stream's), valid while the handler that switched
+// it runs: once that returns, the connection (or stream) ends. A client's is its own. One task reads it at a time, and
+// one writes it at a time.
 class tunnel
 {
 public:
@@ -55,8 +56,9 @@ public:
     // for its tasks' pool).
     [[nodiscard]] virtual io::scheduler* get_scheduler() const noexcept = 0;
 
-    // abort ends the tunnel abruptly: reads (a waiting one too) find the end of the stream, and what's written but not
-    // flushed isn't sent when the connection ends. Any thread may call it.
+    // abort ends the tunnel abruptly: reads (a waiting one too) find the end of the stream (an HTTP/2 stream's fail,
+    // std::errc::connection_aborted, as it's reset, CANCEL), and what's written but not flushed isn't sent when the
+    // connection ends. Any thread may call it.
     virtual void abort() noexcept = 0;
 
 protected:
@@ -75,10 +77,18 @@ protected:
 // handler has the tunnel until it returns: then the connection ends (the server closing it first), with no other
 // response (rw.switched(), and rw.sent(), say so).
 //
-// It fails, sending nothing (so the handler may still respond), with std::errc::not_supported over HTTP/2 (for now), to
-// an HTTP/1.0 client (whose Upgrade a server must ignore: RFC 9110, section 7.8), and for a response_writer that isn't
-// a server's; and with std::errc::invalid_argument for a field that can't be sent (e.g. a line break in a value), or a
-// request whose body hasn't been read to its end (what follows its head isn't the new protocol's yet). It throws
+// Over HTTP/2, which has no 101, it opens an extended CONNECT's stream (RFC 8441: server_request::protocol is set)
+// instead: it answers 200, with fields and the rest of the response's own (but connection-specific ones, which HTTP/2
+// doesn't send), without ending the stream, and returns the stream as the tunnel, whose reads and writes are its DATA,
+// through buffers of 4 KiB each way. The stream's read timeout is off (the tunnel's own, set_read_timeout(), replaces
+// it), and its write timeout stays (the server's write_timeout, past which the stream's reset). Once the handler
+// returns, the server ends the stream (END_STREAM, RFC 8441's orderly close).
+//
+// It fails, sending nothing (so the handler may still respond), with std::errc::not_supported over HTTP/2 for a
+// request that isn't an extended CONNECT, to an HTTP/1.0 client (whose Upgrade a server must ignore: RFC 9110, section
+// 7.8), and for a response_writer that isn't a server's; with std::errc::invalid_argument for a field that can't be
+// sent (e.g. a line break in a value), or a request whose body hasn't been read to its end (what follows its head isn't
+// the new protocol's yet); and over HTTP/2, with the stream's failure if it has failed (e.g. reset). It throws
 // std::logic_error if the final response was sent already (as send() does). If sending the 101 fails, it returns why:
 // the connection has switched then, and ends once the handler returns.
 //

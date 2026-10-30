@@ -132,11 +132,18 @@ class connection;
 // subprotocol chosen and what's in rw.headers() (e.g. a Set-Cookie), and returns the connection, which is the handler's
 // until it returns (see connection).
 //
+// Over HTTP/2 (RFC 8441), the handshake is an extended CONNECT, which the server presents as GET with
+// server_request::protocol "websocket" (see http::server_config::http2_websockets), so the route that serves WebSockets
+// over HTTP/1.1 serves them over HTTP/2 too: accept() answers it with 200 (the subprotocol, and rw.headers()), and the
+// WebSocket is the request's stream, the rest of the HTTP/2 connection going on beside it. It's the same connection
+// (its timeouts, stop and the server's close() alike), counted against http2_max_concurrent_streams until its handler
+// returns, which ends the stream (END_STREAM: the client's end of the stream is the WebSocket's end of its transport).
+//
 // It fails with std::errc::not_supported, responding with nothing (as the handler may), for a response_writer that
 // isn't the server's connection's, and with std::errc::invalid_argument for a subprotocol or field of the response's
 // that can't be sent. If the response was sent already, it throws std::logic_error. A 101 that can't be sent returns
-// the transport's error (the connection then ends once the handler returns). Over HTTP/2, a request isn't a handshake
-// yet (400).
+// the transport's error (the connection then ends once the handler returns); an HTTP/2 stream that has failed (e.g.
+// reset by the client) returns its failure, having sent nothing.
 coro::task<std::expected<connection, std::error_code>>
 accept(const http::server_request& req, http::response_writer& rw, const accept_options& options = {});
 
