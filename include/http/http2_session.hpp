@@ -53,7 +53,12 @@ public:
     session_events& operator=(session_events&&)      = default;
     virtual ~session_events()                        = default;
 
-    // on_headers is a valid header block: its fields (pseudo-headers first), in order.
+    // on_headers is a valid header block: its fields (pseudo-headers first), in order. An extended CONNECT (RFC 8441:
+    // CONNECT with :protocol, :scheme, :path and :authority), which a server's session takes only if its
+    // session_config has it send ENABLE_CONNECT_PROTOCOL, is reported as any request, :protocol among its
+    // pseudo-headers. A CONNECT's stream (plain or extended; a client's, once its response is a 2xx) is a tunnel: its
+    // DATA isn't content, so no Content-Length applies to it, and no trailers may follow its head (RFC 9113, section
+    // 8.5).
     virtual void
     on_headers(stream_id stream, block_kind kind, std::span<const hpack::field> fields, bool end_stream) = 0;
 
@@ -126,6 +131,11 @@ public:
 
     // submit_headers sends a header block on a stream: a request's (on a stream from open_stream()), a response's
     // (informational, or final), or trailers (with end_stream). It fails if the stream isn't open for sending.
+    //
+    // A client's request with :protocol (an extended CONNECT, RFC 8441) may be sent only once the server has sent
+    // SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 (peer_settings().enable_connect_protocol): before, it fails with
+    // std::errc::invalid_argument, sending nothing, and the stream is closed (nothing was sent on it, so it's not
+    // reset: a reset of a stream the server has never seen would be a connection error).
     std::error_code submit_headers(stream_id stream, std::span<const hpack::field> fields, bool end_stream);
 
     // submit_data sends as much of data as the stream's and connection's windows allow (as DATA frames of at most the
@@ -198,14 +208,24 @@ private:
     // unsaid is stream_state::said's urgency for a stream that's said nothing of its priority.
     static constexpr std::uint8_t unsaid = 0xff;
 
+    // exchange is what a stream's request makes of what follows its heads.
+    enum class exchange : std::uint8_t
+    {
+        plain,
+        head,    // a client's request was HEAD: its response has no body
+        connect, // a client's request was CONNECT: a 2xx response makes the stream a tunnel
+        tunnel,  // a CONNECT's (a server's, from its request; a client's, from its 2xx): DATA isn't content, and no
+                 // trailers follow (RFC 9113, section 8.5)
+    };
+
     struct stream_state
     {
-        bool local_closed  = false; // this side has sent END_STREAM
-        bool remote_closed = false; // the peer has sent END_STREAM
-        bool head_received = false; // the peer's (final) head has arrived
-        bool known         = false; // the application knows of it: it opened it, or had its request
-        bool head_request  = false; // a client's request was HEAD: its response has no body
-        bool no_body       = false; // the response is 204 or 304: it has no body
+        bool     local_closed  = false; // this side has sent END_STREAM
+        bool     remote_closed = false; // the peer has sent END_STREAM
+        bool     head_received = false; // the peer's (final) head has arrived
+        bool     known         = false; // the application knows of it: it opened it, or had its request
+        exchange kind          = exchange::plain;
+        bool     no_body       = false; // the response is 204 or 304: it has no body
         // what a client's stream last said of its priority (its request's field, then its PRIORITY_UPDATEs), or
         // nothing (urgency unsaid). NOTE: in what was padding, with the flags.
         priority                     said{.urgency = unsaid};
@@ -295,6 +315,9 @@ private:
         block_kind                   kind = block_kind::head;
         std::optional<std::uint64_t> content_length;
         int                          status = 0; // a response's
+
+        // what the stream is after the block (as before it, unless a CONNECT's head opens a tunnel)
+        exchange stream_kind = exchange::plain;
     };
 
     // validate checks the decoded header block (block_fields) by HTTP/2's rules (RFC 9113, section 8), returning

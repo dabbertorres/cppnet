@@ -622,7 +622,7 @@ TEST_CASE("a malformed request is reset, without the application seeing it", "[h
         test_case{.what   = "a repeated pseudo-header",
                   .fields = {fields[0], fields[1], fields[2], fields[3], fields[3]}},
         test_case{.what   = "an unknown pseudo-header",
-                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = ":protocol", .value = "websocket"}}},
+                  .fields = {fields[0], fields[1], fields[2], fields[3], {.name = ":unknown", .value = "x"}}},
         test_case{.what   = "a value with a newline",
                   .fields = {fields[0], fields[1], fields[2], fields[3], {.name = "x", .value = "a\nb"}}},
         test_case{.what   = "a value with leading space",
@@ -704,6 +704,32 @@ TEST_CASE("a response to HEAD may promise a body it doesn't have", "[http][http2
     pump(c.client, c.server);
 
     CHECK(c.client.events.take() == std::vector<std::string>{"headers 1 head end :status=200 content-length=100"});
+}
+
+TEST_CASE("a response to HEAD may end after its head, short of its Content-Length", "[http][http2][session]")
+{
+    connected  c;
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, request("HEAD"), true));
+    pump(c.client, c.server);
+    c.server.events.take();
+
+    auto fields = response();
+    fields.push_back({.name = "content-length", .value = "100"});
+    REQUIRE_FALSE(c.server.s.submit_headers(id, fields, false));
+
+    const std::vector<hpack::field> trailers{
+        {.name = "x", .value = "y"}
+    };
+    const auto by_trailers = GENERATE(false, true);
+    CAPTURE(by_trailers);
+    if (by_trailers) REQUIRE_FALSE(c.server.s.submit_headers(id, trailers, true));
+    else REQUIRE(c.server.s.submit_data(id, {}, true) == 0U);
+    pump(c.client, c.server);
+
+    CHECK(c.client.events.take()
+          == std::vector<std::string>{"headers 1 head :status=200 content-length=100",
+                                      by_trailers ? "headers 1 trailers end x=y" : "data 1 [] end"});
 }
 
 TEST_CASE("GOAWAY refuses the streams after its last, which may be retried", "[http][http2][session]")
@@ -2450,4 +2476,560 @@ TEST_CASE("ORIGIN in the middle of a header block is a connection error, as any 
     r.frame(http2::frame_type::headers, 0, 1, block).frame(http2::frame_type::origin, 0, 0, origin_entries({}));
     client.deliver(r.bytes);
     CHECK(client.failure == http2::error_code::protocol_error);
+}
+
+namespace
+{
+
+// connect_protocol is a session_config whose server sends SETTINGS_ENABLE_CONNECT_PROTOCOL = 1.
+http2::session_config connect_protocol()
+{
+    http2::session_config config;
+    config.local.enable_connect_protocol = true;
+    return config;
+}
+
+// extended_connect is an extended CONNECT (RFC 8441) for a WebSocket.
+std::vector<hpack::field> extended_connect()
+{
+    return {
+        {              .name = ":method",     .value = "CONNECT"},
+        {            .name = ":protocol",   .value = "websocket"},
+        {              .name = ":scheme",       .value = "https"},
+        {           .name = ":authority", .value = "example.com"},
+        {                .name = ":path",       .value = "/chat"},
+        {.name = "sec-websocket-version",          .value = "13"},
+    };
+}
+
+// plain_connect is RFC 9113's CONNECT, for a tunnel to a host and port.
+std::vector<hpack::field> plain_connect()
+{
+    return {
+        {   .name = ":method",         .value = "CONNECT"},
+        {.name = ":authority", .value = "example.com:443"},
+    };
+}
+
+// without is fields without those named name.
+std::vector<hpack::field> without(std::vector<hpack::field> fields, std::string_view name)
+{
+    std::erase_if(fields, [&](const hpack::field& f) { return f.name == name; });
+    return fields;
+}
+
+// with is fields with one more, after the others (a regular field) or at the pseudo-headers' end (a pseudo-header).
+std::vector<hpack::field> with(std::vector<hpack::field> fields, hpack::field f)
+{
+    const auto at = f.name.starts_with(':')
+                      ? std::ranges::find_if(fields, [](const hpack::field& g) { return !g.name.starts_with(':'); })
+                      : fields.end();
+    fields.insert(at, f);
+    return fields;
+}
+
+// replaced is fields with name's value replaced.
+std::vector<hpack::field> replaced(std::vector<hpack::field> fields, std::string_view name, std::string_view value)
+{
+    for (auto& f : fields)
+    {
+        if (f.name == name) f.value = value;
+    }
+    return fields;
+}
+
+}
+
+TEST_CASE("a server sends SETTINGS_ENABLE_CONNECT_PROTOCOL as 1 if its config says so; a client never sends it",
+          "[http][http2][session][connect-protocol]")
+{
+    const auto sends_it = [](const std::vector<std::string>& settings)
+    { return std::ranges::any_of(settings, [](const std::string& p) { return p.starts_with("8="); }); };
+
+    std::vector<std::byte> out;
+
+    endpoint server{http2::role::server, connect_protocol()};
+    server.s.take_output(out);
+    CHECK(std::ranges::contains(settings_in(out), "8=1"));
+
+    endpoint by_default{http2::role::server};
+    by_default.s.take_output(out);
+    CHECK_FALSE(sends_it(settings_in(out)));
+
+    endpoint client{http2::role::client, connect_protocol()};
+    client.s.take_output(out);
+    CHECK_FALSE(sends_it(settings_in(out)));
+
+    // each side reads the other's: the client has it, the server nothing.
+    connected c{connect_protocol(), connect_protocol()};
+    CHECK(c.client.s.peer_settings().enable_connect_protocol);
+    CHECK_FALSE(c.server.s.peer_settings().enable_connect_protocol);
+    CHECK_FALSE(c.client.failure);
+    CHECK_FALSE(c.server.failure);
+}
+
+TEST_CASE("a client reads SETTINGS_ENABLE_CONNECT_PROTOCOL: 0 or 1, and never withdrawn once 1",
+          "[http][http2][session][connect-protocol]")
+{
+    struct test_case
+    {
+        std::string_view                        what;
+        std::vector<std::vector<std::uint32_t>> frames; // each SETTINGS' values of the setting, the first first
+        bool                                    fails;
+        bool                                    value = false;
+    };
+
+    const auto tc = GENERATE(
+        test_case{
+            .what   = "1",
+            .frames = {{1}},
+            .fails  = false,
+            .value  = true
+    },
+        test_case{.what = "0", .frames = {{0}}, .fails = false},
+        test_case{.what = "left out", .frames = {{}}, .fails = false},
+        test_case{.what = "2", .frames = {{2}}, .fails = true},
+        test_case{.what = "2^32-1", .frames = {{0xffff'ffff}}, .fails = true},
+        test_case{.what = "1, then 1 again", .frames = {{1}, {1}}, .fails = false, .value = true},
+        test_case{.what = "1, then left out", .frames = {{1}, {}}, .fails = false, .value = true},
+        test_case{.what = "1, then 0", .frames = {{1}, {0}}, .fails = true},
+        test_case{.what = "1 then 0 in one SETTINGS", .frames = {{1, 0}}, .fails = true},
+        test_case{.what = "0 then 1 in one SETTINGS", .frames = {{0, 1}}, .fails = false, .value = true},
+        test_case{.what = "left out, then 1", .frames = {{}, {1}}, .fails = false, .value = true},
+        test_case{.what = "0, then 1", .frames = {{0}, {1}}, .fails = false, .value = true},
+        test_case{.what = "1, then 2", .frames = {{1}, {2}}, .fails = true});
+    CAPTURE(tc.what);
+
+    raw r;
+    for (const auto& values : tc.frames)
+    {
+        std::vector<std::byte> payload;
+        for (const auto v : values)
+        {
+            const auto one = setting(http2::setting_id::enable_connect_protocol, v);
+            payload.insert(payload.end(), one.begin(), one.end());
+        }
+        r.frame(http2::frame_type::settings, 0, 0, payload);
+    }
+
+    endpoint client{http2::role::client};
+    client.deliver(r.bytes);
+    if (tc.fails)
+    {
+        CHECK(client.failure == http2::error_code::protocol_error);
+        return;
+    }
+
+    REQUIRE_FALSE(client.failure);
+    CHECK(client.s.peer_settings().enable_connect_protocol == tc.value);
+}
+
+TEST_CASE("a server ignores a client's SETTINGS_ENABLE_CONNECT_PROTOCOL, but for a value past 1",
+          "[http][http2][session][connect-protocol]")
+{
+    struct test_case
+    {
+        std::string_view                        what;
+        std::vector<std::vector<std::uint32_t>> frames;
+        bool                                    fails = false;
+    };
+
+    const auto tc = GENERATE(
+        test_case{
+            .what   = "1",
+            .frames = {{1}}
+    },
+        test_case{.what = "1, then 0", .frames = {{1}, {0}}},
+        test_case{.what = "2", .frames = {{2}}, .fails = true});
+    CAPTURE(tc.what);
+
+    const bool takes = GENERATE(false, true);
+    CAPTURE(takes);
+
+    raw        r;
+    const auto p = bytes_of(http2::preface);
+    r.bytes.insert(r.bytes.end(), p.begin(), p.end());
+    for (const auto& values : tc.frames)
+    {
+        std::vector<std::byte> payload;
+        for (const auto v : values)
+        {
+            const auto one = setting(http2::setting_id::enable_connect_protocol, v);
+            payload.insert(payload.end(), one.begin(), one.end());
+        }
+        r.frame(http2::frame_type::settings, 0, 0, payload);
+    }
+
+    endpoint server{http2::role::server, takes ? connect_protocol() : http2::session_config{}};
+    server.deliver(r.bytes);
+    if (tc.fails)
+    {
+        CHECK(server.failure == http2::error_code::protocol_error);
+        return;
+    }
+
+    REQUIRE_FALSE(server.failure);
+    CHECK_FALSE(server.s.peer_settings().enable_connect_protocol);
+}
+
+TEST_CASE("a server that sent ENABLE_CONNECT_PROTOCOL takes extended CONNECT, reporting :protocol; DATA goes both ways",
+          "[http][http2][session][connect-protocol]")
+{
+    connected c{connect_protocol()};
+    REQUIRE(c.client.s.peer_settings().enable_connect_protocol);
+
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, extended_connect(), false));
+    pump(c.client, c.server);
+    CHECK(c.server.events.take()
+          == std::vector<std::string>{"headers 1 head :method=CONNECT :protocol=websocket :scheme=https "
+                                      ":authority=example.com :path=/chat sec-websocket-version=13"});
+
+    REQUIRE_FALSE(c.server.s.submit_headers(id, response(), false));
+    REQUIRE(c.server.s.submit_data(id, bytes_of("from the server"), false) == 15U);
+    REQUIRE(c.client.s.submit_data(id, bytes_of("from the client"), false) == 15U);
+    pump(c.client, c.server);
+    CHECK(c.client.events.take() == std::vector<std::string>{"headers 1 head :status=200", "data 1 [from the server]"});
+    CHECK(c.server.events.take() == std::vector<std::string>{"data 1 [from the client]"});
+
+    // each side's END_STREAM is its orderly close (RFC 8441, section 5).
+    REQUIRE(c.client.s.submit_data(id, {}, true) == 0U);
+    REQUIRE(c.server.s.submit_data(id, {}, true) == 0U);
+    pump(c.client, c.server);
+    CHECK(c.client.events.take() == std::vector<std::string>{"data 1 [] end"});
+    CHECK(c.server.events.take() == std::vector<std::string>{"data 1 [] end"});
+    CHECK(c.client.s.open_streams() == 0);
+    CHECK(c.server.s.open_streams() == 0);
+}
+
+TEST_CASE("extended CONNECT is malformed without the setting, on another method, or without what it needs",
+          "[http][http2][session][connect-protocol][malformed]")
+{
+    struct test_case
+    {
+        std::string_view          what;
+        std::vector<hpack::field> fields;
+        bool                      takes = true; // the server sent ENABLE_CONNECT_PROTOCOL = 1
+    };
+
+    // :protocol after a regular field.
+    auto after_field = without(extended_connect(), ":protocol");
+    after_field.push_back({.name = ":protocol", .value = "websocket"});
+
+    const auto tc =
+        GENERATE_REF(test_case{.what = "without the setting", .fields = extended_connect(), .takes = false},
+                     test_case{.what = "on GET", .fields = replaced(extended_connect(), ":method", "GET")},
+                     test_case{.what = "on POST", .fields = replaced(extended_connect(), ":method", "POST")},
+                     test_case{.what = "no :scheme", .fields = without(extended_connect(), ":scheme")},
+                     test_case{.what = "no :path", .fields = without(extended_connect(), ":path")},
+                     test_case{.what = "an empty :path", .fields = replaced(extended_connect(), ":path", "")},
+                     test_case{.what = "no :authority", .fields = without(extended_connect(), ":authority")},
+                     test_case{.what = "an empty :protocol", .fields = replaced(extended_connect(), ":protocol", "")},
+                     test_case{.what   = "a :protocol that isn't a token",
+                               .fields = replaced(extended_connect(), ":protocol", "web socket")},
+                     test_case{.what   = "two :protocols",
+                               .fields = with(extended_connect(), {.name = ":protocol", .value = "websocket"})},
+                     test_case{.what = ":protocol after a field", .fields = after_field},
+                     test_case{.what   = "Host disagreeing with :authority",
+                               .fields = with(extended_connect(), {.name = "host", .value = "other.example"})},
+                     test_case{.what   = "a connection-specific field",
+                               .fields = with(extended_connect(), {.name = "upgrade", .value = "websocket"})});
+    CAPTURE(tc.what);
+
+    endpoint server{http2::role::server, tc.takes ? connect_protocol() : http2::session_config{}};
+    raw      r;
+    r.client_start().headers(1, tc.fields, http2::flags::end_headers);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take() == std::vector<std::string>{"settings"});
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream) == std::vector<std::string>{"1 1"});
+
+    // the same, but valid, still works after it.
+    r.bytes.clear();
+    r.headers(3, extended_connect(), http2::flags::end_headers);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take().size() == (tc.takes ? 1U : 0U));
+}
+
+TEST_CASE("plain CONNECT keeps RFC 9113's rules, whether or not the server takes extended CONNECT",
+          "[http][http2][session][connect-protocol]")
+{
+    struct test_case
+    {
+        std::string_view          what;
+        std::vector<hpack::field> fields;
+        bool                      valid = false;
+    };
+
+    const auto tc = GENERATE(
+        test_case{.what = "only :method and :authority", .fields = plain_connect(), .valid = true},
+        test_case{.what = "with :scheme", .fields = with(plain_connect(), {.name = ":scheme", .value = "https"})},
+        test_case{.what = "with :path", .fields = with(plain_connect(), {.name = ":path", .value = "/"})},
+        test_case{.what = "no :authority", .fields = without(plain_connect(), ":authority")});
+    CAPTURE(tc.what);
+
+    const bool takes = GENERATE(false, true);
+    CAPTURE(takes);
+
+    endpoint server{http2::role::server, takes ? connect_protocol() : http2::session_config{}};
+    raw      r;
+    r.client_start().headers(1, tc.fields, http2::flags::end_headers);
+    server.deliver(r.bytes);
+    REQUIRE_FALSE(server.failure);
+
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    if (tc.valid)
+    {
+        CHECK(server.events.take()
+              == std::vector<std::string>{"settings", "headers 1 head :method=CONNECT :authority=example.com:443"});
+        CHECK(frames_of(out, http2::frame_type::rst_stream).empty());
+    }
+    else
+    {
+        CHECK(server.events.take() == std::vector<std::string>{"settings"});
+        CHECK(frames_of(out, http2::frame_type::rst_stream) == std::vector<std::string>{"1 1"});
+    }
+}
+
+TEST_CASE("a server's CONNECT stream is a tunnel: a Content-Length doesn't hold its DATA, and no trailers follow",
+          "[http][http2][session][connect-protocol]")
+{
+    const auto extended = GENERATE(false, true);
+    CAPTURE(extended);
+
+    const auto connect = extended ? extended_connect() : plain_connect();
+    endpoint   server{http2::role::server, connect_protocol()};
+
+    SECTION("DATA past a Content-Length, and ending short of another")
+    {
+        raw r;
+        r.client_start()
+            .headers(1, with(connect, {.name = "content-length", .value = "3"}), http2::flags::end_headers)
+            .frame(http2::frame_type::data, 0, 1, bytes_of("longer than three"))
+            .headers(3, with(connect, {.name = "content-length", .value = "100"}), http2::flags::end_headers)
+            .frame(http2::frame_type::data, http2::flags::end_stream, 3, bytes_of("short"));
+        server.deliver(r.bytes);
+        REQUIRE_FALSE(server.failure);
+
+        const auto events = server.events.take();
+        REQUIRE(events.size() == 5);
+        CHECK(events[2] == "data 1 [longer than three]");
+        CHECK(events[4] == "data 3 [short] end");
+
+        std::vector<std::byte> out;
+        server.s.take_output(out);
+        CHECK(frames_of(out, http2::frame_type::rst_stream).empty());
+    }
+
+    SECTION("a head that ends the stream, with a Content-Length")
+    {
+        raw r;
+        r.client_start().headers(1, with(connect, {.name = "content-length", .value = "5"}), end_both);
+        server.deliver(r.bytes);
+        REQUIRE_FALSE(server.failure);
+        CHECK(server.events.take().size() == 2);
+    }
+
+    SECTION("trailers are the stream's error")
+    {
+        const std::vector<hpack::field> trailers{
+            {.name = "x", .value = "y"}
+        };
+
+        raw r;
+        r.client_start()
+            .headers(1, connect, http2::flags::end_headers)
+            .frame(http2::frame_type::data, 0, 1, bytes_of("data"))
+            .headers(1, trailers, end_both);
+        server.deliver(r.bytes);
+        REQUIRE_FALSE(server.failure);
+
+        const auto events = server.events.take();
+        REQUIRE(events.size() == 4);
+        CHECK(events[2] == "data 1 [data]");
+        CHECK(events[3] == "reset 1 protocol error");
+
+        std::vector<std::byte> out;
+        server.s.take_output(out);
+        CHECK(frames_of(out, http2::frame_type::rst_stream) == std::vector<std::string>{"1 1"});
+    }
+
+    SECTION("a request that isn't CONNECT keeps to its Content-Length, and may have trailers")
+    {
+        const std::vector<hpack::field> trailers{
+            {.name = "x", .value = "y"}
+        };
+
+        raw r;
+        r.client_start()
+            .headers(1, with(request("POST"), {.name = "content-length", .value = "4"}), http2::flags::end_headers)
+            .frame(http2::frame_type::data, 0, 1, bytes_of("data"))
+            .headers(1, trailers, end_both)
+            .headers(3, with(request("POST"), {.name = "content-length", .value = "3"}), http2::flags::end_headers)
+            .frame(http2::frame_type::data, 0, 3, bytes_of("data"));
+        server.deliver(r.bytes);
+        REQUIRE_FALSE(server.failure);
+
+        const auto events = server.events.take();
+        REQUIRE(events.size() == 6);
+        CHECK(events[3] == "headers 1 trailers end x=y");
+        CHECK(events[4].starts_with("headers 3 head"));
+        CHECK(events[5] == "reset 3 protocol error");
+
+        std::vector<std::byte> out;
+        server.s.take_output(out);
+        CHECK(frames_of(out, http2::frame_type::rst_stream) == std::vector<std::string>{"3 1"});
+    }
+}
+
+TEST_CASE("a client sends extended CONNECT only once the server has sent ENABLE_CONNECT_PROTOCOL = 1",
+          "[http][http2][session][connect-protocol]")
+{
+    endpoint client{http2::role::client};
+
+    // what the client sends, for a server to receive at the end.
+    std::vector<std::byte> sent;
+    const auto             take = [&]
+    {
+        std::vector<std::byte> out;
+        client.s.take_output(out);
+        sent.insert(sent.end(), out.begin(), out.end());
+    };
+    take();
+
+    const auto refused = [&](std::string_view when)
+    {
+        CAPTURE(when);
+        const auto id = client.s.open_stream().value();
+        CHECK(client.s.submit_headers(id, extended_connect(), false) == std::errc::invalid_argument);
+
+        // nothing's sent, nor kept: not even a reset, which the server would take as a connection error (the stream's
+        // idle to it).
+        client.s.reset(id, http2::error_code::cancel);
+        CHECK_FALSE(client.s.has_output());
+        CHECK(client.s.open_streams() == 1);
+        CHECK(client.s.submit_data(id, bytes_of("x"), true).error() == http2::error_code::stream_closed);
+        return id;
+    };
+
+    // a plain CONNECT needs no setting.
+    const auto plain = client.s.open_stream().value();
+    CHECK(plain == 1);
+    REQUIRE_FALSE(client.s.submit_headers(plain, plain_connect(), false));
+    take();
+
+    CHECK(refused("before the server's SETTINGS") == 3);
+
+    // the server's SETTINGS without it, then with 0.
+    auto r = server_start();
+    client.deliver(r.bytes);
+    take();
+    CHECK(refused("without it") == 5);
+
+    r.bytes.clear();
+    r.frame(http2::frame_type::settings, 0, 0, setting(http2::setting_id::enable_connect_protocol, 0));
+    client.deliver(r.bytes);
+    take();
+    CHECK(refused("with 0") == 7);
+
+    // then 1.
+    r.bytes.clear();
+    r.frame(http2::frame_type::settings, 0, 0, setting(http2::setting_id::enable_connect_protocol, 1));
+    client.deliver(r.bytes);
+    REQUIRE_FALSE(client.failure);
+    take();
+
+    const auto id = client.s.open_stream().value();
+    CHECK(id == 9);
+    REQUIRE_FALSE(client.s.submit_headers(id, extended_connect(), false));
+    CHECK(client.s.open_streams() == 2);
+    take();
+
+    // which a server that takes it receives, the stream ids skipped being closed to it (RFC 9113, section 5.1.1).
+    endpoint server{http2::role::server, connect_protocol()};
+    server.deliver(sent);
+    REQUIRE_FALSE(server.failure);
+    CHECK(server.events.take()
+          == std::vector<std::string>{"settings",
+                                      "headers 1 head :method=CONNECT :authority=example.com:443",
+                                      "headers 9 head :method=CONNECT :protocol=websocket :scheme=https "
+                                      ":authority=example.com :path=/chat sec-websocket-version=13"});
+    std::vector<std::byte> out;
+    server.s.take_output(out);
+    CHECK(frames_of(out, http2::frame_type::rst_stream).empty());
+    CHECK(frames_of(out, http2::frame_type::goaway).empty());
+}
+
+TEST_CASE("a client's CONNECT is a tunnel once its response is a 2xx: its Content-Length is ignored, and no trailers "
+          "follow",
+          "[http][http2][session][connect-protocol]")
+{
+    const auto extended = GENERATE(false, true);
+    CAPTURE(extended);
+
+    connected  c{connect_protocol()};
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, extended ? extended_connect() : plain_connect(), false));
+    pump(c.client, c.server);
+    c.server.events.take();
+
+    const std::vector<hpack::field> trailers{
+        {.name = "x", .value = "y"}
+    };
+
+    SECTION("a 2xx's Content-Length")
+    {
+        const auto status = GENERATE("200"sv, "299"sv);
+        REQUIRE_FALSE(
+            c.server.s.submit_headers(id, with(response(status), {.name = "content-length", .value = "0"}), false));
+        REQUIRE(c.server.s.submit_data(id, bytes_of("hello"), false) == 5U);
+        pump(c.client, c.server);
+        CHECK(c.client.events.take()
+              == std::vector<std::string>{std::format("headers 1 head :status={} content-length=0", status),
+                                          "data 1 [hello]"});
+
+        REQUIRE(c.server.s.submit_data(id, {}, true) == 0U);
+        pump(c.client, c.server);
+        CHECK(c.client.events.take() == std::vector<std::string>{"data 1 [] end"});
+    }
+
+    SECTION("trailers after a 2xx, after an informational response")
+    {
+        REQUIRE_FALSE(c.server.s.submit_headers(id, response("103"), false));
+        REQUIRE_FALSE(c.server.s.submit_headers(id, response(), false));
+        REQUIRE_FALSE(c.server.s.submit_headers(id, trailers, true));
+        pump(c.client, c.server);
+        CHECK(c.client.events.take()
+              == std::vector<std::string>{"headers 1 informational :status=103",
+                                          "headers 1 head :status=200",
+                                          "reset 1 protocol error"});
+    }
+
+    SECTION("a refusal is a response as any other: its Content-Length holds, and trailers may follow")
+    {
+        REQUIRE_FALSE(
+            c.server.s.submit_headers(id, with(response("404"), {.name = "content-length", .value = "3"}), false));
+        REQUIRE(c.server.s.submit_data(id, bytes_of("abc"), false) == 3U);
+        REQUIRE_FALSE(c.server.s.submit_headers(id, trailers, true));
+        pump(c.client, c.server);
+        CHECK(c.client.events.take()
+              == std::vector<std::string>{"headers 1 head :status=404 content-length=3",
+                                          "data 1 [abc]",
+                                          "headers 1 trailers end x=y"});
+    }
+
+    SECTION("a refusal's DATA past its Content-Length")
+    {
+        REQUIRE_FALSE(
+            c.server.s.submit_headers(id, with(response("404"), {.name = "content-length", .value = "3"}), false));
+        REQUIRE(c.server.s.submit_data(id, bytes_of("too long"), false) == 8U);
+        pump(c.client, c.server);
+        CHECK(c.client.events.take()
+              == std::vector<std::string>{"headers 1 head :status=404 content-length=3", "reset 1 protocol error"});
+    }
 }

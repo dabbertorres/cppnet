@@ -5,7 +5,8 @@ Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see L
 an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3). Stage 4, accepting WebSockets, done (2026-10-29; see
 Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29; see Learned in stage 5). Stage 6,
 the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6). The server's close reaching a WebSocket whose peer
-never lets its reads wait, fixed (2026-10-29; see Fixed after stage 6).
+never lets its reads wait, fixed (2026-10-29; see Fixed after stage 6). Stage 7, extended CONNECT in the session, done
+(2026-10-29; see Learned in stage 7).
 
 ## Goal
 
@@ -852,6 +853,74 @@ waiting for the server's first SETTINGS isn't used.
   failed, and three (the step's check, `read_close()`'s case and the flag cleared) hang rather than fail, a read
   spinning without ever suspending, which the run's time limit shows.
 
+## Learned in stage 7
+
+- The setting: `settings::enable_connect_protocol`, a field like the others (so `encode_settings()` sends it when it's
+  1, and `peer_settings()` is how a client reads the server's, which stage 9's pool will check). A server's session
+  sends it when its `session_config::local.enable_connect_protocol` says so (off by default; nothing sets it until
+  stage 8's `server_config::http2_websockets`); a client's session clears it, as it forces ENABLE_PUSH to 0, since it
+  means nothing from a client. Its value must be 0 or 1 from either side (PROTOCOL_ERROR otherwise): RFC 8441 3 says so
+  of any sender, and Go's `Setting.Valid()` and nghttp2 check it whatever the side, so "ignored from a client" is its
+  meaning, not its range. A client takes 1 then 0 as PROTOCOL_ERROR, within one SETTINGS frame too (settings apply in
+  order); a later SETTINGS that leaves it out changes nothing, and 1 after 0 (or after none) is taken, as nothing
+  forbids enabling it later.
+- `:protocol` reaches the events as a pseudo-header among the fields, in the order sent: `session_events` didn't
+  change, and stage 8's server reads it as it reads `:method`. The value must be a token (Upgrade's protocol names
+  are; an empty one, or one with a space, is malformed). With `:protocol`, CONNECT needs `:scheme`, a non-empty `:path`
+  (as other requests' must be) and `:authority`; RFC 8441 4 names the first two, and `:authority` is CONNECT's.
+- The client's side: `submit_headers()` refuses a request with `:protocol` until the server has sent 1, with
+  `invalid_argument` (as for other things the session won't send), sending nothing, and forgets the stream rather than
+  resetting it: the server has never seen it, so an RST_STREAM would be on an idle stream, a connection error to it
+  (RFC 9113 6.4), and `http2_client_connection::open()` resets a stream whose head fails, which then does nothing. Only
+  `:protocol`'s presence is checked: the session doesn't otherwise check what its own side sends (e.g. `:protocol` on
+  GET). The block's scan moved into `read_request_head()` (method, `:protocol`, the Priority lines), as
+  `submit_headers()` had grown past the lint's cognitive complexity.
+- How CONNECT streams end, which the plan asked to check, needed more than `:protocol`: a CONNECT request's
+  Content-Length bounded its stream's DATA (the session reset a stream whose DATA ran past it), and trailers were taken
+  on it. `stream_state::head_request` became `kind` (`exchange`: plain, head, connect, tunnel; one byte, as before),
+  and a CONNECT's stream is a tunnel: a server's from its request (plain or extended), a client's from a 2xx to its
+  CONNECT (`connect` until then). A tunnel's DATA is the tunnel's, not content: no Content-Length holds it (RFC 9110
+  9.3.6: a CONNECT request has no content, and a client MUST ignore a 2xx's Content-Length), and HEADERS after its head
+  is a stream error (RFC 9113 8.5: only DATA and the frames that manage a stream follow). A non-2xx response to CONNECT
+  is an ordinary response: its Content-Length holds, and trailers may follow. A CONNECT request's Content-Length is
+  ignored rather than refused (nghttp2 ignores it for plain CONNECT, but holds extended CONNECT to it, which resets a
+  WebSocket whose client sent `content-length: 0`; Go holds both to it). For stage 8: the fields are reported as they
+  came, so a Content-Length on an extended CONNECT reaches the server unenforced, and the server shouldn't present it
+  to a handler as the body's length when it shows the request as GET (drop it, or refuse the request).
+- `fuzz_http2`: the server's session sends ENABLE_CONNECT_PROTOCOL = 1; the client's starts with the server's SETTINGS
+  without it, so its extended CONNECTs are refused until the script's SETTINGS say 1. New records: op 2's bit 7 has a
+  client open an extended CONNECT or a plain one; op 7 with bit 7 (and neither 5 nor 6) receives SETTINGS with
+  ENABLE_CONNECT_PROTOCOL of the next byte, or a HEADERS frame encoded with literals (so it decodes whatever the
+  session's table holds): a server a request (an extended CONNECT, without `:path`, `:scheme` or `:authority`, GET with
+  `:protocol`, a plain CONNECT, an extended one with a Content-Length, or trailers) on the peer's next stream or a known
+  one, a client a response (200, with a Content-Length, 404 with one, 103, trailers, or 200 with `:protocol`). The
+  existing properties hold (a refused CONNECT's block isn't among those submitted, so its sending anything would break
+  `blocks_decode()`). Run for 5 minutes (87,452 runs, no failures), and again for 10 minutes on the commit's code
+  (74,741 runs, no failures; the debug build with ASan and UBSan runs about 125 a second).
+- Tests (`test/http/http2.cpp`, `[http][http2][session][connect-protocol]`, on bytes): the setting sent by a server
+  that says so and not by default, never by a client; read by a client (0, 1, left out, 2, 2^32-1, 1 again, 1 then
+  left out, 1 then 0 across frames and within one, 0 then 1, 1 then 2), ignored by a server but for a value past 1;
+  extended CONNECT taken and reported, DATA both ways and END_STREAM each way; refused without the setting, on GET and
+  POST, without `:scheme`, `:path` or `:authority`, with an empty `:path`, an empty `:protocol` or one that isn't a
+  token, two `:protocol`s, `:protocol` after a regular field, Host disagreeing, a connection-specific field; plain
+  CONNECT's rules with and without the setting; a server's tunnel (plain and extended) taking DATA past one
+  Content-Length and ending short of another, a head ending the stream with a Content-Length, trailers reset, and a
+  POST beside it still held to its Content-Length; a client's extended CONNECT refused before the server's SETTINGS,
+  without the setting and with 0 (nothing sent, the stream gone, a reset of it sending nothing), then sent once it's 1,
+  a plain CONNECT sent without it, all of it received by a server's session without an error; a 2xx (200 and 299) to a
+  client's CONNECT ignoring its Content-Length, trailers after a 2xx (after a 103) reset, and a 404's Content-Length
+  held (DATA past it reset) and its trailers kept; and a response to HEAD ending short of its Content-Length with an
+  empty DATA or trailers (the `ended_short()` exception `kind` now carries, which nothing tested). The existing
+  malformed-request case for an unknown pseudo-header used `:protocol`, which the client's session now refuses to
+  send: it uses `:unknown`.
+- Each rule was broken alone (28 breaks: the setting's encoding, a client's cleared, its range, a server ignoring a
+  client's, withdrawal, a client recording it, `:protocol` as a server's pseudo-header, the setting, the method, the
+  token, `:authority`, `:scheme`, `:path` and an empty one, a server's CONNECT's Content-Length and its tunnel, trailers
+  on a tunnel, a client's 2xx's Content-Length, its tunnel and only for a 2xx, a client's CONNECT noted, the client's
+  refusal, the refused stream forgotten and nothing sent, a stream's kind kept across blocks and taken from its head,
+  and HEAD's two exceptions), and the tests failed for every one, once the HEAD test above was added for
+  `ended_short()`'s, which none caught at first.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -876,8 +945,9 @@ Each a pull request, mergeable and tested alone, in this order:
    tested with time.
 6. **The client over HTTP/1.1.** Done (2026-10-29; see Learned in stage 6). `websocket::connect()`, masking, its
    tests, `bench_websocket`; Autobahn's `fuzzingserver` by hand. After the server, so the two test each other.
-7. **Extended CONNECT in the session.** `:protocol`, `settings::enable_connect_protocol`, the rules; tests on bytes and
-   `fuzz_http2`. Nothing advertises it yet: the protocol's rules apart from the server, as stage 6's ORIGIN part was.
+7. **Extended CONNECT in the session.** Done (2026-10-29; see Learned in stage 7). `:protocol`,
+   `settings::enable_connect_protocol`, the rules; tests on bytes and `fuzz_http2`. Nothing advertises it yet: the
+   protocol's rules apart from the server, as stage 6's ORIGIN part was.
 8. **WebSockets over HTTP/2, the server.** `server_config::http2_websockets`, `server_request::protocol`, the
    presentation of extended CONNECT (Decided question 11), `http2_stream_ops::open_tunnel`, the stream's interruptible
    read; `test::h2_client`'s extended CONNECT; browsers by hand. Last of the server's: it changes what every HTTP/2

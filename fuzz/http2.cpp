@@ -8,9 +8,11 @@
 // The input is a script, of records that each start with an op byte (its low 3 bits):
 // - 0: receive the next n bytes (n is the next byte; 0, or more than there are: the rest), as frames.
 // - 1: time passes: the next byte's tens of milliseconds (for the token buckets).
-// - 2: headers (the next byte: bits 0-3 choose a stream, 4-5 what, 6 ends the stream): a server responds (a 200, one
-//      with a Content-Length of 3, a 103, or trailers), a client opens a stream for a request (GET, POST with a
-//      Content-Length of 3, or HEAD) or sends trailers.
+// - 2: headers (the next byte: bits 0-3 choose a stream, 4-5 what, 6 ends the stream, 7 CONNECT): a server responds (a
+//      200, one with a Content-Length of 3, a 103, or trailers), a client opens a stream for a request (GET, POST with
+//      a Content-Length of 3, or HEAD) or sends trailers; with bit 7, a client opens one for an extended CONNECT (what
+//      0 or 2), which it may send only once the server's sent ENABLE_CONNECT_PROTOCOL = 1, or a plain CONNECT (1 or
+//      3), and a server's bit 7 is ignored.
 // - 3: data (the next byte: bits 0-3 choose a stream, 7 ends the stream; the one after, its size in 64s).
 // - 4: reset (the next byte: bits 0-3 choose a stream, 4-7 the code).
 // - 5: consume (the next byte chooses a stream; the one after, how much, in 256s).
@@ -28,7 +30,15 @@
 //      - 1: submit one (the next byte: bits 0-1 how many of "https://a.example", "https://b.example:8443" and
 //        "https://[::1]", bits 2-3 how many origins of 6000 bytes after them, so that they're split into frames): a
 //        server's, as many frames as they need (a client's fails).
-// - 7, without either: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
+// - 7, without either, with the op's bit 7: receive a frame of extended CONNECT's (RFC 8441), as the op's bit 3 says:
+//      - 0: SETTINGS with ENABLE_CONNECT_PROTOCOL of the next byte (0, 1, or a value that's invalid): a client reads it
+//        (and can't withdraw it), a server ignores it;
+//      - 1: HEADERS (the next byte: bits 0-2 what, 3 ends the stream, 4 on a stream the application knows (bits 5-7
+//        choose it) rather than the peer's next): a server receives a request, an extended CONNECT whole, without
+//        :path, :scheme or :authority, GET with :protocol, a plain CONNECT, an extended CONNECT with a Content-Length
+//        of 3, or trailers; a client a response, a 200, one with a Content-Length of 3, a 404 with one, a 103,
+//        trailers, or a 200 with :protocol.
+// - 7, without any of them: receive a frame that random bytes rarely make, as the op's bits 3-4 say:
 //      - 0: SETTINGS changing SETTINGS_HEADER_TABLE_SIZE to the next byte's 64s (255: 65536), for the session's
 //        encoder to follow;
 //      - 1: SETTINGS with NO_RFC7540_PRIORITIES of the next byte (0, 1, or a value that's invalid);
@@ -44,9 +54,11 @@
 // 0, without flags, their entries filling them exactly.
 //
 // The server's script follows the client's preface and SETTINGS, and the client's the server's SETTINGS, each with
-// only NO_RFC7540_PRIORITIES (1, as both sides send it), so that the fuzzer starts past them. The client opens streams
-// before it receives: a GET (1), a POST with a Content-Length of 3 and no body yet (3), a HEAD (5), and a GET with a
-// Priority field of two lines, "u=1" and "i" (7).
+// only NO_RFC7540_PRIORITIES (1, as both sides send it), so that the fuzzer starts past them. The server's session
+// sends ENABLE_CONNECT_PROTOCOL = 1 (so it takes extended CONNECT); the server's SETTINGS the client starts with don't
+// (so it refuses to send one until the script's SETTINGS say 1). The client opens streams before it receives: a GET
+// (1), a POST with a Content-Length of 3 and no body yet (3), a HEAD (5), and a GET with a Priority field of two
+// lines, "u=1" and "i" (7).
 #include "http/http2.hpp"
 
 #include <algorithm>
@@ -277,7 +289,7 @@ public:
     runner(http2::role role, bool bytewise)
         : role{role}
         , bytewise{bytewise}
-        , s{role}
+        , s{role, config_for(role)}
     {
         if (role == http2::role::client)
         {
@@ -358,6 +370,46 @@ private:
     static constexpr std::array trailers{
         hpack::field{.name = "x", .value = "y"},
     };
+    static constexpr std::array extended_connect{
+        hpack::field{   .name = ":method",     .value = "CONNECT"},
+        hpack::field{ .name = ":protocol",   .value = "websocket"},
+        hpack::field{   .name = ":scheme",       .value = "https"},
+        hpack::field{.name = ":authority", .value = "example.com"},
+        hpack::field{     .name = ":path",       .value = "/chat"},
+    };
+    static constexpr std::array plain_connect{
+        hpack::field{   .name = ":method",         .value = "CONNECT"},
+        hpack::field{.name = ":authority", .value = "example.com:443"},
+    };
+
+    // the requests a server receives (op 7's extended CONNECT HEADERS), and the responses a client does.
+    static constexpr std::array no_path{
+        extended_connect[0], extended_connect[1], extended_connect[2], extended_connect[3]};
+    static constexpr std::array no_scheme{
+        extended_connect[0], extended_connect[1], extended_connect[3], extended_connect[4]};
+    static constexpr std::array no_authority{
+        extended_connect[0], extended_connect[1], extended_connect[2], extended_connect[4]};
+    static constexpr std::array get_with_protocol{get[0], extended_connect[1], get[1], get[2], get[3]};
+    static constexpr std::array extended_connect_with_length{
+        extended_connect[0],
+        extended_connect[1],
+        extended_connect[2],
+        extended_connect[3],
+        extended_connect[4],
+        post[4],
+    };
+    static constexpr std::array not_found_with_length{
+        hpack::field{.name = ":status", .value = "404"},
+        post[4],
+    };
+    static constexpr std::array ok_with_protocol{ok[0], extended_connect[1]};
+
+    static http2::session_config config_for(http2::role role)
+    {
+        http2::session_config config;
+        config.local.enable_connect_protocol = role == http2::role::server;
+        return config;
+    }
 
     void open(std::span<const hpack::field> fields, bool end_stream)
     {
@@ -387,6 +439,12 @@ private:
 
         const auto what = (arg >> 4U) & 3U;
         const bool end  = (arg & 0x40U) != 0;
+
+        if (role == http2::role::client && (arg & 0x80U) != 0)
+        {
+            open((what & 1U) == 0 ? fields{extended_connect} : fields{plain_connect}, end);
+            return;
+        }
 
         if (role == http2::role::client && what != 3)
         {
@@ -470,12 +528,77 @@ private:
         events.log += std::format("submit origin {} {}\n", origins.size(), err.value());
     }
 
+    // connect_frame receives a frame of extended CONNECT's (op 7's, with its bit 7): SETTINGS with
+    // ENABLE_CONNECT_PROTOCOL, or a HEADERS frame (a request, or a response).
+    void connect_frame(std::uint8_t which, script& sc)
+    {
+        using fields = std::span<const hpack::field>;
+
+        std::vector<std::byte> frame;
+        const auto             arg = sc.next();
+        if ((which & 1U) == 0)
+        {
+            const std::array<std::byte, 6> setting{std::byte{0},
+                                                   std::byte{8},
+                                                   std::byte{0},
+                                                   std::byte{0},
+                                                   std::byte{0},
+                                                   std::byte{arg}};
+            http2::encode_frame_header(
+                {.length = 6, .type = static_cast<std::uint8_t>(http2::frame_type::settings), .stream = 0},
+                frame);
+            frame.insert(frame.end(), setting.begin(), setting.end());
+            receive(frame);
+            return;
+        }
+
+        const std::array<fields, 8> requests{extended_connect,
+                                             no_path,
+                                             no_scheme,
+                                             no_authority,
+                                             get_with_protocol,
+                                             plain_connect,
+                                             extended_connect_with_length,
+                                             trailers};
+        const std::array<fields, 6> responses{ok,
+                                              ok_with_length,
+                                              not_found_with_length,
+                                              early_hints,
+                                              trailers,
+                                              ok_with_protocol};
+        const auto                  what = arg & 7U;
+        const auto block = role == http2::role::server ? requests.at(what) : responses.at(what % responses.size());
+
+        http2::stream_id id = 0;
+        if ((arg & 0x10U) != 0 || role == http2::role::client) id = stream(arg >> 5U);
+        else id = s.last_peer_stream() == 0 ? 1U : s.last_peer_stream() + 2U;
+
+        // (literals without indexing: the session's decoder takes them whatever its dynamic table holds.)
+        std::vector<std::byte> encoded;
+        peer_encoder.encode(block, encoded);
+        const auto flags =
+            static_cast<std::uint8_t>(http2::flags::end_headers | ((arg & 8U) != 0 ? http2::flags::end_stream : 0U));
+        http2::encode_frame_header({.length = static_cast<std::uint32_t>(encoded.size()),
+                                    .type   = static_cast<std::uint8_t>(http2::frame_type::headers),
+                                    .flags  = flags,
+                                    .stream = id},
+                                   frame);
+        frame.insert(frame.end(), encoded.begin(), encoded.end());
+        receive(frame);
+    }
+
     // rare_frame receives one of the frames random bytes rarely make (op 7's).
     void rare_frame(std::uint8_t which, script& sc)
     {
         if ((which & 8U) != 0)
         {
             origin(which, sc);
+            return;
+        }
+
+        if ((which & 0x10U) != 0)
+        {
+            connect_frame(which, sc);
             return;
         }
 
@@ -670,6 +793,7 @@ private:
     std::vector<std::byte> pending;
     std::vector<std::byte> buffer;
     std::vector<std::byte> data;
+    hpack::encoder         peer_encoder; // the peer's, for op 7's HEADERS: literals, never indexed
 
     std::vector<std::span<const hpack::field>> submitted; // the blocks submitted, in order (static arrays' fields)
 };

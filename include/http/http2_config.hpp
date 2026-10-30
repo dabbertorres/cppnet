@@ -23,17 +23,18 @@ inline constexpr std::uint32_t unlimited = std::numeric_limits<std::uint32_t>::m
 inline constexpr std::uint32_t min_max_frame_size = 16'384;
 inline constexpr std::uint32_t max_max_frame_size = 16'777'215;
 
-// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2; and RFC 9218's
-// NO_RFC7540_PRIORITIES, section 2.1, 0 until it's sent).
+// settings are an endpoint's SETTINGS, starting at their initial values (RFC 9113, section 6.5.2; and RFC 8441's
+// ENABLE_CONNECT_PROTOCOL, section 3, and RFC 9218's NO_RFC7540_PRIORITIES, section 2.1, each 0 until it's sent).
 struct settings
 {
-    std::uint32_t header_table_size      = 4'096;
-    bool          enable_push            = true;
-    bool          no_rfc7540_priorities  = false;
-    std::uint32_t max_concurrent_streams = unlimited;
-    std::uint32_t initial_window_size    = 65'535;
-    std::uint32_t max_frame_size         = min_max_frame_size;
-    std::uint32_t max_header_list_size   = unlimited;
+    std::uint32_t header_table_size       = 4'096;
+    bool          enable_push             = true;
+    bool          enable_connect_protocol = false;
+    bool          no_rfc7540_priorities   = false;
+    std::uint32_t max_concurrent_streams  = unlimited;
+    std::uint32_t initial_window_size     = 65'535;
+    std::uint32_t max_frame_size          = min_max_frame_size;
+    std::uint32_t max_header_list_size    = unlimited;
 
     bool operator==(const settings&) const = default;
 };
@@ -56,6 +57,9 @@ struct session_config
     // This side's settings, sent first. ENABLE_PUSH is always sent as 0 (this side never pushes, nor accepts pushes),
     // and NO_RFC7540_PRIORITIES as 1 (this side sends none of RFC 7540's priority signals, and a server ignores them:
     // RFC 9218, section 2.1).
+    // enable_connect_protocol (off by default) has a server send ENABLE_CONNECT_PROTOCOL as 1, and so take extended
+    // CONNECT (RFC 8441: a request with :protocol, e.g. a WebSocket's); a client's is never sent, as it means nothing
+    // from a client.
     // initial_window_size must be at least its default (65535), as the peer may send that much before it has seen it.
     // max_header_list_size is HPACK's default list size (hpack::default_max_list_size, which http2_session.hpp checks).
     settings local{

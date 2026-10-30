@@ -120,6 +120,7 @@ namespace
         std::optional<std::string_view> scheme;
         std::optional<std::string_view> authority;
         std::optional<std::string_view> path;
+        std::optional<std::string_view> protocol; // extended CONNECT's (RFC 8441, section 4)
         std::optional<std::string_view> status;
         std::optional<std::string_view> host;
         std::optional<std::uint64_t>    content_length;
@@ -134,6 +135,7 @@ namespace
         if (name == ":scheme") return &out.scheme;
         if (name == ":authority") return &out.authority;
         if (name == ":path") return &out.path;
+        if (name == ":protocol") return &out.protocol;
         return nullptr;
     }
 
@@ -189,12 +191,21 @@ namespace
     }
 
     // valid_request is whether a request's pseudo-headers are (RFC 9113, section 8.3.1): CONNECT has only :method and
-    // :authority; others :method, :scheme and a :path; and a Host agrees with :authority (host names ignore case).
-    bool valid_request(const scanned_fields& f) noexcept
+    // :authority; others :method, :scheme and a :path; and a Host agrees with :authority (host names ignore case). An
+    // extended CONNECT (RFC 8441, section 4), if this side takes it (has sent ENABLE_CONNECT_PROTOCOL = 1), is CONNECT
+    // with a :protocol (a token, as Upgrade's protocol names are), :scheme and a :path as other requests have, and
+    // :authority; :protocol otherwise, or with any other method, is malformed.
+    bool valid_request(const scanned_fields& f, bool extended_connect) noexcept
     {
         if (!f.method.has_value()) return false;
 
-        if (*f.method == "CONNECT")
+        if (f.protocol.has_value())
+        {
+            if (!extended_connect || *f.method != "CONNECT" || !is_valid_field_name(*f.protocol)
+                || !f.authority.has_value() || !f.scheme.has_value() || !f.path.has_value() || f.path->empty())
+                return false;
+        }
+        else if (*f.method == "CONNECT")
         {
             if (!f.authority.has_value() || f.scheme.has_value() || f.path.has_value()) return false;
         }
@@ -207,11 +218,49 @@ namespace
     }
 
     // ended_short is whether a stream whose body has ended has less than its Content-Length promised (a response to
-    // HEAD, or a 204 or 304, has none, whatever it says).
+    // HEAD, or a 204 or 304, has none, whatever it says; a tunnel's never has one).
     bool ended_short(const auto& stream) noexcept
     {
-        return stream.content_length.has_value() && stream.received != *stream.content_length && !stream.head_request
-            && !stream.no_body;
+        return stream.content_length.has_value() && stream.received != *stream.content_length
+            && stream.kind != decltype(stream.kind)::head && !stream.no_body;
+    }
+
+    // request_head is what a client's session reads of a header block it sends, if it's a request's head: its method,
+    // whether it has :protocol, and its Priority field, if it has one.
+    struct request_head
+    {
+        std::optional<std::string_view> method; // none for a block that isn't a request's head (trailers)
+        bool                            protocol = false;
+        std::optional<priority>         said;
+    };
+
+    // read_request_head reads a header block a client sends. Its Priority field is read as the server reads it: its
+    // lines joined (RFC 9651, section 4.2; in a string of their own only if there are several, which is rare), over RFC
+    // 9218's default.
+    request_head read_request_head(std::span<const hpack::field> fields)
+    {
+        request_head     out;
+        std::size_t      lines = 0;
+        std::string_view first;
+        std::string      joined;
+        for (const auto& f : fields)
+        {
+            if (f.name == ":method") out.method = f.value;
+            if (f.name == ":protocol") out.protocol = true;
+            if (f.name != "priority") continue;
+
+            if (++lines == 1)
+            {
+                first = f.value;
+                continue;
+            }
+            if (lines == 2) joined = first;
+            joined += ", ";
+            joined += f.value;
+        }
+
+        if (lines > 0) out.said = parse_priority(lines == 1 ? first : std::string_view{joined});
+        return out;
     }
 
     std::optional<int> parse_status(std::string_view value) noexcept
@@ -250,8 +299,9 @@ session::session(role r, const session_config& config)
     auto& local                 = this->config.local;
     local.enable_push           = false;
     local.no_rfc7540_priorities = true;
-    local.initial_window_size   = std::clamp<std::uint32_t>(local.initial_window_size, 65'535, max_window);
-    local.max_frame_size        = std::clamp(local.max_frame_size, min_max_frame_size, max_max_frame_size);
+    if (side == role::client) local.enable_connect_protocol = false;
+    local.initial_window_size = std::clamp<std::uint32_t>(local.initial_window_size, 65'535, max_window);
+    local.max_frame_size      = std::clamp(local.max_frame_size, min_max_frame_size, max_max_frame_size);
 
     // as many CONTINUATIONs as the largest header block this side takes needs, if that's more (a block's encoded size
     // is limited by max_header_list_size too), in frames of the least MAX_FRAME_SIZE: the peer may send frames that
@@ -522,9 +572,10 @@ std::error_code session::end_header_block(const header_block& block, session_eve
         s.known          = true;
         s.content_length = checked->content_length;
         s.no_body        = checked->status == 204 || checked->status == 304;
+        s.kind           = checked->stream_kind;
 
         // a head that ends the stream promises no body.
-        if (block.end_stream && s.content_length.value_or(0) != 0 && !s.head_request && !s.no_body)
+        if (block.end_stream && s.content_length.value_or(0) != 0 && s.kind != exchange::head && !s.no_body)
             return stream_error(id, error_code::protocol_error, &events, now);
     }
     else if (checked->kind == block_kind::trailers && ended_short(s))
@@ -621,12 +672,14 @@ std::expected<session::stream_state*, std::error_code> session::stream_for_block
 std::optional<session::validated> session::validate(const stream_state& s, bool end_stream) const
 {
     validated out;
+    out.stream_kind = s.kind;
 
     const bool trailers = s.head_received;
     if (trailers)
     {
-        // trailers end the stream, and have no pseudo-headers (RFC 9113, section 8.1).
-        if (!end_stream) return std::nullopt;
+        // trailers end the stream, and have no pseudo-headers (RFC 9113, section 8.1); a tunnel has none (only DATA
+        // and the frames that manage the stream follow its head, RFC 9113 section 8.5).
+        if (!end_stream || s.kind == exchange::tunnel) return std::nullopt;
         out.kind = block_kind::trailers;
     }
 
@@ -638,7 +691,15 @@ std::optional<session::validated> session::validate(const stream_state& s, bool 
 
     if (side == role::server)
     {
-        if (!valid_request(*scanned)) return std::nullopt;
+        if (!valid_request(*scanned, config.local.enable_connect_protocol)) return std::nullopt;
+
+        // a CONNECT request has no content (RFC 9110, section 9.3.6): its stream's DATA is the tunnel's, which a
+        // Content-Length doesn't describe, so it's not held to one.
+        if (scanned->method == "CONNECT")
+        {
+            out.stream_kind    = exchange::tunnel;
+            out.content_length = std::nullopt;
+        }
         return out;
     }
 
@@ -652,6 +713,12 @@ std::optional<session::validated> session::validate(const stream_state& s, bool 
         // an informational response is followed by the final one.
         if (end_stream) return std::nullopt;
         out.kind = block_kind::informational;
+    }
+    else if (s.kind == exchange::connect && *code < 300)
+    {
+        // a 2xx to CONNECT opens the tunnel: a client ignores its Content-Length (RFC 9110, section 9.3.6).
+        out.stream_kind    = exchange::tunnel;
+        out.content_length = std::nullopt;
     }
 
     return out;
@@ -771,6 +838,17 @@ std::error_code session::apply_setting(std::uint16_t id, std::uint32_t value, bo
         break;
 
     case setting_id::max_header_list_size: peer.max_header_list_size = value; break;
+
+    case setting_id::enable_connect_protocol:
+        // 0 or 1 from either side (RFC 8441, section 3), but it means something only from a server: that a client may
+        // send extended CONNECT. So a client's is ignored. A server can't withdraw it once it's 1: a later 0 is an
+        // error (a later SETTINGS that leaves it out changes nothing).
+        if (value > 1) return connection_error(error_code::protocol_error, "ENABLE_CONNECT_PROTOCOL");
+        if (side == role::server) break;
+        if (value == 0 && peer.enable_connect_protocol)
+            return connection_error(error_code::protocol_error, "ENABLE_CONNECT_PROTOCOL withdrawn");
+        peer.enable_connect_protocol = value == 1;
+        break;
 
     case setting_id::no_rfc7540_priorities:
         // 0 or 1, in the first SETTINGS, and never changed after (RFC 9218, section 2.1, whose "MAY" treat a change as
@@ -995,36 +1073,24 @@ std::error_code session::submit_headers(stream_id stream, std::span<const hpack:
     if (connection_failed || it == streams.end() || it->second.local_closed)
         return make_error_code(error_code::stream_closed);
 
-    // a response to HEAD has no body, whatever its Content-Length says. And a request's Priority field is the first
-    // thing its stream says of its priority (see submit_priority_update()), read as the server reads it: its lines
-    // joined (RFC 9651, section 4.2; in a string of their own only if there are several, which is rare), over RFC
-    // 9218's default. (Trailers have no :method.)
-    if (side == role::client)
+    // a response to HEAD has no body, whatever its Content-Length says, and one to CONNECT may open a tunnel. And a
+    // request's Priority field is the first thing its stream says of its priority (see submit_priority_update()).
+    // (Trailers have no :method.)
+    if (const auto head = side == role::client ? read_request_head(fields) : request_head{}; head.method.has_value())
     {
-        bool             request = false;
-        std::size_t      lines   = 0;
-        std::string_view first;
-        std::string      joined;
-        for (const auto& f : fields)
+        // extended CONNECT only once the server has said it takes it (RFC 8441, section 4): until then, the server
+        // would take it as malformed. Nothing has been sent on the stream (a request's head is its first frame), so
+        // it's forgotten rather than reset.
+        if (head.protocol && !peer.enable_connect_protocol)
         {
-            if (f.name == ":method")
-            {
-                request                 = true;
-                it->second.head_request = f.value == "HEAD";
-            }
-            else if (f.name == "priority")
-            {
-                if (++lines == 1)
-                {
-                    first = f.value;
-                    continue;
-                }
-                if (lines == 2) joined = first;
-                joined += ", ";
-                joined += f.value;
-            }
+            forget(stream);
+            return std::make_error_code(std::errc::invalid_argument);
         }
-        if (request && lines > 0) it->second.said = parse_priority(lines == 1 ? first : std::string_view{joined});
+
+        auto& s = it->second;
+        if (head.method == "HEAD") s.kind = exchange::head;
+        else if (head.method == "CONNECT") s.kind = exchange::connect;
+        if (head.said.has_value()) s.said = *head.said;
     }
 
     encoded_block.clear();
