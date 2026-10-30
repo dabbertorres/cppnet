@@ -972,7 +972,44 @@ router.GET("/echo",
   `std::errc::operation_canceled`; with a `stop` of its own, its reads find the connection's end, `abnormal_closure`). `instrument::http_metrics` and
   `http_tracing` see the 101 as the response's status, and the whole WebSocket as the request's duration.
 
-`example/websocket-echo` is an echo server (the one Autobahn's TestSuite tests).
+A client opens a WebSocket with `websocket::connect(client, url, options)`, given an `http::client` whose configuration
+it takes (its resolver, `connect_timeout` and `attempt_delay`, its TLS options for `wss://`, `response_header_timeout`
+for the handshake, and `io_timeout` for writes), and has the `websocket::connection` until it destroys it:
+
+```cpp
+net::http::client client{&scheduler};
+
+auto conn = co_await net::websocket::connect(client, "wss://example.com/chat", {.subprotocols = {"chat.v2"}});
+if (!conn) co_return;   // e.g. websocket::errc::bad_status: the server didn't switch
+
+(void)co_await conn->write_message(net::websocket::message_type::text, "hello"sv);
+
+std::string message;
+auto type = co_await conn->read_message(message);
+
+(void)co_await conn->close();   // waits for the server's close, then for it to end TCP
+```
+
+- **The connection:** `ws://` and `wss://` (and `http://` and `https://`, the same) are spoken over HTTP/1.1, on a
+  connection of the WebSocket's own: not one of the client's pool's, nor counted in its limits (over TLS, it offers
+  only `http/1.1` with ALPN, so a server that speaks HTTP/2 agrees on HTTP/1.1). `connect_options::headers` go with the
+  handshake (e.g. `Authorization`, a `Cookie`), `subprotocols` are offered (`conn->subprotocol()` is the one chosen, or
+  empty), and `origin` is sent as `Origin` (programs needn't; browsers do).
+- **The handshake fails** (`websocket::errc`) for a response that isn't the server's switching: `bad_status` for
+  anything but 101 (Switching Protocols), redirects included (they aren't followed, as browsers don't), `bad_accept`,
+  `bad_subprotocol` (one that wasn't offered) or `bad_extension` (none is offered); or as connecting does (e.g.
+  `std::errc::timed_out`, a TLS error). `url` and `options` are copied before `connect()` returns.
+- **Stopping:** `connect_options::stop` covers connecting, the handshake and the WebSocket, as `accept_options::stop`
+  does a server's (`std::errc::operation_canceled`).
+- **Reading, writing, limits and how it ended** are as on the server (`connect_options::connection`, the same
+  `connection_options`). The client's frames are masked (RFC 6455 has a client mask its frames, with keys a server
+  can't predict), into the connection's buffer: the data written isn't changed.
+- **Closing:** once the close handshake is done (its own `close()`, or a read of the server's close, answered), the
+  client waits for the server to end TCP, as RFC 6455 has the server do, for up to `close_timeout`; then the
+  connection ends with its destruction.
+
+`example/websocket-echo` is an echo server (the one Autobahn's TestSuite's `fuzzingclient` tests), and
+`example/websocket-autobahn` a client that runs the TestSuite's `fuzzingserver` cases, echoing their messages.
 
 ## TLS
 

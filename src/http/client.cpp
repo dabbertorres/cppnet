@@ -735,6 +735,8 @@ namespace detail
         return from_scheme == "http"sv && to_scheme == "https"sv && port_of(from) == "80"sv && port_of(to) == "443"sv;
     }
 
+    std::shared_ptr<connection_pool> pool_of(const client& c) noexcept { return c.pool; }
+
 }
 
 client::client(io::scheduler* scheduler, const client_options& options)

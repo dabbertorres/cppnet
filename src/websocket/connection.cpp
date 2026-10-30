@@ -1,3 +1,5 @@
+#include "http/connection.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -20,7 +22,11 @@
 
 #include "coro/notifier.hpp"
 #include "coro/task.hpp"
+#include "http/client.hpp"
+#include "http/connection_pool.hpp"
 #include "http/headers.hpp"
+#include "http/http.hpp"
+#include "http/http11.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/tunnel.hpp"
@@ -30,7 +36,10 @@
 #include "io/reader.hpp"
 #include "io/scheduler.hpp"
 #include "io/writer.hpp"
+#include "tcp.hpp"
+#include "url.hpp"
 #include "util/defer.hpp"
+#include "util/string_util.hpp"
 #include "websocket/frame.hpp"
 #include "websocket/handshake.hpp"
 #include "websocket/session.hpp"
@@ -79,6 +88,67 @@ struct control_frames
 namespace net::websocket::detail
 {
 
+namespace
+{
+
+    // client_tunnel is a client's connection (see connect()), as a tunnel: the WebSocket's own, with buffers of its own
+    // (16 KiB each way, as a server's connection has), whose reader holds what the server sent after its handshake's
+    // response.
+    class client_tunnel final : public http::detail::tunnel
+    {
+    public:
+        static constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
+
+        explicit client_tunnel(std::unique_ptr<http::detail::connection> connection)
+            : conn{std::move(connection)}
+            , in{&http::detail::as_reader(*conn), buffer_size}
+            , out{&http::detail::as_writer(*conn), buffer_size}
+        {}
+
+        client_tunnel(const client_tunnel&)            = delete;
+        client_tunnel& operator=(const client_tunnel&) = delete;
+        client_tunnel(client_tunnel&&)                 = delete;
+        client_tunnel& operator=(client_tunnel&&)      = delete;
+        ~client_tunnel()                               = default;
+
+        [[nodiscard]] io::buffered_reader& reader() noexcept override { return in; }
+        [[nodiscard]] io::buffered_writer& writer() noexcept override { return out; }
+
+        void set_read_timeout(std::optional<io::clock::duration> timeout) noexcept override
+        {
+            socket().set_read_timeout(timeout);
+        }
+
+        void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept override
+        {
+            socket().set_read_deadline(deadline);
+        }
+
+        // NOTE: over TLS, the socket's token is the stream's (see tls::stream::set_stop_token()).
+        void set_stop_token(std::stop_token stop) noexcept override { socket().set_stop_token(std::move(stop)); }
+
+        // a client has no server closing around it.
+        [[nodiscard]] std::stop_token closing() const noexcept override { return {}; }
+
+        [[nodiscard]] io::scheduler* get_scheduler() const noexcept override
+        {
+            return http::detail::socket_of(*conn).get_scheduler();
+        }
+
+        // NOTE: what's written but not flushed is dropped with the tunnel, which ends the connection.
+        void abort() noexcept override { socket().shutdown_read(); }
+
+        // socket is the TCP connection (under TLS's, if it's TLS), for its timeouts.
+        [[nodiscard]] tcp_socket& socket() noexcept { return http::detail::socket_of(*conn); }
+
+    private:
+        std::unique_ptr<http::detail::connection> conn;
+        io::buffered_reader                       in;
+        io::buffered_writer                       out;
+    };
+
+}
+
 // connection_state is a connection's: the session, and what the tasks reading and writing share, in one allocation
 // (so that it doesn't move, as waiters and the message's reader and writer point to it).
 //
@@ -99,19 +169,23 @@ namespace net::websocket::detail
 // waits, with a callback (cancel()) for the rest.
 struct connection_state
 {
-    connection_state(http::detail::tunnel&     t,
-                     role                      r,
-                     const connection_options& options,
-                     std::string_view          protocol,
-                     std::stop_token           stop)
-        : tunnel{t}
-        , scheduler{t.get_scheduler()}
+    // A server's state is over its connection's tunnel (t), a client's over its own (own, which it keeps: t is it).
+    connection_state(http::detail::tunnel&            t,
+                     std::unique_ptr<client_tunnel>&& own,
+                     role                             r,
+                     const connection_options&        options,
+                     std::string_view                 protocol,
+                     std::stop_token                  stop)
+        : owned{std::move(own)}
+        , tunnel{t}
+        , scheduler{tunnel.get_scheduler()}
+        , side{r}
         , close_timeout{options.close_timeout}
         , idle_wait{half_of(options.idle_timeout)}
         , subprotocol{protocol}
         , sess{r, limits{.max_message = options.max_message}}
         , turn{scheduler->pool()}
-        , closing{t.closing()}
+        , closing{tunnel.closing()}
     {
         tunnel.set_read_timeout(idle_wait);
 
@@ -139,6 +213,17 @@ struct connection_state
         tunnel.set_stop_token({});
         tunnel.set_read_timeout(std::nullopt);
         tunnel.set_read_deadline(std::nullopt);
+    }
+
+    // open makes a client's connection, over its own tunnel, once the handshake is done.
+    static connection open(std::unique_ptr<client_tunnel> own,
+                           const connection_options&      options,
+                           std::string_view               protocol,
+                           std::stop_token                stop)
+    {
+        auto& t = *own;
+        return connection{
+            std::make_unique<connection_state>(t, std::move(own), role::client, options, protocol, std::move(stop))};
     }
 
     // half_of is half of an idle timeout, as a read's timeout; none, if it's 0.
@@ -247,7 +332,7 @@ struct connection_state
         reading.store(false, std::memory_order::seq_cst);
         if (close_waiting.load(std::memory_order::seq_cst))
         {
-            read_changes.fetch_add(1, std::memory_order::release);
+            read_changes.fetch_add(1, std::memory_order::seq_cst);
             scheduler->notify_all(read_changes);
         }
     }
@@ -591,9 +676,7 @@ struct connection_state
         {
             if (step == pumped::failed)
             {
-                // the close the failure calls for, if it's this side's to send.
-                (void)co_await send_replies();
-                err = failure();
+                err = co_await end_failed(io::clock::now() + close_timeout);
                 break;
             }
 
@@ -751,16 +834,57 @@ struct connection_state
         std::array<std::byte, max_header_size> head{};
         const auto                             size = encode_header(header, head);
 
-        // usually, the frame fits in the writer's buffer: then it needs no coroutine, unless the flush waits.
-        // NOTE: a client's frames are masked, which the client's stage brings: a server's aren't.
+        // usually, the frame fits in the writer's buffer: then it needs no coroutine, unless the flush waits. A
+        // client's payload is masked as it's copied there, so the caller's isn't changed.
         if (auto room = tunnel.writer().prepare(size + payload.size()); !room.empty())
         {
             std::ranges::copy(std::span{head}.first(size), room.begin());
             std::ranges::copy(payload, room.begin() + static_cast<std::ptrdiff_t>(size));
+            if (header.masked) apply_mask(room.subspan(size), header.mask_key, 0);
             return flush_and_release();
         }
 
+        if (header.masked) return send_masked(head, size, header.mask_key, payload);
         return send_through(head, size, payload);
+    }
+
+    // send_masked writes a client's frame that doesn't fit in the writer's buffer: its payload masked into the buffer,
+    // a buffer's worth at a time, each flushed in turn.
+    coro::task<std::error_code> send_masked(std::array<std::byte, max_header_size> head,
+                                            std::size_t                            size,
+                                            std::array<std::byte, 4>               key,
+                                            std::span<const std::byte>             payload)
+    {
+        auto&      writer = tunnel.writer();
+        const auto header = std::span<const std::byte>{head}.first(size);
+
+        // NOTE: the buffer's empty (the wire's this frame's), and it holds a header.
+        auto room = writer.prepare(size);
+        if (room.empty())
+        {
+            if (auto res = co_await writer.flush(); res.err) co_return fail_write(res.err);
+            room = writer.prepare(size);
+        }
+        std::ranges::copy(header, room.begin());
+
+        std::size_t offset = 0;
+        while (offset < payload.size())
+        {
+            const auto free = writer.capacity() - writer.size();
+            if (free == 0)
+            {
+                if (auto res = co_await writer.flush(); res.err) co_return fail_write(res.err);
+                continue;
+            }
+
+            const auto part = std::min(free, payload.size() - offset);
+            room            = writer.prepare(part);
+            std::ranges::copy(payload.subspan(offset, part), room.begin());
+            apply_mask(room, key, offset);
+            offset += part;
+        }
+
+        co_return co_await flush_and_release();
     }
 
     coro::task<std::error_code>
@@ -933,27 +1057,42 @@ struct connection_state
 
         while (true)
         {
-            const auto seen = read_changes.load(std::memory_order::acquire);
-            if (closed()) co_return std::error_code{};
-            if (auto err = failure())
+            const auto seen = read_changes.load(std::memory_order::seq_cst);
+            if (closed())
             {
-                tunnel.abort();
-                co_return err;
+                // a client's reader that received the peer's close waits for the server's end of the stream (see
+                // await_end()), which this waits for too, as long as the reader has the read side.
+                // NOTE: sequentially consistent, as below.
+                if (side == role::server || !reading.load(std::memory_order::seq_cst)) co_return std::error_code{};
+            }
+            else
+            {
+                if (auto err = failure())
+                {
+                    tunnel.abort();
+                    co_return err;
+                }
+
+                // NOTE: sequentially consistent, with close_waiting's store and end_read()'s: so either this claims
+                //       the read side, or end_read() sees close_waiting.
+                if (!reading.exchange(true, std::memory_order::seq_cst))
+                {
+                    util::defer done{[this] noexcept { end_read(); }};
+                    const auto  err = co_await read_close(deadline);
+                    if (closed()) co_return std::error_code{};
+
+                    tunnel.abort();
+                    co_return err;
+                }
             }
 
-            // NOTE: sequentially consistent, with close_waiting's store and end_read()'s: so either this claims the
-            //       read side, or end_read() sees close_waiting.
-            if (!reading.exchange(true, std::memory_order::seq_cst))
+            if (auto err = co_await scheduler->wait_on(read_changes, seen, deadline))
             {
-                util::defer done{[this] noexcept { end_read(); }};
-                const auto  err = co_await read_close(deadline);
+                // the handshake's done, and a client's reader is still waiting for the server's end of the stream:
+                // the connection ends with this side's close.
                 if (closed()) co_return std::error_code{};
-
-                tunnel.abort();
-                co_return err;
+                co_return fail_transport(err);
             }
-
-            if (auto err = co_await scheduler->wait_on(read_changes, seen, deadline)) co_return fail_transport(err);
         }
     }
 
@@ -962,6 +1101,38 @@ struct connection_state
     {
         std::scoped_lock lock{mu};
         return sess.state() == close_state::closed;
+    }
+
+    // end_failed is what a read that found the connection failed comes to (holding the read side): it sends the close
+    // the failure calls for, if it's this side's to send (or the reply to the peer's), and if that ends a client's
+    // close handshake, waits for the server's end of the stream (see await_end()) until deadline. It returns the
+    // failure.
+    coro::task<std::error_code> end_failed(io::clock::time_point deadline)
+    {
+        (void)co_await send_replies();
+        if (side == role::client && closed()) co_await await_end(deadline);
+        co_return failure();
+    }
+
+    // await_end waits (holding the read side), once a client's close handshake is done, for the server to end the
+    // stream, as RFC 6455 (section 7.1.1) has the server close TCP first, until deadline, dropping whatever comes
+    // before it (nothing should). Either way, the client then ends the connection itself (it's destroyed).
+    coro::task<> await_end(io::clock::time_point deadline)
+    {
+        auto&       reader = tunnel.reader();
+        util::defer idle{[this] noexcept { tunnel.set_read_timeout(idle_wait); }};
+
+        while (!ended)
+        {
+            reader.consume(reader.size());
+
+            const auto left = deadline - io::clock::now();
+            if (left <= io::clock::duration::zero()) co_return;
+            tunnel.set_read_timeout(left);
+
+            // NOTE: however it ended (a reset too), or the timeout passing.
+            if (auto err = co_await reader.fill()) ended = err;
+        }
     }
 
     // read_close reads (holding the read side) until the peer's close comes, dropping what comes before it, or until
@@ -978,7 +1149,7 @@ struct connection_state
             switch (pump(goal::close, t))
             {
             case pumped::done:
-            case pumped::failed: (void)co_await send_replies(); co_return failure();
+            case pumped::failed: co_return co_await end_failed(deadline);
 
             case pumped::reply:
                 if (auto err = co_await send_replies()) co_return err;
@@ -1010,8 +1181,12 @@ struct connection_state
         }
     }
 
+    // NOTE: first, so it's destroyed last (ending a client's connection), once nothing uses it.
+    std::unique_ptr<client_tunnel> owned; // a client's tunnel: none for a server's, which is its connection's
+
     http::detail::tunnel&              tunnel;
     io::scheduler*                     scheduler;
+    role                               side;
     std::chrono::milliseconds          close_timeout;
     std::optional<io::clock::duration> idle_wait; // half the idle timeout, the reads' timeout; none if it's off
     std::string                        subprotocol;
@@ -1169,6 +1344,87 @@ namespace
         }(std::move(writing), size);
     }
 
+    // max_response_head is the most a handshake's response head may be: as the HTTP client's responses'.
+    constexpr std::size_t max_response_head = std::size_t{1'024} * 1'024;
+
+    // limit is a timeout, or none for 0.
+    std::optional<io::clock::duration> limit(std::chrono::milliseconds timeout) noexcept
+    {
+        if (timeout <= std::chrono::milliseconds::zero()) return std::nullopt;
+        return timeout;
+    }
+
+    // endpoint is what a WebSocket's url says to connect to: the URL as HTTP's (ws as http, and wss as https), and its
+    // port (the scheme's default, if it has none).
+    struct endpoint
+    {
+        url         target;
+        std::string port;
+    };
+
+    std::expected<endpoint, std::error_code> endpoint_of(std::string_view text)
+    {
+        auto parsed = url::parse(text);
+        if (!parsed.has_value()) return std::unexpected(invalid());
+
+        const auto is = [&](std::string_view scheme)
+        { return util::equal_ignore_case(std::string_view{parsed->scheme}, scheme); };
+
+        bool tls = false;
+        if (is("wss"sv) || is("https"sv)) tls = true;
+        else if (!is("ws"sv) && !is("http"sv))
+            return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+
+        parsed->scheme = tls ? "https" : "http";
+        auto port      = !parsed->port.empty() ? parsed->port : std::string{tls ? "443" : "80"};
+        return endpoint{.target = std::move(*parsed), .port = std::move(port)};
+    }
+
+    // open connects to where, and opens a WebSocket over the connection (see connect()).
+    // NOTE: everything by value, as connect() returns its task rather than awaiting it.
+    task<std::expected<connection, std::error_code>>
+    open(std::shared_ptr<http::detail::connection_pool> pool, endpoint where, connect_options options)
+    {
+        // once stop's been requested, that's what it failed with, whatever its cancellation caused (e.g. a TLS read
+        // cut short).
+        const auto fail = [&options](std::error_code err)
+        {
+            if (options.stop.stop_requested()) err = std::make_error_code(std::errc::operation_canceled);
+            return std::unexpected(err);
+        };
+
+        auto conn = co_await pool->connect_apart(where.target.scheme, where.target.host, where.port, options.stop);
+        if (!conn.has_value()) co_return fail(conn.error());
+
+        auto own = std::make_unique<detail::client_tunnel>(std::move(*conn));
+
+        // the handshake's request is written (as the WebSocket's frames are) with io_timeout, and its response read
+        // within response_header_timeout, both ended by stop.
+        const auto& config = pool->options();
+        auto&       sock   = own->socket();
+        sock.set_write_timeout(limit(config.io_timeout));
+        sock.set_stop_token(options.stop);
+
+        const auto handshake = detail::make_request(where.target, options);
+        if (auto head = co_await http::http11::request_encode_head(&own->writer(), handshake.request); !head)
+            co_return fail(head.error());
+        if (auto flushed = co_await own->writer().flush(); flushed.err) co_return fail(flushed.err);
+
+        if (auto wait = limit(config.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
+        auto response =
+            co_await http::http11::response_decode(&own->reader(), http::request_method::GET, max_response_head);
+        sock.set_read_deadline(std::nullopt);
+        if (!response.has_value()) co_return fail(response.error());
+
+        // NOTE: what follows the head (frames the server sent right after its response, if it's a 101) stays in the
+        //       reader, for the WebSocket: the response's body (the rest of the connection, after a 101) is never read.
+        const auto chosen = detail::check_response(*response, handshake.key, options.subprotocols);
+        if (!chosen.has_value()) co_return fail(chosen.error());
+        if (options.stop.stop_requested()) co_return fail({});
+
+        co_return connection_state::open(std::move(own), options.connection, *chosen, std::move(options.stop));
+    }
+
     // refuse responds to a handshake that's refused for err.
     task<> refuse(http::response_writer& rw, std::error_code err)
     {
@@ -1217,10 +1473,23 @@ accept(const http::server_request& req, http::response_writer& rw, const accept_
     if (!switched.has_value()) co_return std::unexpected(switched.error());
 
     co_return connection{std::make_unique<connection_state>(**switched,
+                                                            nullptr,
                                                             detail::role::server,
                                                             options.connection,
                                                             subprotocol,
                                                             options.stop.stop_possible() ? options.stop : req.stop)};
+}
+
+task<std::expected<connection, std::error_code>>
+connect(const http::client& client, std::string_view url, const connect_options& options)
+{
+    // NOTE: not a coroutine, so url is parsed (and options copied) before this returns, rather than when the task
+    //       starts (when they might be gone).
+    auto where = endpoint_of(url);
+    if (!where.has_value())
+        return ready_task<std::expected<connection, std::error_code>>(std::unexpected(where.error()));
+
+    return open(http::detail::pool_of(client), std::move(*where), options);
 }
 
 connection::connection(std::unique_ptr<detail::connection_state> state) noexcept

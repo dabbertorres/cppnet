@@ -3,7 +3,8 @@
 Status: decided (2026-10-22): every question at the end as recommended. Stage 1, the helpers, done (2026-10-24; see
 Learned in stage 1). Stage 2, the codec and the session, done (2026-10-29; see Learned in stage 2). Stage 3, switching
 an HTTP/1.1 connection, done (2026-10-29; see Learned in stage 3). Stage 4, accepting WebSockets, done (2026-10-29; see
-Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29; see Learned in stage 5).
+Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29; see Learned in stage 5). Stage 6,
+the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6).
 
 ## Goal
 
@@ -705,6 +706,98 @@ waiting for the server's first SETTINGS isn't used.
   hand, a WebSocket open to the example when it gets SIGTERM receives a close with 1001 at once, and the example exits
   as soon as it's answered.
 
+## Learned in stage 6
+
+- The API, where the plan left it open: `connect(const http::client&, std::string_view url, const connect_options&)`
+  takes the client as `const` (it only reads its configuration and its pool's pointer, which its copies share; the
+  lint's const-correctness wants it so). It's a plain function: the URL's parsed and the options copied before it
+  returns, so neither needs to outlive the task (as `client::get()` does it), and the coroutine (`open()`) takes
+  everything by value. `connect_options` gets `connection` (the same `connection_options`) and `stop`, which covers
+  connecting, the handshake and the WebSocket. The schemes: `ws`, `wss`, `http` and `https`, in any case; another, or
+  none (`url::parse()` takes `127.0.0.1/ws` as a host and path), is `protocol_not_supported`, as a URL without a scheme
+  says nothing of TLS; a URL that doesn't parse is `invalid_argument`. A fragment is dropped (the request target is the
+  path and query).
+- Where the connection comes from: the client's pool, through an internal friend accessor
+  (`http::detail::pool_of(client)`), and a new `connection_pool::connect_apart(scheme, host, port, stop)`: the pool's
+  own `connect()` (the resolver, `connect_timeout`, `attempt_delay`, the TLS handshake within `tls_handshake_timeout`),
+  but never counted or kept, and over TLS with a context of its own (`http1_context()`, made on first use from the same
+  `tls::client_options`, offering only `http/1.1`), or the pool's when `http2` is off (it offers only that already). So
+  "the connector" the plan named is the pool's connecting half; nothing else holds a context.
+- The tunnel (`client_tunnel`, in `connection.cpp`): the connection behind a `unique_ptr` (as the pool gives it), and a
+  16 KiB `buffered_reader` and `buffered_writer` of its own; `closing()` gives no token, `abort()` shuts the reading
+  side. The connection's state owns it (its first member, so it's destroyed last, which closes the socket), taking a
+  `tunnel&` and the `unique_ptr` by rvalue reference, so the reference is bound before the pointer moves.
+- The handshake: the socket's write timeout is `io_timeout` from the start (so the request's write, then the
+  WebSocket's, as the plan had it), and its stop token `stop`; `request_encode_head()` into the tunnel's writer, a
+  flush, then `response_decode()` on the tunnel's reader (a 1 MiB limit on the head, as the HTTP client's; interim
+  responses but 101 skipped) under a read deadline of `response_header_timeout` from the flush; then `check_response()`.
+  A 101's body (the rest of the connection) is never read, so what followed the head is in the reader for the WebSocket.
+  Any failure once stop's been requested is reported as `operation_canceled` (as `client::send()` does: a cancellation
+  can surface as another error, e.g. a TLS read cut short), and stop's checked once more before the connection's made,
+  so a connection is never returned already canceled.
+- Masking: a frame that fits the writer's buffer is copied into `prepare()`d space and masked there (`apply_mask()` from
+  offset 0); one that doesn't goes through `send_masked()`, a coroutine that writes the header, then the payload a
+  buffer's worth at a time, each part copied and masked at its offset, flushing as the buffer fills. The control frames
+  (`control_frames::append()`) were masked already. Writes never touch the caller's data (tested).
+- The close, where the plan was brief ("the client then waits for the server's end of the stream ... within the same
+  timeout"): the wait (`await_end()`, which drops what comes and reads until the stream ends or the deadline) follows
+  the close handshake wherever it finishes on a client, not only in `close()`: the read that answers the server's close
+  (`drive()`'s failed step, through `end_failed()`, with `close_timeout` from then) and `read_close()` (with `close()`'s
+  deadline). `close()` waiting for another task's read, once the handshake's done, waits on while that read is in
+  `await_end()`, and its own deadline passing then is no error (the handshake did finish). Either way the client ends
+  TCP itself only by destroying the connection, after the server's end or the timeout. Not covered: a reply to the
+  server's close left to a writer holding the wire (another task writing as the close comes) is sent by that writer, and
+  nothing then waits for the server's end.
+- An example client beyond Autobahn's driver wasn't added: the guide's section shows a client, and
+  `example/websocket-autobahn` is a small one already (connect, echo, close).
+- `bench_websocket` (`bench/websocket/echo.cpp`, Release, two workers, best of five runs, three runs alike): cppnet's
+  client against cppnet's server, an echo handler, allocations of both sides together.
+
+  | Messages                     | Time per message | Messages a second | Allocations per message |
+  |------------------------------|------------------|-------------------|-------------------------|
+  | 16 B text, one at a time     | 27.8 us          | 36,000            | 4.00                    |
+  | 16 B text, in flight         | 4.0 us           | 249,000           | 0.35                    |
+  | 64 KiB binary, one at a time | 116 us           | 8,600 (537 MiB/s) | 10.0                    |
+  | 64 KiB binary, in flight     | 45 us            | 22,000 (1.4 GiB/s)| 7.4                     |
+
+  One at a time is a round trip through both schedulers and the kernel each; the 4 allocations of a small one are the
+  two reads that wait (each `drive()`'s frame and the socket's wait, as stage 4 found on the server; nothing per
+  write). In flight, reads mostly find messages buffered, and need no coroutine. A large message's are the large
+  writes' coroutines (`send_masked()` on the client, `send_through()` and `io::write_all()` on the server, and their
+  flushes that wait for the socket) as well; not traced further.
+- Autobahn's `fuzzingserver` (Docker, `crossbario/autobahn-testsuite`, its port published to the host; config and report
+  in a scratch directory) against `example/websocket-autobahn` in a Release build, sections 1-7 and 9: 300 cases, 297 OK
+  and 3 INFORMATIONAL (7.1.6, 7.13.1, 7.13.2, which only record what the client did), none NON-STRICT or FAILED, the
+  first time; every case clean, the server ending TCP first in all of them. The run took 19.5 s, section 9 10.5 s (the
+  slowest 9.5.1, 1 MiB in 64-byte frames, 1.2 s); again on the commit's code, the same counts, section 9 in 9.2 s. The
+  suite doesn't see the client's wait for the server's end of TCP: with it taken out, still 297 OK, the server ending
+  TCP first in all 300 (it ends it as soon as it has the client's close, and the driver's connection is destroyed only
+  after its read returns), so the loopback tests are what check it.
+- Tests (`test/websocket/client.cpp`, `[websocket][client]`, and `[tls][http][client][websocket]` in
+  `test/tls/server.cpp`): against cppnet's server, echo (three spellings of the scheme; a 300 KB message and a streamed
+  one), subprotocols, the server's close ending a read, stop before connecting, during the handshake and during a read;
+  against a scripted server (`raw_server` in the test, over `raw_peer`), the handshake's request, the refusals the plan
+  listed and more (no Upgrade, not HTTP, the connection ending), connecting's failures, frames in the 101's write, the
+  frames' masks, the close in four orders (close() alone, close() with another task reading, the server's close, and
+  close() called while the read that answered the server's waits for its end), each with the server ending TCP after a
+  pause or never, and writes timing out at `io_timeout` with a read waiting; and wss:// to a server that speaks HTTP/2,
+  the client's `http2` on and off. Assertions on order and outcomes, with lower bounds only on time (and one upper
+  bound, below a 2 s `close_timeout`, for a server that ends TCP after 100 ms).
+- Each rule and path was broken alone (23 breaks: masking in the buffer, a large frame sent unmasked, `send_masked()`
+  not masking and masking from offset 0, the tunnel's abort, the wait for the server's end, `close()` waiting for a
+  reader in it, `close()`'s deadline once the handshake's done, `await_end()` dropping what comes and its timeout, the
+  pool's TLS context offering h2, the write timeout, the handshake's stop token, failures reported as canceled once
+  stopped, `response_header_timeout`, the last stop check, `http://` and no scheme, the client's role, the response's
+  check, the frames after the 101, the default port, and the context of its own when `http2` is off), and the tests
+  failed for every one but four: failures reported as canceled once stopped (over TCP a canceled wait already says
+  `operation_canceled`; it's for a cancellation that surfaces as another error, as `client::send()` has it), the last
+  stop check before the connection's made (only a race reaches it), the default port (80 and 443 can't be listened on in
+  the tests), and `http1_context()` reusing the pool's context when it offers only http/1.1 (only memory). The tunnel's
+  abort and `close()`'s wait for a reader in `await_end()` were caught once the tests had a read waiting while a write
+  timed out, and a `close()` called after the read had answered the server's close; `response_header_timeout` taken out
+  hangs rather than fails (the scripted server waits for the client), which the run's time limit shows; and
+  `await_end()` not dropping what comes never ends once the buffer's full (the tests' 10 s limits fail it).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -727,8 +820,8 @@ Each a pull request, mergeable and tested alone, in this order:
 5. **Timeouts and the server's close.** Done (2026-10-29; see Learned in stage 5). `idle_timeout` and keep-alive pings, `close_timeout`, `stop`, `close()`'s 1001
    (`tunnel::closing()`, the socket's token); their tests. Split from 4 as they touch the server's lifecycle and are
    tested with time.
-6. **The client over HTTP/1.1.** `websocket::connect()`, masking, its tests, `bench_websocket`; Autobahn's
-   `fuzzingserver` by hand. After the server, so the two test each other.
+6. **The client over HTTP/1.1.** Done (2026-10-29; see Learned in stage 6). `websocket::connect()`, masking, its
+   tests, `bench_websocket`; Autobahn's `fuzzingserver` by hand. After the server, so the two test each other.
 7. **Extended CONNECT in the session.** `:protocol`, `settings::enable_connect_protocol`, the rules; tests on bytes and
    `fuzz_http2`. Nothing advertises it yet: the protocol's rules apart from the server, as stage 6's ORIGIN part was.
 8. **WebSockets over HTTP/2, the server.** `server_config::http2_websockets`, `server_request::protocol`, the

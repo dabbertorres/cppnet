@@ -215,7 +215,19 @@ namespace detail
         // stats are the connections to host and port, over any scheme.
         [[nodiscard]] connection_stats stats(const std::string& host, const std::string& port) const;
 
+        // connect_apart connects a connection of the caller's own to host, for a protocol that switches from HTTP/1.1
+        // (e.g. WebSocket), as the pool would connect one for scheme ("http" or "https"): resolving the host and
+        // connecting within connect_timeout (with attempt_delay and the resolver), then for https the TLS handshake,
+        // within tls_handshake_timeout. But it's never the pool's (counted in its limits, or kept), and over TLS it
+        // offers only http/1.1 with ALPN, so the server can't choose HTTP/2. It fails as acquire() does (e.g. with
+        // std::errc::protocol_not_supported for another scheme), and stop ends it, failing with
+        // std::errc::operation_canceled.
+        coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
+        connect_apart(const std::string& scheme, std::string host, std::string port, std::stop_token stop);
+
         [[nodiscard]] const client_options& options() const noexcept { return config; }
+
+        [[nodiscard]] io::scheduler* get_scheduler() const noexcept { return scheduler; }
 
         // For the tests: how many hosts the pool remembers speak HTTP/2, and whether it remembers that one does.
         [[nodiscard]] std::size_t known_http2_hosts() const;
@@ -252,9 +264,14 @@ namespace detail
 
         static std::string make_key(const std::string& scheme, const std::string& host, const std::string& port);
 
-        // connect connects to host, within deadline, and for https, runs a TLS handshake: either ended by stop.
-        coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
-        connect(bool tls, std::string host, std::string port, io::clock::time_point deadline, std::stop_token stop);
+        // connect connects to host, within deadline, and for https, runs a TLS handshake (offering only http/1.1 with
+        // ALPN if http1_only, otherwise as tls_context()'s): either ended by stop.
+        coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connect(bool                  tls,
+                                                                                        std::string           host,
+                                                                                        std::string           port,
+                                                                                        io::clock::time_point deadline,
+                                                                                        std::stop_token       stop,
+                                                                                        bool http1_only = false);
 
         // wants_http2 is whether a new connection is to speak HTTP/2: it agreed on h2 (or it's cleartext, with prior
         // knowledge).
@@ -370,6 +387,14 @@ namespace detail
 
         std::once_flag                                      tls_made;
         std::expected<tls::client_context, std::error_code> tls_ctx{std::unexpect}; // set once, by tls_context()
+
+        // http1_context returns the TLS context for connect_apart()'s connections, which offers only http/1.1 with
+        // ALPN: tls_context()'s, if that's all it offers (with http2 off), or one of its own, made (once) the first
+        // time one is needed.
+        std::expected<tls::client_context, std::error_code> http1_context();
+
+        std::once_flag                                      http1_made;
+        std::expected<tls::client_context, std::error_code> http1_ctx{std::unexpect}; // set once, by http1_context()
 #endif
     };
 

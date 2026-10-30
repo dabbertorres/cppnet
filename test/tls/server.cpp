@@ -1414,3 +1414,90 @@ TEST_CASE("a WebSocket over HTTPS pings when idle, and goes away when the server
     std::scoped_lock lock{mu};
     CHECK(ends == std::vector<std::string>{server_closes ? "1001 sent" : "1000 peer"});
 }
+
+TEST_CASE("a WebSocket client opens wss:// over HTTP/1.1, from a server that would speak HTTP/2",
+          "[tls][http][client][websocket]")
+{
+    namespace ws = net::websocket;
+
+    std::mutex               mu;
+    std::vector<std::string> ends;
+    net::io::scheduler       sched{make_pool()};
+
+    // whether the client speaks HTTP/2 (so its pool's TLS context offers h2), which the WebSocket's connection never
+    // offers: the server (which speaks HTTP/2 too) agrees on http/1.1, over which alone it can accept a WebSocket.
+    const bool http2 = GENERATE(true, false);
+    CAPTURE(http2);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw);
+                   if (!conn.has_value())
+                   {
+                       std::scoped_lock lock{mu};
+                       ends.push_back("refused: " + conn.error().message());
+                       co_return;
+                   }
+
+                   std::string message;
+                   while (true)
+                   {
+                       const auto type = co_await conn->read_message(message);
+                       if (!type.has_value())
+                       {
+                           std::scoped_lock lock{mu};
+                           ends.push_back(std::format("{}", static_cast<int>(*ws::close_code_of(type.error()))));
+                           co_return;
+                       }
+                       if (co_await conn->write_message(*type, message)) co_return;
+                   }
+               });
+
+    https_server server{&sched, tls_config(), std::move(router)};
+
+    auto options  = trusting_options();
+    options.http2 = http2;
+    http::client client{&sched, options};
+
+    // one that doesn't trust the server's certificate authority (only the system's).
+    http::client untrusting{&sched};
+
+    const std::string large(100'000, 'x');
+
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+
+        auto refused = co_await ws::connect(untrusting, "wss://localhost:" + server.port() + "/ws");
+        if (refused.has_value()) lines.emplace_back("trusted");
+        else if (refused.error() == tls::alert::bad_certificate) lines.emplace_back("untrusted");
+        else lines.push_back(refused.error().message());
+
+        auto conn = co_await ws::connect(client, "wss://localhost:" + server.port() + "/ws");
+        if (!conn.has_value())
+        {
+            lines.push_back("connect: " + conn.error().message());
+            co_return lines;
+        }
+
+        std::string message;
+        for (const auto& sent : {std::string{"hello"}, large})
+        {
+            (void)co_await conn->write_message(ws::message_type::binary, sent);
+            const auto read = co_await conn->read_message(message);
+            if (!read.has_value()) lines.push_back(read.error().message());
+            else lines.emplace_back(message == sent ? "echoed" : "differs");
+        }
+
+        const auto closed = co_await conn->close();
+        lines.push_back("close: " + (closed ? closed.message() : "ok"));
+        lines.push_back(std::format("pooled: {}", client.stats().open));
+        co_return lines;
+    };
+
+    CHECK(sched.run_to_completion(test())
+          == std::vector<std::string>{"untrusted", "echoed", "echoed", "close: ok", "pooled: 0"});
+    CHECK(ends == std::vector<std::string>{"1000"});
+}

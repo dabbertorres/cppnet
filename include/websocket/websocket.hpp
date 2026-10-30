@@ -21,10 +21,17 @@
 #include "io/writer.hpp"
 #include "websocket/error.hpp" // IWYU pragma: export
 
-// WebSockets (RFC 6455): a handler accepts one (accept()), and has it, as a connection, until it returns. A connection
-// reads and writes messages (text or binary), whole or streamed, answers the peer's pings and closes by itself, and
-// ends with the close handshake (close()). How a WebSocket ended is an error: see websocket/error.hpp. Opening one, as
-// a client, isn't supported yet.
+// WebSockets (RFC 6455): a handler accepts one (accept()), and has it, as a connection, until it returns; a client
+// opens one (connect()), and has it until it destroys it. A connection reads and writes messages (text or binary),
+// whole or streamed, answers the peer's pings and closes by itself, and ends with the close handshake (close()). How a
+// WebSocket ended is an error: see websocket/error.hpp.
+// NOTE: declared rather than included (http/client.hpp brings the scheduler, and so spdlog), as nothing else here needs
+//       them: e.g. linting this header takes a nearby source's command, which may be a fuzz target's, without spdlog.
+namespace net::http
+{
+class client;
+}
+
 namespace net::websocket
 {
 
@@ -105,6 +112,15 @@ struct connect_options
 
     // origin is sent as the request's Origin, if it's set (browsers send their page's; other programs, none).
     std::string origin{};
+
+    // connection is the connection's limits.
+    connection_options connection{};
+
+    // stop ends the WebSocket once stop is requested, whenever: connecting and the handshake fail with
+    // std::errc::operation_canceled (whatever else went wrong meanwhile), and once it's open, whatever waits (a read, a
+    // write, close()) fails so, as everything does after it, and the connection is aborted (the server sees it end
+    // without a close).
+    std::stop_token stop{};
 };
 
 class connection;
@@ -123,6 +139,30 @@ class connection;
 // yet (400).
 coro::task<std::expected<connection, std::error_code>>
 accept(const http::server_request& req, http::response_writer& rw, const accept_options& options = {});
+
+// connect opens a WebSocket (RFC 6455, section 4.1) to url: ws:// or wss:// (or http:// or https://, the same over
+// HTTP/1.1, as browsers allow), with client's configuration: its resolver, connect_timeout and attempt_delay to
+// connect, and for wss, its TLS options (the certificate authorities trusted, a client certificate) and
+// tls_handshake_timeout. The connection is the WebSocket's own (never the client's to reuse, nor counted in its
+// limits), always HTTP/1.1 (over TLS, it offers only http/1.1 with ALPN). The handshake's request has options' fields,
+// and its response must come within response_header_timeout of the request's being sent; writing it, and the
+// WebSocket's writes, may go without progress for io_timeout. It fails with:
+// - std::errc::invalid_argument for a url that isn't valid, and std::errc::protocol_not_supported for another scheme
+//   (or wss without TLS);
+// - what connecting failed with (e.g. std::errc::timed_out past connect_timeout, a TLS error), or the handshake's
+//   writing or reading (e.g. std::errc::timed_out past response_header_timeout, or a response that isn't HTTP);
+// - websocket::errc for a response that isn't the server's accepting (RFC 6455 has the client fail the connection):
+//   bad_status for a status other than 101 (Switching Protocols), which includes redirects (they aren't followed, as
+//   browsers don't); not_websocket without Upgrade: websocket and Connection: upgrade; bad_accept for the wrong
+//   Sec-WebSocket-Accept; bad_subprotocol for a subprotocol that wasn't offered; bad_extension for any extension (none
+//   is offered);
+// - std::errc::operation_canceled once options.stop is requested.
+// What the server sent right after its response is the WebSocket's first frames.
+//
+// NOTE: url and options are copied before it returns, so they needn't outlive the task; client must (but not the
+//       connection, which only needs client's scheduler).
+coro::task<std::expected<connection, std::error_code>>
+connect(const http::client& client, std::string_view url, const connect_options& options = {});
 
 // message_writer writes a message a frame at a time (see connection::begin_message()): each write() sends its data as
 // a frame, flushed before it returns, and end_message() ends the message with a final, empty frame. The connection's
@@ -155,7 +195,7 @@ private:
     std::uint64_t             message; // which of the connection's messages written a frame at a time
 };
 
-// connection is a WebSocket, open (see accept()).
+// connection is a WebSocket, open (see accept() and connect()).
 //
 // One task reads at a time (a read while another's in progress fails with std::errc::device_or_resource_busy): it must
 // read, for the peer's pings and close to be answered (as they're answered by reads). Any number of tasks may write at
@@ -164,21 +204,28 @@ private:
 // Its failures are how it ended (see websocket/error.hpp): the peer's close, as its code (e.g. close_code::going_away;
 // close_reason() is its reason), from the read that received it; a close this side sent for what the peer did wrong
 // (e.g. sent(close_code::protocol_error)); abnormal_closure if the connection ended without a close; or the transport's
-// error (e.g. a write's std::errc::timed_out, past the server's write_timeout; and see connection_options::idle_timeout
-// and accept_options::stop). Once it has failed, every operation returns the same failure. Writing after this side's
-// close has been sent fails with std::errc::broken_pipe (as io::status_condition::closed matches).
+// error (e.g. a write's std::errc::timed_out, past the server's write_timeout or the client's io_timeout; and see
+// connection_options::idle_timeout, accept_options::stop and connect_options::stop). Once it has failed, every
+// operation returns the same failure. Writing after this side's close has been sent fails with std::errc::broken_pipe
+// (as io::status_condition::closed matches).
 //
-// The server's close() ends a WebSocket that's reading: the read that's waiting (or the next that has to wait) sends a
-// close saying going_away (1001), then reads on for the peer's close (dropping messages that come before it), for up
-// to connection_options::close_timeout (then aborting the connection), and returns sent(close_code::going_away), as
-// everything does after it. A WebSocket whose own close() is under way finishes that instead. One that isn't reading
-// isn't told until it next reads (a message buffered already is read first). So the server's close() then join()
-// drain the WebSockets that are reading.
+// The server's close() (http::server's) ends a WebSocket that's reading: the read that's waiting (or the next that has
+// to wait) sends a close saying going_away (1001), then reads on for the peer's close (dropping messages that come
+// before it), for up to connection_options::close_timeout (then aborting the connection), and returns
+// sent(close_code::going_away), as everything does after it. A WebSocket whose own close() is under way finishes that
+// instead. One that isn't reading isn't told until it next reads (a message buffered already is read first). So the
+// server's close() then join() drain the WebSockets that are reading.
 //
 // A server's connection is its handler's until the handler returns: it mustn't outlive the handler's call, which ends
-// the HTTP connection. Destroying it without a close (sent by close(), or as the reply to the peer's) aborts it: the
-// peer sees the TCP connection end without one (abnormal_closure, 1006). Tasks reading or writing must have finished by
-// then.
+// the HTTP connection. A client's is its own, and ends when it's destroyed. Destroying it without a close (sent by
+// close(), or as the reply to the peer's) aborts it: the peer sees the TCP connection end without one
+// (abnormal_closure, 1006). Tasks reading or writing must have finished by then.
+//
+// A client's connection, once the close handshake is done (its close() answered, or its read of the server's close
+// answered), waits for the server to end the TCP connection, as RFC 6455 (section 7.1.1) has the server end it first,
+// for up to close_timeout: so close(), or the read, returns once it has (or the timeout's passed: the connection then
+// ends with its destruction), and the client doesn't hold the closed connection's state (TIME_WAIT) instead of the
+// server.
 class connection
 {
 public:
@@ -247,6 +294,8 @@ private:
 
     friend coro::task<std::expected<connection, std::error_code>>
     accept(const http::server_request& req, http::response_writer& rw, const accept_options& options);
+
+    friend struct detail::connection_state;
 
     std::unique_ptr<detail::connection_state> state;
 };

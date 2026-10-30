@@ -32,6 +32,17 @@ enum class client_errc : std::uint8_t
 
 [[nodiscard]] std::error_code make_error_code(client_errc err) noexcept;
 
+class client;
+
+namespace detail
+{
+
+    // pool_of is a client's connection pool (its copies'), for what connects with the client's configuration apart
+    // from its requests (e.g. a WebSocket, whose connection is its own: see connection_pool::connect_apart()).
+    [[nodiscard]] std::shared_ptr<connection_pool> pool_of(const client& c) noexcept;
+
+}
+
 // client sends HTTP/1.x and HTTP/2 requests, reusing connections within the limits of its client_options: to http://
 // URLs, and (with NET_HAS_TLS) https:// ones, over TLS, verifying the server's certificate against
 // client_options::tls's trusted certificate authorities (the system's, by default). Without NET_HAS_TLS, https fails
@@ -131,6 +142,8 @@ public:
     [[nodiscard]] connection_stats stats(const std::string& host, const std::string& port) const;
 
 private:
+    friend std::shared_ptr<detail::connection_pool> detail::pool_of(const client& c) noexcept;
+
     std::shared_ptr<detail::connection_pool> pool;
 };
 

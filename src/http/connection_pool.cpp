@@ -461,8 +461,36 @@ std::shared_ptr<http2_client_connection> connection_pool::available_http2(const 
     return nullptr;
 }
 
-coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connection_pool::connect(
-    bool tls, std::string host, std::string port, io::clock::time_point deadline, std::stop_token stop)
+coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
+connection_pool::connect_apart(const std::string& scheme, std::string host, std::string port, std::stop_token stop)
+{
+    using result = std::expected<std::unique_ptr<connection>, std::error_code>;
+
+#ifdef NET_HAS_TLS
+    const bool tls = scheme == "https";
+    if (!tls && scheme != "http")
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::protocol_not_supported)));
+#else
+    constexpr bool tls = false;
+    if (scheme != "http")
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::protocol_not_supported)));
+#endif
+
+    return connect(tls,
+                   std::move(host),
+                   std::move(port),
+                   io::clock::now() + config.connect_timeout,
+                   std::move(stop),
+                   true);
+}
+
+coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
+connection_pool::connect(bool                  tls,
+                         std::string           host,
+                         std::string           port,
+                         io::clock::time_point deadline,
+                         std::stop_token       stop,
+                         [[maybe_unused]] bool http1_only)
 {
     // connect (resolving the host, then connecting to its addresses) within what's left of the timeout: rounded up, so
     // it doesn't give up before the deadline.
@@ -482,7 +510,7 @@ coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connecti
     if (!tls) co_return std::make_unique<connection>(std::move(*conn));
 
 #ifdef NET_HAS_TLS
-    auto ctx = tls_context();
+    auto ctx = http1_only ? http1_context() : tls_context();
     if (!ctx.has_value()) co_return std::unexpected(ctx.error());
 
     // NOTE: 0 is no limit, but the handshake needs a deadline.
@@ -516,6 +544,21 @@ std::expected<tls::client_context, std::error_code> connection_pool::tls_context
                    });
 
     return tls_ctx;
+}
+
+std::expected<tls::client_context, std::error_code> connection_pool::http1_context()
+{
+    if (!config.http2) return tls_context();
+
+    std::call_once(http1_made,
+                   [this]
+                   {
+                       auto options = config.tls;
+                       options.alpn = std::vector<std::string>{"http/1.1"};
+                       http1_ctx    = tls::client_context::make(options);
+                   });
+
+    return http1_ctx;
 }
 #endif
 
