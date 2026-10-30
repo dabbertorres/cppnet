@@ -495,6 +495,10 @@ private:
     // anyway, its wait timing out.
     coro::task<> write_loop();
 
+    // write_failed ends the connection after the writer's write (or wait) failed with failed, or leaves that to the
+    // reader (see its definition: which, and why), waiting until it has.
+    coro::task<> write_failed(std::error_code failed);
+
     // wait_for_socket waits until the connection is writable: with the writable hook, if it's set.
     coro::task<io::result> wait_for_socket();
 

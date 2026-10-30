@@ -1701,3 +1701,51 @@ TEST_CASE("a WebSocket over an HTTP/2 stream of an HTTPS connection (ALPN h2) ec
     std::scoped_lock lock{mu};
     CHECK(ends == std::vector<std::string>{server_closes ? "1001 sent over TLS: true" : "1000 peer over TLS: true"});
 }
+
+TEST_CASE("an HTTP/2 connection whose writer fails with a TLS failure fails its streams with it, not as cut off",
+          "[tls][http][client][http2]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    // the handler's request has come (its stream's open) by the time the writer's wait fails.
+    std::atomic<std::uint64_t> handling = 0;
+
+    http::router router;
+    router.GET("/large",
+               [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   handling.store(1);
+                   sched.notify_all(handling);
+
+                   // more than the stream's window: the client's reads give it back, which its writer then sends.
+                   const std::string body(std::size_t{256} * 1'024, 'x');
+                   auto*             out = co_await rw.send(http::status::OK, body.size());
+                   (void)co_await net::io::write_all(*out, body);
+               });
+    https_server server{&sched, tls_config(), std::move(router)};
+
+    // the client's writer waits for the socket after each round that wrote (its TCP_NOTSENT_LOWAT): once the request's
+    // being handled, the wait fails as a TLS stream's does once it has failed (e.g. with the peer's alert, which its
+    // writes and waits then return, as its reads do).
+    auto options           = trusting_options();
+    options.http2_writable = [&handling] -> task<net::io::result>
+    {
+        if (handling.load() != 0) co_return net::io::result{.err = make_error_code(tls::errc::protocol_error)};
+        co_return net::io::result{};
+    };
+    http::client client{&sched, options};
+
+    const auto test = [](http::client* client, std::string url) -> task<std::error_code>
+    {
+        auto resp = co_await client->get(url);
+        if (!resp.has_value()) co_return resp.error();
+        if (resp->version.major != 2) co_return std::make_error_code(std::errc::protocol_not_supported);
+
+        auto body = co_await net::io::read_all(*resp->body);
+        co_return body.has_value() ? std::error_code{} : body.error();
+    };
+
+    const auto err = sched.run_to_completion(test(&client, "https://localhost:" + server.port() + "/large"));
+    CAPTURE(err.message());
+    CHECK(err == tls::errc::protocol_error);
+}
