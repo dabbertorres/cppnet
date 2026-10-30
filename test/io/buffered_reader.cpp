@@ -1,8 +1,11 @@
 #include "io/buffered_reader.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -28,6 +31,33 @@ public:
     [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 };
 
+// recording_reader reads from text as much as each read asks for, and records how much that was.
+class recording_reader : public net::io::reader
+{
+public:
+    explicit recording_reader(std::string_view text) noexcept
+        : text{text}
+    {}
+
+    net::coro::task<net::io::result> read(std::span<std::byte> data) override
+    {
+        asked.push_back(data.size());
+        const auto n = std::min(data.size(), text.size());
+        std::ranges::copy(std::as_bytes(std::span{text.substr(0, n)}), data.begin());
+        text.remove_prefix(n);
+        return net::coro::ready_task<net::io::result>(net::io::result{.count = n});
+    }
+
+    using net::io::reader::read;
+
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
+
+    std::vector<std::size_t> asked;
+
+private:
+    std::string_view text;
+};
+
 }
 
 TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
@@ -46,8 +76,9 @@ TEST_CASE("buffer reads to capacity as needed", "[io][buffered_reader]")
     REQUIRE(have_next);
     REQUIRE(static_cast<char>(next) == 'b');
 
+    // (what's buffered, then the end, which comes with it, as the read is larger than the buffer.)
     res = test::sync_wait(reader.read(buf));
-    REQUIRE_FALSE(res.err);
+    CHECK(res.err == net::io::errc::end_of_stream);
     REQUIRE(res.count == 3);
     REQUIRE(buf.substr(0, res.count) == "baz"sv);
 
@@ -96,4 +127,23 @@ TEST_CASE("reader that makes no progress is an error", "[io][buffered_reader]")
 
     res = test::sync_wait(reader.read(small));
     CHECK(res.err == net::io::errc::no_progress);
+}
+
+TEST_CASE("large read goes past the buffer at once", "[io][buffered_reader]")
+{
+    recording_reader         underlying{"0123456789abcdef"sv};
+    net::io::buffered_reader reader(&underlying, 4);
+
+    // larger than the buffer: what's buffered first, then the rest in one read of the underlying reader.
+    std::string buf(2, 0);
+    auto        res = test::sync_wait(reader.read(buf));
+    REQUIRE_FALSE(res.err);
+    CHECK(buf == "01"sv);
+
+    buf.assign(10, 0);
+    res = test::sync_wait(reader.read(buf));
+    REQUIRE_FALSE(res.err);
+    REQUIRE(res.count == 10);
+    CHECK(buf == "23456789ab"sv);
+    CHECK(underlying.asked == std::vector<std::size_t>{4, 8});
 }

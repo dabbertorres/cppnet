@@ -1256,3 +1256,111 @@ TEST_CASE("a WebSocket client stopped before it opens its stream sends nothing, 
                                       "open=1"});
     CHECK(out.get().empty());
 }
+
+TEST_CASE("a WebSocket client's stream holds 256 KiB it hasn't read, and its large writes wait for the server's window",
+          "[websocket][client][http2][flow]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    script             server{&sched};
+    http::client       client{&sched, prior_knowledge()};
+
+    // pattern is size bytes that differ from one to the next, so a piece in the wrong place shows.
+    const auto pattern = [](std::size_t size)
+    {
+        std::string text(size, '\0');
+        for (std::size_t i = 0; i < size; ++i) text[i] = static_cast<char>('a' + (i % 23));
+        return text;
+    };
+    // more than the stream's window, to the client; and much more than the server's stream window, from it.
+    const auto in       = pattern(300'000);
+    const auto out_text = pattern(std::size_t{1} << 20);
+
+    std::atomic<std::uint64_t> held     = 0; // the server has sent what the client's window allows (the client reads)
+    std::atomic<std::uint64_t> released = 0; // the server's begun to give its window back (the client's write goes on)
+    std::atomic<std::uint64_t> client_done = 0; // the client's connection's gone
+
+    const auto serve = [&] -> task<void>
+    {
+        if (!co_await server.open())
+        {
+            out.add("no extended CONNECT");
+            co_return;
+        }
+        auto& s        = server.conn->server;
+        s.hold_windows = true;
+
+        const std::vector<http::hpack::field> head{
+            {.name = ":status", .value = "200"}
+        };
+        REQUIRE_FALSE(s.s.submit_headers(3, head, false));
+
+        // the client widens the stream's window as it opens the tunnel.
+        const bool widened = co_await s.pump([&] { return s.s.send_window(3) == 262'144; });
+        out.add(std::format("widened {}", widened));
+
+        // the server sends what the window allows, which the client holds unread.
+        server.send(test::websocket::frame({.fin = true, .op = opcode::binary}, test::websocket::bytes(in)));
+        (void)co_await s.pump([] { return true; });
+        out.add(std::format("server's window {}", s.s.send_window(3)));
+        raise(&sched, held);
+
+        // the client's write sends what the server's window allows, then waits for it to grow.
+        (void)co_await s.pump([&] { return s.responses[3].body.size() >= 65'535; });
+        out.add(std::format("client sent {}", s.responses[3].body.size()));
+        raise(&sched, released);
+        s.hold_windows = false;
+        s.s.consume(3, s.responses[3].body.size());
+
+        // (the frame's header: 14 bytes, masked with a 64-bit length.)
+        const auto whole = out_text.size() + 14;
+        (void)co_await s.pump([&] { return s.responses[3].body.size() >= whole; });
+        const auto frames = server.frames();
+        out.add(std::format("client's message {}",
+                            frames.size() == 1 && frames.front().header.masked && frames.front().text() == out_text
+                                ? "same"
+                                : "differs"));
+
+        server.send(server_close(ws::close_code::normal_closure), true);
+        (void)co_await s.pump([&] { return s.responses[3].done; });
+        (void)co_await reach(&sched, client_done);
+    };
+
+    const auto run = [&] -> task<void>
+    {
+        {
+            auto conn = co_await connect_after_get(client, server.port());
+            if (!conn.has_value())
+            {
+                out.add("connect: " + conn.error().message());
+                co_return;
+            }
+
+            (void)co_await reach(&sched, held);
+            std::string message;
+            const auto  type = co_await conn->read_message(message);
+            out.add(type.has_value() ? std::format("read {}", message == in ? "same" : "differs")
+                                     : "read: " + describe(type.error()));
+
+            // larger than the tunnel's buffer: masked a buffer's worth at a time, as the server's window allows.
+            const auto wrote = co_await conn->write_message(ws::message_type::binary, out_text);
+            out.add(std::format("wrote {}, after the window grew: {}", describe(wrote), released.load() == 1));
+
+            const auto closing = co_await conn->read_message(message);
+            out.add("then: " + describe(closing.error_or(std::error_code{})));
+        }
+        raise(&sched, client_done);
+    };
+
+    sched.run_to_completion(both(&sched, serve, run));
+
+    const auto lines = out.get();
+    CAPTURE(lines);
+    CHECK(std::ranges::contains(lines, "widened true"));
+    CHECK(std::ranges::contains(lines, "server's window 0"));
+    CHECK(std::ranges::contains(lines, "read same"));
+    CHECK(std::ranges::contains(lines, "client sent 65535"));
+    CHECK(std::ranges::contains(lines, "wrote ok, after the window grew: true"));
+    CHECK(std::ranges::contains(lines, "client's message same"));
+    CHECK(std::ranges::contains(lines, "then: 1000 peer"));
+}

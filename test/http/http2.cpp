@@ -529,6 +529,57 @@ TEST_CASE("a change of INITIAL_WINDOW_SIZE moves open streams' windows", "[http]
     CHECK(c.server.s.send_window(id) == 1'000);
 }
 
+TEST_CASE("a stream's window widened lets the peer send that much, and stays so as it's given back",
+          "[http][http2][session][flow]")
+{
+    connected  c;
+    const auto id = c.client.s.open_stream().value();
+    REQUIRE_FALSE(c.client.s.submit_headers(id, request("POST"), false));
+    pump(c.client, c.server);
+    c.server.events.take();
+
+    // a WINDOW_UPDATE for the difference from the initial window.
+    std::vector<std::byte> out;
+    c.server.s.widen_window(id, 262'144);
+    c.server.s.take_output(out);
+    std::vector<std::byte> update;
+    http2::encode_window_update(id, 262'144 - 65'535, update);
+    CHECK(to_hex(out) == to_hex(update));
+    c.client.deliver(out);
+    CHECK(c.client.s.send_window(id) == 262'144);
+
+    // the client may send all of it, and no more, until the server consumes some.
+    const std::string body(300'000, 'x');
+    REQUIRE(c.client.s.submit_data(id, bytes_of(body), false) == 262'144U);
+    pump(c.client, c.server);
+    CHECK_FALSE(c.server.failure);
+    CHECK(c.client.s.send_window(id) == 0);
+
+    // what's consumed is given back as before (once half the initial window has built up), so the window's the
+    // widened one again once it's all consumed.
+    c.server.s.consume(id, 30'000);
+    pump(c.client, c.server);
+    CHECK(c.client.s.send_window(id) == 0);
+    c.server.s.consume(id, 262'144 - 30'000);
+    pump(c.client, c.server);
+    CHECK(c.client.s.send_window(id) == 262'144);
+    CHECK_FALSE(c.server.failure);
+    CHECK_FALSE(c.client.failure);
+
+    // nothing for a window no wider than the initial one, an unknown stream, or one the peer has ended.
+    c.server.s.widen_window(id, 65'535);
+    c.server.s.take_output(out);
+    CHECK(out.empty());
+    c.server.s.widen_window(99, 262'144);
+    c.server.s.take_output(out);
+    CHECK(out.empty());
+    REQUIRE(c.client.s.submit_data(id, {}, true) == 0U);
+    pump(c.client, c.server);
+    c.server.s.widen_window(id, 262'144);
+    c.server.s.take_output(out);
+    CHECK(out.empty());
+}
+
 TEST_CASE("the connection's window is given back when the peer has run out, though less than half was read",
           "[http][http2][session][flow]")
 {

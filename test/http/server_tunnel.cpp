@@ -1316,3 +1316,123 @@ TEST_CASE("an HTTP/2 tunnel's writes keep the server's write_timeout, which rese
     CHECK(timed_out.load());
     CHECK(result.err == net::http::http2::error_code::cancel);
 }
+
+namespace
+{
+
+// pattern is size bytes that differ from one to the next, so a piece in the wrong place shows.
+std::string pattern(std::size_t size)
+{
+    std::string out(size, '\0');
+    for (std::size_t i = 0; i < size; ++i) out[i] = static_cast<char>('a' + (i % 23));
+    return out;
+}
+
+// wait_for_word waits for word to be at least value, for up to 10 s, returning whether it was.
+task<bool> wait_for_word(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    const auto deadline = net::io::clock::now() + 10s;
+    while (true)
+    {
+        const auto seen = word.load();
+        if (seen >= value) co_return true;
+        if (co_await sched->wait_on(word, seen, deadline)) co_return false;
+    }
+}
+
+}
+
+TEST_CASE("an HTTP/2 tunnel's stream holds 256 KiB its handler hasn't read, and its large writes wait for the window",
+          "[http][server][tunnel][http2][flow]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // more than the tunnel's window, from the client; and much more than the client's stream window, from the handler.
+    const auto in  = pattern(300'000);
+    const auto out = pattern(std::size_t{1} << 20);
+
+    std::atomic<std::uint64_t> go           = 0;     // the client has sent all its window allows (the handler reads)
+    std::atomic<std::uint64_t> wrote        = 0;     // the client's write of in has returned
+    std::atomic<bool>          reading      = false; // the client has begun to read the handler's write
+    std::atomic<bool>          read_whole   = false; // the handler read in with one read, intact
+    std::atomic<bool>          write_waited = false; // the handler's write of out returned once the client was reading
+
+    http::router router;
+    router.GET("/flow",
+               [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
+               {
+                   auto switched = co_await http::detail::switch_protocols(rw, upgrade_fields());
+                   if (!switched.has_value() || !co_await wait_for_word(&sched, go)) co_return;
+                   auto& t = **switched;
+
+                   // larger than the tunnel's buffer: straight from the stream, as it comes.
+                   std::string got(in.size(), '\0');
+                   const auto  read = co_await t.reader().read(std::as_writable_bytes(std::span{got}));
+                   read_whole.store(!read.err && read.count == in.size() && got == in);
+
+                   // larger than the tunnel's buffer: straight to the stream, as the client's window allows.
+                   auto written = co_await t.writer().write(std::as_bytes(std::span{out}));
+                   if (!written.err) written = co_await t.writer().flush();
+                   write_waited.store(!written.err && reading.load());
+               });
+
+    auto server = make_server(&sched, std::move(router));
+
+    std::size_t held_in  = 0; // what the client could send before the handler read: the tunnel's window
+    std::size_t held_out = 0; // what the handler's write could send before the client read: the client's window
+    const auto  result   = sched.run_to_completion(
+        over_h2(&sched,
+                server->local_port(),
+                "/flow",
+                [&](h2_tunnels& t, net::http::http2::stream_id id, h2_tunnels::stream& s, tunnel_result& r) -> task<>
+                {
+                    // the stream's window was widened as the tunnel opened.
+                    if (!co_await t.wait_send_window(id, 262'144))
+                    {
+                        r.err = std::make_error_code(std::errc::timed_out);
+                        co_return;
+                    }
+
+                    const auto write_in = [](h2_tunnels::stream*         s,
+                                             const std::string*          in,
+                                             net::io::scheduler*         sched,
+                                             std::atomic<std::uint64_t>* wrote) -> task<>
+                    {
+                        (void)co_await net::io::write_all(*s, *in);
+                        wrote->store(1);
+                        sched->notify_all(*wrote);
+                    };
+                    REQUIRE(sched.spawn(write_in(&s, &in, &sched, &wrote)));
+
+                    // the client sends what the window allows, which the server holds unread, then waits for it to
+                    // grow.
+                    if (co_await t.wait_send_window(id, 0)) held_in = 262'144;
+                    go.store(1);
+                    sched.notify_all(go);
+                    (void)co_await wait_for_word(&sched, wrote);
+
+                    // the handler's write sends what the client's window allows, then waits for it to grow.
+                    held_out = co_await t.wait_received(id, 65'535);
+                    reading.store(true);
+                    std::string got;
+                    while (got.size() < out.size())
+                    {
+                        std::array<std::byte, 16'384> buf{};
+                        const auto                    res = co_await s.read(buf);
+                        got.append(reinterpret_cast<const char*>(buf.data()), res.count);
+                        if (res.err)
+                        {
+                            r.err = res.err;
+                            break;
+                        }
+                    }
+                    r.received = got == out ? "same" : std::format("differs ({} bytes)", got.size());
+                }));
+
+    CHECK_FALSE(result.err);
+    CHECK(held_in == 262'144);
+    CHECK(read_whole.load());
+    CHECK(held_out == 65'535);
+    CHECK(write_waited.load());
+    CHECK(result.received == "same");
+}

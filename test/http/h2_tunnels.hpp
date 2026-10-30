@@ -113,17 +113,27 @@ public:
             std::size_t sent     = 0;
             while (sent < data.size())
             {
-                const auto seen = owner->changes.load();
+                auto        seen      = owner->changes.load();
+                std::size_t submitted = 0;
                 {
                     std::scoped_lock lock{owner->mu};
                     if (owner->ended)
                         co_return net::io::result{.count = sent,
                                                   .err   = std::make_error_code(std::errc::connection_aborted)};
 
-                    auto submitted = owner->c.s.submit_data(id, data.subspan(sent), false);
-                    if (!submitted.has_value()) co_return net::io::result{.count = sent, .err = submitted.error()};
-                    sent += *submitted;
+                    auto took = owner->c.s.submit_data(id, data.subspan(sent), false);
+                    if (!took.has_value()) co_return net::io::result{.count = sent, .err = took.error()};
+                    submitted = *took;
+                    sent += submitted;
                     owner->wake_writer();
+                }
+
+                // the stream's window has changed (for wait_send_window()): this write's own change isn't one to wait
+                // for.
+                if (submitted > 0)
+                {
+                    owner->changed();
+                    ++seen;
                 }
 
                 if (sent == data.size()) break;
@@ -230,6 +240,23 @@ public:
         std::scoped_lock lock{mu};
         c.s.goaway(c.s.last_peer_stream(), http2::error_code::no_error);
         wake_writer();
+    }
+
+    // wait_send_window waits until this side's window for a stream (not the connection's) is window, e.g. once the
+    // server's widened it, or once what's been written has used it up, returning whether it was (within wait_limit).
+    net::coro::task<bool> wait_send_window(http2::stream_id id, std::int64_t window)
+    {
+        return wait_until([this, id, window] { return c.s.send_window(id) == window; });
+    }
+
+    // wait_received waits until a stream has received at least n bytes of DATA, read or not (or the connection's
+    // ended), returning how much it has.
+    net::coro::task<std::size_t> wait_received(http2::stream_id id, std::size_t n)
+    {
+        (void)co_await wait_until([this, id, n] { return c.responses[id].body.size() >= n || ended; });
+
+        std::scoped_lock lock{mu};
+        co_return c.responses[id].body.size();
     }
 
     // can_open is whether the server's MAX_CONCURRENT_STREAMS lets another stream open now.

@@ -36,19 +36,18 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
 
 coro::task<result> buffered_reader::read_more(std::span<std::byte> data)
 {
-    // Note that we always (try to) read from the inner reader in capacity() increments.
-
     // copy over what we can...
     std::size_t total = size();
     std::ranges::copy(buffered(), data.begin());
     consume(total);
 
-    // At this point, the buffer is empty. As long as length - total is larger
-    // than the buffer capacity, we can skip a copy and read straight to data.
+    // At this point, the buffer is empty. As long as length - total is larger than the buffer capacity, we can skip a
+    // copy and read straight to data: all that's left of it at once, so a large read (e.g. a WebSocket's message, or
+    // a body) takes as few reads of what's wrapped as it can (each a syscall, or a coroutine).
 
     while (data.size() - total > capacity())
     {
-        auto res = co_await impl->read(data.subspan(total, capacity()));
+        auto res = co_await impl->read(data.subspan(total));
         total += res.count;
 
         if (res.err) co_return result{.count = total, .err = res.err};

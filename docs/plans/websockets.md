@@ -1184,6 +1184,146 @@ with `client_options::http2_coalescing` on, so there's no 421 path.
   connection's idle bookkeeping and the pool's wakeup, which nothing waits on here; the stop-before-opening test runs
   the path).
 
+## Learned after stage 9: throughput over HTTP/2
+
+`bench_websocket` showed WebSockets over HTTP/2 well behind HTTP/1.1 for large messages (64 KiB one at a time 222 to
+263 us against 115 to 119; in flight 165 to 178 against 46), with 84 and 77 allocations per message against 10 and
+7.4. Stage 9 guessed at the tunnel's 4 KiB buffers. Measured instead (Release, on this laptop; allocations by a
+temporary `operator new` in the bench recording backtraces, symbolized with `atos`; time with `sample`, and with
+temporary timestamps at the hand-overs between tasks; all taken out again):
+
+- **The allocations** were the HTTP/2 path's, not the tunnel's. `stream_reader::read()` was always a coroutine, so
+  each of the tunnel's 4 KiB reads allocated a frame, even of what was buffered (36 of the 84); `coro::notifier`
+  swapped its list of waiters out on each notify, so the next wait allocated a new one (about 16: the stream's
+  `changed` and the writer's wakeup); and the connection's writer awaited `io::write_all()`, a coroutine, each round
+  (11). What's left (15.6 one at a time, 12.3 in flight, against HTTP/1.1's 10 and 7.4) is a frame per read of the
+  stream that waits (`read_waiting()`: a socket's waiting read is an operation, without a frame, which the stream's
+  isn't) and, on the client, the write that finds `max_ahead` (64 KiB) in the writer's hands, as a 64 KiB message and
+  its header are just over it.
+- **The time** was the stream's window. A 64 KiB message's frame (65,546 bytes) is just larger than a stream's
+  initial window (65,535), so its last bytes waited for a WINDOW_UPDATE, sent once the reader had read half the
+  window: a round trip through both connections' reader and writer tasks, each way, for every message. In flight, the
+  window (given back 32 KiB at a time) bounded what was on the way. The allocation fixes alone took one at a time from
+  226 to 215 us and in flight not at all; a wider window took them to about 120 and 63. The buffers weren't it: 16 KiB
+  tunnel buffers (with the rest of the fixes) measured 126 to 128 us and 67 to 68, slightly worse than 4 KiB's.
+- **What's left, one at a time**, is the hand-overs. Timestamps at the stream's write, the writer taking the output, the
+  write returning, the reader's read returning and the stream's read resuming, for 16 B messages (51 us a round trip):
+  each way, 12 us from the write to the peer's reader (the kernel and the poll, as HTTP/1.1 pays), 5 to 6 us in the
+  writer's `send()`, 2.2 us from the stream's write to the writer taking it and 3.3 us from the reader to the stream's
+  read resuming (hand-overs through the pool, which HTTP/1.1 doesn't make: the WebSocket's own task reads and writes its
+  socket), and 1.4 us in the WebSocket. So four hand-overs a round trip, about 11 us, plus the writer's `poll()` for
+  writability each round (`wait_writable()`, with TCP_NOTSENT_LOWAT): what makes HTTP/2's round trip about 20 us
+  longer, for small and large messages alike. Removing them means a stream's writer writing the socket itself when the
+  connection's writer is idle, or the pool running a task woken by another on the same worker next (Tokio's LIFO slot):
+  both change the connection's or the runtime's core, and are left for later. TCP_NOTSENT_LOWAT off made no difference.
+- **What's left, in flight**, is CPU: both workers were busy 99% of the time (`sample`: 4,170 samples, 37 idle).
+  `send()` 25%, `recv()` 18%, the writer's `poll()` 5%, copying 17% (the session's output, the reader's buffer into
+  `pending`, `received`, and out of it: four copies of each message each way, where HTTP/1.1 has none of its own),
+  waiting for the connection's lock 8% (the reader holds it while it copies DATA in). Reading straight into the reader's
+  buffer (no `pending` copy) measured no difference, nor did reads of 128 KiB rather than 32, nor a tunnel window of
+  16 MiB (54 to 62 us), so they weren't kept. Reading a waiting stream's DATA straight into its reader's span (a stream
+  read as an operation, as a socket's is) would save a copy and the frame, but touches every path that wakes a stream's
+  read; left for later.
+
+The fixes:
+
+- `stream_reader::read()` is a plain function: what's received is taken under the lock and returned as a ready task;
+  only a read that has to wait (or a start callback, the server's 100 Continue) calls the coroutine, `read_waiting()`,
+  which is the old loop.
+- `coro::notifier` holds its first two waiters in place (an array and a count), the rest in the list as before, so a
+  wait allocates nothing while two or fewer wait (a stream's reader and writer). Nothing of the notifier is touched once
+  a waiter's resumed: the pool's pointer is copied first, as a waiter may destroy the notifier as soon as it runs.
+- The connection's writer writes each round with the connection's `write()` (which writes all of it, or fails), not
+  `io::write_all()`.
+- A tunnel's stream's window is 256 KiB each way (`tunnel_window`): `stream_tunnel`'s constructor calls the session's
+  new `widen_window(stream, window)`, which sends one WINDOW_UPDATE for the difference from the initial window, and
+  raises the stream's receive window; what's consumed is given back as before (at half the initial window, 32 KiB), so
+  the window stays 256 KiB. Its maker wakes the writer (the server did already; the client now does). 256 KiB is a TCP
+  receive buffer's order (128 KiB to start on Linux and macOS, growing): 512 KiB measured 56 us in flight and 1 MiB 55,
+  against 256 KiB's 63, for twice and four times what a peer that doesn't read can make the other side hold. Requests'
+  streams keep 64 KiB.
+- Once a tunnel's stream has had all it received read, `take_received()` drops `received`'s memory if it's over
+  32 KiB (`tunnel_kept`): a burst no longer stays allocated for the WebSocket's life.
+- `io::buffered_reader` and `io::buffered_writer` pass what's larger than the buffer straight through with one read or
+  write for all that's left, rather than in pieces of the buffer's size. Over HTTP/2 that's a 64 KiB message written to
+  the stream in one write (framed by the session as the windows allow, the caller's span queued as is) and read from it
+  as it comes; over HTTP/1.1 one `recv()` and one `send()` rather than four, which made HTTP/1.1's WebSockets faster
+  too (one at a time 116 to 98 us, in flight 45 to 38). A read larger than the buffer that meets the end now returns
+  what it read with `end_of_stream` (as a socket's does), where reading in pieces had returned it without, the end
+  left to the next read; `test/io/buffered_reader.cpp`'s first test changed for it.
+
+What a peer can make the other side hold: a tunnel that isn't read holds up to 256 KiB of what was sent to it (64 KiB
+before), in a vector that may be twice that while it's held. The server's connection window still bounds all its
+streams together (`http2_max_concurrent_streams` times 64 KiB, at least 1 MiB: 6.4 MiB by default), so a connection
+can make the server hold no more than before; it can put more of it in one stream. Writes past the buffers aren't
+copied: the stream frames the caller's span as the peer's window allows, and the write returns once it's all framed,
+so a peer that doesn't read holds a writer, not memory. Memory per idle WebSocket over HTTP/2: 8 KiB of tunnel buffers
+as before, plus at most 32 KiB of `received` (before, whatever the largest burst had grown it to: up to about twice
+the 64 KiB window, kept for the stream's life); `coro::notifier` is 24 bytes larger (each stream has one).
+
+Numbers (Release, two workers, best of five runs each; `bench_websocket`'s three runs alike):
+
+| Messages                     | HTTP/1.1, before | after          | HTTP/2, before  | after          |
+|------------------------------|------------------|----------------|-----------------|----------------|
+| 16 B text, one at a time     | 27.5 to 28.4 us  | 27.4 to 28.2   | 52.3 to 53.8    | 48.5 to 53.8   |
+| allocations                  | 4.00             | 4.00           | 12.8 to 13.0    | 6.00           |
+| 16 B text, in flight         | 4.1 us           | 4.2 (one 4.7)  | 1.1 to 1.2      | 0.7 to 0.9     |
+| allocations                  | 0.37             | 0.37           | 0.13            | 0.01           |
+| 64 KiB binary, one at a time | 115 to 118 us    | 96 to 114      | 224 to 243      | 118 to 140     |
+| allocations                  | 10.0             | 10.0           | 83.7            | 15.6           |
+| 64 KiB binary, in flight     | 44 to 46 us      | 34 to 39       | 161 to 291      | 63 to 77       |
+| allocations                  | 7.3              | 7.1            | 77.2            | 12.3           |
+
+(Three runs of each build, interleaved, plus the after build's runs while measuring, which gave 118 to 124 us and 63
+to 65 for HTTP/2's large messages; the in-flight row is the noisiest. Along the way, with each fix added: the
+allocation fixes alone 215 us and 161 us, 24 and 17 allocations; then the reader and writer going past the buffers 213
+and 152, 20 and 16; then the 256 KiB window 118 to 123 and 63 to 65, 15.6 and 12.3. The window without the buffers'
+change: 132 to 137 and 72 to 73.)
+
+So large messages over HTTP/2 are now 1.7 to 2 times faster one at a time and 2.5 times in flight, with a fifth of the
+allocations, but not as fast as over HTTP/1.1, which the buffers' change made faster too: one at a time about 20 us
+slower (the hand-overs, as small messages are), in flight about 1.5 to 2 times (the HTTP/2 path's CPU). Measured
+against HTTP/1.1 as it was before (115 to 118 us, 44 to 46), HTTP/2's one at a time is within 5 to 20 us of it, and
+in flight 1.4 to 1.7 times it.
+
+`bench_request`'s HTTP/2 rows (Release, the build before and after interleaved, four runs each, best of each; the rows
+are bimodal on this laptop, one after-run's 8 bodies at once landing at 2653 us):
+
+| Row                                        | before                   | after                    |
+|--------------------------------------------|--------------------------|--------------------------|
+| a stream at a time                         | 84.0 us, 49.4 allocations | 81.1 us, 40.9 allocations |
+| 8 streams at once (256 KiB each)           | 1234.5 us a round, 97.7 a response | 1181.6 us, 62.3 a response |
+| 8 request bodies at once (256 KiB each)    | 1459.6 us a round, 151.4 a request | 1413.9 us, 104.5 a request |
+
+Its HTTP/1.1 rows didn't move (pipelined 1132 to 1147 ns before and after, over a socket 27.6 to 30.9 us both, the
+allocations the same).
+
+Tests: `test/http/http2.cpp`'s widened window (the WINDOW_UPDATE's bytes, the peer sending all of it and no more,
+given back to it again, and nothing for a window no wider, an unknown stream or one the peer has ended);
+`test/http/server_tunnel.cpp`'s `[flow]` (with `test::h2_tunnels`, which gained `wait_send_window()` and
+`wait_received()`: the client's window is 256 KiB once the tunnel opens, it can send exactly that while the handler
+doesn't read, the handler reads 300,000 bytes in one read, and its write of 1 MiB sends only the client's 65,535 until
+the client reads, returning only after); `test/websocket/client_http2.cpp`'s `[flow]` (a scripted server: the client
+widens the window after the 200, the server can send exactly 256 KiB of a 300,000-byte message before the client
+reads, then all of it; the client's 1 MiB message sends only the server's 65,535 until the server gives the window
+back, returning only after, every frame masked and the message intact); `test/coro/notifier.cpp`'s rounds of 1, 2, 3,
+5 and 3 waiters and a close of 3; `test/io/`'s large read and write going past the buffer at once.
+
+Break-testing, each alone (14 breaks): caught were the tunnel not widening its window, `widen_window()` not raising
+the receive window, not sending the WINDOW_UPDATE, widening a window no wider than the initial one, widening one the
+peer has ended, the reader and the writer going back to pieces of the buffer's size, the notifier not resuming the
+waiters in place, nor those in the list (both hang, which the run's time limit shows), nor clearing the count (a
+coroutine resumed twice: the run aborts), and the ready read not waking the writer for its WINDOW_UPDATE (an existing
+test, a handler's reads giving the window back at once). Not caught: the client not waking its writer after widening
+(the connection's reader wakes the writer after each receive, which the 200's receive does too, so the WINDOW_UPDATE
+goes all the same; the call makes it not depend on that), and dropping `received`'s memory (only memory). The ready
+read, the writer's direct write and the notifier's array are only allocations and time: taken out, behaviour is the
+same, which `bench_websocket` shows.
+
+Stress: the new and changed tests with `[http2][websocket]`, `[http2][tunnel]`, `[websocket][client]`,
+`[http2][server]`, `[http2][client]`, `[session]`, `[flow]`, `[coro][notifier]` and `[io]`'s buffered reader and writer
+(308 test cases a run), 400 times eight at a time: 400 passed.
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:

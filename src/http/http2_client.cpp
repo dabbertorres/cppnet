@@ -459,6 +459,8 @@ http2_client_connection::open_tunnel(const client_request& request, std::string_
 
     if (stream->tunnel != nullptr)
     {
+        // (its window's WINDOW_UPDATE: see stream_tunnel.)
+        wake_writer();
         out.tunnel.emplace(shared_from_this(), std::move(stream));
         taken = true;
     }

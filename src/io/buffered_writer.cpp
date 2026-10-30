@@ -44,18 +44,18 @@ coro::task<result> buffered_writer::write_through(std::span<const std::byte> dat
     // we might be done!
     if (total == data.size()) co_return result{.count = total};
 
-    // Note that we always write to the inner writer in buf.capacity() increments.
-
     // At this point, the buffer is full, and we have more to write. All of it must be flushed before writing anything
     // else, or the output would be out of order.
     auto flushed = co_await flush();
     if (flushed.err) co_return result{.count = total, .err = flushed.err};
 
-    // At this point, the buffer is now empty. As long as writes are larger than the capacity, bypass the buffer.
+    // At this point, the buffer is now empty. As long as what's left is larger than the capacity, bypass the buffer:
+    // all of it at once, so a large write (e.g. a WebSocket's message, or a body) takes as few writes of what's wrapped
+    // as it can (each a syscall, or a coroutine).
 
     while (data.size() - total > buf.capacity())
     {
-        auto res = co_await impl->write(data.subspan(total, buf.capacity()));
+        auto res = co_await impl->write(data.subspan(total));
         total += res.count;
 
         if (res.err) co_return result{.count = total, .err = res.err};

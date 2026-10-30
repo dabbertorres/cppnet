@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -49,6 +50,25 @@ private:
     static net::coro::task<net::io::result> wrote(std::size_t amount) { co_return {.count = amount}; }
 
     bool without_coroutine;
+};
+
+// recording_writer writes all it's given, and records how much each write was.
+class recording_writer : public net::io::writer
+{
+public:
+    net::coro::task<net::io::result> write(std::span<const std::byte> data) override
+    {
+        sizes.push_back(data.size());
+        out.append(reinterpret_cast<const char*>(data.data()), data.size());
+        return net::coro::ready_task<net::io::result>(net::io::result{.count = data.size()});
+    }
+
+    using net::io::writer::write;
+
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
+
+    std::string              out;
+    std::vector<std::size_t> sizes;
 };
 
 // stuck_writer breaks the writer contract by writing nothing, without reporting an error, with or without a coroutine.
@@ -156,4 +176,23 @@ TEST_CASE("writer that makes no progress is an error", "[io][buffered_writer]")
 
     // the unwritten data is kept, rather than dropped.
     CHECK(writer.size() == 4);
+}
+
+TEST_CASE("large write goes past the buffer at once", "[io][buffered_writer]")
+{
+    using namespace std::string_view_literals;
+
+    recording_writer         underlying;
+    net::io::buffered_writer writer{&underlying, 4};
+
+    auto res = test::sync_wait(writer.write("AB"sv));
+    REQUIRE_FALSE(res.err);
+
+    // larger than the buffer: the buffer filled and flushed, then the rest in one write of the underlying writer.
+    res = test::sync_wait(writer.write("CDEFGHIJKL"sv));
+    REQUIRE_FALSE(res.err);
+    REQUIRE(res.count == 10);
+    CHECK(underlying.out == "ABCDEFGHIJKL"sv);
+    CHECK(underlying.sizes == std::vector<std::size_t>{4, 8});
+    CHECK(writer.size() == 0);
 }

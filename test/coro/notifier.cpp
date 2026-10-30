@@ -170,3 +170,46 @@ TEST_CASE("notifiers hand off between coroutines many times without losing a wak
     CHECK(b.load() == rounds);
     scope.join_blocking();
 }
+
+TEST_CASE("notify and close wake every waiter, each time, however many wait", "[coro][notifier]")
+{
+    net::coro::thread_pool pool{2};
+    notifier               n{&pool};
+    std::atomic<int>       value{0};
+    std::atomic<int>       woken{0};
+    std::atomic<int>       closed{0};
+
+    net::coro::async_scope scope;
+
+    // waiter waits for value to reach target (as spawn() runs it until it waits, it's waiting once that returns).
+    const auto waiter = [](notifier*               n,
+                           const std::atomic<int>* value,
+                           int                     target,
+                           std::atomic<int>*       woken,
+                           std::atomic<int>*       closed) -> task<>
+    {
+        if (co_await wait_for(n, value, target)) woken->fetch_add(1);
+        else closed->fetch_add(1);
+    };
+
+    // one waiter, then two, then three, then more (some are held in place, the rest in a list: each round, the place
+    // and the list are used again).
+    int target = 0;
+    for (const int waiters : {1, 2, 3, 5, 3})
+    {
+        ++target;
+        for (int i = 0; i < waiters; ++i) REQUIRE(scope.spawn(waiter(&n, &value, target, &woken, &closed)));
+
+        const int before = woken.load();
+        value.store(target);
+        n.notify();
+        while (woken.load() != before + waiters) std::this_thread::yield();
+    }
+
+    // and close() wakes three waiting, for good.
+    for (int i = 0; i < 3; ++i) REQUIRE(scope.spawn(waiter(&n, &value, target + 1, &woken, &closed)));
+    n.close();
+    scope.join_blocking();
+    CHECK(closed.load() == 3);
+    CHECK(woken.load() == 1 + 2 + 3 + 5 + 3);
+}

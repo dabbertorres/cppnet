@@ -1262,6 +1262,19 @@ void session::reset(stream_id stream, error_code code)
 
 void session::consume(stream_id stream, std::size_t n) { give_back(stream, n); }
 
+void session::widen_window(stream_id stream, std::uint32_t window)
+{
+    const auto it = streams.find(stream);
+    if (it == streams.end() || it->second.remote_closed || window <= config.local.initial_window_size) return;
+
+    // NOTE: what's outstanding (the window left, and what's consumed but not yet given back) is the initial window
+    //       until now, so it's window after: no more than a window can be (RFC 9113, section 6.9.1).
+    auto&      s    = it->second;
+    const auto more = std::min<std::int64_t>(window, max_window) - config.local.initial_window_size;
+    encode_window_update(stream, static_cast<std::uint32_t>(more), output);
+    s.recv_window += more;
+}
+
 void session::give_back(stream_id stream, std::size_t n)
 {
     // the connection's window, once half of it has been consumed, or as much as the peer has left of it (so a stream

@@ -50,6 +50,17 @@ namespace
     // short message) into one DATA frame, and small reads out of the stream's lock.
     constexpr std::size_t tunnel_buffer_size = std::size_t{4} * 1'024;
 
+    // A tunnel's stream's window, each way: what its peer may send that its reader hasn't read yet. A stream's initial
+    // window (64 KiB) is what a request's body needs, but a tunnel carries a protocol's messages (e.g. a WebSocket's),
+    // one after another, as TCP would, whose receive buffer starts at 128 KiB (on Linux and macOS) and grows: so a
+    // message of 64 KiB goes without waiting for a WINDOW_UPDATE, and messages on the way keep going while the window's
+    // given back. What a peer that doesn't read can make the other side hold is still bounded: by this, and by the
+    // connection's window, which bounds all the streams' together.
+    constexpr std::uint32_t tunnel_window = std::uint32_t{256} * 1'024;
+
+    // How much of what a tunnel's stream received it keeps room for once it's all read (see take_received()).
+    constexpr std::size_t tunnel_kept = std::size_t{32} * 1'024;
+
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
 
@@ -162,7 +173,10 @@ namespace
         s.received_start += n;
         if (s.received_start == s.received.size())
         {
-            s.received.clear();
+            // a tunnel lives long, mostly idle: once it's read all it received, it doesn't keep more memory than DATA
+            // that keeps up with its reader needs (a frame or two), whatever a burst took.
+            if (s.tunnel != nullptr && s.received.capacity() > tunnel_kept) s.received = {};
+            else s.received.clear();
             s.received_start = 0;
         }
         else if (s.received_start >= s.received.size() / 2)
@@ -188,6 +202,32 @@ namespace
 }
 
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)
+{
+    if (at_start && !data.empty()) [[unlikely]]
+        return read_waiting(data);
+
+    // usually, a stream that's being read has received something by now (e.g. a tunnel's reads of a large message, a
+    // piece at a time): then there's no need for a coroutine (see coro::ready_task). Otherwise the coroutine looks
+    // again, and waits.
+    auto&       c      = *stream->conn;
+    std::size_t n      = 0;
+    bool        output = false;
+    {
+        std::scoped_lock lock{c.mu};
+        auto&            s = *stream;
+
+        if (s.received_start == s.received.size()) return read_waiting(data);
+
+        n      = take_received(s, data);
+        output = c.session.has_output();
+    }
+
+    // (a WINDOW_UPDATE goes now: see read_waiting().)
+    if (output) c.wake_writer();
+    return coro::ready_task<io::result>(io::result{.count = n});
+}
+
+coro::task<io::result> stream_reader::read_waiting(std::span<std::byte> data)
 {
     if (at_start && !data.empty()) [[unlikely]]
     {
@@ -422,7 +462,9 @@ stream_tunnel::stream_tunnel(http2_stream_base& stream, std::stop_token closing)
     , raw_in{&stream}
     , in{&raw_in, tunnel_buffer_size}
     , out{&stream.writer, tunnel_buffer_size}
-{}
+{
+    stream.conn->session.widen_window(stream.id, tunnel_window);
+}
 
 void stream_tunnel::set_read_timeout(std::optional<io::clock::duration> t) noexcept
 {
@@ -816,7 +858,9 @@ coro::task<> http2_connection_base::write_loop()
 
         if (!out.empty())
         {
-            const auto res = co_await io::write_all(writer, out);
+            // NOTE: a write writes it all (or fails); straight to the writer, rather than through io::write_all(),
+            //       a coroutine whose frame each round would allocate, where the socket's write usually needs none.
+            const auto res = co_await writer.write(std::span<const std::byte>{out});
             wrote          = true;
             if (res.err)
             {

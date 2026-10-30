@@ -174,6 +174,11 @@ public:
     // the stream's and connection's windows (with WINDOW_UPDATEs, once enough has built up).
     void consume(stream_id stream, std::size_t n);
 
+    // widen_window makes a stream's window (what the peer may have sent that the application hasn't consumed) window,
+    // rather than the initial window, if that's larger: a WINDOW_UPDATE for the difference, which stays, as what's
+    // consumed is given back as before. Once per stream; nothing for one that's done receiving (or unknown).
+    void widen_window(stream_id stream, std::uint32_t window);
+
     // goaway sends GOAWAY: last_stream is the last of the peer's streams this side will process (max_stream_id, for the
     // first of a graceful shutdown's two). After it, the peer's new streams are ignored.
     void goaway(stream_id last_stream, error_code code, std::string_view debug = {});

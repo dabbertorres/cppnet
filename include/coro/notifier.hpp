@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <coroutine>
 #include <cstddef>
@@ -74,16 +75,33 @@ public:
     [[nodiscard]] bool closed() const noexcept { return is_closed.load(std::memory_order::acquire); }
 
 private:
+    // How many waiters are held in place, rather than in a list on the heap: so a notifier with few waiters (e.g. an
+    // HTTP/2 stream's reader and writer) doesn't allocate each time one waits.
+    static constexpr std::size_t inline_waiters = 2;
+
+    // woken_list is the waiters notify() or close() took, to resume once the lock's released.
+    struct woken_list
+    {
+        std::array<std::coroutine_handle<>, inline_waiters> first{};
+        std::size_t                                         count = 0; // of first
+        std::vector<std::coroutine_handle<>>                rest;
+    };
+
+    // take_waiters moves the waiters into woken (holding mu).
+    void take_waiters(woken_list& woken) noexcept;
+
     // wake resumes the waiters on the pool.
-    void wake(std::vector<std::coroutine_handle<>>& woken) noexcept;
+    void wake(woken_list& woken) noexcept;
 
     thread_pool*               pool;
     std::atomic<std::uint64_t> current{0};
     std::atomic<bool>          is_closed{false};
     std::atomic<std::size_t>   waiting{0}; // so notify() skips the lock if no one waits
 
-    std::mutex                           mu;
-    std::vector<std::coroutine_handle<>> waiters;
+    std::mutex                                          mu;
+    std::array<std::coroutine_handle<>, inline_waiters> first_waiters{};
+    std::size_t                                         first_count = 0; // of first_waiters
+    std::vector<std::coroutine_handle<>>                waiters;         // those past first_waiters
 };
 
 }

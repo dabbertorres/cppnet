@@ -928,7 +928,10 @@ router.GET("/echo",
   200 rather than 101: the WebSocket is then the request's stream, beside the connection's other requests. It's the same
   `connection`, with the same timeouts, stopping and closing (the server's `close()`'s 1001 too); it counts against
   `http2_max_concurrent_streams` until its handler returns, which ends the stream, and the stream's own read timeout
-  (`body_read_timeout`) doesn't apply, as `idle_timeout` does the timing. A client resetting the stream, or ending it
+  (`body_read_timeout`) doesn't apply, as `idle_timeout` does the timing. The stream's window is 256 KiB each way (a
+  request's is 64 KiB), as a TCP connection's buffers would be, so a message of 64 KiB goes without waiting for the
+  peer to give the window back, and a WebSocket that isn't read holds at most that much of what's sent to it (within
+  the connection's window, which bounds all its streams together). A client resetting the stream, or ending it
   without a close, ends the WebSocket as the TCP connection ending would (`abnormal_closure`). Another `:protocol` is
   answered 501 without a handler, and one with a `Content-Length` other than 0 (a CONNECT has no content) 400. A handler
   that doesn't accept a WebSocket can't answer its request with a 2xx, which the browser would take for the WebSocket
@@ -1018,7 +1021,8 @@ auto type = co_await conn->read_message(message);
   default, as in browsers). Otherwise it's over HTTP/1.1, as above: `connect()` never connects, nor waits for a stream,
   just to find out (as Chrome; nor does it use a connection whose server's settings haven't come yet), and never takes
   another host's connection, even with `client_options::http2_coalescing`. The stream holds the connection open, as a
-  response's body being read does: the `http::client` may go first.
+  response's body being read does: the `http::client` may go first. Its window is 256 KiB each way, as on the
+  server.
 - **The handshake fails** (`websocket::errc`) for a response that isn't the server's switching: `bad_status` for
   anything but 101 (Switching Protocols), or over HTTP/2 a 2xx, redirects included (they aren't followed, as browsers
   don't), `bad_accept` (HTTP/1.1's), `bad_subprotocol` (one that wasn't offered) or `bad_extension` (none is offered);

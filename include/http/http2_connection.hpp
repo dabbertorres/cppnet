@@ -94,7 +94,7 @@ private:
 };
 
 // stream_reader reads what a stream receives (a request's body, or a response's), as its DATA arrives, giving the
-// peer back its windows as it goes.
+// peer back its windows as it goes. A read that finds something received returns without a coroutine.
 class stream_reader final : public io::reader
 {
 public:
@@ -115,6 +115,9 @@ public:
     [[nodiscard]] http2_stream_base* owner() const noexcept { return stream; }
 
 private:
+    // read_waiting is a read that may have to wait: one with nothing received yet, or a start callback to await first.
+    coro::task<io::result> read_waiting(std::span<std::byte> data);
+
     http2_stream_base* stream;
     io::start_callback at_start;
 };
@@ -141,12 +144,16 @@ private:
 // stream_tunnel is a stream once it's a tunnel (see http/tunnel.hpp): once a 2xx has answered its extended CONNECT
 // (RFC 8441), its DATA both ways is the tunnel's protocol's (e.g. a WebSocket's), read and written through buffers of
 // 4 KiB each way over the stream's own reader and writer (so frame headers and small messages are gathered, and large
-// payloads go through). A read that waits is limited by the tunnel's own timeout and deadline, and canceled by its stop
-// token, failing having read nothing while the stream goes on (as a socket's would), where the stream's own timeouts
-// reset it: stream_reader::read() asks check_wait() before each wait, and the connection's timer wakes it at wake_at.
+// payloads go past them, straight to the stream, and from it). Its stream's window is wider than a request's, as a
+// socket's buffers are (256 KiB: see the constructor), so a large message goes without waiting for a WINDOW_UPDATE; and
+// once it's read all its stream received, it keeps no more room for what's to come than a frame or two needs, whatever
+// a burst took. A read that waits is limited by the tunnel's own timeout and deadline, and canceled by its stop token,
+// failing having read nothing while the stream goes on (as a socket's would), where the stream's own timeouts reset it:
+// stream_reader::read() asks check_wait() before each wait, and the connection's timer wakes it at wake_at.
 //
-// A stream's tunnel is its stream's: made once (holding the connection's lock), and destroyed with it, holding the lock
-// too, so its stop token (see set_stop_token()) must be removed before then, as its callback takes the lock.
+// A stream's tunnel is its stream's: made once (holding the connection's lock; its maker then wakes the writer, for the
+// window's WINDOW_UPDATE), and destroyed with it, holding the lock too, so its stop token (see set_stop_token()) must
+// be removed before then, as its callback takes the lock.
 class stream_tunnel final : public tunnel
 {
 public:
