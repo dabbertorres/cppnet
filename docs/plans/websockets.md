@@ -1424,6 +1424,51 @@ In flight, large messages are still about twice HTTP/1.1's (the HTTP/2 path's CP
 6 against 4 for small messages, 26 against 10 for large ones, 3 more than before (likely the drained `received`
 buffer being freed, and grown again, more often, as the reader now runs as soon as DATA comes).
 
+## Learned after stage 9: a stream's read that waits
+
+The allocations left over HTTP/2, found as before (a temporary `operator new` recording backtraces, symbolized with
+`atos`; one run of each of `bench_websocket`'s rows): for 16 B messages one at a time, the 2 over HTTP/1.1's 4 were a
+frame per read of a stream that waited (`read_waiting()`), one each side. For 64 KiB messages one at a time (26
+against 10): 3 such frames, 10 in growing `received` again for each message (a tunnel's drained buffer over 32 KiB is
+freed, and a message comes in 16 KiB frames: 12, 28, 56, then 112 KiB, each side), and 3 in the client's write that
+finds `max_ahead` in the writer's hands (`write_waiting()`'s frame, `buffered_writer::flush()`'s and the WebSocket's
+`flush_and_release()`'s). With 64 WebSockets at once (33 to 42 for large messages): about 5 read frames, 8 in
+`received`, and 10 to 17 in writes waiting their turn.
+
+A read that has to wait is now an operation (`stream_read`, as a socket's read is), with no frame: the stream knows it
+while it waits (`reading`), DATA that comes meanwhile goes straight into its span (as much as fits, the rest to
+`received`, and on until the reader takes its result), and whatever ends or fails the stream, or stops or times out a
+tunnel's read, finishes it (`wake_reader()`), its reader resumed on the pool. That took the read frames out (small
+messages 6 to 4, as HTTP/1.1), but only 2 of large messages' 10 in `received`: a WebSocket's first read of a message is
+its tunnel's 4 KiB fill, and the rest of the message comes before its reader is back for it (it's in the slot of the
+worker whose reader is receiving, which goes on while the socket has more), so it piles up in `received` as before.
+Keeping 64 KiB of a drained tunnel's buffer (and growing it to that at once) took them out too (large, one at a time:
+13.0 allocations, 111 to 113 us; in flight 12.9, 64 to 66 us), at about 80 KiB more per WebSocket held after the
+parallel runs (213 to 223 KiB rather than 131 to 144, with 64 at once); left for a decision, as 32 KiB was chosen to
+bound what an idle WebSocket holds.
+
+Numbers (Release, two workers; the base and this build, three runs each, interleaved, best of five within a run):
+
+| Row                                            | before            | after             | HTTP/1.1, after |
+|------------------------------------------------|-------------------|-------------------|-----------------|
+| HTTP/2, 16 B, one at a time                    | 32.6 to 33.1 us   | 32.0 to 32.9      | 27.8 to 28.2    |
+| allocations                                    | 6.0               | 4.0               | 4.0             |
+| HTTP/2, 64 KiB, one at a time                  | 120 to 122 us     | 116 to 118        | 97 to 98        |
+| allocations                                    | 26.0              | 21.0              | 10.0            |
+| HTTP/2, 64 KiB, in flight                      | 66.9 to 69.4 us   | 66.2 to 67.2      | 37.2 to 37.6    |
+| allocations                                    | 17.6 to 17.7      | 15.7 to 15.8      | 7.1             |
+| 64 WebSockets over HTTP/2, 16 B, one at a time | 4.7 to 4.8 us     | 4.2 to 4.3        |                 |
+| 64 WebSockets over HTTP/2, 64 KiB, one at a time | 87 to 105 us, 31.7 to 41.8 | 74 to 95, 25.4 to 30.8 |    |
+| 64 WebSockets over HTTP/2, 64 KiB, in flight   | 94 to 100 us, 38.0 to 43.2 | 79 to 96, 32.8 to 34.1 |      |
+| `bench_request`, HTTP/2 a stream at a time     | 68.0 to 73.9 us, 39 | 65.8 to 66.3, 38 |                 |
+| `bench_request`, 8 streams at once             | 1210 to 1289 us, 63.6 to 63.9 | 1151 to 1161, 56.2 |  |
+| `bench_request`, 8 request bodies at once      | 1412 to 1446 us, 105.5 | 1302 to 1313, 94.0 |              |
+
+The rest didn't move beyond their noise. What's left against HTTP/1.1, for large messages: `received` growing again
+(above), and writes that wait (the client's write past `max_ahead`, and with many WebSockets, writes waiting their
+turn: a frame for `write_waiting()` and another for `buffered_writer::flush()`), which making a stream's waiting write
+an operation too would halve; in flight, still about twice HTTP/1.1's time (the HTTP/2 path's CPU, above).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:

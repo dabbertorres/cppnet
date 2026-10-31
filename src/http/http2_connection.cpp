@@ -5,8 +5,10 @@
 #include <cassert>
 #include <chrono>
 #include <compare>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <mutex>
 #include <optional>
@@ -205,11 +207,11 @@ namespace
 coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 {
     if (at_start && !data.empty()) [[unlikely]]
-        return read_waiting(data);
+        return read_after_start(data);
 
     // usually, a stream that's being read has received something by now (e.g. a tunnel's reads of a large message, a
-    // piece at a time): then there's no need for a coroutine (see coro::ready_task). Otherwise the coroutine looks
-    // again, and waits.
+    // piece at a time): then there's no need for a coroutine (see coro::ready_task). Otherwise the read waits, as an
+    // operation, which looks again first.
     auto&       c      = *stream->conn;
     std::size_t n      = 0;
     bool        output = false;
@@ -217,73 +219,156 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
         std::scoped_lock lock{c.mu};
         auto&            s = *stream;
 
-        if (s.received_start == s.received.size()) return read_waiting(data);
+        if (s.received_start == s.received.size())
+        {
+            if (!waiting.claim(data))
+                return coro::ready_task<io::result>(
+                    io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)});
+            return coro::operation_task(waiting);
+        }
 
         n      = take_received(s, data);
         output = c.session.has_output();
     }
 
-    // (a WINDOW_UPDATE goes now: see read_waiting().)
-    if (output) c.wake_writer();
+    // a WINDOW_UPDATE goes now: the peer may be waiting for it, while this reader goes on reading what's buffered (or
+    // stops reading for a while).
+    if (output) c.notify_writer();
     return coro::ready_task<io::result>(io::result{.count = n});
 }
 
-coro::task<io::result> stream_reader::read_waiting(std::span<std::byte> data)
+coro::task<io::result> stream_reader::read_after_start(std::span<std::byte> data)
 {
-    if (at_start && !data.empty()) [[unlikely]]
+    const auto callback = std::exchange(at_start, {});
+    if (auto err = co_await callback.call(callback.context); err) co_return io::result{.err = err};
+    co_return co_await read(data);
+}
+
+bool stream_read::claim(std::span<std::byte> into) noexcept
+{
+    if (!try_claim()) return false;
+
+    data   = into;
+    filled = 0;
+    err    = {};
+    woken  = false;
+    busy   = false;
+    timeout_at.reset();
+    return true;
+}
+
+bool stream_read::ready()
+{
+    auto& s = *stream;
+    if (filled > 0 || s.received_start < s.received.size()) return true;
+
+    if (s.received_end) err = make_error_code(io::errc::end_of_stream);
+    else if (s.failure) err = s.failure;
+    // a tunnel's read that's stopped, or out of time, fails having read nothing: the stream goes on.
+    else err = tunnel_wait(s, timeout_at);
+    return static_cast<bool>(err);
+}
+
+bool stream_read::start(std::coroutine_handle<> caller) noexcept
+{
+    auto&            c = *stream->conn;
+    std::scoped_lock lock{c.mu};
+    auto&            s = *stream;
+
+    // (another reader's: e.g. a request's body's, once its stream's a tunnel.)
+    busy = s.reading != nullptr;
+    if (busy || ready()) return false;
+
+    s.reading = this;
+    awaiting  = caller;
+    c.arm_deadline(s.read_deadline, s.read_timeout);
+
+    // (what earlier reads gave back goes now, if it hasn't.)
+    if (c.session.has_output()) c.notify_writer();
+    return true;
+}
+
+std::span<const std::byte> stream_read::take(std::span<const std::byte> incoming) noexcept
+{
+    // finished for something else (e.g. its tunnel's stop): what comes is the next read's.
+    if (woken && filled == 0) return incoming;
+
+    const auto n = std::min(incoming.size(), data.size() - filled);
+    std::ranges::copy(incoming.first(n), data.begin() + static_cast<std::ptrdiff_t>(filled));
+    filled += n;
+    return incoming.subspan(n);
+}
+
+void stream_read::wake() noexcept
+{
+    if (woken || !ready()) return;
+    woken = true;
+
+    // NOTE: on the pool, never here: this holds the connection's lock, which the reader takes for its result. A pool
+    //       refuses only once it's shutting down, which it doesn't while its scheduler's tasks (the connection's) run.
+    if (!stream->conn->get_scheduler()->pool()->resume(awaiting))
     {
-        const auto callback = std::exchange(at_start, {});
-        if (auto err = co_await callback.call(callback.context); err) co_return io::result{.err = err};
+        stream->conn->get_logger().critical(
+            "an HTTP/2 stream's read can't be resumed: the thread pool's shutting down");
+        std::terminate();
+    }
+}
+
+io::result stream_read::result() noexcept
+{
+    if (busy)
+    {
+        release();
+        return io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)};
     }
 
-    auto& c = *stream->conn;
-
-    // a tunnel's read timeout's end, once the read waits (see stream_tunnel::check_wait()).
-    std::optional<io::clock::time_point> timeout_at;
-    while (true)
+    auto&      c = *stream->conn;
+    io::result res;
+    bool       output = false;
     {
-        std::uint64_t seen   = 0;
-        bool          took   = false; // what's buffered
-        std::size_t   n      = 0;
-        bool          output = false;
+        std::scoped_lock lock{c.mu};
+        auto&            s = *stream;
+        if (s.reading == this) s.reading = nullptr;
+
+        // (a tunnel's read that waited has its time: the timer needn't wake it.)
+        if (s.tunnel != nullptr) s.tunnel->wake_at.reset();
+
+        if (filled > 0)
         {
-            std::scoped_lock lock{c.mu};
-            auto&            s = *stream;
-
-            if (s.received_start < s.received.size())
-            {
-                took   = true;
-                n      = take_received(s, data);
-                output = c.session.has_output();
-            }
-            else
-            {
-                if (s.received_end)
-                {
-                    s.hand_over_trailers();
-                    co_return io::result{.err = make_error_code(io::errc::end_of_stream)};
-                }
-                if (s.failure) co_return io::result{.err = s.failure};
-
-                // a tunnel's read that's stopped, or out of time, fails having read nothing: the stream goes on.
-                if (const auto err = tunnel_wait(s, timeout_at)) co_return io::result{.err = err};
-
-                seen = s.changed.value();
-                c.arm_deadline(s.read_deadline, s.read_timeout);
-            }
+            // the peer may send as much more.
+            c.session.consume(s.id, filled);
+            res.count = filled;
         }
-
-        if (took)
+        else if (s.received_start < s.received.size())
         {
-            // a WINDOW_UPDATE goes now: the peer may be waiting for it, while this reader goes on reading what's
-            // buffered (or stops reading for a while).
-            if (output) c.wake_writer();
-            co_return io::result{.count = n};
+            res.count = take_received(s, data);
         }
-
-        c.wake_writer();
-        (void)co_await stream->changed.wait(seen);
+        else
+        {
+            res.err = err;
+            if (err == io::errc::end_of_stream) s.hand_over_trailers();
+        }
+        output = c.session.has_output();
     }
+
+    release();
+    if (output) c.notify_writer();
+    return res;
+}
+
+void stream_read::cancel() noexcept
+{
+    {
+        std::scoped_lock lock{stream->conn->mu};
+        if (stream->reading == this) stream->reading = nullptr;
+    }
+    release();
+}
+
+// NOLINTNEXTLINE(readability-make-member-function-const): it finishes the stream's read.
+void http2_stream_base::wake_reader() noexcept
+{
+    if (reading != nullptr) reading->wake();
 }
 
 void http2_stream_base::hand_over_trailers() noexcept
@@ -476,13 +561,10 @@ void stream_tunnel::set_read_timeout(std::optional<io::clock::duration> t) noexc
 
 void stream_tunnel::set_read_deadline(std::optional<io::clock::time_point> d) noexcept
 {
-    {
-        std::scoped_lock lock{stream.conn->mu};
-        deadline = d;
-    }
-
     // a read that's waiting looks again (see check_wait()), whichever thread this is.
-    stream.changed.notify();
+    std::scoped_lock lock{stream.conn->mu};
+    deadline = d;
+    stream.wake_reader();
 }
 
 void stream_tunnel::set_stop_token(std::stop_token stop) noexcept
@@ -506,6 +588,7 @@ void stream_tunnel::stopper::operator()() const noexcept
     {
         std::scoped_lock lock{s.conn->mu};
         tunnel->stopped = true;
+        s.wake_reader();
     }
     s.changed.notify();
 }
@@ -603,6 +686,7 @@ void http2_connection_base::fail_stream(http2_stream_base& s, std::error_code er
 {
     if (s.failure) return;
     s.failure = err;
+    s.wake_reader();
 
     // the writer mustn't touch the span of a write that's returning.
     send_order.remove(s);
@@ -779,10 +863,21 @@ void http2_connection_base::on_data(http2::stream_id id, std::span<const std::by
         return;
     }
 
+    // straight into the span of a read that's waiting, if nothing's received before it: what doesn't fit is kept
+    // for the next.
     auto& s = *it->second;
+    if (s.reading != nullptr && s.received_start == s.received.size()) data = s.reading->take(data);
     s.received.insert(s.received.end(), data.begin(), data.end());
     if (end_stream) s.received_end = true;
     s.read_deadline.reset();
+    s.wake_reader();
+}
+
+void http2_connection_base::end_received(http2_stream_base& s)
+{
+    s.received_end = true;
+    s.read_deadline.reset();
+    s.wake_reader();
     s.changed.notify();
 }
 
@@ -1025,7 +1120,7 @@ std::optional<io::clock::time_point> http2_connection_base::check_streams(io::cl
         if (s->tunnel != nullptr && expired(s->tunnel->wake_at))
         {
             s->tunnel->wake_at.reset();
-            s->changed.notify();
+            s->wake_reader();
         }
 
         // a write that's waiting its turn, while the writer writes others', isn't held up by the peer: its deadline's

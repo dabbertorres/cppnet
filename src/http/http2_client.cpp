@@ -926,12 +926,8 @@ void http2_client_connection::on_headers(http2::stream_id              id,
     // reaches the end, so whoever reads them does once the body's been read, and they don't change meanwhile.
     if (kind == http2::block_kind::trailers) keep_trailers(s, fields);
 
-    if (end_stream)
-    {
-        s.received_end = true;
-        s.read_deadline.reset();
-    }
-    s.changed.notify();
+    if (end_stream) end_received(s);
+    else s.changed.notify();
 }
 
 void http2_client_connection::on_interim(http2_client_stream& s, std::span<const hpack::field> fields)

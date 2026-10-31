@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -93,13 +94,62 @@ private:
 #endif
 };
 
+// stream_read is a stream_reader's read that has to wait for what its stream's to receive: an operation (see
+// coro::operation), so a read that waits needs no coroutine. Its stream knows it while it waits (reading), and the
+// connection's events finish it, holding the lock: DATA that comes meanwhile goes straight into its span (as much as
+// fits: the rest, to what the stream's received), and the stream's end, its failure, or (a tunnel's) stop or time
+// finish it too. Its reader's resumed on the pool, never by whoever finished it, and takes its result holding the lock:
+// until then, DATA goes on into what's left of the span. The peer's given its window back as the reader takes what's
+// come.
+//
+// As a socket's read, it must outlive a read waiting on it: a coroutine destroyed while it waits cancels it (cancel()),
+// which is only safe while it hasn't finished (its reader not yet resumed).
+class stream_read final : public coro::operation<io::result>
+{
+public:
+    explicit stream_read(http2_stream_base* stream) noexcept
+        : stream{stream}
+    {}
+
+    // claim readies it to read into into, returning false if it's in use.
+    [[nodiscard]] bool claim(std::span<std::byte> into) noexcept;
+
+    bool       start(std::coroutine_handle<> caller) noexcept override;
+    io::result result() noexcept override;
+    void       cancel() noexcept override;
+
+    // take copies what fits of incoming into the read's span, unless it's finished for something else (holding the
+    // lock, with nothing else received before it), returning what's left of incoming.
+    std::span<const std::byte> take(std::span<const std::byte> incoming) noexcept;
+
+    // wake finishes the read if it has something to return (holding the lock), resuming its reader on the pool.
+    void wake() noexcept;
+
+private:
+    // ready is whether the read has something to return (holding the lock): what's come into its span, or what its
+    // stream received, or else why it's done (err: the stream's end, its failure, or a tunnel's stop or time).
+    bool ready();
+
+    http2_stream_base*                   stream;
+    std::span<std::byte>                 data;
+    std::size_t                          filled = 0; // of data, by DATA that came while it waited
+    std::error_code                      err;
+    bool                                 woken = false; // its reader's been resumed
+    bool                                 busy  = false; // another read waits for the stream
+    std::coroutine_handle<>              awaiting;
+    std::optional<io::clock::time_point> timeout_at; // a tunnel's read timeout's end (see stream_tunnel::check_wait())
+};
+
 // stream_reader reads what a stream receives (a request's body, or a response's), as its DATA arrives, giving the
-// peer back its windows as it goes. A read that finds something received returns without a coroutine.
+// peer back its windows as it goes. A read that finds something received returns without a coroutine, and one that has
+// to wait is an operation (see stream_read). Reads take turns: one that's waiting is the reader's only one
+// (std::errc::device_or_resource_busy for another), and its stream's.
 class stream_reader final : public io::reader
 {
 public:
     explicit stream_reader(http2_stream_base* stream) noexcept
         : stream{stream}
+        , waiting{stream}
     {}
 
     coro::task<io::result> read(std::span<std::byte> data) override;
@@ -115,11 +165,12 @@ public:
     [[nodiscard]] http2_stream_base* owner() const noexcept { return stream; }
 
 private:
-    // read_waiting is a read that may have to wait: one with nothing received yet, or a start callback to await first.
-    coro::task<io::result> read_waiting(std::span<std::byte> data);
+    // read_after_start awaits the start callback, then reads.
+    coro::task<io::result> read_after_start(std::span<std::byte> data);
 
     http2_stream_base* stream;
     io::start_callback at_start;
+    stream_read        waiting;
 };
 
 // stream_writer writes what a stream sends (a response's body, or a request's) as DATA, waiting for the
@@ -149,7 +200,8 @@ private:
 // once it's read all its stream received, it keeps no more room for what's to come than a frame or two needs, whatever
 // a burst took. A read that waits is limited by the tunnel's own timeout and deadline, and canceled by its stop token,
 // failing having read nothing while the stream goes on (as a socket's would), where the stream's own timeouts reset it:
-// stream_reader::read() asks check_wait() before each wait, and the connection's timer wakes it at wake_at.
+// a read asks check_wait() before it waits, and again whenever it's woken (see stream_read): by the connection's timer
+// at wake_at, by a deadline set meanwhile, or by stop.
 //
 // A stream's tunnel is its stream's: made once (holding the connection's lock; its maker then wakes the writer, for the
 // window's WINDOW_UPDATE), and destroyed with it, holding the lock too, so its stop token (see set_stop_token()) must
@@ -173,9 +225,9 @@ public:
     void set_read_deadline(std::optional<io::clock::time_point> deadline) noexcept override;
 
     // set_stop_token registers a callback on stop (removing the last's first, which waits for it if it's being made,
-    // so it's called without the connection's lock) that marks the tunnel stopped and wakes the stream's waits, which
-    // then fail (std::errc::operation_canceled): a read that has to wait, and a write that waits for its turn or the
-    // windows (with what it sent before; see http2_connection_base::step_write()).
+    // so it's called without the connection's lock) that marks the tunnel stopped and wakes the stream's read and
+    // waits, which then fail (std::errc::operation_canceled): a read that has to wait, and a write that waits for its
+    // turn or the windows (with what it sent before; see http2_connection_base::step_write()).
     void set_stop_token(std::stop_token stop) noexcept override;
 
     [[nodiscard]] std::stop_token closing() const noexcept override { return closing_token; }
@@ -188,9 +240,9 @@ public:
     // what's been flushed, unless it's ended or failed: nothing's sent after it. Not holding the lock, which it takes.
     void end() noexcept;
 
-    // check_wait is what a read that has nothing to read comes to before it waits (holding the lock): an error if it's
-    // not to wait (stopped, or past its deadline or timeout: timeout_at is when its timeout passes, which it sets the
-    // first time); none otherwise, having set when the timer's to wake it (wake_at), if ever.
+    // check_wait is what a read that has nothing to read comes to before it waits, and whenever it's woken (holding the
+    // lock): an error if it's not to wait (stopped, or past its deadline or timeout: timeout_at is when its timeout
+    // passes, which it sets the first time); none otherwise, having set when the timer's to wake it (wake_at), if ever.
     std::error_code check_wait(std::optional<io::clock::time_point>& timeout_at);
 
     // Guarded by the connection's lock: when the timer's to wake a read that's waiting (its deadline, or its timeout's
@@ -257,6 +309,12 @@ public:
     // hand_over_trailers moves the trailers received to trailers_to, if both are there (holding the lock).
     void hand_over_trailers() noexcept;
 
+    // The read waiting for what's to be received, if one is (see stream_read), and wake_reader, which finishes it if
+    // there's something for it (holding the lock): called whenever the stream receives, ends or fails, and when a
+    // tunnel's read's stop or time may have come.
+    stream_read* reading = nullptr;
+    void         wake_reader() noexcept;
+
     bool            ended = false; // this side has sent END_STREAM
     std::error_code failure;       // reset, timed out, or the connection ended (see fail_stream())
 
@@ -290,7 +348,8 @@ public:
     // The stream's tunnel, once it's one (see stream_tunnel): its reads' limits and stop, which stream_reader checks.
     std::unique_ptr<stream_tunnel> tunnel;
 
-    // notified whenever any of the above changes, or the stream's (or connection's) window grows.
+    // notified whenever any of the above changes (but what's received: its reader's woken by wake_reader()), or the
+    // stream's (or connection's) window grows.
     coro::notifier changed;
 
     stream_writer writer{this};
@@ -402,7 +461,7 @@ public:
 
     // fail_stream fails s with err, unless it has failed already (holding the lock), queuing its stop source (if it
     // has one, and it isn't a tunnel, whose user finds its failure in its reads and writes) for stop_pending() to stop.
-    // Waking its waits is the caller's.
+    // It finishes a read that's waiting; waking its other waits is the caller's.
     //
     // Stop sources are never stopped holding the lock: std::stop_source::request_stop() runs the callbacks registered
     // on it inline, and they're anyone's (the handler's, a scheduler wait's, ...), taking locks of their own. So each
@@ -413,6 +472,9 @@ public:
 
     // stop_pending stops the sources fail_stream() queued (without the lock).
     void stop_pending();
+
+    // notify_writer tells the writer there's output (holding the lock, or not): e.g. a read's WINDOW_UPDATE.
+    void notify_writer() noexcept { writer_wakeup.notify(); }
 
     [[nodiscard]] io::handle native_handle() const noexcept { return detail::native_handle(conn); }
 
@@ -460,6 +522,9 @@ protected:
     [[nodiscard]] bool ending() const noexcept { return is_ending; }
 
     void wake_timer();
+
+    // end_received ends what a stream receives (holding the lock): its trailers, or its head, ended it.
+    static void end_received(http2_stream_base& s);
 
     // The events every connection handles alike (with the lock held).
     void on_data(http2::stream_id id, std::span<const std::byte> data, bool end_stream) override;

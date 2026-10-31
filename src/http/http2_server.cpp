@@ -657,9 +657,7 @@ namespace
                     s.received_trailers->add(f.name, f.value);
                 }
 
-                s.received_end = true;
-                s.read_deadline.reset();
-                s.changed.notify();
+                end_received(s);
             }
             return;
         }
