@@ -1243,7 +1243,12 @@ The fixes:
   against 256 KiB's 63, for twice and four times what a peer that doesn't read can make the other side hold. Requests'
   streams keep 64 KiB.
 - Once a tunnel's stream has had all it received read, `take_received()` drops `received`'s memory if it's over
-  32 KiB (`tunnel_kept`): a burst no longer stays allocated for the WebSocket's life.
+  32 KiB (`tunnel_kept`): a burst no longer stays allocated for the WebSocket's life. (As first written it assigned
+  `{}`, an empty initializer_list, which keeps the capacity, so it dropped nothing, and the numbers below were taken
+  so. `bench_websocket`'s WebSockets in parallel showed it, and it was fixed after: over HTTP/2, what each WebSocket
+  holds after the runs went from about 780 KiB to 140 to 170 with 8 at once, and from 645 to 700 to 130 to 150 with
+  64; at the cost of growing the buffer again for each burst: a 64 KiB message one at a time took 129 to 133 us
+  rather than 119 to 121, with 22.9 allocations rather than 15.6, and in flight 17.6 rather than 12.3.)
 - `io::buffered_reader` and `io::buffered_writer` pass what's larger than the buffer straight through with one read or
   write for all that's left, rather than in pieces of the buffer's size. Over HTTP/2 that's a 64 KiB message written to
   the stream in one write (framed by the session as the windows allow, the caller's span queued as is) and read from it

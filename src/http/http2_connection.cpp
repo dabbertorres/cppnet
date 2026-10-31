@@ -174,8 +174,9 @@ namespace
         if (s.received_start == s.received.size())
         {
             // a tunnel lives long, mostly idle: once it's read all it received, it doesn't keep more memory than DATA
-            // that keeps up with its reader needs (a frame or two), whatever a burst took.
-            if (s.tunnel != nullptr && s.received.capacity() > tunnel_kept) s.received = {};
+            // that keeps up with its reader needs (a frame or two), whatever a burst took. (A new vector: `= {}` would
+            // assign an empty initializer_list, which keeps the capacity.)
+            if (s.tunnel != nullptr && s.received.capacity() > tunnel_kept) s.received = std::vector<std::byte>{};
             else s.received.clear();
             s.received_start = 0;
         }
