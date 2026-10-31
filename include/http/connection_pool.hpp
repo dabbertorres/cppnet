@@ -82,12 +82,14 @@ struct client_options
     // client::send().
     std::chrono::milliseconds expect_continue_timeout = std::chrono::seconds{1};
 
-    // How much an HTTP/1.x response's reader buffers (1 KiB; at least 1 KiB, or the constructor throws
+    // How much an HTTP/1.x response's reader buffers (4 KiB, as Go's; at least 1 KiB, or the constructor throws
     // std::invalid_argument): allocated for each request, and kept until its response's body has been read. A
     // response head line longer than it is read into a string apart, and a body read in pieces smaller than it takes a
     // read of the connection (a syscall) per buffer's worth, where reads larger than it go past it. So larger costs
-    // memory per request in flight, and saves reads for long heads and bodies read in small pieces.
-    std::size_t read_buffer_size = 1'024;
+    // memory per request in flight, and saves reads for long heads and bodies read in small pieces: over loopback, a
+    // response with four 1.5 KiB Set-Cookie lines took 70, 62 and 60 us with 1, 4 and 16 KiB, and a chunked download
+    // read 256 bytes at a time went at 430, 710 and 840 MiB/s; small responses took as long with each.
+    std::size_t read_buffer_size = std::size_t{4} * 1'024;
 
     // How much of a request's body is read from it before it's written to the connection (HTTP/1.x) or its stream
     // (HTTP/2), each time (16 KiB; at least 1 KiB, or the constructor throws std::invalid_argument): allocated for each

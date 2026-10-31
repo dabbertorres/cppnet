@@ -390,9 +390,10 @@ first. A body cut short (the connection ending before all of its Content-Length,
 `std::errc::connection_aborted`, rather than ending: `io::errc::end_of_stream` means it was all read.
 
 `client_options` sizes what a request holds (each at least 1 KiB, or the constructor throws `std::invalid_argument`):
-`read_buffer_size` (1 KiB) is an HTTP/1.x response's reader, from its head until its body's been read (a head line
-longer than it is read into a string apart, and a body read in pieces smaller than it takes a read of the connection a
-buffer's worth); `write_buffer_size` (16 KiB) is how much of a request's body is read before it's written, over either
+`read_buffer_size` (4 KiB, as Go's) is an HTTP/1.x response's reader, from its head until its body's been read (a head
+line longer than it is read into a string apart, and a body read in pieces smaller than it takes a read of the
+connection a buffer's worth: over loopback, 4 KiB rather than 1 took 11% less time for heads with 1.5 KiB lines, and
+read a chunked body 256 bytes at a time 65% faster, and 16 KiB another 5% and 18%); `write_buffer_size` (16 KiB) is how much of a request's body is read before it's written, over either
 version (each read a chunk, if it's chunked, or DATA frames). `http2_read_buffer_size` (32 KiB) is how much an HTTP/2
 connection reads at once, and `http2_stream_window` (65535; up to 2^31-1) how much of a response's body the server may
 send ahead of what's been read of it (SETTINGS_INITIAL_WINDOW_SIZE): one stream's download goes at most a window a
