@@ -888,9 +888,13 @@ coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease 
         opened = co_await open_connection(std::move(conn));
         if (opened)
         {
-            // TLS chooses HTTP/2 with ALPN; over cleartext, serve_requests() looks for its preface.
+            // TLS chooses HTTP/2 with ALPN; over cleartext, serve_requests() looks for its preface, and returns what it
+            // read once its HTTP/1.x state is gone.
+            // NOTE: serve_requests()'s frame (which holds that state) must be its own, freed as it returns, rather than
+            //       elided into this one: Clang 23 doesn't elide it while its result's used (-Rpass-missed=coro-elide).
             if (http2_enabled && detail::alpn(*opened) == "h2"sv) co_await serve_http2(*opened, {});
-            else co_await serve_requests(*opened);
+            else if (auto prefaced = co_await serve_requests(*opened))
+                co_await serve_http2(*opened, std::move(*prefaced));
         }
     }
     catch (const std::exception& ex)
@@ -963,7 +967,7 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
 
 // NOTE: each request is served here, rather than by coroutines of its own (see below), so it's long.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-coro::task<> server::serve_requests(detail::connection& conn)
+coro::task<std::optional<std::vector<std::byte>>> server::serve_requests(detail::connection& conn)
 {
     // close() ends the connection gracefully: at once if it's waiting for a request, or after the request it's serving
     // (see connection_state::phase). abort() (and the destructor) ends it either way.
@@ -989,8 +993,11 @@ coro::task<> server::serve_requests(detail::connection& conn)
         detail::socket_of(conn).set_read_deadline(deadline);
         if (co_await starts_with_preface(state.reader))
         {
-            co_await serve_prefaced(conn, state);
-            co_return;
+            // HTTP/2 is served once this returns (see serve_connection()), with what was read: so the connection
+            // doesn't keep its HTTP/1.x state (its buffers, and this frame) for its life. Unless close() came first.
+            if (!state.hand_over()) co_return std::nullopt;
+            const auto read = state.reader.buffered();
+            co_return std::optional<std::vector<std::byte>>{std::in_place, read.begin(), read.end()};
         }
     }
 
@@ -1100,7 +1107,7 @@ coro::task<> server::serve_requests(detail::connection& conn)
         if (rw.switched())
         {
             if (!state.tunnel.was_aborted()) co_await state.writer.flush();
-            co_return;
+            co_return std::nullopt;
         }
 
         if (!co_await default_response(state, rw))
@@ -1204,15 +1211,10 @@ coro::task<> server::serve_requests(detail::connection& conn)
     }
 
     co_await state.writer.flush();
+    co_return std::nullopt;
 }
 
-coro::task<> server::serve_prefaced(detail::connection& conn, connection_state& state)
-{
-    if (!state.hand_over()) return coro::ready_task<>();
-    return serve_http2(conn, state.reader.buffered());
-}
-
-coro::task<> server::serve_http2(detail::connection& conn, std::span<const std::byte> already_read)
+coro::task<> server::serve_http2(detail::connection& conn, std::vector<std::byte> already_read)
 {
     // HTTP/2's reader waits for as long as the connection's open: its streams, and the connection, have timeouts of
     // their own.
@@ -1222,7 +1224,7 @@ coro::task<> server::serve_http2(detail::connection& conn, std::span<const std::
 
     co_await detail::serve_http2(scheduler,
                                  conn,
-                                 already_read,
+                                 std::move(already_read),
                                  http2_config,
                                  handler,
                                  *logger,

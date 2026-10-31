@@ -7,7 +7,6 @@
 #include <exception>
 #include <memory>
 #include <optional>
-#include <span>
 #include <stop_token>
 #include <string>
 #include <system_error>
@@ -213,14 +212,12 @@ private:
 #endif
 
     // serve_requests reads and responds to conn's HTTP/1.x requests, until it closes (or should be); or if it starts
-    // with HTTP/2's preface (and http2 is on), serves it as HTTP/2.
-    coro::task<> serve_requests(detail::connection& conn);
-
-    // serve_prefaced serves conn, which started with HTTP/2's preface, as HTTP/2: unless the server was closed first.
-    coro::task<> serve_prefaced(detail::connection& conn, connection_state& state);
+    // with HTTP/2's preface (and http2 is on), returns what was read of it, to serve as HTTP/2 (unless the server was
+    // closed first).
+    coro::task<std::optional<std::vector<std::byte>>> serve_requests(detail::connection& conn);
 
     // serve_http2 serves conn as HTTP/2, already_read being what was read of it to tell.
-    coro::task<> serve_http2(detail::connection& conn, std::span<const std::byte> already_read);
+    coro::task<> serve_http2(detail::connection& conn, std::vector<std::byte> already_read);
 
     // head_deadline is how long a connection may take to send the next request's head, or finish its TLS handshake
     // (see header_read_timeout).

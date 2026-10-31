@@ -831,12 +831,11 @@ void http2_connection_base::stop_all(std::vector<std::stop_source>& sources) con
     sources.clear();
 }
 
-coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
+coro::task<> http2_connection_base::run(std::vector<std::byte> pending)
 {
     (void)workers.spawn(write_loop());
     (void)workers.spawn(timer_loop());
 
-    std::vector<std::byte> pending(already_read.begin(), already_read.end());
     std::vector<std::byte> buffer(read_size);
 
     auto&           reader   = as_reader(conn);

@@ -240,7 +240,7 @@ namespace
             , peer_certs{peer_certificates(conn)}
         {}
 
-        coro::task<> serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort);
+        coro::task<> serve(std::vector<std::byte> already_read, std::stop_token stop, std::stop_token abort);
 
         // closing is the server's close() token (serve()'s stop), for the streams' tunnels.
         [[nodiscard]] const std::stop_token& closing() const noexcept { return closing_token; }
@@ -498,7 +498,7 @@ namespace
 {
 
     coro::task<>
-    http2_server_connection::serve(std::span<const std::byte> already_read, std::stop_token stop, std::stop_token abort)
+    http2_server_connection::serve(std::vector<std::byte> already_read, std::stop_token stop, std::stop_token abort)
     {
         // close() (stop) ends the connection gracefully; and the streams' tunnels, by themselves (e.g. a WebSocket's
         // close, going away), which the drain then waits for, as for any stream.
@@ -527,7 +527,7 @@ namespace
                 logger.debug("failed to send ORIGIN: {}", err.message());
         }
 
-        co_await run(already_read);
+        co_await run(std::move(already_read));
     }
 
     void http2_server_connection::stop_handlers()
@@ -1030,14 +1030,14 @@ namespace
 
 }
 
-coro::task<> serve_http2(io::scheduler*             scheduler,
-                         connection&                conn,
-                         std::span<const std::byte> already_read,
-                         const http2_options&       options,
-                         const request_handler&     handler,
-                         spdlog::logger&            logger,
-                         std::stop_token            stop,
-                         std::stop_token            abort)
+coro::task<> serve_http2(io::scheduler*         scheduler,
+                         connection&            conn,
+                         std::vector<std::byte> already_read,
+                         const http2_options&   options,
+                         const request_handler& handler,
+                         spdlog::logger&        logger,
+                         std::stop_token        stop,
+                         std::stop_token        abort)
 {
     // TCP_NOTSENT_LOWAT, now that it's HTTP/2: the kernel then holds little more than what's in flight, and the writer
     // waits for it to take more before framing more, so what's past the scheduler's reordering is the mark and a round.
@@ -1050,7 +1050,7 @@ coro::task<> serve_http2(io::scheduler*             scheduler,
     }
 
     http2_server_connection c{scheduler, conn, options, handler, logger, marked};
-    co_await c.serve(already_read, std::move(stop), std::move(abort));
+    co_await c.serve(std::move(already_read), std::move(stop), std::move(abort));
 }
 
 }

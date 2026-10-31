@@ -592,8 +592,8 @@ public:
     coro::task<bool> wait_queued(std::size_t n);
 
 protected:
-    // run runs the connection until it ends (when the peer closes it, or it fails, or end() is called): already_read
-    // is what was read of it before. Once it's ending, the writer writes what's left and shuts the connection down
+    // run runs the connection until it ends (when the peer closes it, or it fails, or end() is called): pending is what
+    // was read of it before. Once it's ending, the writer writes what's left and shuts the connection down
     // (shutdown(): close_notify over TLS, then FIN), so the peer sees it end at once, while the reader goes on reading
     // (and dropping) what the peer still sends, until it closes its side too, or for linger_time; then it waits for the
     // writer and the timer, and only then awaits finish_streams() (e.g. the server's handlers, which may take a while).
@@ -601,7 +601,7 @@ protected:
     // NOTE: the reader lingers as closing a socket with input unread (or, on macOS, input arriving after shutting down
     //       its reading side) resets the connection, and a reset discards what's still on its way to the peer: e.g.
     //       the end of a response, while the client sends WINDOW_UPDATEs for what it's read of it.
-    coro::task<> run(std::span<const std::byte> already_read);
+    coro::task<> run(std::vector<std::byte> pending);
 
     // add_stream and remove_stream register a stream for the events and timeouts (holding the lock). remove_stream
     // gives the peer back what the stream received but wasn't read.
