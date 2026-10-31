@@ -1469,6 +1469,64 @@ The rest didn't move beyond their noise. What's left against HTTP/1.1, for large
 turn: a frame for `write_waiting()` and another for `buffered_writer::flush()`), which making a stream's waiting write
 an operation too would halve; in flight, still about twice HTTP/1.1's time (the HTTP/2 path's CPU, above).
 
+## Learned after stage 9: chunked receive buffers
+
+What was left of large messages' allocations over HTTP/2 (21 against HTTP/1.1's 10, one at a time) was mostly a
+stream's `received`, a vector that grew by doubling as a message came in (12, 28, 56, then 112 KiB, each side) and,
+once drained, was freed if it was over 32 KiB, so it grew again for every message. Keeping 64 KiB of it would have held
+about 80 KiB more per idle WebSocket (above). It's now a list of chunks, as Go's `dataBuffer`: `received_data`, 16 KiB
+`received_chunk`s (a default-size DATA frame; the link and the bytes in one allocation, uninitialized), taken from the
+connection's `chunk_pool` as DATA arrives and given back as each is read to its end, so a stream holds what's unread
+and nothing once it's read it all. DATA spans chunks (we advertise the default MAX_FRAME_SIZE, so a frame spans at
+most two), and so do reads; a read that waits still takes DATA straight into its span, and one that finds data is still
+a ready task. The compaction (moving what's left to the front once half was read) and `tunnel_kept` are gone.
+
+The pool is what makes steady traffic allocate nothing, and what it keeps is what an idle connection holds, so two
+things bound it:
+
+- A limit, `16 + 1 per stream` (`chunk_pool::limit_for()`), past which chunks given back are freed. Measured: a fixed 4
+  had the streams of a busy connection allocate and free chunks over and over, more than the vectors had (64 WebSockets
+  over HTTP/2, 64 KiB one at a time: 30.3 allocations against 25.4; `bench_request`'s 8 streams at once 61.1 against
+  56.2); 16 took the single WebSocket's to 13.0 one at a time and 11.5 in flight; one more per stream helped the
+  parallel runs (64 at once, one at a time: 20 to 21 against 23 to 28 with 16 alone, noisy), and two or four more
+  gained nothing.
+- Trimming, as Go's `sync.Pool` is emptied over two GC cycles: the connection's timer, once a second while the pool
+  keeps any (`trim_later()`, `trim_chunks()`), frees as many as the fewest it kept since the last trim
+  (`chunk_pool::trim()`), so the chunks traffic takes stay, and an idle connection holds none within 2 s. Without it,
+  whatever the limit, a connection carrying one WebSocket would keep the 4 or 5 chunks (64 to 80 KiB) a 64 KiB message
+  took: the 80 KiB above, per connection rather than per stream.
+
+Small bodies don't need size classes (Go has 1 to 16 KiB): a few bytes that arrive before their reader waits take a
+chunk from the pool, so `bench_request`'s HTTP/2 stream at a time (a 13 B response) went from 38 allocations to 37,
+and the chunk's 16 KiB are the pool's, not the stream's.
+
+Numbers (Release, two workers; the base and this build, three runs each, interleaved, best of five within a run;
+`bench_websocket` now also measures the heap 2.5 s after the parallel runs, as the base's build did too):
+
+| Row                                              | before                 | after                  | HTTP/1.1, after |
+|--------------------------------------------------|------------------------|------------------------|-----------------|
+| HTTP/2, 16 B, one at a time                      | 32.7 to 33.0 us, 4     | 32.4 to 32.8, 4        | 27.7 to 28.2, 4 |
+| HTTP/2, 64 KiB, one at a time                    | 118 to 121 us, 21.0    | 112 to 114, 13.0       | 97 to 99, 10.0  |
+| HTTP/2, 64 KiB, in flight                        | 65.8 to 67.3 us, 15.7 to 15.8 | 59.1 to 60.5, 11.5 | 37.0 to 37.1, 7.1 |
+| 8 over HTTP/2, 64 KiB, one at a time             | 60.2 to 64.0 us, 20.4 to 20.8 | 56.1 to 58.4, 13.0 to 13.4 | 52.7 to 53.5, 10.0 |
+| 8 over HTTP/2, 64 KiB, in flight                 | 65.2 to 66.7 us, 25.1 to 25.3 | 60.3 to 63.2, 20.5 to 21.4 | 37.5 to 38.9, 7.1 |
+| 64 over HTTP/2, 64 KiB, one at a time            | 68.6 to 81.0 us, 25.1 to 30.6 | 64.8 to 72.8, 21.4 to 27.1 | 58.5 to 60.0, 10.2 |
+| 64 over HTTP/2, 64 KiB, in flight                | 77.3 to 78.7 us, 31.7 to 32.0 | 66.3 to 68.8, 28.3 to 28.8 | 41.3 to 44.3, 7.4 |
+| 8 over HTTP/2, KiB per WebSocket after the runs  | 250 to 356             | 326 to 341             |                 |
+| ... and 2.5 s later                              | 250 to 356             | 229 to 242             |                 |
+| 64 over HTTP/2, KiB per WebSocket after the runs | 141 to 150             | 177 to 178             |                 |
+| ... and 2.5 s later                              | 141 to 150             | 135 to 136             |                 |
+| `bench_request`, HTTP/2 a stream at a time       | 65.9 to 68.8 us, 38    | 65.2 to 66.5, 37       |                 |
+| `bench_request`, 8 streams at once               | 1161 to 1204 us, 56.2  | 1106 to 1175, 54.6     |                 |
+| `bench_request`, 8 request bodies at once        | 1295 to 1337 us, 93.9 to 94.0 | 1273 to 1328, 91.4 to 91.5 |       |
+
+The rest (HTTP/1.1, small messages, `bench_request`'s HTTP/1.1 rows) didn't move beyond their noise. Right after the
+runs, the pools hold what the runs took (up to the limit: about 30 KiB more per WebSocket with 64 at once); 2.5 s later
+they hold none, and a WebSocket holds less than before (the vectors kept up to 32 KiB each, for good). What's left
+against HTTP/1.1 for large messages is the writes that wait (the client's write past `max_ahead`: `write_waiting()`'s
+frame, `buffered_writer::flush()`'s and the WebSocket's `flush_and_release()`'s: the 3 one at a time has over
+HTTP/1.1's; with many WebSockets, writes waiting their turn), and in flight the HTTP/2 path's CPU (above).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:

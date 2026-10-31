@@ -60,8 +60,10 @@ namespace
     // connection's window, which bounds all the streams' together.
     constexpr std::uint32_t tunnel_window = std::uint32_t{256} * 1'024;
 
-    // How much of what a tunnel's stream received it keeps room for once it's all read (see take_received()).
-    constexpr std::size_t tunnel_kept = std::size_t{32} * 1'024;
+    // How often the timer trims a connection's free chunks (see chunk_pool::trim()): those none took for as long are
+    // freed, so steady traffic (e.g. a WebSocket's messages, coming every second or more often) reuses them, and an
+    // idle connection holds none within twice this.
+    constexpr auto trim_interval = std::chrono::seconds{1};
 
     // How much output may be waiting for the writer before streams' writes wait for it to catch up.
     constexpr std::size_t max_output = std::size_t{1} << 20;
@@ -160,6 +162,116 @@ template std::error_code append_fields(const trailer_fields&      from,
                                        std::vector<hpack::field>& fields,
                                        field_section              section);
 
+chunk_pool::~chunk_pool()
+{
+    while (first != nullptr) delete std::exchange(first, first->next);
+}
+
+received_chunk* chunk_pool::take()
+{
+    // NOTE: new, not make_unique (nor new received_chunk{}), which would zero the bytes, that are written before
+    //       they're read.
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory): the chunk's owned by its list (see received_data).
+    if (first == nullptr) return new received_chunk;
+
+    auto* chunk = std::exchange(first, first->next);
+    chunk->next = nullptr;
+    --count;
+    fewest = std::min(fewest, count);
+    return chunk;
+}
+
+void chunk_pool::give(received_chunk* chunk) noexcept
+{
+    if (count >= limit)
+    {
+        delete chunk; // NOLINT(cppcoreguidelines-owning-memory): the pool's own, given back
+        return;
+    }
+
+    chunk->next = std::exchange(first, chunk);
+    ++count;
+}
+
+void chunk_pool::set_limit(std::size_t n) noexcept
+{
+    limit = n;
+    for (; count > limit; --count) delete std::exchange(first, first->next); // NOLINT(cppcoreguidelines-owning-memory)
+    fewest = std::min(fewest, count);
+}
+
+bool chunk_pool::trim() noexcept
+{
+    for (; fewest > 0; --fewest, --count)
+        delete std::exchange(first, first->next); // NOLINT(cppcoreguidelines-owning-memory)
+    fewest = count;
+    return count > 0;
+}
+
+received_data::~received_data()
+{
+    while (head != nullptr) delete std::exchange(head, head->next); // NOLINT(cppcoreguidelines-owning-memory)
+}
+
+void received_data::append(std::span<const std::byte> data, chunk_pool& pool)
+{
+    while (!data.empty())
+    {
+        if (tail == nullptr || end == received_chunk::capacity)
+        {
+            auto* chunk = pool.take();
+            if (tail == nullptr) head = chunk;
+            else tail->next = chunk;
+            tail = chunk;
+            end  = 0;
+        }
+
+        const auto n = std::min(data.size(), received_chunk::capacity - end);
+        std::ranges::copy(data.first(n), tail->bytes.begin() + static_cast<std::ptrdiff_t>(end));
+        end += n;
+        count += n;
+        data = data.subspan(n);
+    }
+}
+
+std::size_t received_data::take(std::span<std::byte> into, chunk_pool& pool) noexcept
+{
+    std::size_t taken = 0;
+    while (taken < into.size() && count > 0)
+    {
+        // the head's written up to end if it's the tail, otherwise to the end of its bytes.
+        const auto written = head == tail ? end : received_chunk::capacity;
+        const auto n       = std::min(into.size() - taken, written - start);
+        std::ranges::copy(std::span{head->bytes}.subspan(start, n), into.begin() + static_cast<std::ptrdiff_t>(taken));
+        start += n;
+        taken += n;
+        count -= n;
+
+        // read to its end: back to the pool, as the next DATA may well need it (or another stream's).
+        if (start == written)
+        {
+            auto* drained = std::exchange(head, head->next);
+            if (head == nullptr)
+            {
+                tail = nullptr;
+                end  = 0;
+            }
+            start = 0;
+            pool.give(drained);
+        }
+    }
+    return taken;
+}
+
+void received_data::clear(chunk_pool& pool) noexcept
+{
+    while (head != nullptr) pool.give(std::exchange(head, head->next));
+    tail  = nullptr;
+    start = 0;
+    end   = 0;
+    count = 0;
+}
+
 namespace
 {
 
@@ -170,25 +282,8 @@ namespace
         // (a tunnel's read that waited has its time: the timer needn't wake it.)
         if (s.tunnel != nullptr) s.tunnel->wake_at.reset();
 
-        const auto n = std::min(data.size(), s.received.size() - s.received_start);
-        std::ranges::copy(std::span{s.received}.subspan(s.received_start, n), data.begin());
-        s.received_start += n;
-        if (s.received_start == s.received.size())
-        {
-            // a tunnel lives long, mostly idle: once it's read all it received, it doesn't keep more memory than DATA
-            // that keeps up with its reader needs (a frame or two), whatever a burst took. (A new vector: `= {}` would
-            // assign an empty initializer_list, which keeps the capacity.)
-            if (s.tunnel != nullptr && s.received.capacity() > tunnel_kept) s.received = std::vector<std::byte>{};
-            else s.received.clear();
-            s.received_start = 0;
-        }
-        else if (s.received_start >= s.received.size() / 2)
-        {
-            // a reader that never catches up mustn't keep all it's read: what's left moves to the front, so the buffer
-            // holds at most about twice the stream's window.
-            s.received.erase(s.received.begin(), s.received.begin() + static_cast<std::ptrdiff_t>(s.received_start));
-            s.received_start = 0;
-        }
+        const auto n = s.received.take(data, s.conn->chunks);
+        s.conn->trim_later();
 
         // the peer may send as much more.
         s.conn->session.consume(s.id, n);
@@ -219,7 +314,7 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
         std::scoped_lock lock{c.mu};
         auto&            s = *stream;
 
-        if (s.received_start == s.received.size())
+        if (s.received.empty())
         {
             if (!waiting.claim(data))
                 return coro::ready_task<io::result>(
@@ -260,7 +355,7 @@ bool stream_read::claim(std::span<std::byte> into) noexcept
 bool stream_read::ready()
 {
     auto& s = *stream;
-    if (filled > 0 || s.received_start < s.received.size()) return true;
+    if (filled > 0 || !s.received.empty()) return true;
 
     if (s.received_end) err = make_error_code(io::errc::end_of_stream);
     else if (s.failure) err = s.failure;
@@ -339,7 +434,7 @@ io::result stream_read::result() noexcept
             c.session.consume(s.id, filled);
             res.count = filled;
         }
-        else if (s.received_start < s.received.size())
+        else if (!s.received.empty())
         {
             res.count = take_received(s, data);
         }
@@ -705,6 +800,14 @@ void http2_connection_base::wake_timer_at(io::clock::time_point at)
     if (!timer_target.has_value() || at < *timer_target) wake_timer();
 }
 
+void http2_connection_base::trim_later()
+{
+    if (trim_at.has_value() || chunks.size() == 0) return;
+
+    trim_at = io::clock::now() + trim_interval;
+    wake_timer_at(*trim_at);
+}
+
 void http2_connection_base::stop_pending()
 {
     std::vector<std::stop_source> sources;
@@ -835,7 +938,11 @@ bool http2_connection_base::receive(std::vector<std::byte>& pending)
     return go_on;
 }
 
-void http2_connection_base::add_stream(http2_stream_base& s) { active.emplace(s.id, &s); }
+void http2_connection_base::add_stream(http2_stream_base& s)
+{
+    active.emplace(s.id, &s);
+    chunks.set_limit(chunk_pool::limit_for(active.size()));
+}
 
 void http2_connection_base::remove_stream(http2::stream_id id)
 {
@@ -845,12 +952,13 @@ void http2_connection_base::remove_stream(http2::stream_id id)
     // what the stream received that no one read is given back, or the connection's window would shrink for good (the
     // session gives back only the connection's, if it's done with the stream).
     auto& s = *it->second;
-    if (const auto unread = s.received.size() - s.received_start; unread > 0) session.consume(id, unread);
-    s.received.clear();
-    s.received_start = 0;
+    if (const auto unread = s.received.size(); unread > 0) session.consume(id, unread);
+    s.received.clear(chunks);
     send_order.remove(s);
 
     active.erase(it);
+    chunks.set_limit(chunk_pool::limit_for(active.size()));
+    trim_later();
 }
 
 void http2_connection_base::on_data(http2::stream_id id, std::span<const std::byte> data, bool end_stream)
@@ -866,8 +974,8 @@ void http2_connection_base::on_data(http2::stream_id id, std::span<const std::by
     // straight into the span of a read that's waiting, if nothing's received before it: what doesn't fit is kept
     // for the next.
     auto& s = *it->second;
-    if (s.reading != nullptr && s.received_start == s.received.size()) data = s.reading->take(data);
-    s.received.insert(s.received.end(), data.begin(), data.end());
+    if (s.reading != nullptr && s.received.empty()) data = s.reading->take(data);
+    s.received.append(data, chunks);
     if (end_stream) s.received_end = true;
     s.read_deadline.reset();
     s.wake_reader();
@@ -1072,6 +1180,8 @@ coro::task<> http2_connection_base::timer_loop()
                 // the timer would spin until it's back. (The writer's woken below, each time, to frame the others.)
                 if (turn_held != 0 && turn_held_until <= now) turn_held = 0;
                 if (turn_held != 0 && (!next.has_value() || turn_held_until < *next)) next = turn_held_until;
+
+                trim_chunks(now, next);
             }
 
             // (perhaps ended just now:) the reader lingers until linger_until (see run()).
@@ -1100,6 +1210,19 @@ coro::task<> http2_connection_base::timer_loop()
         const auto err = co_await scheduler->wait_on(timer_word, seen, next);
         if (err == std::errc::operation_canceled) break;
     }
+}
+
+void http2_connection_base::trim_chunks(io::clock::time_point now, std::optional<io::clock::time_point>& next)
+{
+    if (!trim_at.has_value()) return;
+
+    // the next trim's due while some are kept.
+    if (*trim_at <= now)
+    {
+        if (chunks.trim()) trim_at = now + trim_interval;
+        else trim_at.reset();
+    }
+    if (trim_at.has_value() && (!next.has_value() || *trim_at < *next)) next = trim_at;
 }
 
 std::optional<io::clock::time_point> http2_connection_base::check_streams(io::clock::time_point now)

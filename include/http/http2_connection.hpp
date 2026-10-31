@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <coroutine>
@@ -92,6 +93,106 @@ private:
 #ifndef NDEBUG
     std::atomic<std::thread::id> owner{};
 #endif
+};
+
+// received_chunk is a piece of what a stream's received and not yet read (see received_data): a default-size DATA
+// frame's worth of bytes, and the link to the next piece, in one allocation. Its bytes aren't initialized: they're
+// written before they're read.
+// NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes, deliberately.
+struct received_chunk
+{
+    static constexpr std::size_t capacity = std::size_t{16} * 1'024;
+
+    received_chunk*                 next = nullptr;
+    std::array<std::byte, capacity> bytes;
+};
+
+// chunk_pool is a connection's free received_chunks, which its streams take as DATA arrives and give back as they're
+// read, so steady traffic reuses them rather than allocating. It keeps at most its limit (freeing the rest), which the
+// connection sets from how many streams it has (see limit_for()), and the connection's timer trims it (see trim()), so
+// an idle connection soon holds none. Guarded by the connection's lock; it frees what it keeps when it's destroyed.
+class chunk_pool
+{
+public:
+    // How many free chunks a connection keeps: 16 (256 KiB, what a tunnel's stream may hold unread, see stream_tunnel),
+    // and one more for each of its streams, so busy streams reuse what one another give back. (Measured with
+    // bench_websocket and bench_request: 4, or 4 and one a stream, had the streams of a busy connection allocate
+    // chunks again and again, more than the vectors these replaced; more per stream gained nothing.)
+    static constexpr std::size_t base_free       = 16;
+    static constexpr std::size_t free_per_stream = 1;
+
+    // limit_for is the limit for a connection with streams streams.
+    [[nodiscard]] static constexpr std::size_t limit_for(std::size_t streams) noexcept
+    {
+        return base_free + (free_per_stream * streams);
+    }
+
+    chunk_pool() = default;
+
+    chunk_pool(const chunk_pool&)            = delete;
+    chunk_pool& operator=(const chunk_pool&) = delete;
+    chunk_pool(chunk_pool&&)                 = delete;
+    chunk_pool& operator=(chunk_pool&&)      = delete;
+    ~chunk_pool();
+
+    // take is a free chunk, or a new one if none is (whose bytes aren't initialized).
+    [[nodiscard]] received_chunk* take();
+
+    // give takes a chunk back: kept if fewer than the limit are, freed otherwise.
+    void give(received_chunk* chunk) noexcept;
+
+    // set_limit sets how many free chunks it keeps, freeing those past it.
+    void set_limit(std::size_t n) noexcept;
+
+    // trim frees the chunks it's kept since the last trim that none took (as many as the fewest it kept meanwhile),
+    // returning whether it keeps any: called periodically, it keeps what traffic takes, and frees the rest within two
+    // periods.
+    bool trim() noexcept;
+
+    // size is how many free chunks it keeps.
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+
+private:
+    received_chunk* first  = nullptr;
+    std::size_t     count  = 0;
+    std::size_t     fewest = 0; // since the last trim
+    std::size_t     limit  = limit_for(0);
+};
+
+// received_data is what a stream's received and not yet read: a list of chunks from its connection's chunk_pool, each
+// given back as it's read to its end, so it holds no more than what's unread needs (an idle stream, nothing). DATA may
+// span chunks, as may a read. It frees the chunks it still holds when it's destroyed (a stream may outlive its
+// connection), so a stream that's done gives them back first (clear()), holding the connection's lock.
+class received_data
+{
+public:
+    received_data() = default;
+
+    received_data(const received_data&)            = delete;
+    received_data& operator=(const received_data&) = delete;
+    received_data(received_data&&)                 = delete;
+    received_data& operator=(received_data&&)      = delete;
+    ~received_data();
+
+    [[nodiscard]] bool        empty() const noexcept { return count == 0; }
+    [[nodiscard]] std::size_t size() const noexcept { return count; }
+
+    // append adds data after what's there, taking chunks from pool as it needs them.
+    void append(std::span<const std::byte> data, chunk_pool& pool);
+
+    // take moves as much as fits into into, from the front, giving the chunks it's read to their ends back to pool,
+    // and returns how much it took.
+    std::size_t take(std::span<std::byte> into, chunk_pool& pool) noexcept;
+
+    // clear drops what's there, giving its chunks back to pool.
+    void clear(chunk_pool& pool) noexcept;
+
+private:
+    received_chunk* head  = nullptr; // read from start
+    received_chunk* tail  = nullptr; // written up to end
+    std::size_t     start = 0;
+    std::size_t     end   = 0;
+    std::size_t     count = 0; // what's unread, over all the chunks
 };
 
 // stream_read is a stream_reader's read that has to wait for what its stream's to receive: an operation (see
@@ -196,12 +297,12 @@ private:
 // (RFC 8441), its DATA both ways is the tunnel's protocol's (e.g. a WebSocket's), read and written through buffers of
 // 4 KiB each way over the stream's own reader and writer (so frame headers and small messages are gathered, and large
 // payloads go past them, straight to the stream, and from it). Its stream's window is wider than a request's, as a
-// socket's buffers are (256 KiB: see the constructor), so a large message goes without waiting for a WINDOW_UPDATE; and
-// once it's read all its stream received, it keeps no more room for what's to come than a frame or two needs, whatever
-// a burst took. A read that waits is limited by the tunnel's own timeout and deadline, and canceled by its stop token,
-// failing having read nothing while the stream goes on (as a socket's would), where the stream's own timeouts reset it:
-// a read asks check_wait() before it waits, and again whenever it's woken (see stream_read): by the connection's timer
-// at wake_at, by a deadline set meanwhile, or by stop.
+// socket's buffers are (256 KiB: see the constructor), so a large message goes without waiting for a WINDOW_UPDATE;
+// what its stream holds of it meanwhile is what's unread (see received_data), whatever a burst took. A read that waits
+// is limited by the tunnel's own timeout and deadline, and canceled by its stop token, failing having read nothing
+// while the stream goes on (as a socket's would), where the stream's own timeouts reset it: a read asks check_wait()
+// before it waits, and again whenever it's woken (see stream_read): by the connection's timer at wake_at, by a deadline
+// set meanwhile, or by stop.
 //
 // A stream's tunnel is its stream's: made once (holding the connection's lock; its maker then wakes the writer, for the
 // window's WINDOW_UPDATE), and destroyed with it, holding the lock too, so its stop token (see set_stop_token()) must
@@ -295,9 +396,8 @@ public:
     http2_connection_base* conn;
     http2::stream_id       id;
 
-    std::vector<std::byte> received; // DATA not read yet, from received_start (before it, what's read)
-    std::size_t            received_start = 0;
-    bool                   received_end   = false;
+    received_data received; // DATA not read yet
+    bool          received_end = false;
 
     // The trailers received (those that may be: see trailer_allowed()), held until the reader reaches the end of what
     // was received, which moves them to trailers_to, if it's set (e.g. a request's): so whoever looks at them does on
@@ -407,6 +507,7 @@ public:
     // Used by the streams, holding the lock.
     connection_mutex mu;
     http2::session   session;
+    chunk_pool       chunks; // for what the streams receive (see received_data)
 
     // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
     // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
@@ -452,6 +553,10 @@ public:
 
     // wake_timer_at tells the timer of a time it's to act at (holding the lock): e.g. a tunnel's read's wake_at.
     void wake_timer_at(io::clock::time_point at);
+
+    // trim_later has the timer trim chunks (see chunk_pool::trim()) while it keeps some (holding the lock): called once
+    // chunks have been given back to it.
+    void trim_later();
 
     // get_logger is the connection's logger (e.g. for what its streams' heads and ends drop).
     [[nodiscard]] spdlog::logger& get_logger() const noexcept { return logger; }
@@ -570,6 +675,10 @@ private:
     coro::task<>                         timer_loop();
     std::optional<io::clock::time_point> check_streams(io::clock::time_point now);
 
+    // trim_chunks trims chunks if it's time (see trim_later()), bringing next forward to the next trim if that's sooner
+    // (holding the lock).
+    void trim_chunks(io::clock::time_point now, std::optional<io::clock::time_point>& next);
+
     // fill submits DATA from the streams waiting in the scheduler, a frame at a time in their order, until max_ahead
     // of DATA waits for the writer, or none is ready (has a window); it wakes each stream whose write it's all framed
     // (holding the lock). A stream whose write it's framed keeps its turn for its writer's next write, briefly
@@ -616,6 +725,7 @@ private:
     bool                                 reader_done = false; // it's stopped lingering
     io::clock::time_point                linger_until;        // when the timer stops the reader, once ending
     std::optional<io::clock::time_point> timer_target;
+    std::optional<io::clock::time_point> trim_at; // when the timer next trims chunks, while it keeps some
 
     coro::notifier             writer_wakeup; // output to write, or the connection's ending
     std::atomic<std::uint64_t> timer_word{0}; // the timer's, for scheduler::wait_on()
