@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <compare>
 #include <coroutine>
 #include <cstdint>
@@ -297,23 +298,29 @@ void scheduler::run()
         // NOTE: the scope interrupts the loop once it has drained after being closed.
         if (stopping.load(std::memory_order::acquire) && scope.empty()) return;
 
-        poll(true, done);
+        poll(std::nullopt, done);
         resume(done);
         done.clear();
     }
 }
 
-void scheduler::poll(bool block, completions& done) noexcept
+void scheduler::poll(std::optional<std::chrono::nanoseconds> limit, completions& done) noexcept
 {
     std::array<ready_event, 64>    events{};
     std::optional<clock::duration> timeout = clock::duration::zero();
 
+    const bool block = !limit || *limit > std::chrono::nanoseconds::zero();
     if (block)
     {
         // A wait with an earlier deadline, from after next_deadline() looked, interrupts the loop: either it's in time
         // for the second look, or it sees what sleeping_until was set to in between (as both use sequential
         // consistency), and is earlier (see note_deadline()).
         auto next = next_deadline();
+        if (limit)
+        {
+            const auto until = clock::now() + std::chrono::duration_cast<clock::duration>(*limit);
+            next             = std::min(next, until.time_since_epoch().count());
+        }
         sleeping_until.store(next);
         next = std::min(next, next_deadline());
 

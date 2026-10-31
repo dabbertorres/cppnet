@@ -4,9 +4,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <thread>
 #include <type_traits>
@@ -37,9 +40,10 @@ public:
     class poller
     {
     public:
-        // poll waits for I/O (if block, until some is ready, or wake() is called), and adds the coroutines it readied
-        // to ready.
-        virtual void poll(bool block, std::vector<std::coroutine_handle<>>& ready) noexcept = 0;
+        // poll waits for I/O for up to timeout (none: until some is ready, or wake() is called; zero: not at all), and
+        // adds the coroutines it readied to ready.
+        virtual void poll(std::optional<std::chrono::nanoseconds> timeout,
+                          std::vector<std::coroutine_handle<>>&   ready) noexcept = 0;
 
         // wake makes a poll() that's blocked return (or the next one, if none is).
         virtual void wake() noexcept = 0;
@@ -111,12 +115,31 @@ public:
     [[nodiscard]] operation schedule();
 
     // resume queues handles to be resumed, all together (so, with one lock), returning how many it queued: none if
-    // the pool is shutting down.
+    // the pool is shutting down. From one of the pool's workers, the last of them goes in the worker's slot instead,
+    // to run next on it, once what it's running returns (or suspends), never inline: so a coroutine that resumes
+    // another, then waits, hands over to it without a thread waking up. (Tokio's LIFO slot, Go's runnext.) A worker
+    // runs its slot at most max_next_runs times in a row before what's queued; and one that runs a coroutine which
+    // doesn't return to it for long has its slot's coroutine queued for the others, by an idle worker that checks now
+    // and then (see watch_slots_locked()).
     template<RangeOf<std::coroutine_handle<>> R>
     std::size_t resume(const R& handles) noexcept
     {
-        std::size_t new_jobs = 0;
-        std::size_t woken    = 0;
+        auto* const             own = own_slot();
+        std::coroutine_handle<> next{nullptr};
+        bool                    rest = false;
+        for (const auto& handle : handles)
+        {
+            if (handle == nullptr) [[unlikely]]
+                continue;
+            if (own == nullptr || next != nullptr) rest = true;
+            if (own != nullptr) next = handle;
+        }
+
+        if (!rest) return own != nullptr && next != nullptr && put_next(*own, next) ? 1 : 0;
+
+        std::size_t new_jobs  = 0;
+        std::size_t displaced = 0;
+        std::size_t woken     = 0;
 
         {
             std::scoped_lock lock{wait_mutex};
@@ -124,7 +147,7 @@ public:
 
             for (const auto& handle : handles)
             {
-                if (handle != nullptr) [[likely]]
+                if (handle != nullptr && handle != next) [[likely]]
                 {
                     // NOTE: counted before it's queued, as a worker may finish it as soon as the lock is released.
                     num_jobs.fetch_add(1, std::memory_order::release);
@@ -133,11 +156,12 @@ public:
                 }
             }
 
-            woken = wake_locked(new_jobs);
+            if (own != nullptr && next != nullptr) displaced = put_next_locked(*own, next);
+            woken = wake_locked(new_jobs + displaced);
         }
 
         notify(woken);
-        return new_jobs;
+        return new_jobs + (next != nullptr ? 1 : 0);
     }
 
     bool resume(std::coroutine_handle<> handle) noexcept;
@@ -155,27 +179,74 @@ public:
     [[nodiscard]] bool on_worker() const noexcept;
 
 private:
+    // slot is a worker's slot for the coroutine it runs next (see resume()). Only its worker puts one in, and takes it
+    // out to run it; another takes it only to queue it, once it's been there too long (see watch_slots_locked()).
+    struct alignas(64) slot
+    {
+        std::atomic<void*>         next{nullptr}; // the coroutine's address
+        std::atomic<std::uint64_t> puts{0};       // how many it's been given, written before next
+    };
+
+    // seen_job is what watch_slots_locked() last saw in a slot.
+    struct seen_job
+    {
+        void*         next = nullptr;
+        std::uint64_t puts = 0;
+    };
+
+    // max_next_runs is how many times in a row a worker runs its slot's coroutine, rather than the queue's next: so
+    // coroutines handing over to each other don't hold up the queue, where what I/O readied waits. (Tokio's
+    // MAX_LIFO_POLLS_PER_TICK is 3: here a third run in a row slowed contended HTTP/2 request bodies, measurably.)
+    static constexpr std::size_t max_next_runs = 2;
+
     // poll_interval is how many jobs a worker runs before polling (if no one else is), even if more are queued, so
     // that I/O isn't held up by a queue that never empties. (Tokio's event_interval.)
     static constexpr std::size_t poll_interval = 61;
 
-    // watchdog_interval is how often the standby (see worker()) checks that someone's polling: so how long a coroutine
-    // that doesn't suspend can hold up I/O, when other workers are asleep. (Go's sysmon checks at most this often, once
-    // idle.)
+    // watchdog_interval is how often the standby (see sleep_locked()) checks that someone's polling: so how long a
+    // coroutine that doesn't suspend can hold up I/O, when other workers are asleep. (Go's sysmon checks at most this
+    // often, once idle.) It also bounds how long a coroutine waits in the slot of a worker that doesn't come back for
+    // it: from one interval to two.
     static constexpr std::chrono::milliseconds watchdog_interval{10};
 
-    void worker();
+    void worker(std::size_t index);
     void schedule(std::coroutine_handle<> /*handle*/);
+
+    // own_slot is the calling thread's slot, if it's one of the pool's workers (otherwise null).
+    [[nodiscard]] slot* own_slot() const noexcept;
+
+    // put_next puts handle in own (the calling worker's slot), queuing the coroutine it held, if any; it returns false
+    // if the pool is shutting down. put_next_locked does it holding wait_mutex, once running has been checked, and
+    // returns how many it queued, for the caller to wake workers for.
+    bool        put_next(slot& own, std::coroutine_handle<> handle) noexcept;
+    std::size_t put_next_locked(slot& own, std::coroutine_handle<> handle) noexcept;
+
+    // first_use_locked notes that a slot's been used, returning how many workers to wake for it (see slots_used).
+    std::size_t first_use_locked() noexcept;
+
+    // run_next runs own's coroutines, while there are any and runs (how many in a row) is under max_next_runs.
+    void run_next(slot& own, std::size_t& runs, std::size_t& since_poll) noexcept;
+
+    // sleep_locked sleeps (with wait_mutex, which lock holds, released meanwhile) until woken, or, as the standby, for
+    // watchdog_interval.
+    void sleep_locked(std::unique_lock<std::mutex>& lock);
 
     // poll_locked polls (with wait_mutex, which lock holds, released meanwhile), and queues what's readied.
     void poll_locked(std::unique_lock<std::mutex>& lock, std::vector<std::coroutine_handle<>>& ready);
+
+    // watch_slots_locked queues the coroutines that have been in a slot since it last looked, at least
+    // watchdog_interval ago (so those whose workers are running a coroutine that doesn't return to them), returning
+    // how many. Called holding wait_mutex, by the standby and by a worker that polled.
+    std::size_t watch_slots_locked() noexcept;
 
     // wake_locked wakes workers for new_jobs: sleeping workers if there are any (returning how many to notify, once
     // wait_mutex is released), or else the poller, if it's blocked. Must be called holding wait_mutex.
     std::size_t wake_locked(std::size_t new_jobs) noexcept;
     void        notify(std::size_t woken) noexcept;
 
+    std::size_t                         num_workers = 0;
     std::vector<std::thread>            threads;
+    std::unique_ptr<slot[]>             slots; // NOLINT(*-avoid-c-arrays): one per worker, never resized
     std::mutex                          wait_mutex;
     std::condition_variable             wait;
     std::deque<std::coroutine_handle<>> jobs;
@@ -191,8 +262,18 @@ private:
     poller*                 polls      = nullptr;
     bool                    polling    = false;
     bool                    poll_woken = false;
-    bool                    standby    = false; // whether a sleeping worker is the standby (see worker())
+    bool                    standby    = false; // whether a sleeping worker is the standby (see sleep_locked())
     std::condition_variable polled;             // notified when a poll ends, for detach()
+
+    // Guarded by wait_mutex.
+    // - poll_capped is whether the poll in progress has a timeout (watchdog_interval), as no worker is the standby.
+    // - seen is what watch_slots_locked() saw in each slot when it last looked, at watched_at.
+    bool                                  poll_capped = false;
+    std::vector<seen_job>                 seen;
+    std::chrono::steady_clock::time_point watched_at;
+
+    // slots_used is whether any worker has used its slot: from then on, a pool without a poller has a standby too.
+    std::atomic<bool> slots_used{false};
 };
 
 }

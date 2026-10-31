@@ -86,6 +86,14 @@ auto deadline = scheduler->call_at(net::io::clock::now() + 5s, [&source] noexcep
 co_await work(source.get_token());   // stopped after 5 seconds, or with the request
 ```
 
+A task that one of the pool's workers resumes (e.g. one waiting on a `wait_on()` word, woken by `notify_all()` from
+another task) runs next on that worker, once the task that woke it suspends or returns, rather than waking another
+worker for it: so a hand-over between tasks costs no thread wakeup. A worker runs at most two such in a row before what
+else is waiting. If the waking task goes on for long without suspending (e.g. a loop whose awaits all find their
+results ready), the woken one waits for it: after 10 to 20 ms, an idle worker takes it over (on a pool of one worker,
+it waits until the task suspends). Tasks resumed from other threads, and `co_await pool.yield()`, wait their turn
+behind what's queued.
+
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that (4, unless the scheduler is made
 with `io::scheduler::options{.blocking_threads = n}`; the rest wait for one), and returns a task of its result.

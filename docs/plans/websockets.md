@@ -1365,6 +1365,65 @@ Stress: the new and changed tests with `[http2][websocket]`, `[http2][tunnel]`, 
 `[http2][server]`, `[http2][client]`, `[session]`, `[flow]`, `[coro][notifier]` and `[io]`'s buffered reader and writer
 (308 test cases a run), 400 times eight at a time: 400 passed.
 
+## Learned after stage 9: the pool's run-next slot
+
+The four hand-overs a round trip over HTTP/2 makes (above) each went through the pool's shared queue: the coroutine
+woken (a stream's reader, the connection's writer) was queued, and a worker woken for it, usually the other one, which
+was asleep or blocked polling. `coro::thread_pool` now has a slot per worker (Tokio's LIFO slot, Go's `runnext`):
+`resume()` called on one of the pool's workers puts the coroutine in that worker's slot, which it runs once what it's
+running returns to it, before the queue, without the lock or a wakeup. A worker runs its slot at most twice in a row,
+then the queue. And the connection's reader no longer wakes the writer after every receive, only when the session has
+output, streams wait their turn, or the connection's ending: the needless wakeup cost a hand-over, and took the slot
+from the stream the receive had woken. Alone, that change measured nothing (16 B round trips 51 to 52 us against 50),
+so it went in with the slot.
+
+A slot can't be stolen, and nothing makes a coroutine give way, so one that never returns to its worker (its awaits all
+ready) would hold up what's in its slot for good. Two bounds were tried:
+
+- Go's way: a slot put wakes an idle worker (unless one's already looking), which takes the coroutine if it's still
+  there after 3 us. A wakeup per hand-over is what the slot was to save: 16 B round trips took 48.7 us (against 50 with
+  no slot, 33.6 with the other bound), and not waking a worker that's polling (taking Go's check that none is spinning
+  literally) still 45.9, with nothing then bounding the wait while the only idle worker polls.
+- The watchdog's: the standby, which already wakes every 10 ms, and a worker back from a poll queue a coroutine still
+  in the same slot (the same put) at two looks 10 ms apart; a worker polling while no standby's asleep polls with a
+  10 ms timeout (the poller's `poll()` takes one now). So the wait's bounded at 10 to 20 ms, on two workers or more, and
+  costs nothing per hand-over. This one was kept.
+
+With Tokio's 3 runs in a row, `bench_request`'s 8 request bodies at once came out 4 to 15% slower (1451 to 1637 us a
+round against 1384 to 1413). It wasn't lost parallelism: the other worker was idle at the put for only about 5% of
+the slot runs, and Go's bound, which hands those to it, was as slow. It was the queue, where what I/O readied waits:
+with more slot runs in a row its jobs waited longer (a mean of 24 us with no slot runs, 36 to 44 with two, 46 to 51
+with three), and 2 measured as the base (medians of 15 runs: 1404 us against 1408; 3: 1463), keeping the rest of the
+gain (a stream at a time 66.6 us; 1: 70.2).
+
+Numbers (Release, two workers; the base and this build, three runs each, interleaved, best of five within a run):
+
+| Row                                        | before             | after              | HTTP/1.1, after |
+|--------------------------------------------|--------------------|--------------------|-----------------|
+| HTTP/2, 16 B, one at a time                | 50.0 to 50.4 us    | 32.6 to 32.9       | 27.1 to 27.8    |
+| HTTP/2, 16 B, in flight                    | 0.66 to 0.86 us    | 0.37 to 0.41       | 4.1 to 4.2      |
+| HTTP/2, 64 KiB, one at a time              | 128 to 131 us      | 120 to 122         | 95 to 98        |
+| allocations                                | 22.9 to 23.1       | 26.0               | 10.0            |
+| HTTP/2, 64 KiB, in flight                  | 68.9 to 71.3 us    | 67.6 to 68.2       | 33.0 to 34.5    |
+| 64 WebSockets over HTTP/2, 16 B, one at a time | 7.4 to 7.5 us  | 4.7 to 4.9         |                 |
+| `bench_request`, HTTP/2 a stream at a time | 79.8 to 83.9 us    | 66.5 to 69.1       |                 |
+| `bench_request`, 8 request bodies at once  | 1397 to 1426 us    | 1378 to 1416       |                 |
+| `bench_request`, 8 streams at once         | 1192 to 1259 us    | 1231 to 1354       |                 |
+| `bench_notifier`, 2 workers, 1 pair        | 484 to 505 ns      | 175 to 180         |                 |
+| `bench_notifier`, 4 workers, 1 pair        | 3081 to 3305 ns    | 171 to 172         |                 |
+
+The rest of `bench_websocket` (HTTP/1.1, and the parallel runs' larger messages) and `bench_request`'s other rows
+didn't move beyond their noise; the process's CPU time went down (`bench_websocket` 13.7 + 22.8 s user and system to
+11.8 + 19.9). 8 streams at once is bimodal on this laptop (about 1200 and 1400 us, alternating between runs): over 20
+runs each, its lower mode was about 3% slower (medians 1240 us against 1206). `bench_notifier` on one worker is about
+10% slower (a pair 433 to 449 ns against 378 to 413): every third hand-over there goes through the queue.
+
+So one WebSocket over HTTP/2 now takes 1.2 to 1.25 times HTTP/1.1's time one at a time, small or large, from 1.8 and
+1.3.
+In flight, large messages are still about twice HTTP/1.1's (the HTTP/2 path's CPU, above). The allocations are next:
+6 against 4 for small messages, 26 against 10 for large ones, 3 more than before (likely the drained `received`
+buffer being freed, and grown again, more often, as the reader now runs as soon as DATA comes).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:

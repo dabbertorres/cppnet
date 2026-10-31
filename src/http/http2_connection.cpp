@@ -715,6 +715,7 @@ coro::task<> http2_connection_base::run(std::span<const std::byte> already_read)
 bool http2_connection_base::receive(std::vector<std::byte>& pending)
 {
     bool                          go_on = true;
+    bool                          wake  = true;
     std::vector<std::stop_source> stopping; // the streams it failed
     {
         std::scoped_lock lock{mu};
@@ -737,9 +738,14 @@ bool http2_connection_base::receive(std::vector<std::byte>& pending)
 
         // NOTE: taken here, rather than with stop_pending() (which would lock again), as it's usually empty.
         stopping.swap(to_stop);
+
+        // the writer only if there's something for it: what the session has to send, or streams waiting their turns,
+        // whose windows may have grown. Waking it for nothing would cost a hand-over, and take the place (see
+        // coro::thread_pool::resume()) of a stream's reader this readied.
+        wake = session.has_output() || !send_order.empty() || is_ending || !go_on;
     }
 
-    writer_wakeup.notify();
+    if (wake) writer_wakeup.notify();
     stop_all(stopping);
     after_receive();
     return go_on;

@@ -805,9 +805,9 @@ private:
     void resume(const completions& done) noexcept;
     void resume(std::coroutine_handle<> awaiting) noexcept;
 
-    // poll waits for I/O (if block, until some is ready, the next deadline, or wake() is called), and dispatches it,
-    // and the timers that expired, to done.
-    void poll(bool block, completions& done) noexcept override;
+    // poll waits for I/O (for up to limit, if any, until some is ready, the next deadline, or wake() is called), and
+    // dispatches it, and the timers that expired, to done.
+    void poll(std::optional<std::chrono::nanoseconds> limit, completions& done) noexcept override;
     void wake() noexcept override;
 
     std::shared_ptr<coro::thread_pool> workers;
