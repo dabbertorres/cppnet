@@ -234,6 +234,9 @@ constexpr std::array groups{
 //
 // It asks for clients' certificates, and requires one, as client_auth says (a server's).
 //
+// It refuses TLS 1.2's renegotiation, as Botan's does, but by ending the connection rather than with a warning the
+// connection goes on after (see abort_connection_on_undesired_renegotiation()).
+//
 // Its sessions' tickets are good for ticket_lifetime (a server's: Botan's default, a day, for a client's).
 //
 // It offers only the key exchange groups above (those of them the Botan it's built against has), and so only ECDHE in
@@ -274,6 +277,14 @@ public:
     {
         return auth == net::tls::client_auth::required;
     }
+
+    // NOTE: neither side allows renegotiation (Botan's allow_client_initiated_renegotiation() and
+    //       allow_server_initiated_renegotiation() are false), and a peer's attempt (a client's ClientHello after the
+    //       handshake, or a server's HelloRequest) fails the connection with a fatal no_renegotiation alert, where
+    //       Botan's default sends it as a warning and goes on. RFC 9113 9.2.1 requires HTTP/2 over TLS 1.2 to treat a
+    //       renegotiation as a connection error; and as Go's crypto/tls fails a connection on any renegotiation it
+    //       isn't set up for, so does cppnet's, whatever the protocol over it. (TLS 1.3 has no renegotiation.)
+    [[nodiscard]] bool abort_connection_on_undesired_renegotiation() const override { return true; }
 
     [[nodiscard]] bool allow_tls12() const override { return allows(net::tls::version::tls12); }
     [[nodiscard]] bool allow_tls13() const override { return allows(net::tls::version::tls13); }

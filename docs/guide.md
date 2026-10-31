@@ -1108,6 +1108,11 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   version agreed on, and a server's handlers see it in `server_request::tls_version`. The HTTP client's
   `client_options::tls` and the server's `server_context` (in `server_config::tls`) carry them. `tls::version` is in
   `tls/version.hpp`, which builds without TLS too; its `none` (no TLS) isn't a version a context may allow.
+- TLS 1.2's renegotiation isn't allowed, on either side: a peer's attempt (a client's new ClientHello, or a server's
+  HelloRequest) ends the connection with a fatal `no_renegotiation` alert (code 100), as RFC 9113 requires of HTTP/2
+  over TLS 1.2, and Go does for any connection. The stream's reads, and writes after them, then fail with the alert it
+  sent (`tls::sent_alert_base` + 100); an HTTP server's connection ends, stopping the tokens of handlers waiting on
+  it. cppnet's own endpoints never renegotiate. TLS 1.3 has no renegotiation.
 - `stream::connect()` takes an optional `std::stop_token`, as `stream::accept()` does in its `accept_options` (`stop`):
   requesting stop ends a handshake that's waiting, with `std::errc::operation_canceled`. `stream::set_stop_token()` does
   the same for reads and writes (as a socket's): a canceled read can be tried again, but a canceled write fails the

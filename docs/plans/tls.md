@@ -766,6 +766,28 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   still costs about 0.4 ms of CPU a handshake here (the client limited to X25519: resumed 617 to 735, full ECDSA 1114
   to 1338).
 
+### Renegotiation (after stage 4)
+
+- **Before:** Botan's default policy refuses TLS 1.2's renegotiation on both sides
+  (`allow_client_initiated_renegotiation()` and `allow_server_initiated_renegotiation()` are false), but with a
+  warning-level `no_renegotiation` alert, after which the connection goes on (RFC 5746 section 4.2's way). RFC 9113
+  9.2.1 requires HTTP/2 over TLS 1.2 to treat a renegotiation as a connection error, and Go's `crypto/tls` fails the
+  connection on any renegotiation it isn't set up for (`handleRenegotiation()`: a server always, a client unless
+  `Renegotiation` allows it), whatever runs over it.
+- **Now:** the policy's `abort_connection_on_undesired_renegotiation()` is true, for every connection (HTTP/1.1's too,
+  as Go's). Botan throws `TLS_Exception(NoRenegotiation)` from `received_data()` (a server's on a ClientHello after the
+  handshake, a client's on a HelloRequest), and its channel sends the alert at the fatal level (Go sends it as a
+  warning, but fails its side all the same). So the side that refused fails its reads, and its writes after them, with
+  the alert it sent (`sent_alert_base` + 100), after flushing the alert (as for any alert `feed()` sends); the side that
+  tried gets a fatal alert 100 from its peer, then the end of the connection. Over HTTP/2 the server can't send
+  GOAWAY(PROTOCOL_ERROR) first, as TLS has failed by then: the connection fails its streams with the error and closes;
+  an HTTP/1.1 connection's handler that waits is stopped by the watch's failed read. TLS 1.3 has no renegotiation.
+- **Tests:** `test/tls/renegotiation.cpp` (`[tls][renegotiation]`), against Botan's TLS 1.2 endpoints driven by hand
+  (`test/tls/botan_peer.hpp`): a client renegotiating with `stream::accept()`'s stream, a server sending a HelloRequest
+  to `stream::connect()`'s, and a client renegotiating with `http::server` over HTTP/1.1 and HTTP/2 while a handler
+  waits (stopped). Botan's own client fails (unexpected_message) on application data while it's renegotiating, so the
+  HTTP/2 test reads the server's opening frames, up to its SETTINGS acknowledgement, first.
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`
