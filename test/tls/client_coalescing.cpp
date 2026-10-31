@@ -5,6 +5,7 @@
 // hosts table names a.test, b.test and x.w.test 127.0.0.1 (and nothing else) finds them. Each host has a server of its
 // own, on a port of its own, so which server a request reached says which connection it went on: b.test's own server,
 // or another host's whose ORIGIN listed b.test's origin (its port being b.test's server's).
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -972,4 +973,146 @@ TEST_CASE("a coalesced request's 421 sends it again as a first attempt, which is
     CHECK(ok(out.got[0]));
     CHECK(a_seen.count("b.test") == 1);
     CHECK(b_server.heads.load() == 2);
+}
+
+namespace
+{
+
+// lines is what requests sent in the background came to, each as "<HTTP major version> <status> <body>" (or
+// "error: ..."), in the order they finished.
+struct lines
+{
+    net::io::scheduler*        sched = nullptr;
+    std::mutex                 mu;
+    std::vector<std::string>   got; // guarded by mu
+    std::atomic<std::uint64_t> count{0};
+
+    // reached waits (up to 10 seconds) until n requests have finished, returning whether they have.
+    task<bool> reached(std::uint64_t n)
+    {
+        const auto deadline = net::io::clock::now() + 10s;
+        for (auto seen = count.load(); seen < n; seen = count.load())
+        {
+            if (co_await sched->wait_on(count, seen, deadline)) break;
+        }
+        co_return count.load() >= n;
+    }
+
+    std::vector<std::string> all()
+    {
+        std::scoped_lock lock{mu};
+        return got;
+    }
+};
+
+// get GETs url (with "Connection: close", if close), noting what it came to in out; then shuts stop down (if given), so
+// that an accept for a connection the client didn't make fails, rather than waiting for ever.
+task<> get(http::client* c, std::string url, bool close, lines* out, net::listener* stop = nullptr)
+{
+    http::client_request req{.method = http::request_method::GET, .uri = net::url::parse(url).value()};
+    if (close) req.headers.set("Connection", "close");
+
+    std::string line;
+    auto        resp = co_await c->send(std::move(req));
+    if (!resp.has_value())
+    {
+        line = "error: " + resp.error().message();
+    }
+    else
+    {
+        const auto body = co_await net::io::read_all(*resp->body);
+        line            = std::format("{} {} {}",
+                                      resp->version.major,
+                                      static_cast<int>(resp->status_code),
+                                      body.value_or("(failed: " + body.error_or(std::error_code{}).message() + ")"));
+    }
+
+    {
+        std::scoped_lock lock{out->mu};
+        out->got.push_back(std::move(line));
+    }
+    out->count.fetch_add(1);
+    out->sched->notify_all(out->count);
+    if (stop != nullptr) stop->shutdown();
+}
+
+}
+
+TEST_CASE("a coalesced request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 to its own host, its origin kept",
+          "[tls][http][client][http2][coalescing][http11-required]")
+{
+    dns::resolver resolver{names()};
+    served        b_seen;
+    lines         out;
+
+    net::io::scheduler sched{make_pool()};
+    out.sched     = &sched;
+    auto       la = listen(&sched);
+    auto       lb = listen(&sched);
+    const auto pa = la.local_port();
+    const auto pb = lb.local_port();
+
+    // b.test's own server (HTTP/2 too: the request's sent again over HTTP/1.1 all the same).
+    const auto   b_server = serve(&sched, std::move(lb), &b_seen, {});
+    http::client client{&sched, options_for(&resolver, true)};
+
+    const auto test = [&] -> task<>
+    {
+        // a.test's connection, to the server the test plays, which lists b.test's origin. The PINGs make sure the
+        // client's done with the receive the ORIGIN came in (see client_origin.cpp).
+        REQUIRE(sched.spawn(get(&client, url_of("a.test", pa), false, &out, &la)));
+        auto accepted = co_await la.accept();
+        REQUIRE(accepted.has_value());
+        auto stream = co_await tls::stream::accept(std::move(*accepted),
+                                                   server_with(pki().names_chain, pki().names_key),
+                                                   net::io::clock::now() + 5s,
+                                                   {.alpn = std::vector<std::string>{"h2"}});
+        REQUIRE(stream.has_value());
+
+        http::detail::connection side{std::move(*stream)};
+        test::h2_client          played{&http::detail::as_reader(side),
+                                        &http::detail::as_writer(side),
+                                        &http::detail::socket_of(side),
+                                        http2::role::server};
+
+        bool done = co_await played.pump([&] { return played.responses.contains(1); });
+        REQUIRE(done);
+        REQUIRE_FALSE(played.s.submit_origin(std::vector<std::string>{origin("b.test", pb)}));
+        played.respond(1, "200", "a.test");
+        done = co_await played.sync();
+        REQUIRE(done);
+        done = co_await played.sync();
+        REQUIRE(done);
+        done = co_await out.reached(1);
+        REQUIRE(done);
+
+        // b.test's request is coalesced onto it, and reset: it goes to b.test's own server, which closes the
+        // connection after it, so the next request to b.test has none.
+        REQUIRE(sched.spawn(get(&client, url_of("b.test", pb), true, &out)));
+        done = co_await played.pump([&] { return played.responses.contains(3); });
+        REQUIRE(done);
+        CHECK(std::ranges::find(played.responses[3].headers,
+                                std::pair<std::string, std::string>{":authority", std::format("b.test:{}", pb)})
+              != played.responses[3].headers.end());
+        played.s.reset(3, http2::error_code::http_1_1_required);
+        done = co_await played.pump([] { return true; });
+        REQUIRE(done);
+        done = co_await out.reached(2);
+        REQUIRE(done);
+
+        // 0xd says nothing of whose the origin is: the connection's Origin Set still has b.test's, so the next is
+        // coalesced again.
+        REQUIRE(sched.spawn(get(&client, url_of("b.test", pb), false, &out)));
+        done = co_await played.pump([&] { return played.responses.contains(5); });
+        REQUIRE(done);
+        played.respond(5, "200", "coalesced");
+        done = co_await played.pump([] { return true; });
+        REQUIRE(done);
+        done = co_await out.reached(3);
+        REQUIRE(done);
+    };
+
+    sched.run_to_completion(test());
+    CHECK(out.all() == std::vector<std::string>{"2 200 a.test", "1 200 b.test", "2 200 coalesced"});
+    CHECK(b_seen.count("b.test") == 1);
 }

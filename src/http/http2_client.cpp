@@ -322,9 +322,13 @@ coro::task<std::expected<client_response, std::error_code>> http2_client_connect
         auto             opened = open(request, ends_after);
         if (!opened.has_value())
         {
-            // nothing was sent, nor the body read: a refused request may be sent again (on another connection),
-            // whatever it is.
-            if (state != nullptr) state->unsent = opened.error() == http2::error_code::refused_stream;
+            // nothing was sent, nor the body read: a refused request may be sent again (on another connection, or
+            // over HTTP/1.1, if the server's GOAWAY asked for it), whatever it is.
+            if (state != nullptr)
+            {
+                state->unsent = opened.error() == http2::error_code::refused_stream
+                             || opened.error() == http2::error_code::http_1_1_required;
+            }
 
             not_opened(lock);
             co_return std::unexpected(opened.error());
@@ -385,7 +389,7 @@ void http2_client_connection::not_opened(std::unique_lock<connection_mutex>& loc
 }
 
 coro::task<std::expected<tunnel_response, std::error_code>>
-http2_client_connection::open_tunnel(const client_request& request, std::string_view protocol)
+http2_client_connection::open_tunnel(const client_request& request, std::string_view protocol, send_state* state)
 {
     std::shared_ptr<http2_client_stream> stream;
     {
@@ -393,6 +397,11 @@ http2_client_connection::open_tunnel(const client_request& request, std::string_
         auto             opened = open(request, std::nullopt, protocol);
         if (!opened.has_value())
         {
+            if (state != nullptr)
+            {
+                state->unsent = opened.error() == http2::error_code::refused_stream
+                             || opened.error() == http2::error_code::http_1_1_required;
+            }
             not_opened(lock);
             co_return std::unexpected(opened.error());
         }
@@ -441,14 +450,8 @@ http2_client_connection::open_tunnel(const client_request& request, std::string_
                 break;
             }
 
-            if (s.failure)
-            {
-                // a stream the server didn't process may be opened again (e.g. on another connection).
-                auto err = s.failure;
-                if (err == http2::error_code::refused_stream && s.processed)
-                    err = make_error_code(http2::error_code::cancel);
-                co_return std::unexpected(err);
-            }
+            // a stream the server didn't process may be opened again (e.g. on another connection).
+            if (s.failure) co_return std::unexpected(head_failure(s, std::nullopt, state));
 
             seen = s.changed.value();
             arm_deadline(s.read_deadline, options.response_header_timeout);
@@ -474,7 +477,11 @@ std::expected<std::shared_ptr<http2_client_stream>, std::error_code> http2_clien
     if (reserved > 0) --reserved;
 
     if (request.stop.stop_requested()) return std::unexpected(std::make_error_code(std::errc::operation_canceled));
-    if (ending() || peer_goaway || draining) return std::unexpected(make_error_code(http2::error_code::refused_stream));
+    if (ending() || peer_goaway || draining)
+    {
+        return std::unexpected(
+            make_error_code(goaway_http11 ? http2::error_code::http_1_1_required : http2::error_code::refused_stream));
+    }
 
     // the head is made before the stream is opened, as a stream that's opened must be sent.
     auto stream           = std::make_shared<http2_client_stream>(this, 0, pool);
@@ -754,22 +761,7 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
                 break;
             }
 
-            if (s.failure)
-            {
-                // a request the server didn't process may be sent again; one it did, or whose body was cut short,
-                // mustn't be.
-                auto err = s.failure;
-                if (err == http2::error_code::refused_stream && s.processed)
-                    err = make_error_code(http2::error_code::cancel);
-                if (body_error.has_value() && err != http2::error_code::refused_stream) err = *body_error;
-
-                // the connection ended (not after the server's GOAWAY, which says what it processed) before any
-                // response: the request may or may not have been processed.
-                if (state != nullptr)
-                    state->dropped = !s.processed && !peer_goaway && err == std::errc::connection_aborted;
-
-                co_return std::unexpected(err);
-            }
+            if (s.failure) co_return std::unexpected(head_failure(s, body_error, state));
 
             seen = s.changed.value();
             arm_deadline(s.read_deadline, options.response_header_timeout);
@@ -781,6 +773,37 @@ http2_client_connection::wait_for_head(std::shared_ptr<http2_client_stream> stre
     // NOTE: made without the lock, as it registers stop's callback, which takes it.
     resp.body = std::make_unique<http2_response_body>(shared_from_this(), std::move(stream), request.stop);
     co_return resp;
+}
+
+std::error_code http2_client_connection::head_failure(const http2_client_stream&     s,
+                                                      std::optional<std::error_code> body_error,
+                                                      send_state*                    state) const
+{
+    using http2::error_code;
+
+    // a request the server didn't process may be sent again; one it did, or whose body was cut short, mustn't be.
+    auto err = s.failure;
+    if (err == error_code::refused_stream && s.processed) err = make_error_code(error_code::cancel);
+
+    // the server's GOAWAY asked for HTTP/1.1 (RFC 9113, section 7), and the connection ended before the response:
+    // that's why it failed.
+    if (goaway_http11 && err == std::errc::connection_aborted) err = make_error_code(error_code::http_1_1_required);
+
+    const bool http11 = err == error_code::http_1_1_required;
+    if (body_error.has_value() && err != error_code::refused_stream && !http11) err = *body_error;
+
+    if (state != nullptr)
+    {
+        // the connection ended (not after the server's GOAWAY, which says what it processed) before any response: the
+        // request may or may not have been processed.
+        state->dropped = !s.processed && !peer_goaway && err == std::errc::connection_aborted;
+
+        // the server asked for HTTP/1.1 before it answered anything (once it has, e.g. with 103 Early Hints, it's had
+        // the request): after its GOAWAY's last stream, it didn't process it (RFC 9113, section 8.7).
+        state->http11_required = http11 && !s.processed;
+        state->unprocessed     = state->http11_required && goaway_http11 && s.id > goaway_last;
+    }
+    return err;
 }
 
 // NOLINTNEXTLINE(bugprone-exception-escape): done() only throws if it can't allocate, when terminating is fine.
@@ -971,11 +994,26 @@ void http2_client_connection::on_interim(http2_client_stream& s, std::span<const
 // (a client's session never reports it: a response's head over the limit resets its stream.)
 void http2_client_connection::on_header_list_too_large(http2::stream_id /*stream*/, bool /*end_stream*/) {}
 
-void http2_client_connection::on_goaway(http2::stream_id /*last*/, std::error_code err, std::string_view /*debug*/)
+void http2_client_connection::on_goaway(http2::stream_id last, std::error_code err, std::string_view /*debug*/)
 {
     // no more streams: once those it has are done, so is the connection.
     logger.debug("HTTP/2 server sent GOAWAY: {}", err.message());
     peer_goaway = true;
+    goaway_last = last;
+
+    // the server asks for HTTP/1.1 (RFC 9113, section 7). The streams after the last weren't processed: they fail with
+    // that, rather than refused_stream (which the session then reports, after this), so they're sent again over
+    // HTTP/1.1; those it may have processed go on, unless the connection ends before their responses (see
+    // head_failure()). NOTE: a later GOAWAY (with any code) may lower the last stream, failing more.
+    if (err == http2::error_code::http_1_1_required) goaway_http11 = true;
+    if (!goaway_http11) return;
+
+    for (auto& [id, s] : streams)
+    {
+        if (id <= last) continue;
+        fail_stream(*s, make_error_code(http2::error_code::http_1_1_required));
+        s->changed.notify();
+    }
 }
 
 void http2_client_connection::on_ping_ack(std::span<const std::byte, 8> /*opaque*/) {}

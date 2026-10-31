@@ -1488,14 +1488,17 @@ namespace
     // open_stream opens a WebSocket over a stream of conn (an HTTP/2 connection of the client's, whose server allows
     // extended CONNECT, with a stream reserved for it), as an extended CONNECT (RFC 8441, section 5): the request's
     // head is written with io_timeout and its response read within response_header_timeout, as over HTTP/1.1, and stop
-    // ends both, then the WebSocket.
-    task<std::expected<connection, std::error_code>> open_stream(
-        std::shared_ptr<http::detail::http2_client_connection> conn, const endpoint& where, connect_options& options)
+    // ends both, then the WebSocket. state says how far it got, if it failed.
+    task<std::expected<connection, std::error_code>>
+    open_stream(std::shared_ptr<http::detail::http2_client_connection> conn,
+                const endpoint&                                        where,
+                connect_options&                                       options,
+                http::detail::http2_client_connection::send_state&     state)
     {
         auto request = detail::make_http2_request(where.target, options);
         request.stop = options.stop;
 
-        auto opened = co_await conn->open_tunnel(request, "websocket"sv);
+        auto opened = co_await conn->open_tunnel(request, "websocket"sv, &state);
         if (!opened.has_value()) co_return failure(options, opened.error());
 
         // NOTE: a stream that isn't the WebSocket's (refused here) is done with as the response goes: reset, unless
@@ -1518,13 +1521,20 @@ namespace
         const auto fail = [&options](std::error_code err) { return failure(options, err); };
 
         // over HTTP/2, on a connection the client has to the host whose server allows it, with a stream free; or, if
-        // there's none (as Chrome does), or the stream's refused before the server's looked at it, over HTTP/1.1.
+        // there's none (as Chrome does), or the stream's refused before the server's looked at it, or the server asks
+        // for HTTP/1.1 (HTTP_1_1_REQUIRED, RFC 9113 section 7) before answering anything, over HTTP/1.1.
         if (options.http2)
         {
             if (auto shared = pool->reserve_tunnel(where.target.scheme, where.target.host, where.port))
             {
-                auto opened = co_await open_stream(std::move(shared), where, options);
-                if (opened.has_value() || opened.error() != http::http2::error_code::refused_stream) co_return opened;
+                http::detail::http2_client_connection::send_state state;
+                auto opened = co_await open_stream(std::move(shared), where, options, state);
+                if (opened.has_value()) co_return opened;
+
+                const auto err = opened.error();
+                const bool http11 =
+                    err == http::http2::error_code::http_1_1_required && (state.unsent || state.http11_required);
+                if (err != http::http2::error_code::refused_stream && !http11) co_return opened;
             }
         }
 

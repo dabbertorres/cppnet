@@ -417,7 +417,20 @@ HTTP/2 (one of its connections agreed on it, or with prior knowledge) wait for a
 than each making their own. As Go's client does, it knows that of a host only while it has connections: a burst of
 requests to a host with none connects in parallel. A request the server refused without processing it is sent again,
 once, on another connection, if it has no body (or if nothing of it was sent yet); so is one safe to repeat, without a
-body, whose connection dropped (without GOAWAY) before its response. The request's `Host`, if it has one, is its
+body, whose connection dropped (without GOAWAY) before its response. A server may ask for a request over HTTP/1.1
+instead (`HTTP_1_1_REQUIRED`, RFC 9113 section 7: e.g. IIS, for a client certificate one resource needs): with a
+stream's reset, before it's answered anything (not after an interim response), the request's sent again, once, over
+HTTP/1.1 to its own host, if it's safe to repeat (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) and has no body, or a body
+`client_request::get_body` reads again; with GOAWAY, so is any request the server didn't process (after its last
+stream, or not yet opened), whatever its method, and a stream it may have processed goes on, but is sent again so if
+it's safe to repeat and the connection ends before its response. It goes on an idle HTTP/1.1 connection to the host if
+there's one, or a new one whose TLS handshake offers only `http/1.1` (in cleartext, without prior knowledge), which is
+then kept as any other; at `max_connections_per_host`, an idle HTTP/2 connection of the host's is closed to make room.
+Otherwise (or once the response's head has come, for its body's reads), it fails with
+`http2::error_code::http_1_1_required`. The HTTP/2 connection goes on (after a reset), a coalesced request goes to its
+own host, the redirects it then follows to the same origin go over HTTP/1.1 too, and nothing's remembered of the host:
+the next request tries HTTP/2 again (turn `client_options::http2` off for a host that always asks). The request's
+`Host`, if it has one, is its
 `:authority`. A request's version and `Connection` field are HTTP/1.x's, and mean nothing over HTTP/2: turn
 `client_options::http2` off to send HTTP/1.0, or close a connection after a request. HTTP/2 connections count against
 `max_connections` as others do (one without streams is idle, and may be closed to make room for another host's), close
@@ -1028,7 +1041,10 @@ auto type = co_await conn->read_message(message);
   extended CONNECT's stream of that connection instead, beside the client's requests (`connect_options::http2`, on by
   default, as in browsers). Otherwise it's over HTTP/1.1, as above: `connect()` never connects, nor waits for a stream,
   just to find out (as Chrome; nor does it use a connection whose server's settings haven't come yet), and never takes
-  another host's connection, even with `client_options::http2_coalescing`. The stream holds the connection open, as a
+  another host's connection, even with `client_options::http2_coalescing`. A stream the server refuses before
+  processing it (`REFUSED_STREAM`, or after its GOAWAY's last stream), or asks to have over HTTP/1.1
+  (`HTTP_1_1_REQUIRED`) before answering anything, is opened over HTTP/1.1 instead; once the WebSocket's open, a reset
+  (with any code) ends it as the connection's end would (1006). The stream holds the connection open, as a
   response's body being read does: the `http::client` may go first. Its window is 256 KiB each way, as on the
   server.
 - **The handshake fails** (`websocket::errc`) for a response that isn't the server's switching: `bad_status` for

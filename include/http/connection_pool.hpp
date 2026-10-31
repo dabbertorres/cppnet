@@ -196,13 +196,21 @@ namespace detail
         // HTTP/2 connection that's authoritative for its origin (see http2_client_connection::authoritative_for()), and
         // reserves it if there's one: the lease is coalesced, and its key is the connection's host's (it stays counted
         // there). It looks again after each wait.
+        //
+        // With http1_only (for a request the server asked to have over HTTP/1.1: HTTP_1_1_REQUIRED), it returns an
+        // HTTP/1.x connection: an idle one to host (if allow_idle), or a new one, which over TLS offers only http/1.1
+        // with ALPN, and in cleartext doesn't speak HTTP/2 (even with prior knowledge). It's counted, kept and reused
+        // as any HTTP/1.x connection, and says nothing of whether the host speaks HTTP/2: nor do requests to the host
+        // wait for it as for an HTTP/2 connection being made. At max_connections_per_host, it closes an idle HTTP/2
+        // connection (without streams) of the host's to make room.
         coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
                                                                   std::string                    host,
                                                                   std::string                    port,
                                                                   bool                           allow_idle,
-                                                                  const http2_client_connection* skip     = nullptr,
-                                                                  std::stop_token                stop     = {},
-                                                                  bool                           coalesce = true);
+                                                                  const http2_client_connection* skip       = nullptr,
+                                                                  std::stop_token                stop       = {},
+                                                                  bool                           coalesce   = true,
+                                                                  bool                           http1_only = false);
 
         // release returns a leased connection: kept idle if it's reusable (it's at the start of a response, with
         // nothing unread), and closed otherwise.
@@ -342,23 +350,30 @@ namespace detail
                         bool                           allow_idle,
                         const http2_client_connection* skip,
                         bool                           coalesce,
+                        bool                           http1_only,
                         connections&                   closing,
                         std::uint64_t&                 seen);
 
         // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
         // try_claim, given candidates, fills it with the connections a request may be coalesced onto, and returns
         // neither a lease nor room to connect, if the host has no HTTP/2 connection with a stream free, nor an idle one
-        // (if allow_idle), and there are any: for take_coalesced() to look through, without mu.
+        // (if allow_idle), and there are any: for take_coalesced() to look through, without mu. With http1_only, it
+        // looks only for an idle HTTP/1.x connection, or room (see acquire()).
         claim try_claim(const std::string&                  key,
                         bool                                tls,
                         bool                                allow_idle,
                         const http2_client_connection*      skip,
+                        bool                                http1_only,
                         connections&                        closing,
                         std::vector<coalescing_connection>* candidates);
         bool  has_room(const host_connections& host) const noexcept;
         bool  evict_idle(const std::string& except_key, connections& closing);
+        bool  evict_own_http2(const std::string& key, connections& closing); // an idle HTTP/2 connection of the host's
         void  forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
         void  connected(const std::string& key) noexcept; // a connection being made is, or failed
+
+        // not_connected counts out a connection that was being made for a request, but isn't (taking mu).
+        void                                 not_connected(const std::string& key, bool http1_only) noexcept;
         std::optional<io::clock::time_point> close_expired(connections& closing);
 
         // freed tells waiters that a connection may be free.

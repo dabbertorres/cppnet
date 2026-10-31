@@ -2152,6 +2152,25 @@ idle stream would be a connection error for the peer.
   look; a host's first coalesced request verifies the certificate (once per host and connection, part 11's).
   `acquire()`'s frame keeps two booleans more.
 
+### After stage 6: HTTP_1_1_REQUIRED in the client (done 2026-10-31)
+
+RFC 9113 section 7's `HTTP_1_1_REQUIRED` (0xd), as a stream's reset or a GOAWAY's code, has the client send the
+request again over HTTP/1.1, as Chromium and curl do (Go and .NET return it). The user's decisions: a reset falls back
+only its own request, idempotent ones (RFC 9110 9.2.2), and the connection goes on; a GOAWAY's code is kept, its
+streams after the last fail with it (rather than `refused_stream`) and fall back whatever their method, those at or
+below it go on and, if the connection's end cuts them off before their heads, fail with it (rather than
+`connection_aborted`) and fall back only if idempotent, and requests opened after it fail with it, unsent, and fall
+back; a body only through `get_body` (as 421's), never because it wasn't read yet; none once an interim response has
+come (the server's had the request); at most once a hop, the HTTP/1.1 attempt a first one (its own error returned if
+it fails); the choice carried to later redirects to the same scheme, host and port (a bool on `send()`'s frame), and
+remembered nowhere else (no host cache, as Chromium's `HttpServerProperties`). The pool's `acquire(..., http1_only)`
+takes an idle HTTP/1.1 connection, or connects with `http1_context()` (cleartext: no prior knowledge), counted and kept
+as any, without erasing `http2_hosts` or counting as the HTTP/2 connection being made that requests wait for; at
+`max_connections_per_host` it closes an idle HTTP/2 connection of its own host (`evict_own_http2()`). A coalesced
+request falls back to its own host, its origin kept in the set. WebSockets fall back as for `REFUSED_STREAM`
+(whatever the method: an extended CONNECT is the WebSocket's), but not after an interim response, and stay 1006 once
+open. The server never sends it. No benchmark: the normal path gains an `acquire()` argument and a bool.
+
 ## Stage 5
 
 Decided (2026-10-20). Four things, chosen for stage 5: interim (1xx) responses checked end to end, Early Hints among

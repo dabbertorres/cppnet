@@ -182,7 +182,8 @@ public:
     struct send_state
     {
         // Refused before its stream was opened (the connection was ending, or had the server's GOAWAY): nothing of it
-        // was sent, nor its body read.
+        // was sent, nor its body read. It fails with refused_stream, or after a GOAWAY with HTTP_1_1_REQUIRED, with
+        // that.
         bool unsent = false;
 
         // The connection ended, without the server's GOAWAY, before the response's head (or any informational
@@ -192,6 +193,13 @@ public:
         // It expected 100 (Continue), and its response (returned) is a 417 (Expectation Failed) that came before its
         // body was sent: so it may be sent again, without the expectation (see client::send()).
         bool expectation_failed = false;
+
+        // It failed with HTTP_1_1_REQUIRED (http2::error_code::http_1_1_required: the server's RST_STREAM said so, or
+        // its GOAWAY did and the connection ended before the response's head) before any response, informational ones
+        // too: so it may be sent again over HTTP/1.1, if it's safe to repeat, or whatever it is if unprocessed says
+        // the server didn't process it (it was after the last stream of the server's GOAWAY).
+        bool http11_required = false;
+        bool unprocessed     = false;
     };
 
     // start runs the connection, as one of the scheduler's tasks, returning false if the scheduler's stopping.
@@ -243,9 +251,10 @@ public:
     // (io_timeout). Any other response's stream is done with (reset, unless both sides have ended it). It takes the
     // stream reserve(true) reserved, whatever happens. request.stop cancels it until the head has come, as send()'s;
     // the tunnel's stop is its user's (stream_tunnel::set_stop_token()). It fails as send() does: e.g. with
-    // refused_stream (in http2::category()) if the server didn't process it, so it may be opened elsewhere.
-    coro::task<std::expected<tunnel_response, std::error_code>> open_tunnel(const client_request& request,
-                                                                            std::string_view      protocol);
+    // refused_stream (in http2::category()) if the server didn't process it, so it may be opened elsewhere, or with
+    // http_1_1_required, state (if given) saying how far it got.
+    coro::task<std::expected<tunnel_response, std::error_code>>
+    open_tunnel(const client_request& request, std::string_view protocol, send_state* state = nullptr);
 
     // close ends the connection (GOAWAY), failing the streams still open.
     void close();
@@ -380,6 +389,12 @@ private:
     // idle_now is whether it has no streams, nor any reserved (holding the lock).
     [[nodiscard]] bool idle_now() const noexcept { return streams.empty() && reserved == 0; }
 
+    // head_failure is what a stream that failed before its response's head comes to (holding the lock): its failure,
+    // or body_error, if sending the body failed first, unless the server refused the stream or asked for HTTP/1.1
+    // (which say more); and in state (if given), whether it may be sent again.
+    std::error_code
+    head_failure(const http2_client_stream& s, std::optional<std::error_code> body_error, send_state* state) const;
+
     // wait_for_head waits for the response's head, returning the response (with its body, canceled by request.stop),
     // or why it didn't come (and in state, whether the connection dropped first). It passes the informational
     // responses that come first to request.on_informational, in order, without the lock.
@@ -399,6 +414,8 @@ private:
     std::size_t                                                                reserved    = 0;
     bool                                                                       peer_goaway = false;
     bool                                                                       draining    = false; // drain()ed
+    // the server's GOAWAY said HTTP_1_1_REQUIRED (any of them: see on_goaway()).
+    bool goaway_http11 = false;
     // on.origins_known is to be called (after the receive whose ORIGIN initialized the Origin Set, without the lock).
     bool                                 tell_origins = false;
     std::optional<io::clock::time_point> idle_from = io::clock::now(); // when it was last idle (none: not yet looked)
@@ -409,6 +426,9 @@ private:
     // over cleartext), verifying the server's certificate (without, nothing says the server is anyone's, its own
     // origin's included). NOTE: here, in what was padding, and before own_origin, which is made from it.
     bool keeps_origins = false;
+
+    // Guarded by mu: the last stream of the server's GOAWAY, once it's sent one.
+    http2::stream_id goaway_last = 0;
 
     std::size_t awaiting_continue = 0; // streams waiting for 100 (Continue): none, and the timer doesn't look for them
 

@@ -108,7 +108,8 @@ connection_pool::acquire(std::string                    scheme,
                          bool                           allow_idle,
                          const http2_client_connection* skip,
                          std::stop_token                stop,
-                         bool                           coalesce)
+                         bool                           coalesce,
+                         bool                           http1_only)
 {
 #ifdef NET_HAS_TLS
     const bool tls = scheme == "https";
@@ -129,13 +130,13 @@ connection_pool::acquire(std::string                    scheme,
 
     // another host's HTTP/2 connection may take an https request (see client_options::http2_coalescing): looked for
     // once, then again after each wait. (Without the option, there are none to find: see start_http2().)
-    const bool may_coalesce = coalesce && tls;
+    const bool may_coalesce = coalesce && tls && !http1_only;
     bool       look         = may_coalesce;
 
     while (true)
     {
         std::uint64_t seen  = 0;
-        auto          found = claim_any(key, host, port, tls, allow_idle, skip, look, closing, seen);
+        auto          found = claim_any(key, host, port, tls, allow_idle, skip, look, http1_only, closing, seen);
         if (found.leased.has_value()) co_return std::move(*found.leased);
 
         // none of them would take it: it connects, or waits, as it would have (and looks again after waiting).
@@ -164,28 +165,22 @@ connection_pool::acquire(std::string                    scheme,
 
     closing.clear();
 
-    // the connection's counted (in open, and as being connected) until it's made: and if this coroutine's destroyed
-    // first, counted out.
-    bool settled = false;
-    // NOTE: forget() and freed() don't throw (nor allocate, given no connection to close).
-    util::defer unsettled{[this, &key, &settled] noexcept
+    // the connection's counted (in open, and as being connected, unless it's HTTP/1.x's alone) until it's made: and if
+    // this coroutine's destroyed first, counted out.
+    bool        settled = false;
+    util::defer unsettled{[this, &key, &settled, http1_only] noexcept
                           {
-                              if (settled) return;
-                              {
-                                  connections      none;
-                                  std::scoped_lock lock{mu};
-                                  connected(key);
-                                  forget(key, nullptr, none);
-                              }
-                              freed();
+                              if (!settled) not_connected(key, http1_only);
                           }};
 
-    auto conn = co_await connect(tls, host, port, deadline, std::move(stop));
+    auto conn = co_await connect(tls, host, port, deadline, std::move(stop), http1_only);
     if (!conn.has_value()) co_return std::unexpected(conn.error());
+
+    settled = true;
+    if (http1_only) co_return lease{.conn = std::move(*conn), .http2 = nullptr, .key = key, .reused = false};
 
     // a connection that speaks HTTP/2 is shared by the host's requests, from now on: over TLS, with its own origin, the
     // first of the Origin Set the server's ORIGIN frames may make it.
-    settled = true;
     if (wants_http2(**conn))
     {
         auto shared = start_http2(key, std::move(*conn), tls ? origin_text(host, port) : std::string{});
@@ -211,6 +206,7 @@ connection_pool::claim connection_pool::claim_any(const std::string&            
                                                   bool                           allow_idle,
                                                   const http2_client_connection* skip,
                                                   bool                           coalesce,
+                                                  bool                           http1_only,
                                                   connections&                   closing,
                                                   std::uint64_t&                 seen)
 {
@@ -221,7 +217,7 @@ connection_pool::claim connection_pool::claim_any(const std::string&            
 
         // NOTE: before looking, so that a connection (or stream) freed after this is waited for no longer.
         seen  = released.load(std::memory_order::acquire);
-        found = try_claim(key, tls, allow_idle, skip, closing, coalesce ? &candidates : nullptr);
+        found = try_claim(key, tls, allow_idle, skip, http1_only, closing, coalesce ? &candidates : nullptr);
     }
 
     if (candidates.empty()) return found;
@@ -232,11 +228,12 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
                                                   bool                                tls,
                                                   bool                                allow_idle,
                                                   const http2_client_connection*      skip,
+                                                  bool                                http1_only,
                                                   connections&                        closing,
                                                   std::vector<coalescing_connection>* candidates)
 {
     // an HTTP/2 connection to the host with a stream free.
-    if (auto shared = available_http2(key, skip))
+    if (auto shared = http1_only ? nullptr : available_http2(key, skip))
         return {
             .leased = lease{.conn = nullptr, .http2 = std::move(shared), .key = key, .reused = true}
         };
@@ -245,7 +242,8 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
     // without mu.
     if (candidates != nullptr && coalescing_candidates(key, allow_idle, skip, *candidates)) return {};
 
-    if (const auto found = hosts.find(key); found != hosts.end())
+    // (a request for HTTP/1.x waits for no HTTP/2 connection.)
+    if (const auto found = hosts.find(key); !http1_only && found != hosts.end())
     {
         const auto& conns = found->second;
 
@@ -274,23 +272,34 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
         forget(key, std::move(conn), closing);
     }
 
-    auto& host_conns = hosts[key];
+    auto* host_conns = &hosts[key];
 
     // at the limit altogether, but not for this host: make room by closing another host's idle connection.
-    const bool room = has_room(host_conns)
-                   || ((config.max_connections_per_host == 0 || host_conns.open < config.max_connections_per_host)
-                       && evict_idle(key, closing));
+    bool room = has_room(*host_conns)
+             || ((config.max_connections_per_host == 0 || host_conns->open < config.max_connections_per_host)
+                 && evict_idle(key, closing));
+
+    // a request for HTTP/1.x (the server asked for it) may take the place of the host's own idle HTTP/2 connection,
+    // which it can't use: otherwise, at max_connections_per_host, it would wait for that to time out. NOTE: closing it
+    // may close the host's last connection, so the entry's looked up again.
+    if (!room && http1_only && evict_own_http2(key, closing))
+    {
+        host_conns = &hosts[key];
+        room       = true;
+    }
 
     if (room)
     {
-        ++host_conns.open;
-        ++host_conns.connecting;
+        ++host_conns->open;
         ++open;
+
+        // NOTE: an HTTP/1.x connection being made isn't one that requests for HTTP/2 wait for (see above).
+        if (!http1_only) ++host_conns->connecting;
         return {.connect = true};
     }
 
     // nothing's open to this host, so don't keep an entry for it while waiting.
-    if (host_conns.open == 0) hosts.erase(key);
+    if (host_conns->open == 0) hosts.erase(key);
     return {};
 }
 
@@ -781,6 +790,25 @@ bool connection_pool::evict_idle(const std::string& except_key, connections& clo
     return true;
 }
 
+bool connection_pool::evict_own_http2(const std::string& key, connections& closing)
+{
+    const auto it = hosts.find(key);
+    if (it == hosts.end()) return false;
+
+    // one without streams (nor any reserved): one with them is waited for, as any busy connection is.
+    auto&      shared = it->second.http2;
+    const auto found  = std::ranges::find_if(shared, [](const auto& c) { return c->idle_since().has_value(); });
+    if (found == shared.end()) return false;
+
+    // counted out now, as evict_idle() does.
+    auto evicted = std::move(*found);
+    shared.erase(found);
+    uncoalesce(evicted.get());
+    evicted->close();
+    forget(key, nullptr, closing);
+    return true;
+}
+
 void connection_pool::forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing)
 {
     if (conn != nullptr) closing.push_back(std::move(conn));
@@ -793,6 +821,18 @@ void connection_pool::forget(const std::string& key, std::unique_ptr<connection>
         host_gone(key);
         hosts.erase(it);
     }
+}
+
+void connection_pool::not_connected(const std::string& key, bool http1_only) noexcept
+{
+    // NOTE: forget() and freed() don't throw (nor allocate, given no connection to close).
+    {
+        connections      none;
+        std::scoped_lock lock{mu};
+        if (!http1_only) connected(key);
+        forget(key, nullptr, none);
+    }
+    freed();
 }
 
 void connection_pool::connected(const std::string& key) noexcept

@@ -1045,9 +1045,14 @@ TEST_CASE("a WebSocket client's handshake over HTTP/2 times out, and stops", "[w
     CHECK(reset == make_error_code(http2::error_code::cancel).message());
 }
 
-TEST_CASE("a WebSocket client's stream refused by its HTTP/2 server goes over HTTP/1.1 instead",
+TEST_CASE("a WebSocket client's stream refused by its HTTP/2 server, or asked for HTTP/1.1, goes over HTTP/1.1 instead",
           "[websocket][client][http2]")
 {
+    // REFUSED_STREAM, or HTTP_1_1_REQUIRED (RFC 9113, section 7) as a reset, or as a GOAWAY whose last stream is the
+    // GET's.
+    const auto how = GENERATE("refused"sv, "http11"sv, "goaway"sv);
+    CAPTURE(how);
+
     record             out;
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     script             server{&sched};
@@ -1058,8 +1063,10 @@ TEST_CASE("a WebSocket client's stream refused by its HTTP/2 server goes over HT
         if (!co_await server.open()) co_return;
         auto& s = server.conn->server;
 
-        // not processed: the client may open it elsewhere.
-        s.s.reset(3, http2::error_code::refused_stream);
+        // not processed (or to be sent over HTTP/1.1): the client may open it elsewhere.
+        if (how == "refused") s.s.reset(3, http2::error_code::refused_stream);
+        else if (how == "http11") s.s.reset(3, http2::error_code::http_1_1_required);
+        else s.s.goaway(1, http2::error_code::http_1_1_required);
         (void)co_await s.sync();
 
         auto second = co_await server.listener.accept();
@@ -1094,14 +1101,19 @@ TEST_CASE("a WebSocket client's stream refused by its HTTP/2 server goes over HT
     CHECK(out.get() == std::vector<std::string>{"GET /ws?x=1 HTTP/1.1", "connected", "close", "close: ok"});
 }
 
-TEST_CASE("a WebSocket client's stream refused once its server has answered it isn't opened again",
-          "[websocket][client][http2]")
+TEST_CASE(
+    "a WebSocket client's stream refused, or asked for HTTP/1.1, once its server has answered it isn't opened again",
+    "[websocket][client][http2]")
 {
+    const auto code = GENERATE(http2::error_code::refused_stream, http2::error_code::http_1_1_required);
+    CAPTURE(code);
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     script             server{&sched};
     http::client       client{&sched, prior_knowledge()};
 
-    // an interim response says the server processed it: REFUSED_STREAM after that can't mean it never saw it.
+    // an interim response says the server processed it: REFUSED_STREAM after that can't mean it never saw it, and
+    // HTTP_1_1_REQUIRED after it isn't taken as asking before anything's been done.
     std::atomic<std::uint64_t> connections = 1;
     const auto                 serve       = [&] -> task<void>
     {
@@ -1112,7 +1124,7 @@ TEST_CASE("a WebSocket client's stream refused once its server has answered it i
         };
         REQUIRE_FALSE(s.s.submit_headers(3, early, false));
         (void)co_await s.sync();
-        s.s.reset(3, http2::error_code::refused_stream);
+        s.s.reset(3, code);
         (void)co_await s.sync();
     };
 
@@ -1125,7 +1137,7 @@ TEST_CASE("a WebSocket client's stream refused once its server has answered it i
     };
 
     sched.run_to_completion(both(&sched, serve, run));
-    CHECK(err == http2::error_code::cancel);
+    CHECK(err == (code == http2::error_code::refused_stream ? http2::error_code::cancel : code));
     CHECK(connections.load() == 1);
 }
 
@@ -1136,8 +1148,9 @@ TEST_CASE("a WebSocket client over HTTP/2 finds its connection's end, and its st
     script             server{&sched};
     http::client       client{&sched, prior_knowledge()};
 
-    // the connection ends (the server closes it), the stream's reset, or the stream ends without a close.
-    const auto how = GENERATE("connection"sv, "reset"sv, "end"sv);
+    // the connection ends (the server closes it), the stream's reset (with HTTP_1_1_REQUIRED too, too late to go over
+    // HTTP/1.1), or the stream ends without a close.
+    const auto how = GENERATE("connection"sv, "reset"sv, "http11"sv, "end"sv);
     CAPTURE(how);
 
     std::atomic<std::uint64_t> reading = 0;
@@ -1152,6 +1165,7 @@ TEST_CASE("a WebSocket client over HTTP/2 finds its connection's end, and its st
 
         if (how == "connection") server.conn->socket.shutdown_write();
         else if (how == "reset") s.s.reset(3, http2::error_code::cancel);
+        else if (how == "http11") s.s.reset(3, http2::error_code::http_1_1_required);
         else s.send(3, {}, true);
         (void)co_await s.pump([] { return false; }, 300ms);
     };
