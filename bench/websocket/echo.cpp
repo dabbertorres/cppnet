@@ -16,7 +16,9 @@
 // memory each holds is the heap's growth (both sides', as the allocator counts it: all of the process's threads), from
 // before the client connects (each of these runs has a client of its own, so HTTP/2's connection is counted too) to
 // once they're open (and have each made a round trip, so both sides' reads wait, as an idle WebSocket's do), and to
-// after the runs (still open: what they kept of the runs, as the echo's message, 64 KiB each), divided by N.
+// after the runs (still open: what they kept of the runs, as the echo's message, 64 KiB each), and to after they've
+// then been idle for a while (what they keep for good: e.g. an HTTP/2 connection's free chunks for what its streams
+// receive are freed once none have been taken for a second or two), divided by N.
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -104,6 +106,9 @@ constexpr std::array loads{
 
 // how many WebSockets the parallel runs open at once.
 constexpr std::array widths{std::size_t{8}, std::size_t{64}};
+
+// How long a parallel run's WebSockets are left idle after the runs, before the heap's measured again.
+constexpr auto idle_for = std::chrono::milliseconds{2'500};
 
 // measured is a run's: how long it took, and the allocations it made.
 struct measured
@@ -304,6 +309,7 @@ struct in_parallel
     std::vector<measured> best;
     double                open  = 0;
     double                after = 0;
+    double                idle  = 0;
 };
 
 // per_websocket is how many messages each of n WebSockets sends in a parallel run of count, so that all of them send
@@ -369,6 +375,9 @@ run_parallel(net::io::scheduler* sched, http::client* client, std::string url, s
         }
     }
     result.after = (static_cast<double>(heap_in_use()) - static_cast<double>(before)) / static_cast<double>(n);
+
+    (void)co_await sched->sleep_until(net::io::clock::now() + idle_for);
+    result.idle = (static_cast<double>(heap_in_use()) - static_cast<double>(before)) / static_cast<double>(n);
 
     for (auto& conn : conns) (void)co_await conn.close();
     co_return result;
@@ -466,11 +475,14 @@ int main()
     {
         const auto        n       = widths[p / 2];
         const auto* const version = p % 2 == 0 ? "HTTP/1.1 (a connection each)" : "HTTP/2 (one connection)";
-        std::println("{} WebSockets at once, {}: {:.1f} KiB per WebSocket once open, {:.1f} KiB after the runs",
+        std::println("{} WebSockets at once, {}: {:.1f} KiB per WebSocket once open, {:.1f} KiB after the runs, "
+                     "{:.1f} KiB once idle for {} s",
                      n,
                      version,
                      r.parallel[p].open / 1'024.0,
-                     r.parallel[p].after / 1'024.0);
+                     r.parallel[p].after / 1'024.0,
+                     r.parallel[p].idle / 1'024.0,
+                     std::chrono::duration<double>(idle_for).count());
         for (std::size_t i = 0; i < r.parallel[p].best.size(); ++i)
         {
             const auto&       l   = loads[i / 2];
