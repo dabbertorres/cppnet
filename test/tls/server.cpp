@@ -1727,8 +1727,11 @@ TEST_CASE("an HTTP/2 connection whose writer fails with a TLS failure fails its 
     // the client's writer waits for the socket after each round that wrote (its TCP_NOTSENT_LOWAT): once the request's
     // being handled, the wait fails as a TLS stream's does once it has failed (e.g. with the peer's alert, which its
     // writes and waits then return, as its reads do).
-    auto options           = trusting_options();
-    options.http2_writable = [&handling] -> task<net::io::result>
+    // (its stream window the least, so the response's body is more than it, and the client's writer sends its
+    // WINDOW_UPDATEs.)
+    auto options                = trusting_options();
+    options.http2_stream_window = 65'535;
+    options.http2_writable      = [&handling] -> task<net::io::result>
     {
         if (handling.load() != 0) co_return net::io::result{.err = make_error_code(tls::errc::protocol_error)};
         co_return net::io::result{};

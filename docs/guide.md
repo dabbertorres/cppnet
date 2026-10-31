@@ -395,9 +395,11 @@ line longer than it is read into a string apart, and a body read in pieces small
 connection a buffer's worth: over loopback, 4 KiB rather than 1 took 11% less time for heads with 1.5 KiB lines, and
 read a chunked body 256 bytes at a time 65% faster, and 16 KiB another 5% and 18%); `write_buffer_size` (16 KiB) is how much of a request's body is read before it's written, over either
 version (each read a chunk, if it's chunked, or DATA frames). `http2_read_buffer_size` (32 KiB) is how much an HTTP/2
-connection reads at once, and `http2_stream_window` (65535; up to 2^31-1) how much of a response's body the server may
-send ahead of what's been read of it (SETTINGS_INITIAL_WINDOW_SIZE): one stream's download goes at most a window a
-round trip, and a body that isn't read holds that much.
+connection reads at once, and `http2_stream_window` (4 MiB, as Go's; from 65535 to 2^31-1) how much of a response's
+body the server may send ahead of what's been read of it (SETTINGS_INITIAL_WINDOW_SIZE): one stream's download goes at
+most a window a round trip (one download over a 20 ms round trip went at 2.8, about 30 and 73 MiB/s with 64 KiB, 1 MiB
+and 4 MiB), and a body that isn't read holds that much, as does a WebSocket over HTTP/2 that isn't read, whose stream
+has this window if it's more than its own.
 
 HTTP/2 is used over TLS with servers that agree on it with ALPN (unless `client_options::http2` is off), and over
 cleartext only when `client_options::http2_prior_knowledge` says the server speaks it. A response's `version` says

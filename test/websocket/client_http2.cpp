@@ -1277,7 +1277,10 @@ TEST_CASE("a WebSocket client's stream holds 256 KiB it hasn't read, and its lar
     record             out;
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     script             server{&sched};
-    http::client       client{&sched, prior_knowledge()};
+    // (the client's stream window the least, so the stream's is the tunnel's own.)
+    auto options                = prior_knowledge();
+    options.http2_stream_window = 65'535;
+    http::client client{&sched, options};
 
     // pattern is size bytes that differ from one to the next, so a piece in the wrong place shows.
     const auto pattern = [](std::size_t size)

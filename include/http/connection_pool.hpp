@@ -141,11 +141,15 @@ struct client_options
     std::size_t http2_read_buffer_size = std::size_t{32} * 1'024;
 
     // How much of a response's body an HTTP/2 server may send ahead of what's been read of it
-    // (SETTINGS_INITIAL_WINDOW_SIZE; from 65535 to 2^31-1, or the constructor throws std::invalid_argument): a
-    // stream's download goes at most this much a round trip (64 KiB is about 640 KiB/s over a 100 ms round trip). The
-    // connection's window is 1 GiB, as Go's, so streams read one at a time don't wait for each other. What a response
-    // body that isn't read can make the client hold is this much (in 16 KiB chunks, freed as they're read).
-    std::uint32_t http2_stream_window = http2::default_window;
+    // (SETTINGS_INITIAL_WINDOW_SIZE: 4 MiB, as Go's; from 65535 to 2^31-1, or the constructor throws
+    // std::invalid_argument): a stream's download goes at most this much a round trip. One 64 MiB download over a
+    // 20 ms round trip went at 2.8, 23 to 40 and 71 to 75 MiB/s with windows of 64 KiB, 1 MiB and 4 MiB, and 16 MiB
+    // over 100 ms at 0.6, 4 to 7 and 10 to 12 MiB/s. The connection's window is 1 GiB, as Go's, so streams read one at
+    // a time don't wait for each other. What a response body that isn't read can make the client hold is this much (in
+    // 16 KiB chunks, freed as they're read); and as a stream's window can't be made smaller than the connection's
+    // setting, a WebSocket over HTTP/2 has this window if it's more than its own
+    // (websocket::connection_options::http2_window).
+    std::uint32_t http2_stream_window = std::uint32_t{4} << 20;
 
 #ifdef NET_HAS_TLS
     // For https:// URLs: which certificate authorities to trust (the system's, by default), or not to verify servers'
