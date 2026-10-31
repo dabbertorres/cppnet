@@ -1527,6 +1527,86 @@ against HTTP/1.1 for large messages is the writes that wait (the client's write 
 frame, `buffered_writer::flush()`'s and the WebSocket's `flush_and_release()`'s: the 3 one at a time has over
 HTTP/1.1's; with many WebSockets, writes waiting their turn), and in flight the HTTP/2 path's CPU (above).
 
+## Learned after stage 9: configurable sizes
+
+The buffers and windows that a connection, stream or WebSocket holds were constants; they're options now (the guide's
+"Buffers and windows" says what each sizes), with today's values as defaults but two, which measuring changed. The
+WebSocket's are `connect_options::read_buffer_size` and `write_buffer_size` (16 KiB, the client's own HTTP/1.1
+connection), and `connection_options::http2_window` (256 KiB, the stream's window: `tunnel_window` was) and
+`http2_buffer_size` (4 KiB, the tunnel's buffers: `tunnel_buffer_size` was), both passed through
+`switch_protocols()` and `open_tunnel()` in `http::detail::tunnel_options`. A server's WebSocket over HTTP/1.1 uses the
+connection's buffers (`server_config::read_buffer_size` and `write_buffer_size`), so `accept_options` has none.
+
+The tunnel's buffers stay 4 KiB. `bench_websocket` has medium messages now (8 KiB: past the tunnel's buffers, within a
+DATA frame), and takes the buffers' size as its argument. 16 KiB buffers against 4 (Release, two workers, three runs
+each, best of five within a run; time per message, allocations per message; both sides counted, as they share the
+process):
+
+| Row                                         | 4 KiB                    | 16 KiB                   | HTTP/1.1          |
+|---------------------------------------------|--------------------------|--------------------------|-------------------|
+| HTTP/2, 8 KiB, one at a time                | 40.2 to 42.2 us, 9       | 37.8 to 38.8, 4          | 31.9 to 32.2, 4   |
+| HTTP/2, 8 KiB, in flight                    | 8.1 us, 7.6              | 6.9 to 7.1, 1.9          | 7.1 to 7.6, 1.5   |
+| HTTP/2, 64 KiB, one at a time               | 111.7 to 113.7 us, 13    | 117.2 to 120.8, 14       | 97.0 to 99.8, 10  |
+| HTTP/2, 64 KiB, in flight                   | 52.2 to 53.4 us, 11.4    | 57.6 to 59.0, 11.5       | 35.5 to 37.9, 7.1 |
+| 64 over HTTP/2, 8 KiB, one at a time        | 11.2 to 11.6 us, 9.2     | 9.9 to 10.2, 4.6         | 18.5 to 18.6, 4.0 |
+| 64 over HTTP/2, 8 KiB, in flight            | 11.8 to 13.0 us, 11.5 to 13.3 | 9.1 to 10.6, 6.5 to 7.1 | 7.5 to 7.8, 1.1 |
+| 64 over HTTP/2, 64 KiB, in flight           | 65.8 to 67.1 us, 28.4 to 28.8 | 60.7 to 65.1, 21.1 to 23.1 | 42.9 to 44.2, 7.4 |
+| 8 over HTTP/2, KiB per WebSocket once open  | 36.4 to 38.3             | 86.5 to 87.4             | 80.8 to 83.6      |
+| 64 over HTTP/2, KiB per WebSocket once open | 28.9 to 29.1             | 76.8 to 77.0             | 82.3 to 82.8      |
+
+16 KiB gathers an 8 KiB message (and its header) into one write and one DATA frame, so it's 7 to 13% faster and
+allocates half as much; but 64 KiB messages one at a time and in flight are 5 to 10% slower (with many WebSockets, a
+little faster), and each WebSocket holds 24 KiB more a side once open (the table's 48: both sides), more than doubling
+what an idle WebSocket over HTTP/2 holds. Not a change for the default; an application whose messages are mostly 4 to
+16 KiB can raise it.
+
+The client's HTTP/2 stream window is 4 MiB now (Go's), from 64 KiB. Over loopback the window hardly shows, so
+`bench_client stream <client's window> <server's window> [MiB]` (one stream's download, then upload, through
+`http::client` from cppnet's server, cleartext with prior knowledge) ran in a throwaway Linux container (Arch, the
+image's packages, `NET_TLS=OFF`), with netem delaying the loopback interface (`tc qdisc add dev lo root netem delay
+10ms`, so a 20 ms round trip; then 50 ms, 100 ms), three runs each:
+
+| Round trip | 64 KiB    | 1 MiB              | 4 MiB              |
+|------------|-----------|--------------------|--------------------|
+| none (one run) | 1400 MiB/s | 1468 MiB/s    | 885 MiB/s          |
+| 20 ms      | 2.8 MiB/s | 22.8 to 40.3 MiB/s | 70.9 to 74.6 MiB/s |
+| 100 ms     | 0.6 MiB/s | 3.8 to 7.3 MiB/s   | 10.2 to 11.7 MiB/s (16 MiB: slow start's share) |
+
+A stream's window can't be made smaller than the connection's setting, so a client's WebSocket over HTTP/2 now has the
+client's 4 MiB window rather than its own 256 KiB (`http2_window` only widens): a server sending to a client that
+doesn't read can make it hold 4 MiB per WebSocket. With both sides cppnet's, `bench_websocket`'s HTTP/2 64 KiB in flight
+went from 58.1 to 59.4 us to 52.2 to 53.4. The server's stream window stays 64 KiB: its connection's window holds every
+stream's, so 1 MiB a stream would let a client make it hold 100 MiB per connection.
+
+The uploads found something else: on Linux, cppnet's client doesn't set TCP_NODELAY (the server does), so an upload
+stalls on Nagle's algorithm against the server's delayed ACKs, about 40 ms a window: 1.6 MiB/s over loopback with the
+server's 64 KiB window, 48 MiB/s with 1 MiB (macOS's loopback hides it: 1 GiB/s). A probe that set it on the pool's
+connections went at 946 and 1088 MiB/s over loopback, and over 20 ms at 2.8 MiB/s with 64 KiB and 23 MiB/s with
+1 MiB, as the downloads do. Left for a change of its own.
+
+The client's HTTP/1.1 response reader is 4 KiB now (Go's), from 1 KiB (`buffered_reader`'s default, never chosen).
+`bench_client` (Release, three runs, best of five within each; the server's allocations counted too):
+
+| Reader | small GET         | 4 Set-Cookie lines of 1.5 KiB | chunked 8 MiB, read 256 B at a time |
+|--------|-------------------|-------------------------------|-------------------------------------|
+| 1 KiB  | 43.2 to 44.4 us, 30 | 69.9 to 71.3 us, 67         | 427 to 449 MiB/s                    |
+| 4 KiB  | 43.3 to 44.2 us, 30 | 62.2 to 62.6 us, 45         | 698 to 728 MiB/s                    |
+| 16 KiB | 43.6 to 43.8 us, 30 | 59.4 to 59.9 us, 39         | 834 to 852 MiB/s                    |
+
+4 KiB takes most of the gain at a quarter of 16 KiB's memory per request in flight.
+
+`tls::client_options` and `server_options` have `write_batch_size` (64 KiB, at least 16 KiB). Kept in the context and
+copied into each stream's `detail::connection`, it first sat among the members that flush writes, and `bench_tls
+writes` went from about 430 MiB/s to 365 for every size, allocations and heap unchanged; aligning the ciphertext buffer
+to 64 bytes didn't help, and the member as the struct's last did (413 to 431 MiB/s against the base's 418 to 433). Something
+in that struct is sensitive to where its cache lines fall: worth a look of its own.
+
+At the defaults otherwise (six runs of `bench_request`, three of `bench_websocket`, interleaved with the base's):
+`bench_request`'s HTTP/2 8 streams at once went from 1095 to 1220 us a round to 870 to 994 (the client's window), and
+the first request's bytes up from 112 to 118 (the client's SETTINGS says its window); its pipelined rows' medians
+were 1 to 3% slower (pipelined 1104 to 1158 ns against 1098 to 1134 before), on a path whose code didn't change (nor was it the bench's buffers following the server's option: a build with the constant again ran as this one), so likely where the code fell, and the rest moved within
+their noise, as did `bench_websocket`'s rows but HTTP/2's in flight (above).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
