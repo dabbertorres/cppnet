@@ -136,7 +136,7 @@ public:
     detail::stream_tunnel& make_tunnel()
     {
         std::scoped_lock lock{c.mu};
-        stream.tunnel = std::make_unique<detail::stream_tunnel>(stream, std::stop_token{});
+        stream.tunnel = std::make_unique<detail::stream_tunnel>(stream, std::stop_token{}, detail::tunnel_options{});
         return *stream.tunnel;
     }
 

@@ -62,7 +62,8 @@ public:
                 std::stop_token                                     stop)
         : pool{std::move(pool)}
         , leased{std::move(leased)}
-        , reader{std::make_unique<net::io::buffered_reader>(&net::http::detail::as_reader(*this->leased.conn))}
+        , reader{std::make_unique<net::io::buffered_reader>(&net::http::detail::as_reader(*this->leased.conn),
+                                                            this->pool->options().read_buffer_size)}
         , stop{std::move(stop)}
     {}
 
@@ -455,10 +456,11 @@ await_continue(net::io::buffered_reader*            reader,
     }
 }
 
-// send_body sends the body of a request whose head was sent alone.
-net::coro::task<std::error_code> send_body(net::io::buffered_writer& out, const net::http::client_request& request)
+// send_body sends the body of a request whose head was sent alone, read body_buffer at a time.
+net::coro::task<std::error_code>
+send_body(net::io::buffered_writer& out, const net::http::client_request& request, std::size_t body_buffer)
 {
-    auto res = co_await net::http::http11::request_encode_body(&out, request);
+    auto res = co_await net::http::http11::request_encode_body(&out, request, body_buffer);
     if (!res.has_value()) co_return res.error();
     co_return (co_await out.flush()).err;
 }
@@ -499,7 +501,7 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
     {
         sock.set_read_deadline(std::nullopt);
 
-        const auto err = co_await send_body(out, request);
+        const auto err = co_await send_body(out, request, options.write_buffer_size);
         if (err && !closed_early(err)) co_return sent{.response = std::unexpected(err)};
 
         if (err) written = std::unexpected(err);
@@ -527,7 +529,7 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
         reusable_request && options.keep_alive && net::http::http11::connection_reusable(resp, request.method);
     if (!kept) co_return deliver(body, resp, request, false);
 
-    const auto err = co_await send_body(out, request);
+    const auto err = co_await send_body(out, request, options.write_buffer_size);
     co_return deliver(body, resp, request, !err);
 }
 
@@ -662,7 +664,7 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
 
     auto res = expecting ? co_await http11::request_encode_head(&out, request)
-                         : co_await http11::request_encode(&out, request);
+                         : co_await http11::request_encode(&out, request, options.write_buffer_size);
     if (res.has_value())
     {
         if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);

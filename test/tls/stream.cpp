@@ -2384,3 +2384,201 @@ TEST_CASE("a write whose task is destroyed before it's awaited leaves its turn t
     const bool in_order = server_read == first + last;
     CHECK(in_order);
 }
+
+TEST_CASE("contexts refuse a write batch smaller than a record", "[tls][write][batches]")
+{
+    const std::size_t size = GENERATE(16'383, 16'384);
+    CAPTURE(size);
+
+    auto client = tls::client_context::make({.trusted_ca_file = pki().ca, .write_batch_size = size});
+    auto server = tls::server_context::make(
+        {.certificate_chain = pki().localhost_chain, .private_key = pki().localhost_key, .write_batch_size = size});
+    if (size < 16'384)
+    {
+        REQUIRE_FALSE(client.has_value());
+        CHECK(client.error() == std::errc::invalid_argument);
+        REQUIRE_FALSE(server.has_value());
+        CHECK(server.error() == std::errc::invalid_argument);
+    }
+    else
+    {
+        CHECK(client.has_value());
+        CHECK(server.has_value());
+    }
+}
+
+namespace
+{
+
+// relayed is what a relay between a TLS client and its server saw: the lengths of the TLS records each way (after
+// their 5-byte headers).
+struct relayed
+{
+    std::mutex               mu;
+    std::vector<std::size_t> up;   // the client's
+    std::vector<std::size_t> down; // the server's
+};
+
+// forward copies from one connection to the other until it ends (then ending the other's outgoing side), noting the
+// lengths of the records it copies in lengths, under mu.
+task<> forward(net::tcp_socket& from, net::tcp_socket& to, std::mutex& mu, std::vector<std::size_t>& lengths)
+{
+    std::vector<std::byte>        pending;
+    std::array<std::byte, 16'384> buf{};
+    while (true)
+    {
+        auto res = co_await from.read(buf);
+        if (res.count > 0)
+        {
+            const auto got = std::span{buf}.first(res.count);
+            if ((co_await net::io::write_all(to, got)).err) break;
+
+            pending.insert(pending.end(), got.begin(), got.end());
+            std::scoped_lock lock{mu};
+            while (pending.size() >= 5)
+            {
+                const auto length =
+                    (std::to_integer<std::size_t>(pending[3]) << 8) | std::to_integer<std::size_t>(pending[4]);
+                if (pending.size() < 5 + length) break;
+                lengths.push_back(length);
+                pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(5 + length));
+            }
+        }
+        if (res.err) break;
+    }
+    to.shutdown_write();
+}
+
+// relay accepts a connection, connects it to the server on port, and copies between them until both ways have ended.
+task<>
+relay(net::io::scheduler* sched, net::listener* listener, std::uint16_t port, relayed* seen, server_outcome* ended)
+{
+    auto client = co_await listener->accept();
+    if (!client.has_value()) co_return;
+    auto server = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+    if (!server.has_value()) co_return;
+
+    server_outcome down_done{.sched = sched, .err = {}};
+    const auto     down = [](net::tcp_socket* from, net::tcp_socket* to, relayed* seen, server_outcome* done) -> task<>
+    {
+        co_await forward(*from, *to, seen->mu, seen->down);
+        done->finish({});
+    };
+    if (!sched->spawn(down(&*server, &*client, seen, &down_done))) co_return;
+
+    co_await forward(*client, *server, seen->mu, seen->up);
+    while (down_done.done.load() == 0) (void)co_await sched->wait_on(down_done.done, 0);
+    ended->finish({});
+}
+
+// written_records is the plaintext lengths of the last of records (TLS 1.3's: each with its content type and a 16-byte
+// tag) that carry total bytes, in order; empty if they don't add up to it.
+std::vector<std::size_t> written_records(const std::vector<std::size_t>& records, std::size_t total)
+{
+    std::vector<std::size_t> out;
+    std::size_t              sum = 0;
+    for (auto it = records.rbegin(); it != records.rend() && sum < total; ++it)
+    {
+        out.insert(out.begin(), *it - 17);
+        sum += *it - 17;
+    }
+    return sum == total ? out : std::vector<std::size_t>{};
+}
+
+}
+
+TEST_CASE("a large write goes as records of write_batch_size's batches", "[tls][write][batches]")
+{
+    struct test_case
+    {
+        std::string_view         name;
+        std::size_t              batch = 0;
+        std::vector<std::size_t> want; // the records of a write of 40 KiB: their plaintext
+    };
+
+    // a batch is encrypted whole, as records of 16 KiB but its last, before the next.
+    const auto tc = GENERATE(
+        test_case{
+            .name  = "20 KiB",
+            .batch = 20'480,
+            .want  = {16'384, 4'096, 16'384, 4'096}
+    },
+        test_case{.name = "24 KiB", .batch = 24'576, .want = {16'384, 8'192, 16'384}},
+        test_case{.name = "64 KiB, the default", .batch = 65'536, .want = {16'384, 16'384, 8'192}});
+    const bool by_server = GENERATE(false, true);
+    CAPTURE(tc.name, by_server);
+
+    constexpr std::size_t size = 40'960;
+    const auto            data = pattern(size);
+
+    // (outliving the scheduler's tasks, which use them.)
+    relayed            seen;
+    net::io::scheduler sched{make_pool()};
+    server_outcome     relay_ended{.sched = &sched, .err = {}};
+    server_outcome     server_done{.sched = &sched, .err = {}};
+    std::string        server_read;
+
+    net::listener tls_listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    tls_listener.listen(8);
+    net::listener relay_listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    relay_listener.listen(8);
+    REQUIRE(sched.spawn(relay(&sched, &relay_listener, tls_listener.local_port(), &seen, &relay_ended)));
+
+    auto server_ctx = tls::server_context::make({.certificate_chain = pki().localhost_chain,
+                                                 .private_key       = pki().localhost_key,
+                                                 .write_batch_size  = by_server ? tc.batch : 65'536});
+    REQUIRE(server_ctx.has_value());
+    auto client_ctx =
+        tls::client_context::make({.trusted_ca_file = pki().ca, .write_batch_size = by_server ? 65'536 : tc.batch});
+    REQUIRE(client_ctx.has_value());
+
+    // the server writes the data (if it's the writer), then reads until close_notify.
+    const auto serve = [by_server, &data, &server_read, &server_done](tls::stream& s) -> task<>
+    {
+        if (by_server && (co_await s.write(std::as_bytes(std::span{data}))).err) co_return;
+        auto [got, err] = co_await read_to_end(s);
+        server_read     = std::move(got);
+        server_done.finish(err);
+        co_await s.close();
+    };
+    REQUIRE(sched.spawn(serve_once(&tls_listener, *server_ctx, serve)));
+
+    const auto client = [&] -> task<std::vector<std::size_t>>
+    {
+        auto s = co_await connect_to(&sched, relay_listener.local_port(), *client_ctx, "localhost");
+        REQUIRE(s.has_value());
+
+        // the data's all arrived (and so through the relay) once the reader has read it: the client, or the server,
+        // which reads to close_notify, after it.
+        std::string read;
+        if (by_server)
+        {
+            std::array<std::byte, 4'096> buf{};
+            while (read.size() < size)
+            {
+                auto res = co_await s->read(buf);
+                read += as_string(std::span{buf}.first(res.count));
+                if (res.err) break;
+            }
+        }
+        else
+        {
+            const auto written = co_await s->write(std::as_bytes(std::span{data}));
+            CHECK_FALSE(written.err);
+        }
+        (void)co_await s->shutdown();
+        co_await server_done.wait();
+        co_await s->close();
+        co_await relay_ended.wait();
+        if (by_server) CHECK(read == data);
+        else CHECK(server_read == data);
+
+        // (each side's close_notify, an alert of 2 bytes, after the data.)
+        std::scoped_lock lock{seen.mu};
+        auto             records = by_server ? seen.down : seen.up;
+        while (!records.empty() && records.back() == 2 + 17) records.pop_back();
+        co_return written_records(records, size);
+    };
+
+    CHECK(sched.run_to_completion(client()) == tc.want);
+}

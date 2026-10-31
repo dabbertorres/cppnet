@@ -234,7 +234,8 @@ namespace
                                     options.session,
                                     logger,
                                     marked,
-                                    marked ? options.writable : writable_function{}}
+                                    marked ? options.writable : writable_function{},
+                                    options.read_size}
             , options{options}
             , handler{handler}
             , peer_certs{peer_certificates(conn)}
@@ -399,7 +400,7 @@ namespace
     }
 
     std::expected<tunnel*, std::error_code>
-    http2_open_tunnel(http2_stream& stream, server_response& resp, fields_view fields)
+    http2_open_tunnel(http2_stream& stream, server_response& resp, fields_view fields, const tunnel_options& options)
     {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast): a server's stream is a server connection's.
         auto&   c      = static_cast<http2_server_connection&>(*stream.conn);
@@ -420,7 +421,7 @@ namespace
             // can't hold a write longer.
             stream.read_timeout = std::chrono::milliseconds::zero();
             stream.read_deadline.reset();
-            stream.tunnel = std::make_unique<stream_tunnel>(stream, c.closing());
+            stream.tunnel = std::make_unique<stream_tunnel>(stream, c.closing(), options);
             opened        = stream.tunnel.get();
         }
 

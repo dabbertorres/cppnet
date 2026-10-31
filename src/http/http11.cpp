@@ -438,11 +438,9 @@ constexpr std::string_view connection_te = "Connection: TE\r\n";
 // version, status code and reason phrase, and the line's end and the head's.
 constexpr std::size_t max_start_line_overhead = 128;
 
-// body_buffer is how much of a body is read at a time.
-constexpr std::size_t body_buffer = std::size_t{16} * 1'024;
-
-// copy_length copies exactly length bytes from body, which mustn't end before then.
-task<std::error_code> copy_length(net::io::reader& body, net::io::writer& out, std::size_t length)
+// copy_length copies exactly length bytes from body, which mustn't end before then, reading body_buffer at a time.
+task<std::error_code>
+copy_length(net::io::reader& body, net::io::writer& out, std::size_t length, std::size_t body_buffer)
 {
     std::vector<std::byte> buf(std::min(length, body_buffer));
 
@@ -464,8 +462,10 @@ task<std::error_code> copy_length(net::io::reader& body, net::io::writer& out, s
     co_return std::error_code{};
 }
 
-// copy_chunked copies body, until it ends, as chunks (but not the last chunk, which ends them).
-task<std::error_code> copy_chunked(net::io::reader& body, net::http::http11::chunked_writer& chunked)
+// copy_chunked copies body, until it ends, as chunks (but not the last chunk, which ends them), reading body_buffer at
+// a time.
+task<std::error_code>
+copy_chunked(net::io::reader& body, net::http::http11::chunked_writer& chunked, std::size_t body_buffer)
 {
     std::vector<std::byte> buf(body_buffer);
 
@@ -581,10 +581,12 @@ std::string encode_head(const client_request& req, const request_framing& framin
     return head;
 }
 
-// write_body writes a request's body as framing says, which isn't none: then, if it's chunked, the last chunk, with
-// make_trailers' fields.
-task<net::http::request_encoder_result>
-write_body(net::io::writer* writer, const client_request& req, request_framing framing) noexcept
+// write_body writes a request's body as framing says, which isn't none, read body_buffer at a time: then, if it's
+// chunked, the last chunk, with make_trailers' fields.
+task<net::http::request_encoder_result> write_body(net::io::writer*      writer,
+                                                   const client_request& req,
+                                                   request_framing       framing,
+                                                   std::size_t           body_buffer) noexcept
 {
     net::http::http11::chunked_writer chunked{writer};
     try
@@ -595,11 +597,11 @@ write_body(net::io::writer* writer, const client_request& req, request_framing f
         {
         case request_framing::kind::none: break;
         case request_framing::kind::length:
-            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length);
+            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length, body_buffer);
             break;
         case request_framing::kind::chunked:
             // a chunked request without a body (only if it asked for chunked) is just the last chunk.
-            if (req.body != nullptr) err = co_await copy_chunked(*req.body, chunked);
+            if (req.body != nullptr) err = co_await copy_chunked(*req.body, chunked, body_buffer);
             break;
         }
 
@@ -811,7 +813,8 @@ std::error_code check_request(const client_request& req) noexcept
     }
 }
 
-task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept
+task<request_encoder_result>
+request_encode(io::writer* writer, const client_request& req, std::size_t body_buffer) noexcept
 {
     if (auto err = check_request(req); err) co_return std::unexpected(err);
 
@@ -823,7 +826,7 @@ task<request_encoder_result> request_encode(io::writer* writer, const client_req
 
     // NOTE: a request without a body (most) has no frame for it.
     if (framing.how == request_framing::kind::none) co_return writer;
-    co_return co_await write_body(writer, req, framing);
+    co_return co_await write_body(writer, req, framing, body_buffer);
 }
 
 task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept
@@ -836,7 +839,8 @@ task<request_encoder_result> request_encode_head(io::writer* writer, const clien
     co_return writer;
 }
 
-task<request_encoder_result> request_encode_body(io::writer* writer, const client_request& req) noexcept
+task<request_encoder_result>
+request_encode_body(io::writer* writer, const client_request& req, std::size_t body_buffer) noexcept
 {
     try
     {
@@ -844,7 +848,7 @@ task<request_encoder_result> request_encode_body(io::writer* writer, const clien
         if (!framing.has_value()) return coro::ready_task<request_encoder_result>(std::unexpected(framing.error()));
         if (framing->how == request_framing::kind::none) return coro::ready_task<request_encoder_result>(writer);
 
-        return write_body(writer, req, *framing);
+        return write_body(writer, req, *framing, body_buffer);
     }
     catch (const std::bad_alloc&)
     {

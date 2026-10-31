@@ -1092,3 +1092,102 @@ TEST_CASE("a WebSocket client's writes time out at the client's io_timeout", "[w
     const auto timed_out = std::make_error_code(std::errc::timed_out).message();
     CHECK(lines == std::vector<std::string>{"write: " + timed_out, "then: " + timed_out, "read: " + timed_out});
 }
+
+TEST_CASE("a WebSocket client's own buffers carry messages whatever their sizes", "[websocket][client][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const std::size_t size = GENERATE(1'024, 65'536);
+    CAPTURE(size);
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router));
+
+    http::client client{&sched};
+
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+
+        auto conn = co_await ws::connect(client,
+                                         url_of(server->local_port()),
+                                         {.read_buffer_size = size, .write_buffer_size = size});
+        if (!conn.has_value()) co_return std::vector<std::string>{"connect: " + conn.error().message()};
+
+        // messages shorter and longer than the buffers, and a frame's header across their ends.
+        std::string message;
+        for (const std::size_t length : {0, 1'000, 1'020, 1'024, 5'000, 70'000, 300'000})
+        {
+            std::string data(length, '\0');
+            for (std::size_t i = 0; i < length; ++i) data[i] = static_cast<char>('a' + ((i + length) % 26));
+
+            if (auto err = co_await conn->write_message(ws::message_type::text, data))
+                co_return std::vector<std::string>{"write: " + describe(err)};
+            const auto read = co_await conn->read_message(message);
+            if (!read.has_value()) co_return std::vector<std::string>{"read: " + describe(read.error())};
+            lines.push_back(std::format("{} {}", length, message == data ? "same" : "differs"));
+        }
+
+        lines.push_back("close: " + describe(co_await conn->close()));
+        co_return lines;
+    };
+
+    CHECK(sched.run_to_completion(test())
+          == std::vector<std::string>{"0 same",
+                                      "1000 same",
+                                      "1020 same",
+                                      "1024 same",
+                                      "5000 same",
+                                      "70000 same",
+                                      "300000 same",
+                                      "close: ok"});
+}
+
+TEST_CASE("a WebSocket client refuses sizes out of their ranges, before it connects", "[websocket][client][sizes]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    // a port no one listens on: a listener's, closed. A connect that got as far as connecting is refused there.
+    std::uint16_t closed_port = 0;
+    {
+        auto listener = net::listener::make(&sched, "127.0.0.1", "0").value();
+        closed_port   = listener.local_port();
+    }
+
+    struct test_case
+    {
+        std::string_view    name;
+        ws::connect_options options;
+        std::errc           want = std::errc::invalid_argument;
+    };
+
+    const auto tc = GENERATE(
+        test_case{
+            .name    = "read_buffer_size under 1 KiB",
+            .options = {.read_buffer_size = 1'023}
+    },
+        test_case{.name = "write_buffer_size under 1 KiB", .options = {.write_buffer_size = 1'023}},
+        test_case{.name = "http2_window under 65535", .options = {.connection = {.http2_window = 65'534}}},
+        test_case{.name = "http2_window over 2^31-1", .options = {.connection = {.http2_window = 0x8000'0000}}},
+        test_case{.name = "http2_buffer_size under 1 KiB", .options = {.connection = {.http2_buffer_size = 1'023}}},
+        test_case{.name    = "the least of each",
+                  .options = {.read_buffer_size  = 1'024,
+                              .write_buffer_size = 1'024,
+                              .connection        = {.http2_window = 65'535, .http2_buffer_size = 1'024}},
+                  .want    = std::errc::connection_refused},
+        test_case{.name    = "the most window",
+                  .options = {.connection = {.http2_window = 0x7fff'ffff}},
+                  .want    = std::errc::connection_refused});
+    CAPTURE(tc.name);
+
+    http::client client{&sched};
+    const auto   got = sched.run_to_completion(
+        [](http::client* client, std::string url, ws::connect_options options) -> task<std::error_code>
+        {
+            auto conn = co_await ws::connect(*client, url, options);
+            co_return conn.has_value() ? std::error_code{} : conn.error();
+        }(&client, url_of(closed_port), tc.options));
+    CHECK(got == tc.want);
+}

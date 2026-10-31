@@ -60,6 +60,14 @@ struct client_options
     // it trusts, as cppnet's does) issued by one of them; otherwise the client sends none, as one without does.
     std::optional<std::filesystem::path> certificate_chain{};
     std::optional<std::filesystem::path> private_key{};
+
+    // How much of a large write a stream encrypts at once, then flushes before it encrypts more (64 KiB; at least
+    // 16 KiB, a record's plaintext, or make() fails with std::errc::invalid_argument): a write no larger, with none
+    // waiting, is encrypted whole. A large write holds a batch's ciphertext at most, and allocates it once per batch:
+    // so larger costs memory per writing stream, and saves allocations and wakeups per large write, but no time (a
+    // 16 MiB write over loopback took as long with 16, 64 and 256 KiB batches, which peaked at about 140, 350 and
+    // 900 KiB of heap). A batch that isn't a multiple of 16 KiB ends in a shorter record.
+    std::size_t write_batch_size = std::size_t{64} * 1'024;
 };
 
 class stream;
@@ -161,7 +169,8 @@ class client_context
 public:
     // make loads the trusted certificate authorities, and the certificate and key, failing if a file can't be read, or
     // (with std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none), or
-    // if there's a certificate without a key or a key without a certificate, or the key isn't the certificate's.
+    // if there's a certificate without a key or a key without a certificate, or the key isn't the certificate's, or
+    // write_batch_size is under 16 KiB.
     static std::expected<client_context, std::error_code> make(const client_options& options = {});
 
 private:
@@ -224,6 +233,9 @@ struct server_options
     // trusting every public CA for them would let anyone with a web server's certificate in.
     std::optional<std::filesystem::path> client_ca_file{};
 
+    // How much of a large write a stream encrypts at once (see client_options::write_batch_size).
+    std::size_t write_batch_size = std::size_t{64} * 1'024;
+
     // Session resumption, with tickets (as Go's, on by default): once a TLS 1.3 handshake is done, the server sends the
     // client a ticket (its session, encrypted with the server's key), with which the client's next connection resumes
     // the session, skipping the certificates (sending, signing for and verifying them, both ways) though still
@@ -261,7 +273,7 @@ public:
     // std::errc::invalid_argument) if min_version is after max_version, or either isn't a version (e.g. none), or the
     // key isn't the certificate's, or there's client_auth without client_ca_file, or client_ca_file without it, or
     // session_ticket_lifetime isn't more than 0 and at most 7 days, or there are session_ticket_keys without
-    // session_tickets.
+    // session_tickets, or write_batch_size is under 16 KiB.
     static std::expected<server_context, std::error_code> make(const server_options& options);
 
     // set_session_ticket_keys replaces the keys tickets are encrypted with (as server_options::session_ticket_keys),

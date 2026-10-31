@@ -17,9 +17,8 @@ namespace net::http::http2
 
 using stream_id = std::uint32_t;
 
-// max_stream_id is the largest stream id (31 bits), and the largest window.
+// max_stream_id is the largest stream id (31 bits), as max_window (http2_config.hpp) is the largest window.
 inline constexpr std::uint32_t max_stream_id = 0x7fff'ffff;
-inline constexpr std::int64_t  max_window    = 0x7fff'ffff;
 
 // preface is what a client sends first (RFC 9113, section 3.4), before its SETTINGS frame.
 inline constexpr std::string_view preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

@@ -3915,3 +3915,174 @@ TEST_CASE("an HTTP/2 extended CONNECT with Content-Length: 0 is a WebSocket's, a
                                       "then write: 1000 peer",
                                       "then close: ok"});
 }
+
+TEST_CASE("a WebSocket's connection sizes out of their ranges fail accept(), which answers nothing",
+          "[websocket][server][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    struct test_case
+    {
+        std::string_view       name;
+        ws::connection_options connection;
+    };
+
+    const auto tc =
+        GENERATE(test_case{.name = "http2_window under 65535", .connection = {.http2_window = 65'534}},
+                 test_case{.name = "http2_window over 2^31-1", .connection = {.http2_window = 0x8000'0000}},
+                 test_case{.name = "http2_buffer_size under 1 KiB", .connection = {.http2_buffer_size = 1'023}});
+    CAPTURE(tc.name);
+
+    // the handler finds the mistake, and is left to respond, as it does (refusing nothing of the client's).
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.connection = tc.connection});
+                   out.add(conn.has_value() ? "accepted" : "failed: " + conn.error().message());
+                   if (conn.has_value()) co_return;
+
+                   rw.headers().set("Connection"sv, "close"sv);
+                   co_await rw.send(http::status::SERVICE_UNAVAILABLE, 0);
+               });
+    auto server = make_server(&sched, std::move(router));
+
+    const auto result =
+        sched.run_to_completion(run_peer(&sched, server->local_port(), test::websocket::handshake(), {}));
+    CHECK(result.head.starts_with("HTTP/1.1 503 "));
+    CHECK(out.get()
+          == std::vector<std::string>{"failed: " + std::make_error_code(std::errc::invalid_argument).message()});
+}
+
+TEST_CASE("a WebSocket over HTTP/1.1 echoes messages through the server's connection buffers, whatever their size",
+          "[websocket][server][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const std::size_t size = GENERATE(1'024, 65'536);
+    CAPTURE(size);
+
+    http::router router;
+    router.GET("/ws", [&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); });
+    auto server = make_server(&sched, std::move(router), {.read_buffer_size = size, .write_buffer_size = size});
+
+    // messages shorter and longer than the buffers, and a frame's header across their ends.
+    std::vector<std::string> messages;
+    std::vector<std::byte>   frames;
+    for (const std::size_t length : {0, 1'000, 1'020, 1'024, 5'000, 70'000})
+    {
+        auto& text = messages.emplace_back(length, '\0');
+        for (std::size_t i = 0; i < length; ++i) text[i] = static_cast<char>('a' + ((i + length) % 26));
+        frames = join(frames, client_frame(opcode::text, text));
+    }
+    frames = join(frames, close_frame(ws::close_code::normal_closure));
+
+    const auto result =
+        sched.run_to_completion(run_peer(&sched, server->local_port(), test::websocket::handshake(), frames));
+    CHECK(result.head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    REQUIRE(result.frames.size() == messages.size() + 1);
+    for (std::size_t i = 0; i < messages.size(); ++i)
+    {
+        CAPTURE(i);
+        CHECK(result.frames[i].text() == messages[i]);
+    }
+    CHECK(summary(result.frames.back()) == "close:1000");
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream widens its window to http2_window", "[websocket][server][http2][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    struct test_case
+    {
+        std::string_view name;
+        std::uint32_t    window        = 0;      // the WebSocket's
+        std::uint32_t    stream_window = 65'535; // the server's
+        std::int64_t     want          = 0;      // the stream's window, as the client sees it
+    };
+
+    const auto tc = GENERATE(test_case{.name = "the default", .window = 262'144, .want = 262'144},
+                             test_case{.name = "1 MiB", .window = 1U << 20, .want = 1 << 20},
+                             test_case{.name = "the initial window: no wider", .window = 65'535, .want = 65'535},
+                             test_case{.name          = "less than the server's stream window: no wider",
+                                       .window        = 262'144,
+                                       .stream_window = 1U << 20,
+                                       .want          = 1 << 20});
+    CAPTURE(tc.name);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.http2_window = tc.window}}); });
+    auto server = make_server(&sched, std::move(router), {.http2_stream_window = tc.stream_window});
+
+    const auto client = [&] -> task<std::int64_t>
+    {
+        auto conn = co_await connect_h2(&sched, server->local_port());
+        REQUIRE(conn.has_value());
+
+        test::h2_client c{&*conn, &*conn, &*conn};
+        const bool      settings = co_await c.settings();
+        REQUIRE(settings);
+        auto id = c.extended_connect("/ws", "websocket", ws_fields());
+        REQUIRE(id.has_value());
+
+        // the 200, then (as the tunnel's made after it) the window's WINDOW_UPDATE, if any, which a PING's answer
+        // follows.
+        const bool head = co_await c.pump([&] { return !c.responses[*id].status.empty(); });
+        REQUIRE(head);
+        const bool synced = co_await c.sync();
+        REQUIRE(synced);
+        const auto window = c.s.send_window(*id);
+
+        const auto close = close_frame(ws::close_code::normal_closure);
+        c.send(*id, std::string_view{reinterpret_cast<const char*>(close.data()), close.size()}, false);
+        (void)co_await c.wait_for(*id);
+        co_return window;
+    };
+
+    CHECK(sched.run_to_completion(client()) == tc.want);
+    CHECK(out.get() == std::vector<std::string>{"read: 1000 peer reason=", "then write: 1000 peer", "then close: ok"});
+}
+
+TEST_CASE("a WebSocket over an HTTP/2 stream echoes messages whatever its buffers' size",
+          "[websocket][server][http2][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const std::size_t size = GENERATE(1'024, 65'536);
+    CAPTURE(size);
+
+    http::router router;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw)
+               { return echo(req, rw, out, {.connection = {.http2_buffer_size = size}}); });
+    auto server = make_server(&sched, std::move(router));
+
+    std::vector<std::string> messages;
+    std::vector<std::byte>   frames;
+    for (const std::size_t length : {0, 1'000, 1'020, 1'024, 5'000, 70'000, 300'000})
+    {
+        auto& text = messages.emplace_back(length, '\0');
+        for (std::size_t i = 0; i < length; ++i) text[i] = static_cast<char>('a' + ((i + length) % 26));
+        frames = join(frames, client_frame(opcode::text, text));
+    }
+    frames = join(frames, close_frame(ws::close_code::normal_closure));
+
+    const auto result =
+        sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps_sending(&sched, frames)));
+    CAPTURE(result.err.message(), out.get());
+
+    REQUIRE(result.frames.size() == messages.size() + 1);
+    for (std::size_t i = 0; i < messages.size(); ++i)
+    {
+        CAPTURE(i);
+        CHECK(result.frames[i].text() == messages[i]);
+    }
+    CHECK(summary(result.frames.back()) == "close:1000");
+    CHECK(result.err == net::io::errc::end_of_stream);
+}

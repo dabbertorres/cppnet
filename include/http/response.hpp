@@ -326,6 +326,25 @@ namespace detail
     // tunnel is a connection's bytes once it has switched protocols (see http/tunnel.hpp).
     class tunnel;
 
+    // tunnel_options size an HTTP/2 stream that's opened as a tunnel (see stream_tunnel): ignored over HTTP/1.1, whose
+    // tunnel is the connection's own buffers.
+    struct tunnel_options
+    {
+        // The stream's receive window, raised from the connection's stream window (if that's less) with one
+        // WINDOW_UPDATE: what the peer may send that the tunnel's reader hasn't read yet. A stream's initial window
+        // (64 KiB) is what a request's body needs, but a tunnel carries a protocol's messages (e.g. a WebSocket's), one
+        // after another, as TCP would, whose receive buffer starts at 128 KiB (on Linux and macOS) and grows: so a
+        // message of 64 KiB goes without waiting for a WINDOW_UPDATE, and messages on the way keep going while the
+        // window's given back. What a peer that doesn't read can make the other side hold is still bounded: by this,
+        // and by the connection's window, which bounds all the streams' together.
+        std::uint32_t window = std::uint32_t{256} * 1'024;
+
+        // How much the tunnel's reader and writer each buffer: the stream has buffers of its own (what's received, and
+        // the connection's output), so this only gathers small writes (e.g. a WebSocket's frame header and a short
+        // message) into one DATA frame, and small reads out of the stream's lock.
+        std::size_t buffer_size = std::size_t{4} * 1'024;
+    };
+
     // switch_hook is how a response_writer reaches the connection it responds on, to switch it: made once per
     // connection (a function and its context, as io::start_callback is), so a response_writer holds only a pointer to
     // it. call readies the connection, on the handler's task, and returns its tunnel: from then, nothing but the
@@ -340,7 +359,8 @@ namespace detail
     };
 
     // switch_protocols switches the connection rw's request came on to another protocol (see http/tunnel.hpp).
-    coro::task<std::expected<tunnel*, std::error_code>> switch_protocols(response_writer& rw, fields_view fields);
+    coro::task<std::expected<tunnel*, std::error_code>>
+    switch_protocols(response_writer& rw, fields_view fields, const tunnel_options& options = {});
 
     // http2_stream_ops are what a response_writer does with an HTTP/2 stream, which its server provides: so that
     // response_writer doesn't depend on HTTP/2's server (as it doesn't on HTTP/1.1's encoder).
@@ -364,9 +384,10 @@ namespace detail
         // the DATA that follows, both ways, is the protocol's. It fails, sending nothing and leaving resp as it was,
         // with std::errc::not_supported if the stream's request wasn't an extended CONNECT, and with the stream's
         // failure if it has failed (e.g. reset).
-        std::expected<tunnel*, std::error_code> (*open_tunnel)(http2_stream&    stream,
-                                                               server_response& resp,
-                                                               fields_view      fields);
+        std::expected<tunnel*, std::error_code> (*open_tunnel)(http2_stream&         stream,
+                                                               server_response&      resp,
+                                                               fields_view           fields,
+                                                               const tunnel_options& options);
     };
 
     // put_fields puts fields in headers, replacing those of the same names, for a response that switches (or opens a
@@ -471,8 +492,8 @@ public:
     [[nodiscard]] bool continue_unmet() const noexcept { return continuation == continue_state::unmet; }
 
 private:
-    friend coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_protocols(response_writer& rw,
-                                                                                                fields_view fields);
+    friend coro::task<std::expected<detail::tunnel*, std::error_code>>
+    detail::switch_protocols(response_writer& rw, fields_view fields, const detail::tunnel_options& options);
 
     // continue_state is how a request's expectation of 100 Continue stands.
     enum class continue_state : std::uint8_t

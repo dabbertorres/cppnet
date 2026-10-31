@@ -300,8 +300,8 @@ void detail::put_fields(headers& to, fields_view fields)
     }
 }
 
-coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_protocols(response_writer& rw,
-                                                                                     fields_view      fields)
+coro::task<std::expected<detail::tunnel*, std::error_code>>
+detail::switch_protocols(response_writer& rw, fields_view fields, const tunnel_options& options)
 {
     using result = std::expected<tunnel*, std::error_code>;
 
@@ -317,7 +317,7 @@ coro::task<std::expected<detail::tunnel*, std::error_code>> detail::switch_proto
         if (!valid())
             return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::invalid_argument)));
 
-        auto opened = h2->ops->open_tunnel(*h2->stream, *rw.resp, fields);
+        auto opened = h2->ops->open_tunnel(*h2->stream, *rw.resp, fields, options);
         if (opened.has_value())
         {
             rw.final_sent = true;

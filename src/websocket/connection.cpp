@@ -29,6 +29,7 @@
 #include "http/http11.hpp"
 #include "http/http2.hpp"
 #include "http/http2_client.hpp"
+#include "http/http2_config.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 #include "http/tunnel.hpp"
@@ -112,19 +113,18 @@ namespace
     };
 
     // client_tunnel is a client's connection (see connect()), as a tunnel: the WebSocket's own, with buffers of its own
-    // (16 KiB each way, as a server's connection has), whose reader holds what the server sent after its handshake's
-    // response.
+    // (connect_options' sizes), whose reader holds what the server sent after its handshake's response.
     class client_tunnel final
         : public http::detail::tunnel
         , public client_transport
     {
     public:
-        static constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
-
-        explicit client_tunnel(std::unique_ptr<http::detail::connection> connection)
+        client_tunnel(std::unique_ptr<http::detail::connection> connection,
+                      std::size_t                               read_buffer_size,
+                      std::size_t                               write_buffer_size)
             : conn{std::move(connection)}
-            , in{&http::detail::as_reader(*conn), buffer_size}
-            , out{&http::detail::as_writer(*conn), buffer_size}
+            , in{&http::detail::as_reader(*conn), read_buffer_size}
+            , out{&http::detail::as_writer(*conn), write_buffer_size}
         {}
 
         client_tunnel(const client_tunnel&)            = delete;
@@ -1477,6 +1477,19 @@ namespace
         return endpoint{.target = std::move(*parsed), .port = std::move(port)};
     }
 
+    // valid_sizes is whether a connection's sizes are in their ranges (see connection_options).
+    bool valid_sizes(const connection_options& options) noexcept
+    {
+        return http::detail::valid_window(options.http2_window)
+            && options.http2_buffer_size >= http::detail::min_buffer_size;
+    }
+
+    // tunnel_options_of is what an HTTP/2 stream's tunnel is opened with for a connection's options.
+    http::detail::tunnel_options tunnel_options_of(const connection_options& options) noexcept
+    {
+        return {.window = options.http2_window, .buffer_size = options.http2_buffer_size};
+    }
+
     // failure is what opening a WebSocket failed with: once stop's been requested, that, whatever its cancellation
     // caused (e.g. a TLS read cut short).
     std::unexpected<std::error_code> failure(const connect_options& options, std::error_code err)
@@ -1498,7 +1511,7 @@ namespace
         auto request = detail::make_http2_request(where.target, options);
         request.stop = options.stop;
 
-        auto opened = co_await conn->open_tunnel(request, "websocket"sv, &state);
+        auto opened = co_await conn->open_tunnel(request, "websocket"sv, tunnel_options_of(options.connection), &state);
         if (!opened.has_value()) co_return failure(options, opened.error());
 
         // NOTE: a stream that isn't the WebSocket's (refused here) is done with as the response goes: reset, unless
@@ -1541,7 +1554,9 @@ namespace
         auto conn = co_await pool->connect_apart(where.target.scheme, where.target.host, where.port, options.stop);
         if (!conn.has_value()) co_return fail(conn.error());
 
-        auto own = std::make_unique<detail::client_tunnel>(std::move(*conn));
+        auto own = std::make_unique<detail::client_tunnel>(std::move(*conn),
+                                                           options.read_buffer_size,
+                                                           options.write_buffer_size);
 
         // the handshake's request is written (as the WebSocket's frames are) with io_timeout, and its response read
         // within response_header_timeout, both ended by stop.
@@ -1599,6 +1614,9 @@ namespace
 task<std::expected<connection, std::error_code>>
 accept(const http::server_request& req, http::response_writer& rw, const accept_options& options)
 {
+    // a mistake in the options is the handler's, which is left to respond.
+    if (!valid_sizes(options.connection)) co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+
     auto key = detail::check_request(req);
     if (auto refused = key.has_value() ? detail::check_origin(req, options) : key.error())
     {
@@ -1618,7 +1636,7 @@ accept(const http::server_request& req, http::response_writer& rw, const accept_
     }
     if (!subprotocol.empty()) fields.set("Sec-WebSocket-Protocol"sv, subprotocol);
 
-    auto switched = co_await http::detail::switch_protocols(rw, fields);
+    auto switched = co_await http::detail::switch_protocols(rw, fields, tunnel_options_of(options.connection));
     if (!switched.has_value()) co_return std::unexpected(switched.error());
 
     co_return connection{std::make_unique<connection_state>(**switched,
@@ -1637,6 +1655,13 @@ connect(const http::client& client, std::string_view url, const connect_options&
     auto where = endpoint_of(url);
     if (!where.has_value())
         return ready_task<std::expected<connection, std::error_code>>(std::unexpected(where.error()));
+
+    if (!valid_sizes(options.connection) || options.read_buffer_size < http::detail::min_buffer_size
+        || options.write_buffer_size < http::detail::min_buffer_size)
+    {
+        return ready_task<std::expected<connection, std::error_code>>(
+            std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+    }
 
     return open(http::detail::pool_of(client), std::move(*where), options);
 }

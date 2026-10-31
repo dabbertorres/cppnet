@@ -52,6 +52,18 @@ struct server_config
     std::size_t   max_connections         = 512;
     std::uint16_t max_pending_connections = 512;
 
+    // How much each HTTP/1.x connection's reader and writer buffer (16 KiB each; at least 1 KiB, or the constructors
+    // throw std::invalid_argument). They're kept for the connection's life, as a WebSocket's (which reads and writes
+    // through them: see websocket::accept()), so they're most of what an idle connection holds. A request's head
+    // that's all in the read buffer is decoded without a coroutine, and so is each request of a pipelined batch: a
+    // read buffer of at least max_header_bytes takes every head allowed in place (a line longer than it is read into a
+    // string apart); and a response's head that fits the write buffer is formatted straight into it. So smaller
+    // buffers cost less memory per connection, and more reads and writes (syscalls, and coroutine frames) for heads
+    // and small bodies; reads and writes larger than a buffer go past it, so larger buffers save little for large
+    // bodies. Over TLS a read returns a record's plaintext (16 KiB) at most, so a larger read buffer saves no reads.
+    std::size_t read_buffer_size  = std::size_t{16} * 1'024;
+    std::size_t write_buffer_size = std::size_t{16} * 1'024;
+
     // Serve HTTP/2 as well as HTTP/1.1: over TLS when the client agrees on h2 with ALPN, and over cleartext when a
     // client starts with HTTP/2's preface (prior knowledge). Its streams are limited by the timeouts above, as
     // requests are (a stream that times out is reset, rather than the connection closed), and a connection without
@@ -60,6 +72,21 @@ struct server_config
 
     // The most streams (requests) an HTTP/2 client may have open on a connection at once (nginx's default).
     std::uint32_t http2_max_concurrent_streams = 100;
+
+    // How much an HTTP/2 connection's reader reads at once (32 KiB; at least 1 KiB, or the constructors throw
+    // std::invalid_argument), kept for the connection's life: less costs more reads for a burst of frames. Over TLS a
+    // read returns a record's plaintext (16 KiB) at most, so more than that only matters over cleartext.
+    std::size_t http2_read_buffer_size = std::size_t{32} * 1'024;
+
+    // How much of a request's body an HTTP/2 client may send ahead of what its handler has read
+    // (SETTINGS_INITIAL_WINDOW_SIZE: 65535, the protocol's initial window; from 65535 to 2^31-1, or the constructors
+    // throw std::invalid_argument). A stream's upload goes at most this much a round trip: 64 KiB is about 640 KiB/s
+    // over a 100 ms round trip. The connection's window holds every stream's (this times http2_max_concurrent_streams,
+    // at least 1 MiB, at most 2^31-1), so a client may make the server hold that much per connection, received and
+    // not yet read (in 16 KiB chunks, freed as they're read: a body read as it comes holds little). So larger speeds
+    // uploads over long round trips, at the cost of what a client that sends without its handler reading can make the
+    // server hold. 64 KiB is nginx's (http2_body_preread_size) and Envoy's edge guidance; Go's server takes 1 MiB.
+    std::uint32_t http2_stream_window = http2::default_window;
 
     // Whether an HTTP/2 connection sends responses that contend for it by their priorities (RFC 9218): the most
     // urgent first, those of one urgency one at a time in the order they were requested (or, if incremental, taking
@@ -254,6 +281,8 @@ private:
     io::scheduler*                  scheduler;
 
     std::size_t          max_header_bytes;
+    std::size_t          read_buffer_size;
+    std::size_t          write_buffer_size;
     std::chrono::seconds header_read_timeout;
     std::chrono::seconds body_read_timeout;
     std::chrono::seconds write_timeout;

@@ -253,7 +253,8 @@ http2_client_connection::http2_client_connection(io::scheduler*              sch
                             options.session,
                             *log,
                             set_mark(*owned, options.notsent_lowat, *log),
-                            options.writable}
+                            options.writable,
+                            options.read_size}
     , options{options}
     , on{std::move(on)}
     , keeps_origins{verifies_peer(*owned)}
@@ -388,8 +389,8 @@ void http2_client_connection::not_opened(std::unique_lock<connection_mutex>& loc
     if (on.freed) on.freed();
 }
 
-coro::task<std::expected<tunnel_response, std::error_code>>
-http2_client_connection::open_tunnel(const client_request& request, std::string_view protocol, send_state* state)
+coro::task<std::expected<tunnel_response, std::error_code>> http2_client_connection::open_tunnel(
+    const client_request& request, std::string_view protocol, const tunnel_options& tunnel, send_state* state)
 {
     std::shared_ptr<http2_client_stream> stream;
     {
@@ -445,7 +446,7 @@ http2_client_connection::open_tunnel(const client_request& request, std::string_
                 {
                     s.read_timeout = std::chrono::milliseconds::zero();
                     s.read_deadline.reset();
-                    s.tunnel = std::make_unique<stream_tunnel>(s, std::stop_token{});
+                    s.tunnel = std::make_unique<stream_tunnel>(s, std::stop_token{}, tunnel);
                 }
                 break;
             }
@@ -537,7 +538,7 @@ coro::task<http2_client_connection::body_result> http2_client_connection::send_b
                           length.value_or(std::numeric_limits<std::size_t>::max()),
                           io::limit_reader::mode::up_to};
 
-    std::vector<std::byte> buffer(std::size_t{16} * 1'024);
+    std::vector<std::byte> buffer(options.body_buffer_size);
     std::size_t            sent = 0;
     while (!length.has_value() || sent < *length)
     {

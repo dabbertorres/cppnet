@@ -82,6 +82,19 @@ struct client_options
     // client::send().
     std::chrono::milliseconds expect_continue_timeout = std::chrono::seconds{1};
 
+    // How much an HTTP/1.x response's reader buffers (1 KiB; at least 1 KiB, or the constructor throws
+    // std::invalid_argument): allocated for each request, and kept until its response's body has been read. A
+    // response head line longer than it is read into a string apart, and a body read in pieces smaller than it takes a
+    // read of the connection (a syscall) per buffer's worth, where reads larger than it go past it. So larger costs
+    // memory per request in flight, and saves reads for long heads and bodies read in small pieces.
+    std::size_t read_buffer_size = 1'024;
+
+    // How much of a request's body is read from it before it's written to the connection (HTTP/1.x) or its stream
+    // (HTTP/2), each time (16 KiB; at least 1 KiB, or the constructor throws std::invalid_argument): allocated for each
+    // request with a body, while it's sent. So larger costs memory per upload in flight, and saves reads of the body
+    // and writes (syscalls, over HTTP/1.x).
+    std::size_t write_buffer_size = std::size_t{16} * 1'024;
+
     // Whether to speak HTTP/2 (each request a stream of a connection that others share) to servers that do: over TLS,
     // it's offered with ALPN, and used if the server agrees. A request's HTTP/1.x version and Connection field mean
     // nothing over HTTP/2: turning this off is how to send HTTP/1.0, or close a connection after a request.
@@ -120,6 +133,17 @@ struct client_options
     // Internal (for tests): what an HTTP/2 connection's writer waits with for its socket to take more, instead of the
     // socket (only with http2_notsent_lowat set), if set: e.g. to hold the connection "unwritable".
     detail::writable_function http2_writable{};
+
+    // How much an HTTP/2 connection's reader reads at once (32 KiB; at least 1 KiB, or the constructor throws
+    // std::invalid_argument), as the server's (server_config::http2_read_buffer_size).
+    std::size_t http2_read_buffer_size = std::size_t{32} * 1'024;
+
+    // How much of a response's body an HTTP/2 server may send ahead of what's been read of it
+    // (SETTINGS_INITIAL_WINDOW_SIZE; from 65535 to 2^31-1, or the constructor throws std::invalid_argument): a
+    // stream's download goes at most this much a round trip (64 KiB is about 640 KiB/s over a 100 ms round trip). The
+    // connection's window is 1 GiB, as Go's, so streams read one at a time don't wait for each other. What a response
+    // body that isn't read can make the client hold is this much (in 16 KiB chunks, freed as they're read).
+    std::uint32_t http2_stream_window = http2::default_window;
 
 #ifdef NET_HAS_TLS
     // For https:// URLs: which certificate authorities to trust (the system's, by default), or not to verify servers'

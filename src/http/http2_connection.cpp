@@ -44,22 +44,6 @@ namespace net::http::detail
 namespace
 {
 
-    // How much is read from the connection at once.
-    constexpr std::size_t read_size = std::size_t{32} * 1'024;
-
-    // How much a stream's tunnel buffers each way (see stream_tunnel): the stream has buffers of its own (what's
-    // received, and the connection's output), so this only gathers small writes (e.g. a WebSocket's frame header and a
-    // short message) into one DATA frame, and small reads out of the stream's lock.
-    constexpr std::size_t tunnel_buffer_size = std::size_t{4} * 1'024;
-
-    // A tunnel's stream's window, each way: what its peer may send that its reader hasn't read yet. A stream's initial
-    // window (64 KiB) is what a request's body needs, but a tunnel carries a protocol's messages (e.g. a WebSocket's),
-    // one after another, as TCP would, whose receive buffer starts at 128 KiB (on Linux and macOS) and grows: so a
-    // message of 64 KiB goes without waiting for a WINDOW_UPDATE, and messages on the way keep going while the window's
-    // given back. What a peer that doesn't read can make the other side hold is still bounded: by this, and by the
-    // connection's window, which bounds all the streams' together.
-    constexpr std::uint32_t tunnel_window = std::uint32_t{256} * 1'024;
-
     // How often the timer trims a connection's free chunks (see chunk_pool::trim()): those none took for as long are
     // freed, so steady traffic (e.g. a WebSocket's messages, coming every second or more often) reuses them, and an
     // idle connection holds none within twice this.
@@ -637,14 +621,14 @@ std::expected<std::size_t, std::error_code> http2_connection_base::submit_body(h
 
 io::handle stream_writer::native_handle() const noexcept { return stream->conn->native_handle(); }
 
-stream_tunnel::stream_tunnel(http2_stream_base& stream, std::stop_token closing)
+stream_tunnel::stream_tunnel(http2_stream_base& stream, std::stop_token closing, const tunnel_options& options)
     : stream{stream}
     , closing_token{std::move(closing)}
     , raw_in{&stream}
-    , in{&raw_in, tunnel_buffer_size}
-    , out{&stream.writer, tunnel_buffer_size}
+    , in{&raw_in, options.buffer_size}
+    , out{&stream.writer, options.buffer_size}
 {
-    stream.conn->session.widen_window(stream.id, tunnel_window);
+    stream.conn->session.widen_window(stream.id, options.window);
 }
 
 void stream_tunnel::set_read_timeout(std::optional<io::clock::duration> t) noexcept
@@ -747,7 +731,8 @@ http2_connection_base::http2_connection_base(io::scheduler*               schedu
                                              const http2::session_config& config,
                                              spdlog::logger&              logger,
                                              bool                         waits_writable,
-                                             writable_function            writable)
+                                             writable_function            writable,
+                                             std::size_t                  read_size)
     : session{side, config}
     , scheduler{scheduler}
     , pool{scheduler->pool()}
@@ -755,6 +740,7 @@ http2_connection_base::http2_connection_base(io::scheduler*               schedu
     , logger{logger}
     , waits_writable{waits_writable}
     , writable{std::move(writable)}
+    , read_size{read_size}
     , writer_wakeup{pool}
 {}
 

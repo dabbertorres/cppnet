@@ -66,9 +66,6 @@ using namespace std::string_view_literals;
 // The most of an unread request body to read and discard, rather than closing the connection.
 constexpr std::size_t max_discard_bytes = std::size_t{64} * 1'024;
 
-// How much a connection reads, and writes, at once.
-constexpr std::size_t buffer_size = std::size_t{16} * 1'024;
-
 // current_date is the Date header's value for a response sent now (RFC 9110, section 6.6.1: a server with a clock
 // sends one). It's formatted at most once a second, on each thread, so the view is only valid until the thread next
 // calls it (e.g. after a co_await, which may continue on another).
@@ -197,6 +194,7 @@ net::http::http2::session_config http2_session_config(const net::http::server_co
     net::http::http2::session_config config;
     config.local.max_concurrent_streams  = cfg.http2_max_concurrent_streams;
     config.local.enable_connect_protocol = cfg.http2_websockets;
+    config.local.initial_window_size     = cfg.http2_stream_window;
 
     // NOTE: saturating, as max_header_bytes may be near SIZE_MAX (no limit, in effect).
     constexpr std::size_t field_overhead = 32 * net::http::http11::max_fields;
@@ -208,6 +206,20 @@ net::http::http2::session_config http2_session_config(const net::http::server_co
     config.connection_window = static_cast<std::uint32_t>(
         std::clamp<std::uint64_t>(streams, std::uint64_t{1} << 20, net::http::http2::max_window));
     return config;
+}
+
+// check_sizes throws std::invalid_argument for a size of cfg's out of its range: a buffer of less than
+// detail::min_buffer_size, or a window HTTP/2 doesn't allow.
+void check_sizes(const net::http::server_config& cfg)
+{
+    using net::http::detail::min_buffer_size;
+
+    if (cfg.read_buffer_size < min_buffer_size) throw std::invalid_argument{"read_buffer_size is under 1 KiB"};
+    if (cfg.write_buffer_size < min_buffer_size) throw std::invalid_argument{"write_buffer_size is under 1 KiB"};
+    if (cfg.http2_read_buffer_size < min_buffer_size)
+        throw std::invalid_argument{"http2_read_buffer_size is under 1 KiB"};
+    if (!net::http::detail::valid_window(cfg.http2_stream_window))
+        throw std::invalid_argument{"http2_stream_window isn't from 65535 to 2^31-1"};
 }
 
 // http2_origins_of is cfg's http2_origins, normalized and without repeats, throwing std::invalid_argument for one that
@@ -284,6 +296,8 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
     , logger{cfg.logger}
     , scheduler{scheduler}
     , max_header_bytes{cfg.max_header_bytes}
+    , read_buffer_size{cfg.read_buffer_size}
+    , write_buffer_size{cfg.write_buffer_size}
     , header_read_timeout{cfg.header_read_timeout}
     , body_read_timeout{cfg.body_read_timeout}
     , write_timeout{cfg.write_timeout}
@@ -299,11 +313,14 @@ server::server(io::scheduler* scheduler, net::listener listener, request_handler
           .notsent_lowat       = cfg.http2_notsent_lowat,
           .writable            = cfg.http2_writable,
           .origins             = http2_origins_of(cfg),
+          .read_size           = cfg.http2_read_buffer_size,
       }
 #ifdef NET_HAS_TLS
     , tls_ctx{cfg.tls}
 #endif
 {
+    check_sizes(cfg);
+
     // NOTE: listening from now, rather than from when serve() starts (on a worker), so connections made in between are
     //       queued (up to max_pending_connections) rather than refused.
     if (!this->listener.listening()) this->listener.listen(max_pending_connections);
@@ -454,10 +471,14 @@ coro::task<bool> server::room_for_connection()
 // that their memory (e.g. for header values) is.
 struct server::connection_state
 {
-    connection_state(detail::connection* conn, std::stop_token closing, std::optional<io::clock::duration> read_timeout)
-        : writer{&detail::as_writer(*conn), buffer_size}
+    connection_state(detail::connection*                conn,
+                     std::stop_token                    closing,
+                     std::optional<io::clock::duration> read_timeout,
+                     std::size_t                        read_buffer_size,
+                     std::size_t                        write_buffer_size)
+        : writer{&detail::as_writer(*conn), write_buffer_size}
         , input{&detail::as_reader(*conn), &writer}
-        , reader{&input, buffer_size}
+        , reader{&input, read_buffer_size}
         , conn{conn}
         , read_timeout{read_timeout}
         , closing{std::move(closing)}
@@ -971,7 +992,7 @@ coro::task<std::optional<std::vector<std::byte>>> server::serve_requests(detail:
 {
     // close() ends the connection gracefully: at once if it's waiting for a request, or after the request it's serving
     // (see connection_state::phase). abort() (and the destructor) ends it either way.
-    connection_state state{&conn, closing.get_token(), read_timeout()};
+    connection_state state{&conn, closing.get_token(), read_timeout(), read_buffer_size, write_buffer_size};
     auto&            req  = state.req;
     auto&            resp = state.resp;
 

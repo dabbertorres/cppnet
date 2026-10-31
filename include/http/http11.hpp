@@ -25,9 +25,14 @@ using coro::task;
 // - std::errc::not_supported for transfer codings other than chunked, or versions other than HTTP/1.0 and 1.1.
 std::error_code check_request(const client_request& req) noexcept;
 
-// request_encode writes a request, including its body: with its Content-Length (which it must match), or chunked.
-// POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
-task<request_encoder_result> request_encode(io::writer* writer, const client_request& req) noexcept;
+// default_body_buffer is how much of a request's body request_encode() reads at a time, by default
+// (client_options::write_buffer_size).
+inline constexpr std::size_t default_body_buffer = std::size_t{16} * 1'024;
+
+// request_encode writes a request, including its body: with its Content-Length (which it must match), or chunked; read
+// body_buffer at a time. POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
+task<request_encoder_result>
+request_encode(io::writer* writer, const client_request& req, std::size_t body_buffer = default_body_buffer) noexcept;
 
 // request_encode_head writes a request's head: what request_encode() writes before the body, failing as it does. For a
 // client that waits for 100 (Continue) before it sends the body (Expect: 100-continue), with request_encode_body().
@@ -35,7 +40,9 @@ task<request_encoder_result> request_encode_head(io::writer* writer, const clien
 
 // request_encode_body writes the body of a request whose head request_encode_head() wrote (and, if it's chunked, the
 // last chunk, with make_trailers' fields): the rest of what request_encode() writes.
-task<request_encoder_result> request_encode_body(io::writer* writer, const client_request& req) noexcept;
+task<request_encoder_result> request_encode_body(io::writer*           writer,
+                                                 const client_request& req,
+                                                 std::size_t           body_buffer = default_body_buffer) noexcept;
 
 task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
 

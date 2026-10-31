@@ -19,6 +19,11 @@ namespace net::http::http2
 
 inline constexpr std::uint32_t unlimited = std::numeric_limits<std::uint32_t>::max();
 
+// default_window and max_window are a flow-control window's initial size (a stream's, until SETTINGS change it, and a
+// connection's) and the largest it may be (RFC 9113, sections 6.9.1 and 6.9.2).
+inline constexpr std::uint32_t default_window = 65'535;
+inline constexpr std::int64_t  max_window     = 0x7fff'ffff;
+
 // min_max_frame_size and max_max_frame_size are MAX_FRAME_SIZE's bounds.
 inline constexpr std::uint32_t min_max_frame_size = 16'384;
 inline constexpr std::uint32_t max_max_frame_size = 16'777'215;
@@ -32,7 +37,7 @@ struct settings
     bool          enable_connect_protocol = false;
     bool          no_rfc7540_priorities   = false;
     std::uint32_t max_concurrent_streams  = unlimited;
-    std::uint32_t initial_window_size     = 65'535;
+    std::uint32_t initial_window_size     = default_window;
     std::uint32_t max_frame_size          = min_max_frame_size;
     std::uint32_t max_header_list_size    = unlimited;
 
@@ -104,6 +109,23 @@ struct session_config
 namespace net::http::detail
 {
 
+// min_buffer_size is the least a buffer the configurations size may be (server_config's and client_options'
+// *_buffer_size, and the WebSocket's): less only costs more reads and writes, and a reader must hold what's parsed in
+// place (e.g. HTTP/2's preface, or a WebSocket frame's header).
+inline constexpr std::size_t min_buffer_size = 1'024;
+
+// default_read_size is how much an HTTP/2 connection reads at once, by default (server_config's and client_options'
+// http2_read_buffer_size).
+inline constexpr std::size_t default_read_size = std::size_t{32} * 1'024;
+
+// valid_window is whether window may be an HTTP/2 stream's receive window (server_config's and client_options'
+// http2_stream_window, and a WebSocket's http2_window): at least the initial window, which the peer may send before it
+// has seen it, and no more than a window may be.
+constexpr bool valid_window(std::uint32_t window) noexcept
+{
+    return window >= http2::default_window && window <= http2::max_window;
+}
+
 // writable_function waits until an HTTP/2 connection's socket can take more (see socket::wait_writable()), as its
 // writer (a server's or a client's) does before each round with TCP_NOTSENT_LOWAT set: for tests, which hold a
 // connection "unwritable" with it.
@@ -137,6 +159,9 @@ struct http2_options
     // The origins sent in ORIGIN after the server's SETTINGS, on connections over TLS: server_config::http2_origins,
     // normalized (and checked against the certificate). Empty sends none.
     std::vector<std::string> origins{};
+
+    // How much a connection reads at once: server_config::http2_read_buffer_size.
+    std::size_t read_size = default_read_size;
 };
 
 // http2_client_options are what a client's HTTP/2 connections are made with: client_options'.
@@ -162,6 +187,11 @@ struct http2_client_options
     // Internal (for tests): what the writer waits with instead of the socket, if set (only while notsent_lowat is set):
     // client_options::http2_writable.
     writable_function writable{};
+
+    // How much a connection reads at once (client_options::http2_read_buffer_size), and how much of a request's body
+    // is read before it's written to its stream (client_options::write_buffer_size).
+    std::size_t read_size        = default_read_size;
+    std::size_t body_buffer_size = std::size_t{16} * 1'024;
 };
 
 }

@@ -1378,3 +1378,127 @@ TEST_CASE("a WebSocket client's stream holds 256 KiB it hasn't read, and its lar
     CHECK(std::ranges::contains(lines, "client's message same"));
     CHECK(std::ranges::contains(lines, "then: 1000 peer"));
 }
+
+TEST_CASE("a WebSocket client over HTTP/2 widens its stream's window to http2_window",
+          "[websocket][client][http2][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    script             server{&sched};
+
+    struct test_case
+    {
+        std::string_view name;
+        std::uint32_t    window        = 0;      // the WebSocket's
+        std::uint32_t    stream_window = 65'535; // the client's
+        std::int64_t     want          = 0;      // the stream's window, as the server sees it
+    };
+
+    const auto tc = GENERATE(test_case{.name = "the default", .window = 262'144, .want = 262'144},
+                             test_case{.name = "1 MiB", .window = 1U << 20, .want = 1 << 20},
+                             test_case{.name = "the initial window: no wider", .window = 65'535, .want = 65'535},
+                             test_case{.name          = "less than the client's stream window: no wider",
+                                       .window        = 262'144,
+                                       .stream_window = 1U << 20,
+                                       .want          = 1 << 20});
+    CAPTURE(tc.name);
+
+    auto options                = prior_knowledge();
+    options.http2_stream_window = tc.stream_window;
+    http::client client{&sched, options};
+
+    std::atomic<std::uint64_t> client_done = 0; // the client's WebSocket's gone
+
+    const auto serve = [&] -> task<void>
+    {
+        if (!co_await server.open())
+        {
+            out.add("no extended CONNECT");
+            co_return;
+        }
+        auto& s = server.conn->server;
+
+        const std::vector<http::hpack::field> head{
+            {.name = ":status", .value = "200"}
+        };
+        REQUIRE_FALSE(s.s.submit_headers(3, head, false));
+
+        // the client's close comes after the window's WINDOW_UPDATE, if any, which it sent as it opened the tunnel.
+        (void)co_await s.pump([&] { return !server.frames().empty(); });
+        out.add(std::format("window {}", s.s.send_window(3)));
+
+        server.send(server_close(ws::close_code::normal_closure), true);
+        (void)co_await s.pump([&] { return s.responses[3].done; });
+        (void)co_await reach(&sched, client_done);
+    };
+
+    const auto run = [&] -> task<void>
+    {
+        {
+            ws::connect_options ws_options;
+            ws_options.connection.http2_window = tc.window;
+            auto conn                          = co_await connect_after_get(client, server.port(), ws_options);
+            if (!conn.has_value())
+            {
+                out.add("connect: " + conn.error().message());
+                co_return;
+            }
+            out.add("close: " + describe(co_await conn->close()));
+        }
+        raise(&sched, client_done);
+    };
+
+    sched.run_to_completion(both(&sched, serve, run));
+
+    const auto lines = out.get();
+    CAPTURE(lines);
+    CHECK(std::ranges::contains(lines, std::format("window {}", tc.want)));
+    CHECK(std::ranges::contains(lines, "close: ok"));
+}
+
+TEST_CASE("a WebSocket client over HTTP/2 echoes messages whatever its buffers' size",
+          "[websocket][client][http2][sizes]")
+{
+    record             out;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+
+    const std::size_t size = GENERATE(1'024, 65'536);
+    CAPTURE(size);
+
+    auto server =
+        make_server(&sched,
+                    routes([&](http::server_request& req, http::response_writer& rw) { return echo(req, rw, out); }));
+    http::client client{&sched, prior_knowledge()};
+
+    const auto test = [&] -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> lines;
+
+        ws::connect_options options;
+        options.connection.http2_buffer_size = size;
+        auto conn                            = co_await connect_after_get(client, server->local_port(), options);
+        if (!conn.has_value()) co_return std::vector<std::string>{"connect: " + conn.error().message()};
+
+        // messages shorter and longer than the buffers, and a frame's header across their ends.
+        for (const std::size_t length : {0, 1'000, 1'020, 1'024, 5'000, 70'000, 300'000})
+        {
+            std::string data(length, '\0');
+            for (std::size_t i = 0; i < length; ++i) data[i] = static_cast<char>('a' + ((i + length) % 26));
+            lines.push_back(std::format("{} {}", length, co_await echoes(*conn, data)));
+        }
+
+        lines.push_back("close: " + describe(co_await conn->close()));
+        co_return lines;
+    };
+
+    CHECK(sched.run_to_completion(test())
+          == std::vector<std::string>{"0 same",
+                                      "1000 same",
+                                      "1020 same",
+                                      "1024 same",
+                                      "5000 same",
+                                      "70000 same",
+                                      "300000 same",
+                                      "close: ok"});
+    CHECK(std::ranges::contains(out.get(), "HTTP/2 subprotocol="));
+}

@@ -65,6 +65,23 @@ struct connection_options
     // 0 turns it off. Reads do the timing, with no task or timer of their own: so it applies only while the
     // application reads, as it must anyway, for the peer's pings and close to be answered.
     std::chrono::milliseconds idle_timeout = std::chrono::seconds{60};
+
+    // Over HTTP/2 (a stream of a connection, RFC 8441), the stream's receive window (256 KiB; from 65535 to 2^31-1,
+    // or accept() and connect() fail with std::errc::invalid_argument): what the peer may send that hasn't been read
+    // yet, raised with one WINDOW_UPDATE from the connection's stream window (if that's less). A message larger than
+    // it waits for the window to be given back as it's read, a round trip each time; a peer whose messages aren't read
+    // can make this side hold this much (in 16 KiB chunks, freed as they're read: an idle WebSocket holds none). The
+    // connection's window bounds all of its streams' together, so many WebSockets on one connection can't all have
+    // theirs outstanding: the server's is http2_stream_window times http2_max_concurrent_streams (at least 1 MiB; see
+    // http::server_config), the client's 1 GiB. Ignored over HTTP/1.1, where TCP's buffers do this.
+    std::uint32_t http2_window = std::uint32_t{256} * 1'024;
+
+    // Over HTTP/2, how much the WebSocket's reader and writer of its stream each buffer (4 KiB; at least 1 KiB, or
+    // accept() and connect() fail with std::errc::invalid_argument), kept for its life: they gather a frame's header
+    // and a short message into one DATA frame, and small reads out of the connection's lock, while larger reads and
+    // writes go past them. Ignored over HTTP/1.1, whose buffers are the connection's: the server's (see
+    // http::server_config::read_buffer_size), or the client's own (see connect_options).
+    std::size_t http2_buffer_size = std::size_t{4} * 1'024;
 };
 
 // accept_options are how a server accepts a WebSocket's handshake.
@@ -113,6 +130,15 @@ struct connect_options
     // origin is sent as the request's Origin, if it's set (browsers send their page's; other programs, none).
     std::string origin{};
 
+    // Over HTTP/1.1, how much the WebSocket's own connection's reader and writer buffer (16 KiB each, as the server's
+    // connections; at least 1 KiB, or connect() fails with std::errc::invalid_argument), kept for its life: a message
+    // that's all in the read buffer is read without a coroutine, and a frame that fits the write buffer is masked into
+    // it and written at once, while larger ones go past them. So smaller costs less memory per WebSocket, and more
+    // reads and writes (syscalls) for small messages. The http::client's own buffers (client_options) aren't used.
+    // Ignored over HTTP/2 (see connection_options::http2_buffer_size).
+    std::size_t read_buffer_size  = std::size_t{16} * 1'024;
+    std::size_t write_buffer_size = std::size_t{16} * 1'024;
+
     // connection is the connection's limits.
     connection_options connection{};
 
@@ -150,9 +176,10 @@ class connection;
 //
 // It fails with std::errc::not_supported, responding with nothing (as the handler may), for a response_writer that
 // isn't the server's connection's, and with std::errc::invalid_argument for a subprotocol or field of the response's
-// that can't be sent. If the response was sent already, it throws std::logic_error. A 101 that can't be sent returns
-// the transport's error (the connection then ends once the handler returns); an HTTP/2 stream that has failed (e.g.
-// reset by the client) returns its failure, having sent nothing.
+// that can't be sent, or (before it looks at the request) a size of options.connection out of its range. If the
+// response was sent already, it throws std::logic_error. A 101 that can't be sent returns the transport's error (the
+// connection then ends once the handler returns); an HTTP/2 stream that has failed (e.g. reset by the client) returns
+// its failure, having sent nothing.
 coro::task<std::expected<connection, std::error_code>>
 accept(const http::server_request& req, http::response_writer& rw, const accept_options& options = {});
 
@@ -164,8 +191,8 @@ accept(const http::server_request& req, http::response_writer& rw, const accept_
 // (RFC 8441: see connect_options::http2). The handshake's request has options' fields, and its response must come
 // within response_header_timeout of the request's being sent; writing it, and the WebSocket's writes, may go without
 // progress for io_timeout. It fails with:
-// - std::errc::invalid_argument for a url that isn't valid, and std::errc::protocol_not_supported for another scheme
-//   (or wss without TLS);
+// - std::errc::invalid_argument for a url that isn't valid, or a size of options' out of its range, and
+//   std::errc::protocol_not_supported for another scheme (or wss without TLS);
 // - what connecting failed with (e.g. std::errc::timed_out past connect_timeout, a TLS error), or the handshake's
 //   writing or reading (e.g. std::errc::timed_out past response_header_timeout, or a response that isn't HTTP);
 // - websocket::errc for a response that isn't the server's accepting (RFC 6455 has the client fail the connection):

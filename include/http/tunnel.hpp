@@ -80,8 +80,9 @@ protected:
 // Over HTTP/2, which has no 101, it opens an extended CONNECT's stream (RFC 8441: server_request::protocol is set)
 // instead: it answers 200, with fields and the rest of the response's own (but connection-specific ones, which HTTP/2
 // doesn't send), without ending the stream, and returns the stream as the tunnel, whose reads and writes are its DATA,
-// through buffers of 4 KiB each way. The stream's read timeout is off (the tunnel's own, set_read_timeout(), replaces
-// it), and its write timeout stays (the server's write_timeout, past which the stream's reset). Once the handler
+// through buffers of options.buffer_size each way, its window widened to options.window (see tunnel_options, which
+// mean nothing over HTTP/1.1). The stream's read timeout is off (the tunnel's own, set_read_timeout(), replaces it),
+// and its write timeout stays (the server's write_timeout, past which the stream's reset). Once the handler
 // returns, the server ends the stream (END_STREAM, RFC 8441's orderly close).
 //
 // It fails, sending nothing (so the handler may still respond), with std::errc::not_supported over HTTP/2 for a
@@ -93,6 +94,7 @@ protected:
 // the connection has switched then, and ends once the handler returns.
 //
 // NOTE: when it fails before it needs a coroutine, it throws when it's called, rather than when it's awaited.
-coro::task<std::expected<tunnel*, std::error_code>> switch_protocols(response_writer& rw, fields_view fields);
+coro::task<std::expected<tunnel*, std::error_code>>
+switch_protocols(response_writer& rw, fields_view fields, const tunnel_options& options);
 
 }

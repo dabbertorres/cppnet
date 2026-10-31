@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <ratio>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -57,6 +58,21 @@ bool still_open(const net::http::detail::connection& conn) noexcept
     return n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
+// checked is options, throwing std::invalid_argument for a size out of its range: a buffer of less than
+// detail::min_buffer_size, or a window HTTP/2 doesn't allow.
+net::http::client_options checked(net::http::client_options options)
+{
+    using net::http::detail::min_buffer_size;
+
+    if (options.read_buffer_size < min_buffer_size) throw std::invalid_argument{"read_buffer_size is under 1 KiB"};
+    if (options.write_buffer_size < min_buffer_size) throw std::invalid_argument{"write_buffer_size is under 1 KiB"};
+    if (options.http2_read_buffer_size < min_buffer_size)
+        throw std::invalid_argument{"http2_read_buffer_size is under 1 KiB"};
+    if (!net::http::detail::valid_window(options.http2_stream_window))
+        throw std::invalid_argument{"http2_stream_window isn't from 65535 to 2^31-1"};
+    return options;
+}
+
 }
 
 namespace net::http::detail
@@ -64,7 +80,7 @@ namespace net::http::detail
 
 connection_pool::connection_pool(io::scheduler* scheduler, client_options options)
     : scheduler{scheduler}
-    , config{std::move(options)}
+    , config{checked(std::move(options))}
     , http2_config{
           .response_header_timeout = config.response_header_timeout,
           .io_timeout              = config.io_timeout,
@@ -72,8 +88,12 @@ connection_pool::connection_pool(io::scheduler* scheduler, client_options option
           .idle_timeout            = config.keep_alive ? config.idle_timeout : std::chrono::milliseconds::zero(),
           .notsent_lowat           = config.http2_notsent_lowat,
           .writable                = config.http2_writable,
+          .read_size               = config.http2_read_buffer_size,
+          .body_buffer_size        = config.write_buffer_size,
       }
 {
+    http2_config.session.local.initial_window_size = config.http2_stream_window;
+
     // a response's head may be as large as HTTP/1.1's (1 MiB), plus 32 bytes a field, for 100 of them.
     http2_config.session.local.max_header_list_size = (std::uint32_t{1} << 20) + (32 * 100);
 

@@ -350,6 +350,10 @@ private:
     std::chrono::seconds            ticket_lifetime;
 };
 
+// min_write_batch is the least write_batch_size may be: a record's plaintext (RFC 8446, section 5.1), as a smaller
+// batch only makes more records, each shorter.
+constexpr std::size_t min_write_batch = std::size_t{16} * 1'024;
+
 // valid_versions is whether min to max are versions there are, in order.
 bool valid_versions(net::tls::version min, net::tls::version max) noexcept
 {
@@ -961,6 +965,7 @@ struct client_state
     std::shared_ptr<const Botan::TLS::Policy>     policy;
     bool                                          skip_verification = false;
     std::vector<std::string>                      alpn;
+    std::size_t                                   write_batch = 0; // client_options::write_batch_size
 };
 
 struct server_state
@@ -973,6 +978,7 @@ struct server_state
     std::vector<std::string>                      alpn;
     std::shared_ptr<const server_hooks>           hooks; // null without any
     Botan::X509_Certificate                       leaf;  // the server's certificate (its chain's first), for covers()
+    std::size_t                                   write_batch = 0; // server_options::write_batch_size
 };
 
 namespace
@@ -1654,12 +1660,11 @@ struct connection
     std::size_t               flush_waiters = 0;
     std::error_code           write_failure; // a write that failed, which may have sent part of a record
 
-    // How much of a write is encrypted at once (see write_batched()); and the turns of writes that go so (see
-    // write_turn): how many have been given, whose it is, and those that ended before it was theirs.
-    static constexpr std::size_t write_batch = std::size_t{64} * 1'024;
-    std::uint64_t                turns_given = 0;
-    std::uint64_t                turn_now    = 0;
-    std::set<std::uint64_t>      turns_skipped;
+    // The turns of writes that go a batch at a time (see write_turn): how many have been given, whose it is, and those
+    // that ended before it was theirs.
+    std::uint64_t           turns_given = 0;
+    std::uint64_t           turn_now    = 0;
+    std::set<std::uint64_t> turns_skipped;
 
     // notified when a flush has written some, or stopped.
     coro::notifier flushed;
@@ -1673,6 +1678,12 @@ struct connection
     // a client's context (null for a server's stream), for verify_for(): its trust store and policy. NOTE: set before
     //       the stream is made, and never after, so it's read without mu.
     std::shared_ptr<client_state> client;
+
+    // How much of a write is encrypted at once (see write_batched()): the context's. NOTE: set before the stream is
+    //       made, and never after. Last, so the members above stay where they were: 8 bytes more among them (before
+    //       the turns) made writes 15% slower (bench_tls writes, about 430 MiB/s to 365), with the ciphertext
+    //       buffer aligned to 64 bytes too, so something above is sensitive to where its cache lines fall.
+    std::size_t write_batch = 0;
 };
 
 void callbacks::tls_emit_data(std::span<const std::uint8_t> data)
@@ -1754,7 +1765,7 @@ std::expected<client_context, std::error_code> client_context::make(const client
 std::expected<client_context, std::error_code> detail::make_client_context(const client_options& options,
                                                                            const policy_limits&  limits)
 {
-    if (!valid_versions(options.min_version, options.max_version))
+    if (!valid_versions(options.min_version, options.max_version) || options.write_batch_size < min_write_batch)
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     // a certificate needs its key, and a key its certificate.
@@ -1796,6 +1807,7 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
                                                           limits),
             .skip_verification = options.insecure_skip_verification,
             .alpn              = options.alpn,
+            .write_batch       = options.write_batch_size,
         });
 
         return client_context{std::move(state)};
@@ -1819,7 +1831,7 @@ std::expected<server_context, std::error_code> server_context::make(const server
 std::expected<server_context, std::error_code> detail::make_server_context(const server_options& options,
                                                                            server_hooks          hooks)
 {
-    if (!valid_versions(options.min_version, options.max_version))
+    if (!valid_versions(options.min_version, options.max_version) || options.write_batch_size < min_write_batch)
         return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     // TLS 1.3's tickets last 7 days at most (RFC 8446 4.6.1); and keys are only used with tickets.
@@ -1884,6 +1896,7 @@ std::expected<server_context, std::error_code> detail::make_server_context(const
             .alpn        = options.alpn,
             .hooks       = std::move(shared_hooks),
             .leaf        = std::move(leaf),
+            .write_batch = options.write_batch_size,
         });
 
         return server_context{std::move(state)};
@@ -1915,8 +1928,9 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
     if (host.empty() && !ctx.state->skip_verification)
         co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
-    auto c    = std::make_unique<detail::connection>(std::move(conn));
-    c->client = ctx.state;
+    auto c         = std::make_unique<detail::connection>(std::move(conn));
+    c->client      = ctx.state;
+    c->write_batch = ctx.state->write_batch;
 
     try
     {
@@ -1946,8 +1960,9 @@ coro::task<std::expected<stream, std::error_code>> stream::connect(
 coro::task<std::expected<stream, std::error_code>>
 stream::accept(tcp_socket conn, server_context ctx, io::clock::time_point deadline, accept_options options)
 {
-    auto c        = std::make_unique<detail::connection>(std::move(conn));
-    c->hold_reply = options.hold_close_reply;
+    auto c         = std::make_unique<detail::connection>(std::move(conn));
+    c->hold_reply  = options.hold_close_reply;
+    c->write_batch = ctx.state->write_batch;
 
     try
     {
@@ -1997,7 +2012,7 @@ coro::task<io::result> stream::write(std::span<const std::byte> data)
         std::scoped_lock lock{conn->mu};
 
         // usually, a write is a batch at most, and no other has a turn: it's encrypted at once.
-        if (data.size() <= detail::connection::write_batch && !conn->writes_waiting())
+        if (data.size() <= conn->write_batch && !conn->writes_waiting())
         {
             if (auto err = conn->send_locked(data)) return coro::ready_task<io::result>(io::result{.err = err});
             target = conn->emitted;

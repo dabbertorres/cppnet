@@ -250,11 +250,13 @@ public:
     // tunnel's (see stream_tunnel), its own read timeout off (the tunnel's own replaces it), its write timeout kept
     // (io_timeout). Any other response's stream is done with (reset, unless both sides have ended it). It takes the
     // stream reserve(true) reserved, whatever happens. request.stop cancels it until the head has come, as send()'s;
-    // the tunnel's stop is its user's (stream_tunnel::set_stop_token()). It fails as send() does: e.g. with
-    // refused_stream (in http2::category()) if the server didn't process it, so it may be opened elsewhere, or with
-    // http_1_1_required, state (if given) saying how far it got.
-    coro::task<std::expected<tunnel_response, std::error_code>>
-    open_tunnel(const client_request& request, std::string_view protocol, send_state* state = nullptr);
+    // the tunnel's stop is its user's (stream_tunnel::set_stop_token()), its window and buffers tunnel's. It fails as
+    // send() does: e.g. with refused_stream (in http2::category()) if the server didn't process it, so it may be opened
+    // elsewhere, or with http_1_1_required, state (if given) saying how far it got.
+    coro::task<std::expected<tunnel_response, std::error_code>> open_tunnel(const client_request& request,
+                                                                            std::string_view      protocol,
+                                                                            const tunnel_options& tunnel = {},
+                                                                            send_state*           state  = nullptr);
 
     // close ends the connection (GOAWAY), failing the streams still open.
     void close();
@@ -354,8 +356,8 @@ private:
         bool            body_failed = false;
     };
 
-    // send_body sends the request's body on the stream (length bytes of it, if that's set), then ends it (see
-    // end_request()).
+    // send_body sends the request's body on the stream (length bytes of it, if that's set), read options'
+    // body_buffer_size at a time, then ends it (see end_request()).
     coro::task<body_result>
     send_body(client_request& request, http2_client_stream& stream, std::optional<std::size_t> length);
 

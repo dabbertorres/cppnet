@@ -389,12 +389,21 @@ A response's connection is reused once its body has been read to the end, and cl
 first. A body cut short (the connection ending before all of its Content-Length, or its last chunk, came) fails, with
 `std::errc::connection_aborted`, rather than ending: `io::errc::end_of_stream` means it was all read.
 
+`client_options` sizes what a request holds (each at least 1 KiB, or the constructor throws `std::invalid_argument`):
+`read_buffer_size` (1 KiB) is an HTTP/1.x response's reader, from its head until its body's been read (a head line
+longer than it is read into a string apart, and a body read in pieces smaller than it takes a read of the connection a
+buffer's worth); `write_buffer_size` (16 KiB) is how much of a request's body is read before it's written, over either
+version (each read a chunk, if it's chunked, or DATA frames). `http2_read_buffer_size` (32 KiB) is how much an HTTP/2
+connection reads at once, and `http2_stream_window` (65535; up to 2^31-1) how much of a response's body the server may
+send ahead of what's been read of it (SETTINGS_INITIAL_WINDOW_SIZE): one stream's download goes at most a window a
+round trip, and a body that isn't read holds that much.
+
 HTTP/2 is used over TLS with servers that agree on it with ALPN (unless `client_options::http2` is off), and over
 cleartext only when `client_options::http2_prior_knowledge` says the server speaks it. A response's `version` says
 which was used. An HTTP/2 connection is shared by the host's requests, each on a stream of its own, up to the
 server's limit on streams; then another connection is opened (within `max_connections_per_host`), or, with
 `strict_max_concurrent_streams`, requests wait for a stream. Its responses' bodies may be read in any order, or not at
-all: each stream holds at most its window (64 KiB) of a body not yet read, and the connection's window has room for
+all: each stream holds at most its window (`http2_stream_window`) of a body not yet read, and the connection's window has room for
 every stream's. Request bodies that contend for a connection take turns by their requests' `Priority` fields (see
 Priority, under the server, below), read as the server reads them (what a field leaves out, or all of it if it doesn't
 parse, is RFC 9218's default, `u=3` not incremental): the most urgent first, and of one urgency, incremental ones a
@@ -800,6 +809,28 @@ scheduler.spawn(server.serve());
   listener from `listener::make()` instead of a host and port. A head over `max_header_bytes` is answered 431 (Request
   Header Fields Too Large) without a handler: over HTTP/1.1 the connection then closes; over HTTP/2 (whose limit counts
   32 bytes more a field, as HTTP/2 counts a header list) only the stream ends, and the connection goes on.
+- **Buffers and windows:** `server_config::read_buffer_size` and `write_buffer_size` (16 KiB each, at least 1 KiB) are
+  each HTTP/1.x connection's reader and writer, kept for its life (and a WebSocket's over it, which reads and writes
+  through them). A head that's all in the read buffer is decoded in place (a buffer of at least `max_header_bytes`
+  takes every head allowed so; a longer line is read into a string), and so is a batch of pipelined requests; a
+  response's head that fits the write buffer is formatted straight into it. Smaller buffers hold less per connection
+  and take more reads and writes (syscalls) for heads and small bodies; reads and writes larger than a buffer go past it,
+  so larger buffers gain little for large bodies, and over TLS a read returns a record's plaintext (16 KiB) at most.
+  `http2_read_buffer_size` (32 KiB, at least 1 KiB) is how much an HTTP/2 connection reads at once.
+  `http2_stream_window` (65535, the protocol's initial window; up to 2^31-1) is how much of a request's body a client
+  may send ahead of what its handler has read (SETTINGS_INITIAL_WINDOW_SIZE): one stream's upload goes at most a window
+  a round trip (64 KiB over 100 ms is about 640 KiB/s), and the connection's window holds every stream's (the window
+  times `http2_max_concurrent_streams`, at least 1 MiB), which is what a client can make the server hold per
+  connection, received and unread. The constructors throw `std::invalid_argument` for a size out of its range.
+
+  What a connection holds at the defaults, besides what its requests and responses hold: an HTTP/1.1 connection 32 KiB
+  (its two buffers), plus over TLS a record's worth of ciphertext (17 KiB) and Botan's state; an HTTP/2 connection
+  32 KiB (its read buffer, whether over TLS or with prior knowledge, which frees the HTTP/1.1 buffers it was told
+  apart with), HPACK's tables (up to twice 4 KiB each way) and TLS's, and while streams are busy, what they've received
+  and not read (up to a window each, in 16 KiB chunks that are freed once the connection's been idle for a second or
+  two) and the output waiting for the writer (up to 1 MiB); a WebSocket over HTTP/2 its tunnel's buffers (8 KiB:
+  `websocket::connection_options::http2_buffer_size` each way) and up to its window (256 KiB) unread; a WebSocket over
+  HTTP/1.1 nothing more than its connection's buffers.
 - **Stopping:** `server.close()` stops accepting and ends the connections gracefully: a connection waiting for a
   request (its first, or the next on a kept-alive one) closes at once, and one in the middle of a request finishes it
   (the handler reads the body and sends its response as usual, which says `Connection: close` if it wasn't sent yet),
@@ -949,10 +980,17 @@ router.GET("/echo",
   200 rather than 101: the WebSocket is then the request's stream, beside the connection's other requests. It's the same
   `connection`, with the same timeouts, stopping and closing (the server's `close()`'s 1001 too); it counts against
   `http2_max_concurrent_streams` until its handler returns, which ends the stream, and the stream's own read timeout
-  (`body_read_timeout`) doesn't apply, as `idle_timeout` does the timing. The stream's window is 256 KiB each way (a
-  request's is 64 KiB), as a TCP connection's buffers would be, so a message of 64 KiB goes without waiting for the
-  peer to give the window back, and a WebSocket that isn't read holds at most that much of what's sent to it (within
-  the connection's window, which bounds all its streams together). A client resetting the stream, or ending it
+  (`body_read_timeout`) doesn't apply, as `idle_timeout` does the timing. The stream's window is
+  `connection_options::http2_window` (256 KiB, from 65535 to 2^31-1; or the server's `http2_stream_window`, if that's
+  more) each way (a request's is 64 KiB), as a TCP connection's buffers would be, so a message of 64 KiB goes without
+  waiting for the peer to give the window back, and a WebSocket that isn't read holds at most that much of what's sent
+  to it (within the connection's window, which bounds all its streams together: so many WebSockets on one connection
+  can't all have theirs outstanding at once). It's read and written through buffers of
+  `connection_options::http2_buffer_size` (4 KiB, at least 1 KiB) each way, which gather a frame's header and a short
+  message into one DATA frame; larger reads and writes go past them. Both mean nothing over HTTP/1.1, whose buffers are
+  the connection's (`server_config::read_buffer_size` and `write_buffer_size`). `accept()` fails with
+  `std::errc::invalid_argument` for one out of its range, before it looks at the request, answering nothing (so the
+  handler may). A client resetting the stream, or ending it
   without a close, ends the WebSocket as the TCP connection ending would (`abnormal_closure`). Another `:protocol` is
   answered 501 without a handler, and one with a `Content-Length` other than 0 (a CONNECT has no content) 400. A handler
   that doesn't accept a WebSocket can't answer its request with a 2xx, which the browser would take for the WebSocket
@@ -1034,7 +1072,10 @@ auto type = co_await conn->read_message(message);
   connection of the WebSocket's own: not one of the client's pool's, nor counted in its limits (over TLS, it offers
   only `http/1.1` with ALPN, so a server that speaks HTTP/2 agrees on HTTP/1.1). `connect_options::headers` go with the
   handshake (e.g. `Authorization`, a `Cookie`), `subprotocols` are offered (`conn->subprotocol()` is the one chosen, or
-  empty), and `origin` is sent as `Origin` (programs needn't; browsers do).
+  empty), and `origin` is sent as `Origin` (programs needn't; browsers do). Its reader and writer buffer
+  `connect_options::read_buffer_size` and `write_buffer_size` (16 KiB each, as the server's connections; at least
+  1 KiB), not the `http::client`'s own: a message that's all in the read buffer is read without a coroutine, and a frame
+  that fits the write buffer is masked into it.
 - **Over HTTP/2:** if the client already has an HTTP/2 connection to the URL's host (and port, and scheme: e.g. from
   a request to the same server), whose server has said it allows WebSockets over it (RFC 8441's
   `SETTINGS_ENABLE_CONNECT_PROTOCOL`, which cppnet's server sends by default), with a stream free, the WebSocket is an
@@ -1045,8 +1086,10 @@ auto type = co_await conn->read_message(message);
   processing it (`REFUSED_STREAM`, or after its GOAWAY's last stream), or asks to have over HTTP/1.1
   (`HTTP_1_1_REQUIRED`) before answering anything, is opened over HTTP/1.1 instead; once the WebSocket's open, a reset
   (with any code) ends it as the connection's end would (1006). The stream holds the connection open, as a
-  response's body being read does: the `http::client` may go first. Its window is 256 KiB each way, as on the
-  server.
+  response's body being read does: the `http::client` may go first. Its window and buffers are
+  `connection_options::http2_window` and `http2_buffer_size`, as on the server (the window, or the client's
+  `http2_stream_window` if that's more). A size out of its range fails `connect()` with `std::errc::invalid_argument`,
+  before it connects.
 - **The handshake fails** (`websocket::errc`) for a response that isn't the server's switching: `bad_status` for
   anything but 101 (Switching Protocols), or over HTTP/2 a 2xx, redirects included (they aren't followed, as browsers
   don't), `bad_accept` (HTTP/1.1's), `bad_subprotocol` (one that wasn't offered) or `bad_extension` (none is offered);
@@ -1140,8 +1183,11 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 - A read and writes may run at once (e.g. HTTP/2's reader and writer), but only one read. A write returns once what it
   wrote has gone to the socket (after what was queued before it, e.g. another write, or a read's reply to the peer), so
   the socket's write deadline and timeout limit it; a write that fails fails every write after it (part of a record
-  may have gone). A write larger than 64 KiB is encrypted and sent 64 KiB at a time, so it holds no more than that of
-  ciphertext, whatever its size; writes go whole, in the order they were called (one called while a large one is
+  may have gone). A write larger than `write_batch_size` (in `client_options` and `server_options`: 64 KiB; at least
+  16 KiB, a record's plaintext, or `make()` fails with `std::errc::invalid_argument`) is encrypted and sent a batch at a
+  time, so it holds no more than a batch of ciphertext, whatever its size: a larger batch costs memory per writing
+  stream and saves allocations, but no time (over loopback, a 16 MiB write took as long in batches of 16, 64 and
+  256 KiB, whose heap peaked at about 140, 350 and 900 KiB); writes go whole, in the order they were called (one called while a large one is
   going waits for it, as `shutdown()`'s close_notify does), and a read's replies to the peer may go between its parts.
   As a write's place is taken when `write()` is called, a large write's task must be awaited (or destroyed) before the
   task that made it awaits a later write or `shutdown()` on the same stream, which would otherwise wait for it for ever.

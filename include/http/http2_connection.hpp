@@ -294,11 +294,12 @@ private:
 };
 
 // stream_tunnel is a stream once it's a tunnel (see http/tunnel.hpp): once a 2xx has answered its extended CONNECT
-// (RFC 8441), its DATA both ways is the tunnel's protocol's (e.g. a WebSocket's), read and written through buffers of
-// 4 KiB each way over the stream's own reader and writer (so frame headers and small messages are gathered, and large
-// payloads go past them, straight to the stream, and from it). Its stream's window is wider than a request's, as a
-// socket's buffers are (256 KiB: see the constructor), so a large message goes without waiting for a WINDOW_UPDATE;
-// what its stream holds of it meanwhile is what's unread (see received_data), whatever a burst took. A read that waits
+// (RFC 8441), its DATA both ways is the tunnel's protocol's (e.g. a WebSocket's), read and written through buffers
+// (tunnel_options::buffer_size each way) over the stream's own reader and writer (so frame headers and small messages
+// are gathered, and large payloads go past them, straight to the stream, and from it). Its stream's window is wider
+// than a request's, as a socket's buffers are (tunnel_options::window), so a large message goes without waiting for a
+// WINDOW_UPDATE; what its stream holds of it meanwhile is what's unread (see received_data), whatever a burst took.
+// A read that waits
 // is limited by the tunnel's own timeout and deadline, and canceled by its stop token, failing having read nothing
 // while the stream goes on (as a socket's would), where the stream's own timeouts reset it: a read asks check_wait()
 // before it waits, and again whenever it's woken (see stream_read): by the connection's timer at wake_at, by a deadline
@@ -310,8 +311,9 @@ private:
 class stream_tunnel final : public tunnel
 {
 public:
-    // closing is the server's close() token (none for a client's).
-    stream_tunnel(http2_stream_base& stream, std::stop_token closing);
+    // closing is the server's close() token (none for a client's). The stream's window is widened to options.window,
+    // if that's more than it has.
+    stream_tunnel(http2_stream_base& stream, std::stop_token closing, const tunnel_options& options);
 
     stream_tunnel(const stream_tunnel&)            = delete;
     stream_tunnel& operator=(const stream_tunnel&) = delete;
@@ -490,13 +492,15 @@ class http2_connection_base : protected http2::session_events
 public:
     // waits_writable is whether the writer waits for the connection to be writable before each round (see
     // write_loop()): with TCP_NOTSENT_LOWAT set on it. writable, if set, is what it waits with instead (for tests).
+    // read_size is how much the reader reads at once.
     http2_connection_base(io::scheduler*               scheduler,
                           connection&                  conn,
                           http2::role                  side,
                           const http2::session_config& config,
                           spdlog::logger&              logger,
                           bool                         waits_writable = false,
-                          writable_function            writable       = {});
+                          writable_function            writable       = {},
+                          std::size_t                  read_size      = default_read_size);
 
     http2_connection_base(const http2_connection_base&)            = delete;
     http2_connection_base& operator=(const http2_connection_base&) = delete;
@@ -714,6 +718,7 @@ private:
     // Whether the writer waits for the connection to be writable before each round, and with what (see write_loop()).
     const bool        waits_writable;
     writable_function writable;
+    const std::size_t read_size;
 
     // Guarded by mu.
     std::size_t                          data_queued  = 0; // DATA submitted not yet taken
