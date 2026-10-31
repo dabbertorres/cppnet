@@ -21,6 +21,9 @@ target_link_libraries(bench_router PRIVATE net)
 add_benchmark(bench_request http/request.cpp)
 target_link_libraries(bench_request PRIVATE net)
 
+add_benchmark(bench_client http/client.cpp)
+target_link_libraries(bench_client PRIVATE net)
+
 add_benchmark(bench_websocket websocket/echo.cpp)
 target_link_libraries(bench_websocket PRIVATE net)
 

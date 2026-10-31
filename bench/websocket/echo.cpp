@@ -1,8 +1,9 @@
 // bench_websocket measures WebSocket messages over loopback, cppnet's client against cppnet's server (a handler that
 // echoes each message whole): the time per message, and the heap allocations per message (the client's and the
-// server's together, as they share the process), for small messages (16 bytes of text) and large ones (64 KiB, binary:
-// past both sides' 16 KiB buffers, so the client masks them a buffer's worth at a time, and the server reads them
-// straight into the message). Two ways:
+// server's together, as they share the process), for small messages (16 bytes of text), medium ones (8 KiB, binary:
+// past an HTTP/2 WebSocket's 4 KiB buffers, within HTTP/1.1's 16 KiB ones and a DATA frame) and large ones (64 KiB,
+// binary: past both sides' 16 KiB buffers, so the client masks them a buffer's worth at a time, and the server reads
+// them straight into the message). Two ways:
 // - one at a time: the client writes a message, and reads its echo, before the next (a round trip each), as a client
 //   waiting for each answer does;
 // - in flight: one task writes the messages while another reads their echoes, so as many are on the way as the
@@ -19,6 +20,9 @@
 // after the runs (still open: what they kept of the runs, as the echo's message, 64 KiB each), and to after they've
 // then been idle for a while (what they keep for good: e.g. an HTTP/2 connection's free chunks for what its streams
 // receive are freed once none have been taken for a second or two), divided by N.
+//
+// An argument sets both sides' HTTP/2 WebSockets' buffers (connection_options::http2_buffer_size, in bytes; 4 KiB by
+// default): e.g. `bench_websocket 16384`.
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -30,6 +34,7 @@
 #include <memory>
 #include <new>
 #include <print>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -97,11 +102,15 @@ struct load
 };
 
 constexpr std::array loads{
-    load{     .name = "small (16 B text)",.size = 16,.type = ws::message_type::text,.count = 20'000       },
+    load{     .name = "small (16 B text)",.size = 16,.type = ws::message_type::text,.count = 20'000        },
+    load{.name  = "medium (8 KiB binary)",
+         .size  = std::size_t{8} * 1'024,
+         .type  = ws::message_type::binary,
+         .count = 10'000},
     load{.name  = "large (64 KiB binary)",
          .size  = std::size_t{64} * 1'024,
          .type  = ws::message_type::binary,
-         .count = 2'000},
+         .count = 2'000 },
 };
 
 // how many WebSockets the parallel runs open at once.
@@ -123,6 +132,16 @@ struct measured
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<std::size_t> accepted_over_http2 = 0;
 
+// How much each side's HTTP/2 WebSockets buffer each way (connection_options::http2_buffer_size): main()'s argument.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::size_t http2_buffer_size = std::size_t{4} * 1'024;
+
+// options are both sides' WebSockets': messages up to 1 MiB, and http2_buffer_size.
+ws::connection_options options()
+{
+    return {.max_message = std::uint64_t{1} << 20, .http2_buffer_size = http2_buffer_size};
+}
+
 // heap_in_use is how much of the heap the process's allocations hold (all of its threads'), as the allocator counts it
 // (on macOS and Linux; 0 elsewhere).
 std::size_t heap_in_use()
@@ -142,7 +161,7 @@ std::size_t heap_in_use()
 // echo accepts a WebSocket, and echoes its messages whole until it ends.
 task<> echo(const http::server_request& req, http::response_writer& rw)
 {
-    auto conn = co_await ws::accept(req, rw, {.connection = {.max_message = std::uint64_t{1} << 20}});
+    auto conn = co_await ws::accept(req, rw, {.connection = options()});
     if (!conn.has_value()) co_return;
     if (req.version.major == 2) accepted_over_http2.fetch_add(1);
 
@@ -233,7 +252,7 @@ task<std::vector<measured>> run(net::io::scheduler* sched, http::client* client,
         (void)co_await net::io::read_all(*resp->body);
     }
 
-    auto conn = co_await ws::connect(*client, url, {.connection = {.max_message = std::uint64_t{1} << 20}});
+    auto conn = co_await ws::connect(*client, url, {.connection = options()});
     if (!conn.has_value())
     {
         std::println(stderr, "failed to connect: {}", conn.error().message());
@@ -340,7 +359,7 @@ run_parallel(net::io::scheduler* sched, http::client* client, std::string url, s
     conns.reserve(n);
     for (std::size_t i = 0; i < n; ++i)
     {
-        auto conn = co_await ws::connect(*client, url, {.connection = {.max_message = std::uint64_t{1} << 20}});
+        auto conn = co_await ws::connect(*client, url, {.connection = options()});
         if (!conn.has_value())
         {
             std::println(stderr, "failed to connect: {}", conn.error().message());
@@ -398,9 +417,12 @@ void print_measured(const measured& m, load l, std::size_t count)
 
 }
 
-int main()
+int main(int argc, char** argv)
 {
     spdlog::set_level(spdlog::level::warn);
+
+    const std::span args{argv, static_cast<std::size_t>(argc)};
+    if (args.size() > 1) http2_buffer_size = std::stoul(args[1]);
 
     auto               workers = std::make_shared<net::coro::thread_pool>(2);
     net::io::scheduler scheduler{workers};
@@ -459,9 +481,11 @@ int main()
         if (p.best.size() != loads.size() * 2) return 1;
     }
 
-    std::println("cppnet's client and server, over loopback ({} workers; best of {}):",
+    std::println("cppnet's client and server, over loopback ({} workers; best of {}; HTTP/2's WebSockets' buffers {} "
+                 "KiB):",
                  workers->concurrency(),
-                 repeats);
+                 repeats,
+                 static_cast<double>(http2_buffer_size) / 1'024.0);
     for (std::size_t i = 0; i < r.single.size(); ++i)
     {
         const auto&       l       = loads[(i / 2) % loads.size()];

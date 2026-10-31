@@ -129,7 +129,6 @@ constexpr std::size_t pipelined       = 16;
 constexpr int         batches         = 50'000;
 constexpr int         repeats         = 7;
 constexpr std::size_t date_bytes      = 29; // e.g. "Sun, 06 Nov 1994 08:49:37 GMT"
-constexpr std::size_t buffer_size     = std::size_t{16} * 1'024;
 constexpr int         socket_requests = 50'000;
 constexpr int         http2_requests  = 20'000;
 constexpr int         counted_bytes   = 1'000; // requests
@@ -229,14 +228,21 @@ struct steps
     std::size_t requests = 0;
 };
 
+// server_defaults is the server's configuration by default: for its connections' buffers' sizes, which serve() uses.
+const http::server_config& server_defaults()
+{
+    static const http::server_config defaults{};
+    return defaults;
+}
+
 // serve serves the requests from input, as server::serve_connection and serve_request do (without the logging and
-// error handling).
+// error handling), with buffers of the server's sizes by default.
 template<typename Router>
 task<void> serve(const Router& router, net::io::reader& input, net::io::writer& out, steps& counted)
 {
-    net::io::buffered_writer   writer{&out, buffer_size};
+    net::io::buffered_writer   writer{&out, server_defaults().write_buffer_size};
     net::io::flush_before_read flushing{&input, &writer};
-    net::io::buffered_reader   reader{&flushing, buffer_size};
+    net::io::buffered_reader   reader{&flushing, server_defaults().read_buffer_size};
 
     const std::string date(date_bytes, 'x');
 
