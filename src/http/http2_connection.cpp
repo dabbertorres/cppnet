@@ -965,7 +965,10 @@ coro::task<> http2_connection_base::timer_loop()
                 const auto own = check_connection(now);
                 if (own.has_value() && (!next.has_value() || *own < *next)) next = own;
 
-                // (the writer's woken below, each time.)
+                // a held turn that's over is let go here, not left to the writer's fill(): the writer may be away
+                // for long (e.g. waiting for the socket), and its deadline, past, would end each wait at once, so
+                // the timer would spin until it's back. (The writer's woken below, each time, to frame the others.)
+                if (turn_held != 0 && turn_held_until <= now) turn_held = 0;
                 if (turn_held != 0 && (!next.has_value() || turn_held_until < *next)) next = turn_held_until;
             }
 
@@ -1051,7 +1054,7 @@ void http2_connection_base::fill()
     if (send_order.empty() || session.send_window(0) <= 0) return;
 
     // the stream that ended the last round keeps its turn (see below) until it writes again, ends or fails, or for
-    // hold_turn: until then, nothing else is framed (the timer wakes the writer once it's over).
+    // hold_turn: until then, nothing else is framed (the timer lets it go and wakes the writer once it's over).
     if (turn_still_held()) return;
 
     const std::size_t frame = session.peer_settings().max_frame_size;

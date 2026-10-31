@@ -7,13 +7,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <sys/socket.h>
@@ -69,9 +73,10 @@ struct handlers
     std::atomic<std::uint64_t> queued{0};
 };
 
-// make_router answers /bytes with x-size bytes (with a Content-Length), written at once; /queued (the probe) once
-// x-count streams wait in the connection's scheduler, counting it (in handlers::queued) before it answers, as its
-// answer may be held with the writer; and /mark with the TCP_NOTSENT_LOWAT of the connection's socket.
+// make_router answers /bytes with x-size bytes (with a Content-Length), written at once; /frames likewise, written a
+// frame at a time; /queued (the probe) once x-count streams wait in the connection's scheduler, counting it (in
+// handlers::queued) before it answers, as its answer may be held with the writer; and /mark with the TCP_NOTSENT_LOWAT
+// of the connection's socket.
 http::router make_router(handlers* h)
 {
     http::router r;
@@ -83,6 +88,20 @@ http::router make_router(handlers* h)
 
               const std::string data(size, 'x');
               (void)co_await body->write(std::as_bytes(std::span{data}));
+          });
+    r.GET("/frames",
+          [](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const auto size = std::stoul(std::string{req.headers.get("x-size"sv).value_or("0"sv)});
+              auto*      body = co_await resp.send(http::status::OK, size);
+
+              const std::string data(frame, 'x');
+              for (std::size_t sent = 0; sent < size; sent += frame)
+              {
+                  const auto res =
+                      co_await body->write(std::as_bytes(std::span{data}.first(std::min(frame, size - sent))));
+                  if (res.err) co_return;
+              }
           });
     r.GET("/queued",
           [h](const http::server_request& req, http::response_writer& resp) -> task<void>
@@ -130,15 +149,16 @@ http2::session_config open_windows()
     return config;
 }
 
-// request_bytes requests size bytes from /bytes, with a Priority field of priority, and sends it.
-task<http2::stream_id> request_bytes(h2_client& c, std::size_t size, std::string_view priority)
+// request_bytes requests size bytes from path (/bytes, or /frames), with a Priority field of priority, and sends it.
+task<http2::stream_id>
+request_bytes(h2_client& c, std::size_t size, std::string_view priority, std::string_view path = "/bytes")
 {
     const auto                      length = std::to_string(size);
     const std::vector<hpack::field> fields{
         {  .name = "x-size",   .value = length},
         {.name = "priority", .value = priority}
     };
-    const auto id = c.request("GET", "/bytes", {}, true, fields);
+    const auto id = c.request("GET", path, {}, true, fields);
     (void)co_await c.pump([] { return true; }); // (what's to be written is, first)
     co_return id;
 }
@@ -332,5 +352,75 @@ TEST_CASE("an HTTP/2 response waiting its turn doesn't time out while the writer
             CHECK(bulk.body.size() == frame);
             CHECK(c.responses[ids[0]].body.size() == big);
             CHECK(frames(c, ids, "UB").find('B') == big / frame);
+        }(&sched, server.port(), &gate, &h));
+}
+
+TEST_CASE("a turn held while the writer waits for the socket is let go when it's over",
+          "[http][http2][server][notsent-lowat][scheduler]")
+{
+    // one worker: a timer that spun once the turn was over, until the writer was back, would hold it, and the test's
+    // task (which lets the writer go) would never run again.
+    writer_gate        gate;
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(1)};
+    gate.sched = &sched;
+    handlers    h{.sched = &sched};
+    test_server server{&sched, &h, {.http2_writable = gate.hook()}};
+
+    // stops the scheduler after 10 seconds (unless the test's done first), so a timer that spins fails the test rather
+    // than hanging it. (Destroyed before the server and the scheduler.)
+    std::jthread watchdog{[&sched](const std::stop_token& stop)
+                          {
+                              std::mutex                  mu;
+                              std::condition_variable_any cv;
+                              std::unique_lock            lock{mu};
+                              cv.wait_for(lock, stop, 10s, [] { return false; });
+                              if (!stop.stop_requested()) sched.request_stop();
+                          }};
+
+    sched.run_to_completion(
+        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<>
+        {
+            auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
+            REQUIRE(conn.has_value());
+            h2_client c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
+
+            bool ok = co_await c.sync();
+            REQUIRE(ok);
+            c.data_log.clear();
+
+            // a bulk download, which goes at once as far as max_ahead (64 KiB) and queues the rest; the writer writes
+            // that, then waits for the socket.
+            gate->hold();
+            std::vector<http2::stream_id> ids;
+            ids.push_back(co_await request_bytes(c, 16 * frame, "u=7"));
+            ok = co_await probe(c, h, 1, 1);
+            REQUIRE(ok);
+            ok = co_await stop_probe::reach(sched, gate->held, 1);
+            REQUIRE(ok);
+
+            // an urgent one, written a frame at a time, queues behind it.
+            ids.push_back(co_await request_bytes(c, 2 * frame, "u=0", "/frames"));
+            ok = co_await probe(c, h, 2, 2);
+            REQUIRE(ok);
+
+            // a round: the urgent one's first frame, after which its turn's held (for a millisecond) for its next
+            // write, so the round ends there; then the writer waits for the socket again.
+            gate->grant();
+            ok = co_await stop_probe::reach(sched, gate->held, 2);
+            REQUIRE(ok);
+
+            // the turn's over long before this (the writer still waiting): a canceled sleep is the watchdog's stop.
+            const auto slept = co_await sched->sleep_until(net::io::clock::now() + 50ms);
+            REQUIRE_FALSE(slept);
+
+            gate->open();
+            ok = co_await c.pump([&]
+                                 { return std::ranges::all_of(ids, [&](auto id) { return c.responses[id].done; }); });
+            REQUIRE(ok);
+
+            // the urgent one's frames together: the round with its first ended there, rather than going on with the
+            // bulk one's.
+            CHECK(frames(c, ids, "BU") == "BBBBUUBBBBBBBBBBBB");
+            for (const auto id : ids) CHECK_FALSE(c.responses[id].reset);
         }(&sched, server.port(), &gate, &h));
 }
