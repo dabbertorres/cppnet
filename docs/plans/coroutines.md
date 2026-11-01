@@ -220,13 +220,14 @@ adopts one.
 ## Measuring
 
 Every stage measures before and after, against the bar (Decided question 2), and its pull request gives a verdict per
-row: beyond the spread (a gain or a regression) or within it (noise, ignored). A row's spread is the range of master's
-rounds in stage 0's baselines (and of the rounds measured with the stage, if wider).
+row: a gain or a regression, or noise (ignored), told apart by a Mann-Whitney U test on the row's interleaved rounds
+(p < 0.05; from 0.05 to 0.2, more rounds, up to about 10 a side, then the test again; Decided question 2), with the
+medians, ranges and p in the pull request.
 
 - **Allocations** are exact: each stage states the counts its rows should reach (from Where things stand).
 - **Time**: the stage's rows, master and the branch built from the same commands, 5 rounds each, interleaved
   (alternating which goes first), each run started only with the 1-minute load below 4; medians, with every round
-  listed in the pull request (their spread is the noise). Wall time for rows in memory (pipelined, one per read, the
+  listed in the pull request. Wall time for rows in memory (pipelined, one per read, the
   middleware rows, the client's chunked reads, `bench_task`); **CPU time per unit** for socket rows (stage 0 adds it),
   and `bench/web` (cppnet's server alone) for throughput under load (Decided question 5).
 - **Frame sizes**: Clang's `-Rpass=coro-elide` remarks give each frame's size (`frame_size=`), and the elided calls'
@@ -295,7 +296,10 @@ All decided 2026-11-01.
    difference within a row's measured spread (the interleaved rounds' range) is neither a gain nor a regression: it is
    noise, and ignored. Each row's noise is defined by stage 0's baselines (the round-to-round spread of master's rounds);
    allocation counts are exact, so they're unaffected. Each stage's verdict states, per row, whether its difference is
-   beyond the spread (a real gain or regression) or within it (ignored).
+   beyond the spread (a real gain or regression) or within it (ignored). How noise is told from a difference (the
+   user's choice, after stage 1, 2026-11-01): a Mann-Whitney U test on each row's interleaved rounds, before against
+   after; p < 0.05 is a gain or a regression, by the medians' direction; with p from 0.05 to 0.2, rounds are added (up
+   to about 10 a side) and the test is run again; otherwise it's noise. Each row reports its medians, ranges and p.
 3. **The adapter's shape.** (a) One generic operation template in `coro/`; (b) hand-written operations per class;
    (c) ready tasks only where nothing waits. **Decided: (a).**
 4. **Spawning without wrapper coroutines.** (a) The task's promise is the detached task (Seastar's way), in stage 5;
