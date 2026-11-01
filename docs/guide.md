@@ -201,7 +201,11 @@ for them. With `attempt_delay` 0, or `proto` limiting it to one family, the name
 `"::1"`, or `"fe80::1%en0"` with its zone) isn't, so it's connected to without a thread. A port that isn't a number
 (e.g. `"http"`) fails with `std::errc::invalid_argument`. `connect_options::proto` limits it to IPv4's or IPv6's
 addresses. It fails with the resolver's error, the last address's (e.g. `std::errc::connection_refused`), `timed_out`,
-or `operation_canceled`.
+or `operation_canceled`. The socket it returns has Nagle's algorithm off (TCP_NODELAY), as Go's, curl's and Chromium's
+connections have, and as `http::server` sets it on those it accepts: with it on, a small write waits until what was
+sent before is acknowledged, which a peer delaying its acknowledgements holds up (by 40 ms or more on Linux, where an
+upload stalled that long at the end of each flow-control window). It's set on the attempt that won, once it's
+connected, and a failure to set it is ignored; `sock->set_nodelay(false)` turns Nagle's algorithm back on.
 
 A socket's reads and writes can be limited by a **deadline** (a time by which they must finish:
 `set_read_deadline()`, `set_write_deadline()`, `set_deadline()`) or a **timeout** (how long each may go without
@@ -221,7 +225,6 @@ longer be reordered, e.g. by priority), however large the send buffer grows, wit
 `send()` stops at the mark by itself, but macOS's doesn't, so wait before writing:
 
 ```cpp
-(void)sock->set_nodelay();
 (void)sock->set_notsent_lowat(16 * 1024);   // std::errc::not_supported where there's no such option
 
 while (/* more to write */)
@@ -363,7 +366,8 @@ a scheme nor a host. An empty query or fragment is none (`/path?` builds as `/pa
 connections within `client_options`' limits (per host, altogether, idle time), with timeouts for connecting
 (`connect_timeout`, which resolving the host counts towards, with `client_options::resolver`, by default
 `dns::default_resolver()`; a host's addresses are raced as `connect` races them, `client_options::attempt_delay` apart),
-the TLS handshake, the response's head, and stalled reads and writes.
+the TLS handshake, the response's head, and stalled reads and writes. Its connections (and the WebSocket client's) have
+Nagle's algorithm off, as `connect` leaves them.
 
 ```cpp
 net::http::client client{&scheduler};

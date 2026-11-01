@@ -66,6 +66,23 @@ connect_error(net::io::scheduler* sched, std::string host, std::string port, std
     co_return conn.has_value() ? std::error_code{} : conn.error();
 }
 
+// nodelay is TCP_NODELAY's value on conn's socket (not 0: Nagle's algorithm is off), or why it couldn't be read.
+std::expected<int, std::error_code> nodelay(const net::tcp_socket& conn)
+{
+    int       value = -1;
+    socklen_t size  = sizeof(value);
+    if (::getsockopt(conn.native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, &size) != 0)
+        return std::unexpected(std::error_code{errno, std::system_category()});
+    return value;
+}
+
+// nodelay_of is TCP_NODELAY's value on the socket conn has (see nodelay()), or why connecting failed.
+std::expected<int, std::error_code> nodelay_of(const connect_result& conn)
+{
+    if (!conn.has_value()) return std::unexpected(conn.error());
+    return nodelay(*conn);
+}
+
 std::string closed_port()
 {
     // bind a port, and then let it go: nothing is listening on it afterwards.
@@ -183,6 +200,111 @@ TEST_CASE("connecting resolves names with the resolver given", "[tcp][connect]")
     CAPTURE(err.message());
     CHECK_FALSE(err);
     CHECK(lookup.finished.load() >= 1); // (a call for each family, unless it connected before the second was made)
+}
+
+TEST_CASE("connecting turns Nagle's algorithm off on the socket it returns", "[tcp][connect][nodelay]")
+{
+    // the name resolves to 127.0.0.1, where a listener is.
+    test::blocking_lookup lookup;
+    lookup.release();
+
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+    const auto port = listener->local_port();
+
+    SECTION("to a name")
+    {
+        const auto connect = [](net::io::scheduler* sched,
+                                std::uint16_t       port,
+                                net::dns::resolver* resolver) -> net::coro::task<std::expected<int, std::error_code>>
+        {
+            auto conn =
+                co_await net::tcp_socket::connect(sched, "listener.test", std::to_string(port), {.resolver = resolver});
+            co_return nodelay_of(conn);
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, port, &lookup.resolver));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+    }
+
+    SECTION("to an IP address")
+    {
+        const auto connect = [](net::io::scheduler* sched,
+                                std::uint16_t       port) -> net::coro::task<std::expected<int, std::error_code>>
+        {
+            auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+            co_return nodelay_of(conn);
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, port));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+    }
+
+    SECTION("to addresses")
+    {
+        const auto connect = [](net::io::scheduler* sched,
+                                std::uint16_t       port) -> net::coro::task<std::expected<int, std::error_code>>
+        {
+            const std::array<net::ip_addr, 1> addresses{net::ipv4_addr::loopback()};
+
+            auto conn = co_await net::tcp_socket::connect(sched, addresses, port);
+            co_return nodelay_of(conn);
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, port));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+    }
+
+    SECTION("which set_nodelay(false) turns back on")
+    {
+        struct values
+        {
+            std::expected<int, std::error_code> connected;
+            std::expected<int, std::error_code> off;
+            std::expected<int, std::error_code> on;
+        };
+
+        const auto connect = [](net::io::scheduler* sched, std::uint16_t port) -> net::coro::task<values>
+        {
+            auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+            if (!conn.has_value())
+            {
+                const std::unexpected failed{conn.error()};
+                co_return values{.connected = failed, .off = failed, .on = failed};
+            }
+
+            // sets it, then reads it back.
+            const auto turned = [&conn](bool on) -> std::expected<int, std::error_code>
+            {
+                if (auto set = conn->set_nodelay(on); !set.has_value()) return std::unexpected(set.error());
+                return nodelay(*conn);
+            };
+
+            auto connected = nodelay(*conn);
+            auto off       = turned(false);
+            auto on        = turned(true);
+            co_return values{.connected = connected, .off = off, .on = on};
+        };
+
+        const auto result = sched.run_to_completion(connect(&sched, port));
+        CAPTURE(result.connected.error_or({}).message(),
+                result.off.error_or({}).message(),
+                result.on.error_or({}).message());
+        REQUIRE(result.connected.has_value());
+        CHECK(*result.connected != 0);
+        REQUIRE(result.off.has_value());
+        CHECK(*result.off == 0);
+        REQUIRE(result.on.has_value());
+        CHECK(*result.on != 0);
+    }
 }
 
 TEST_CASE("connecting's timeout covers resolving", "[tcp][connect][timeout]")
@@ -1054,6 +1176,86 @@ TEST_CASE("racing attempts takes the first to connect, and closes the rest", "[t
     }
     CHECK(won == 1);
     CHECK(lost == 1);
+}
+
+TEST_CASE("racing attempts turns Nagle's algorithm off on the attempt that wins",
+          "[tcp][connect][happy-eyeballs][nodelay]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const auto port = listener->local_port();
+
+    const auto connect = [](net::io::scheduler* sched, fake_network* network, net::tcp_socket::connect_options options)
+        -> net::coro::task<std::expected<int, std::error_code>>
+    {
+        auto [conn, _] = co_await connect_through(sched, network, std::move(options));
+        co_return nodelay_of(conn);
+    };
+
+    SECTION("the first, waited for before the next is due")
+    {
+        fake_network network{
+            {{addr("192.0.2.1"), answer}, {addr("192.0.2.2"), answer}},
+            port
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, &network, {.attempt_delay = 10s}));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+        CHECK(network.tried() == std::vector{addr("192.0.2.1")});
+    }
+
+    SECTION("a later one, started while the first hangs")
+    {
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), answer}},
+            port
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, &network, {.attempt_delay = 50ms}));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+        CHECK(network.tried().size() == 2);
+    }
+
+    SECTION("one that outlasted the delay, in a task of its own")
+    {
+        // both hang, and the first (by then the race's, in its own task) connects for real as the second starts: the
+        // first can only win as the race's winner.
+        fake_network network{
+            {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), hang}},
+            port
+        };
+
+        std::error_code connecting;
+        network.connect_hanging(2, port, &connecting);
+
+        const auto value = sched.run_to_completion(connect(&sched, &network, {.attempt_delay = 50ms}));
+        CAPTURE(connecting.message(), value.error_or({}).message());
+        CHECK((!connecting || connecting == std::errc::operation_in_progress));
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+        CHECK(network.tried().size() == 2);
+    }
+
+    SECTION("one at a time")
+    {
+        fake_network network{
+            {{addr("192.0.2.1"), refuse}, {addr("192.0.2.2"), answer}},
+            port
+        };
+
+        const auto value = sched.run_to_completion(connect(&sched, &network, {.attempt_delay = 0ms}));
+        CAPTURE(value.error_or({}).message());
+        REQUIRE(value.has_value());
+        CHECK(*value != 0);
+        CHECK(network.tried() == network.addresses_given());
+    }
 }
 
 TEST_CASE("racing attempts fails with the last attempt's error", "[tcp][connect][happy-eyeballs]")

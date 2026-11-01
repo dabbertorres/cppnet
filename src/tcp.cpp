@@ -158,6 +158,18 @@ std::expected<started, std::error_code> start(net::io::scheduler*               
     return std::unexpected(err);
 }
 
+// connected is conn, which has connected (and won: it's what connect returns), with Nagle's algorithm off
+// (TCP_NODELAY), as Go, curl and Chromium set it on their clients' connections. With it on, a write that doesn't fill a
+// segment waits until what was sent before is acknowledged, and a peer that delays its acknowledgements (Linux's, by
+// 40 ms or more) holds it up that long: e.g. an upload stalls at the end of each flow-control window, and a request's
+// head written apart from its body waits. Set on the winner alone, not on each attempt. A failure to set it is
+// ignored: the connection works either way, and a caller who wants Nagle's algorithm calls set_nodelay(false).
+net::tcp_socket connected(net::tcp_socket conn) noexcept
+{
+    [[maybe_unused]] const auto set = conn.set_nodelay();
+    return conn;
+}
+
 // one_at_a_time connects to the first of addresses that accepts, trying them in order, by deadline, each attempt
 // getting its share of what's left (see net::detail::attempt_deadline()).
 net::coro::task<std::expected<net::tcp_socket, std::error_code>>
@@ -183,14 +195,14 @@ one_at_a_time(net::io::scheduler*                      scheduler,
             last_err = attempt.error();
             continue;
         }
-        if (attempt->connected) co_return std::move(attempt->conn);
+        if (attempt->connected) co_return connected(std::move(attempt->conn));
 
         auto& conn   = attempt->conn;
         auto  result = co_await wait_connected(scheduler,
                                                conn.native_handle(),
                                                net::detail::attempt_deadline(now, deadline, addresses.size() - i),
                                                options.stop);
-        if (!result) co_return std::move(conn);
+        if (!result) co_return connected(std::move(conn));
 
         conn.close(false);
 
@@ -499,7 +511,7 @@ keep_racing(net::io::scheduler*                       scheduler,
         const bool waiting = more_coming(more, addresses, next);
 
         auto now = state->look(spawned, next);
-        if (now.winner.has_value()) co_return std::move(*now.winner);
+        if (now.winner.has_value()) co_return connected(std::move(*now.winner));
 
         if (auto err = ended(scheduler, options.stop, deadline); err) co_return std::unexpected(err);
         if (next == addresses.size() && now.in_flight == 0 && !waiting) co_return std::unexpected(now.last_err);
@@ -517,7 +529,7 @@ keep_racing(net::io::scheduler*                       scheduler,
                 next_start = time;
                 continue;
             }
-            if (attempt->connected) co_return std::move(attempt->conn);
+            if (attempt->connected) co_return connected(std::move(attempt->conn));
 
             // NOTE: refused (and so destroyed, closing the socket) only if the scheduler is stopping.
             if (!scheduler->spawn(racing_attempt(state, index, std::move(attempt->conn), deadline)))
@@ -589,7 +601,7 @@ racing(net::io::scheduler*                      scheduler,
             last_err = attempt.error();
             continue;
         }
-        if (attempt->connected) co_return std::move(attempt->conn);
+        if (attempt->connected) co_return connected(std::move(attempt->conn));
 
         // the last waits until the end (unless more may come).
         auto&      conn  = attempt->conn;
@@ -597,7 +609,7 @@ racing(net::io::scheduler*                      scheduler,
         const auto until = inline_until(now, last, options.attempt_delay, deadline);
 
         auto err = co_await wait_connected(scheduler, conn.native_handle(), until, options.stop);
-        if (!err) co_return std::move(conn);
+        if (!err) co_return connected(std::move(conn));
 
         if (err != std::errc::timed_out || last || net::io::clock::now() >= deadline)
         {

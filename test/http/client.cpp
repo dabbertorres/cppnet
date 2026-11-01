@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
@@ -198,6 +199,47 @@ TEST_CASE("the client sends a URL's path and query as given", "[http][client]")
     CHECK(sched.run_to_completion(get(&sched, url, http2)) == "200");
     CHECK(received == target);
     CHECK(version == (http2 ? 2U : 1U));
+}
+
+TEST_CASE("the client's connections have Nagle's algorithm off", "[http][client][nodelay]")
+{
+    const bool http2 = GENERATE(false, true);
+    CAPTURE(http2);
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    net::http::server  server{&sched,
+                              net::listener::make(&sched, "127.0.0.1", "0").value(),
+                              [](net::http::server_request&, net::http::response_writer& resp) -> task<>
+                              {
+                                 auto* body = co_await resp.send(net::http::status::OK, 5);
+                                 (void)co_await net::io::write_all(*body, "hello"sv);
+                              }};
+    REQUIRE(sched.spawn(server.serve()));
+
+    // TCP_NODELAY on the client's socket (the response's body's handle, before the body's read, which gives an HTTP/1.1
+    // connection back), and the version: HTTP/2 in cleartext with prior knowledge, HTTP/1.1 otherwise.
+    auto get = [](net::io::scheduler* sched, std::string url, bool http2) -> task<std::string>
+    {
+        net::http::client_options options;
+        options.http2_prior_knowledge = http2;
+        net::http::client client{sched, options};
+
+        auto resp = co_await client.get(url);
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        int        value = -1;
+        socklen_t  size  = sizeof(value);
+        const bool got   = ::getsockopt(resp->body->native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, &size) == 0;
+
+        auto body = co_await net::io::read_all(*resp->body);
+        if (!body.has_value()) co_return "error: " + body.error().message();
+        if (*body != "hello") co_return "body: " + *body;
+        if (!got) co_return "getsockopt failed";
+        co_return std::format("{}: {}", resp->version.major, value != 0 ? "on" : "off");
+    };
+
+    const auto url = std::format("http://127.0.0.1:{}/", server.local_port());
+    CHECK(sched.run_to_completion(get(&sched, url, http2)) == (http2 ? "2: on" : "1: on"));
 }
 
 #ifndef NET_HAS_TLS

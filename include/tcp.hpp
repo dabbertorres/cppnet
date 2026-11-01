@@ -92,7 +92,9 @@ public:
     // addresses that accepts (see connect() for addresses, and connect_options::attempt_delay for starting before the
     // lookup's done), on port, which must be a number (e.g. "80", not "http").
     // An IP address (e.g. "127.0.0.1" or "::1", or an IPv6 address with a zone, "fe80::1%en0") isn't resolved: it's
-    // connected to without a blocking thread (see io::scheduler::run_blocking()). It fails with:
+    // connected to without a blocking thread (see io::scheduler::run_blocking()). The socket returned has Nagle's
+    // algorithm off (see set_nodelay()), as Go's, curl's and Chromium's connections have, set once it's connected (a
+    // failure to set it is ignored). It fails with:
     // - std::errc::invalid_argument if port isn't a number from 0 to 65535, or host isn't a valid name.
     // - the resolver's error if host can't be resolved (compare it with dns::condition: e.g. not_found).
     // - std::errc::address_family_not_supported if the host is an IP address that options.proto rules out.
@@ -110,8 +112,9 @@ public:
 
     // connect connects to the first of addresses (those of options.proto's family) that accepts, trying them in order
     // (interleaved by family, see connect_options::attempt_delay), on port, without resolving anything. The addresses
-    // are copied before it returns, so they needn't outlive the task. It fails as connect(host, ...) does once that has
-    // resolved, and with std::errc::address_family_not_supported if no address is of options.proto's family, or
+    // are copied before it returns, so they needn't outlive the task. The socket returned has Nagle's algorithm off, as
+    // connect(host, ...)'s has. It fails as connect(host, ...) does once that has resolved, and with
+    // std::errc::address_family_not_supported if no address is of options.proto's family, or
     // std::errc::invalid_argument if there are none.
     static coro::task<std::expected<tcp_socket, std::error_code>> connect(io::scheduler*           scheduler,
                                                                           std::span<const ip_addr> addresses,
@@ -125,7 +128,9 @@ public:
     }
 
     // set_nodelay turns Nagle's algorithm off (TCP_NODELAY), so a small write is sent right away, rather than when what
-    // was sent before is acknowledged.
+    // was sent before is acknowledged (which a peer delaying its acknowledgements holds up, by 40 ms or more on Linux).
+    // connect() turns it off on the sockets it returns, as http::server does on those it accepts: set_nodelay(false)
+    // turns it back on.
     [[nodiscard]] std::expected<void, std::error_code> set_nodelay(bool nodelay = true) const noexcept;
 
     // set_notsent_lowat sets the socket's TCP_NOTSENT_LOWAT: the most it holds written but not yet sent before it no
