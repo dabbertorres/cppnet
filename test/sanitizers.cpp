@@ -19,4 +19,16 @@ extern "C"
     return "leak:_gai_nat64_second_pass\n"
            "leak:nw_path_libinfo_path_check\n";
 }
+
+// Races ThreadSanitizer reports in code it can't see, rather than this project's.
+// NOLINTNEXTLINE(*-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp): the sanitizer runtime looks for this name.
+[[gnu::visibility("default"), gnu::used]] const char* __tsan_default_suppressions()
+{
+    // Botan (built by vcpkg without -fsanitize=thread): its cipher suites are a function-local static vector
+    // (Ciphersuite::all_known_ciphersuites()), made once under the static's guard and never changed. A thread that
+    // finds it made already does so in Botan's uninstrumented code, so TSan never sees it synchronize with the thread
+    // that made it, and reports that thread's reads (e.g. our policy's, of a suite's code) as racing the construction:
+    // when several clients' first handshakes run at once.
+    return "race:Botan::TLS::Ciphersuite\n";
+}
 }
