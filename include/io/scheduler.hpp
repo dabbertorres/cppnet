@@ -62,6 +62,44 @@ namespace detail
     template<typename F>
     using blocking_result_t = blocking_result<F>::type;
 
+    // blocking_outcome is how a blocking call (see scheduler::blocking_call) ended: func's result, or what it threw.
+    template<typename T>
+    class blocking_outcome
+    {
+    public:
+        void return_value(T result) { outcome.template emplace<1>(std::move(result)); }
+        // NOTE: assigned, as coro::task's promise does: emplace() returns the alternative through std::get, which
+        //       libstdc++ can throw from, as far as clang-tidy sees.
+        void unhandled_exception() noexcept { outcome = std::current_exception(); }
+
+        // take is func's result, or rethrows what it threw.
+        T take()
+        {
+            if (const auto* error = std::get_if<2>(&outcome)) std::rethrow_exception(*error);
+            return std::move(std::get<1>(outcome));
+        }
+
+    private:
+        std::variant<std::monostate, T, std::exception_ptr> outcome;
+    };
+
+    template<>
+    class blocking_outcome<void>
+    {
+    public:
+        void return_void() const noexcept { /* noop */ }
+        void unhandled_exception() noexcept { error = std::current_exception(); }
+
+        // take rethrows what func threw, if it did.
+        void take() const
+        {
+            if (error) std::rethrow_exception(error);
+        }
+
+    private:
+        std::exception_ptr error;
+    };
+
 }
 
 // scheduler runs tasks on a thread pool, and resumes them when the handles they wait on are ready.
@@ -78,7 +116,8 @@ namespace detail
 // - A wait can also be canceled alone: the overloads that take a std::stop_token end with
 //   std::errc::operation_canceled when stop is requested (see stoppable_wait_operation), as do sockets' reads and
 //   writes given one (socket::set_stop_token()).
-// - shutdown() stops the scheduler, and blocks until its tasks have finished and run() has returned.
+// - shutdown() stops the scheduler, and blocks until its tasks and blocking calls (see run_blocking()) have finished,
+//   and run() has returned.
 //
 // A scheduler can't be restarted once stopped.
 class scheduler : private coro::thread_pool::poller
@@ -89,6 +128,8 @@ public:
 
 private:
     struct waiter;
+    struct blocking_start;
+    struct blocking_end;
 
     using watched_list = std::multimap<const std::atomic<std::uint64_t>*, waiter*>;
 
@@ -598,51 +639,143 @@ public:
         return {this, deadline, std::forward<F>(func)};
     }
 
+    // blocking_call is what run_blocking() returns: an awaitable of func's result (awaited once, as a task), which runs
+    // func on a blocking thread once it's awaited, and then resumes the awaiting coroutine on the workers.
+    //
+    // Its state (func, its result, and whether the awaiting coroutine is still there) isn't the awaiting coroutine's:
+    // it's a frame of its own (one allocation, made by run_blocking()), shared by the call and the blocking thread, and
+    // freed by whichever is done with it last. So the awaiting coroutine may be destroyed while it waits, as for any of
+    // the runtime's waits: func isn't run if it hadn't started (it was waiting for a thread), and otherwise runs to its
+    // end (nothing can interrupt it), its result (or exception) is dropped, and nothing is resumed. Once func has
+    // returned, though, the awaiting coroutine is being resumed, and mustn't be destroyed. A call destroyed without
+    // being awaited never runs func.
+    //
+    // Awaited directly, a call allocates nothing more. Where a task is needed (e.g. for spawn(), an async_scope, or to
+    // keep it as a coro::task<T>), it converts to one: a small coroutine awaiting it, a second allocation. The task is
+    // as safe to destroy, unawaited (func never runs) or while it waits (as above), as the call.
+    template<typename T>
+    class [[nodiscard]] blocking_call
+    {
+    public:
+        struct promise_type : detail::blocking_outcome<T>
+        {
+            // NOTE: given blocking_job()'s arguments.
+            template<typename... Args>
+            explicit promise_type(scheduler* sched, const Args&... /*func*/) noexcept
+                : sched{sched}
+            {}
+
+            blocking_call get_return_object() noexcept
+            {
+                return blocking_call{std::coroutine_handle<promise_type>::from_promise(*this)};
+            }
+
+            [[nodiscard]] std::suspend_always initial_suspend() const noexcept { return {}; }
+            [[nodiscard]] blocking_end        final_suspend() const noexcept { return {}; }
+
+            // leave notes that the awaiting coroutine is gone, returning whether func has returned already: then the
+            // call is the last to have the state.
+            bool leave() noexcept { return (flags.fetch_or(left, std::memory_order::acq_rel) & done) != 0; }
+
+            // finish notes that func has returned (or thrown), returning whether the awaiting coroutine is gone: then
+            // the blocking thread is the last to have the state.
+            bool finish() noexcept { return (flags.fetch_or(done, std::memory_order::acq_rel) & left) != 0; }
+
+            // gone is whether the awaiting coroutine is gone.
+            [[nodiscard]] bool gone() const noexcept { return (flags.load(std::memory_order::acquire) & left) != 0; }
+
+            scheduler*              sched;
+            std::coroutine_handle<> awaiting{nullptr};
+
+        private:
+            static constexpr std::uint8_t done = 1;
+            static constexpr std::uint8_t left = 2;
+
+            std::atomic<std::uint8_t> flags{0};
+        };
+
+        blocking_call(const blocking_call&)            = delete;
+        blocking_call& operator=(const blocking_call&) = delete;
+
+        // NOTE: not once it's awaited.
+        blocking_call(blocking_call&& other) noexcept
+            : job{std::exchange(other.job, nullptr)}
+            , waiting{other.waiting}
+            , refused{other.refused}
+        {}
+
+        blocking_call& operator=(blocking_call&&) = delete;
+
+        ~blocking_call()
+        {
+            if (!job) return;
+
+            // the awaiting coroutine is being destroyed while it waits: the blocking thread frees the state, unless
+            // func has returned already.
+            if (waiting && !job.promise().leave()) return;
+
+            job.destroy();
+        }
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> awaiting) noexcept
+        {
+            auto& promise    = job.promise();
+            promise.awaiting = awaiting;
+            waiting          = true;
+
+            // NOTE: once it's started, func may return, and the awaiting coroutine be resumed (on another thread), at
+            //       any moment, so nothing here may be touched again.
+            if (promise.sched->begin_blocking(job)) return true;
+
+            waiting = false;
+            refused = true;
+            return false;
+        }
+
+        T await_resume()
+        {
+            waiting = false;
+            if (refused) throw std::runtime_error{"the scheduler's blocking threads are shutting down"};
+            return job.promise().take();
+        }
+
+        // operator coro::task<T> makes a task of the call (see above), which awaits it once it's awaited itself.
+        // NOTE: not once it's awaited.
+        // NOLINTNEXTLINE(*-explicit-constructor): implicit, so a call goes where a task does.
+        operator coro::task<T>() && { return as_task(std::move(*this)); }
+
+    private:
+        // as_task awaits call: the coroutine behind a task made of it. Its frame holds the call, so destroying it
+        // (unstarted, or while it waits) is destroying the call (see above).
+        static coro::task<T> as_task(blocking_call call)
+        {
+            if constexpr (std::is_void_v<T>) co_await std::move(call);
+            else co_return co_await std::move(call);
+        }
+
+        explicit blocking_call(std::coroutine_handle<promise_type> job) noexcept
+            : job{job}
+        {}
+
+        std::coroutine_handle<promise_type> job;
+        bool                                waiting = false; // awaited, and not resumed yet
+        bool                                refused = false; // the blocking threads wouldn't take it
+    };
+
     // run_blocking runs func on a thread set aside for blocking calls (e.g. getaddrinfo(); options::blocking_threads of
     // them, func waiting for one to be free), so it doesn't hold up the worker threads, and then continues on the
-    // worker threads. Stopping the scheduler doesn't interrupt func, and shutdown() waits for the task awaiting it, as
-    // for any task.
+    // worker threads (see blocking_call). Nothing interrupts func once it has started: stopping the scheduler doesn't,
+    // and neither does destroying the coroutine awaiting it, which leaves func to finish alone. So func's own captures
+    // (by value) live until it's done, but what it refers to (by reference or pointer) must outlive its run, not just
+    // the awaiting coroutine. shutdown() waits for blocking calls under way, whether or not their awaiting coroutines
+    // are still there.
     template<std::invocable F>
-    coro::task<std::invoke_result_t<F>> run_blocking(F func)
+    blocking_call<std::invoke_result_t<F>> run_blocking(F func)
     {
-        using result_type = std::invoke_result_t<F>;
-
-        co_await blocking->schedule();
-
-        // the awaiting coroutine must continue on the workers, even if func throws.
-        std::exception_ptr error;
-
-        if constexpr (std::is_void_v<result_type>)
-        {
-            try
-            {
-                std::invoke(std::move(func));
-            }
-            catch (...)
-            {
-                error = std::current_exception();
-            }
-
-            co_await workers->schedule();
-            if (error) std::rethrow_exception(error);
-        }
-        else
-        {
-            std::optional<result_type> result;
-
-            try
-            {
-                result.emplace(std::invoke(std::move(func)));
-            }
-            catch (...)
-            {
-                error = std::current_exception();
-            }
-
-            co_await workers->schedule();
-            if (error) std::rethrow_exception(error);
-            co_return std::move(*result);
-        }
+        // NOTE: not a coroutine itself: blocking_job()'s frame is the call's state.
+        return blocking_job(this, std::move(func));
     }
 
     // run_blocking(func, stop) is run_blocking(func), unless stop is requested before func starts: then func isn't
@@ -651,12 +784,12 @@ public:
     // given stop, to check as it goes. Once func has run, its result is returned, even if stop was requested meanwhile.
     template<typename F>
         requires std::invocable<F, std::stop_token> || std::invocable<F>
-    coro::task<std::expected<detail::blocking_result_t<F>, std::error_code>> run_blocking(F func, std::stop_token stop)
+    blocking_call<std::expected<detail::blocking_result_t<F>, std::error_code>> run_blocking(F               func,
+                                                                                             std::stop_token stop)
     {
         using result_type = detail::blocking_result_t<F>;
         using expected    = std::expected<result_type, std::error_code>;
 
-        // NOTE: not a coroutine itself, so this adds no frame to run_blocking(func)'s.
         return run_blocking(
             [func = std::move(func), stop = std::move(stop)] mutable -> expected
             {
@@ -734,9 +867,10 @@ public:
     // but doesn't wait on it (e.g. work between waits). Its callbacks run on the thread calling request_stop().
     [[nodiscard]] std::stop_token stop_token() const noexcept { return stopper.get_token(); }
 
-    // shutdown stops the scheduler, and blocks until its tasks have finished, and run() has returned (if running). It
-    // throws std::logic_error if it's called from one of the pool's workers (e.g. by one of the scheduler's tasks),
-    // which would wait for itself: call request_stop() there instead.
+    // shutdown stops the scheduler, and blocks until its tasks have finished, the blocking calls under way have too
+    // (see run_blocking()), and run() has returned (if running). It throws std::logic_error if it's called from one of
+    // the pool's workers (e.g. by one of the scheduler's tasks), which would wait for itself: call request_stop() there
+    // instead.
     void shutdown();
 
 private:
@@ -788,6 +922,70 @@ private:
     // make_calls makes the calls whose deadlines have passed.
     void make_calls() noexcept;
 
+    // blocking_job is a blocking call (see blocking_call), whose frame is its state: func, run on a blocking thread
+    // once the call is awaited, unless the awaiting coroutine has gone by then. NOTE: its frame must never be elided
+    // into the caller's (HALO), which it may outlive: Clang doesn't, as its handle goes to begin_blocking(), out of
+    // line (checked with -Rpass-missed=coro-elide), and it mustn't be made [[clang::coro_await_elidable]].
+    template<std::invocable F>
+    static blocking_call<std::invoke_result_t<F>> blocking_job(scheduler* /*self: the promise's*/, F func)
+    {
+        co_await blocking_start{};
+
+        if constexpr (std::is_void_v<std::invoke_result_t<F>>) std::invoke(std::move(func));
+        else co_return std::invoke(std::move(func));
+    }
+
+    // blocking_start begins a blocking call's job, on the blocking thread: it frees the state instead, if the awaiting
+    // coroutine has gone (then, the call left it to the job).
+    struct blocking_start
+    {
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        template<typename Promise>
+        bool await_suspend(std::coroutine_handle<Promise> job) noexcept
+        {
+            const auto& promise = job.promise();
+            if (!promise.gone()) return false;
+
+            auto* const sched = promise.sched;
+            job.destroy();
+            sched->end_blocking();
+            return true;
+        }
+
+        void await_resume() const noexcept { /* noop */ }
+    };
+
+    // blocking_end ends a blocking call's job, on the blocking thread, once func has returned (or thrown): it resumes
+    // the awaiting coroutine on the workers, or, if that's gone, frees the state (with func and its result).
+    struct blocking_end
+    {
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        template<typename Promise>
+        void await_suspend(std::coroutine_handle<Promise> job) noexcept
+        {
+            // NOTE: once finish() has said the awaiting coroutine is there, it's resumed, and may free the state at any
+            //       moment: so this only uses copies.
+            auto&       promise  = job.promise();
+            auto* const sched    = promise.sched;
+            const auto  awaiting = promise.awaiting;
+
+            if (promise.finish()) job.destroy();
+            else sched->resume(awaiting);
+
+            sched->end_blocking();
+        }
+
+        void await_resume() const noexcept { /* noop */ }
+    };
+
+    // begin_blocking counts a blocking call under way, and has the blocking threads run its job, returning false (and
+    // not counting it) if they won't, as they're shutting down. end_blocking counts it done: once it no longer uses the
+    // scheduler (but the count, which outlives the blocking threads).
+    bool begin_blocking(std::coroutine_handle<> job) noexcept;
+    void end_blocking() noexcept;
+
     void dispatch(std::span<const ready_event> events, completions& done) noexcept;
     void notify(const std::atomic<std::uint64_t>& word, bool all) noexcept;
     // expire_timers completes the waits whose deadlines have passed, returning whether a call's has too (see
@@ -811,6 +1009,12 @@ private:
     void wake() noexcept override;
 
     std::shared_ptr<coro::thread_pool> workers;
+
+    // blocking_calls counts the blocking calls under way, from when they're awaited until they're done with the
+    // scheduler (see begin_blocking()), for shutdown() to wait for. It outlives blocking, so that its threads may
+    // notify it as they finish.
+    std::atomic<std::size_t> blocking_calls{0};
+
     std::unique_ptr<coro::thread_pool> blocking;
     std::shared_ptr<spdlog::logger>    logger;
     detail::event_loop                 loop;

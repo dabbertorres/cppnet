@@ -92,6 +92,27 @@ bool eventually(F check)
     return true;
 }
 
+// set_flag sets a flag, and wakes those waiting for it.
+void set_flag(std::atomic<bool>& flag) noexcept
+{
+    flag.store(true);
+    flag.notify_all();
+}
+
+// gone_when_destroyed is a handle whose last copy sets gone, once destroyed: for seeing when what holds it is.
+std::shared_ptr<void> gone_when_destroyed(std::atomic<bool>* gone)
+{
+    return {nullptr, [gone](std::nullptr_t) noexcept { gone->store(true); }};
+}
+
+// await_blocking awaits run_blocking(func), and then sets resumed (if given).
+template<typename F>
+task<> await_blocking(scheduler* sched, F func, std::atomic<bool>* resumed = nullptr)
+{
+    (void)co_await sched->run_blocking(std::move(func));
+    if (resumed != nullptr) resumed->store(true);
+}
+
 task<net::io::result> read_some(net::socket* sock, std::string* out)
 {
     std::array<std::byte, 256> buf{};
@@ -613,21 +634,32 @@ TEST_CASE("connections can be accepted, read from, and written to", "[io][schedu
 
 TEST_CASE("run_blocking runs on another thread, and continues on the workers", "[io][scheduler][run_blocking]")
 {
-    scheduler sched{make_pool()};
+    const auto pool = make_pool();
+    scheduler  sched{pool};
 
-    auto check = [](scheduler* sched) -> task<std::pair<bool, bool>>
+    struct seen
+    {
+        bool ran_elsewhere = false;
+        bool came_back     = false;
+        bool on_worker     = false;
+    };
+
+    auto check = [](scheduler* sched, const net::coro::thread_pool* pool) -> task<seen>
     {
         auto worker   = std::this_thread::get_id();
         auto blocking = co_await sched->run_blocking([] { return std::this_thread::get_id(); });
         auto after    = std::this_thread::get_id();
 
         // after may be a different worker, but it's not the blocking thread.
-        co_return std::pair{blocking != worker, after != blocking};
+        co_return seen{.ran_elsewhere = blocking != worker,
+                       .came_back     = after != blocking,
+                       .on_worker     = pool->on_worker()};
     };
 
-    auto [ran_elsewhere, came_back] = sched.run_to_completion(check(&sched));
+    auto [ran_elsewhere, came_back, on_worker] = sched.run_to_completion(check(&sched, pool.get()));
     CHECK(ran_elsewhere);
     CHECK(came_back);
+    CHECK(on_worker);
 }
 
 TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
@@ -638,6 +670,262 @@ TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
     { co_return co_await sched->run_blocking([] -> int { throw std::runtime_error{"boom"}; }); };
 
     CHECK_THROWS_AS(sched.run_to_completion(throws(&sched)), std::runtime_error);
+}
+
+TEST_CASE("run_blocking leaves func to finish alone if its caller is destroyed meanwhile",
+          "[io][scheduler][run_blocking][abandon]")
+{
+    const bool throws = GENERATE(false, true);
+    CAPTURE(throws);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> finished{false};
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> func_gone{false};   // func's captures
+    std::atomic<bool> result_gone{false}; // its result
+
+    scheduler              sched{make_pool()};
+    const net::util::defer let_go{[&release] noexcept { set_flag(release); }};
+
+    auto caller = await_blocking(
+        &sched,
+        [&started, &release, &finished, &result_gone, throws, owned = gone_when_destroyed(&func_gone)]
+        {
+            set_flag(started);
+            release.wait(false);
+            finished.store(true);
+            if (throws) throw std::runtime_error{"boom"};
+            return gone_when_destroyed(&result_gone);
+        },
+        &resumed);
+
+    // the caller starts here, and suspends once it has handed func to a blocking thread.
+    CHECK(caller.resume());
+    REQUIRE(eventually([&] { return started.load(); }));
+
+    CHECK(caller.destroy());
+    CHECK_FALSE(func_gone.load()); // func still runs, with its captures
+
+    set_flag(release);
+
+    // the blocking thread frees the call's state (its result, then func) once func has returned.
+    REQUIRE(eventually([&] { return func_gone.load(); }));
+    CHECK(finished.load());
+    CHECK(result_gone.load() != throws);
+    CHECK_FALSE(resumed.load());
+}
+
+TEST_CASE("run_blocking doesn't start func if its caller is destroyed while it waits for a thread",
+          "[io][scheduler][run_blocking][abandon]")
+{
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> ran{false};
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> func_gone{false};
+
+    // one blocking thread, which the first call holds.
+    scheduler              sched{make_pool(), scheduler::options{.blocking_threads = 1}};
+    const net::util::defer let_go{[&release] noexcept { set_flag(release); }};
+
+    REQUIRE(sched.spawn(await_blocking(&sched,
+                                       [&started, &release]
+                                       {
+                                           set_flag(started);
+                                           release.wait(false);
+                                       })));
+    REQUIRE(eventually([&] { return started.load(); }));
+
+    auto caller =
+        await_blocking(&sched, [&ran, owned = gone_when_destroyed(&func_gone)] { ran.store(true); }, &resumed);
+    CHECK(caller.resume()); // waits for the thread, from here on
+
+    CHECK(caller.destroy());
+    CHECK_FALSE(func_gone.load()); // the call is still queued, with func
+
+    // the thread, free, takes the call, and frees it.
+    set_flag(release);
+    REQUIRE(eventually([&] { return func_gone.load(); }));
+    CHECK_FALSE(ran.load());
+    CHECK_FALSE(resumed.load());
+}
+
+TEST_CASE("run_blocking with a stop token doesn't start func if stop is requested while it waits for a thread",
+          "[io][scheduler][run_blocking][stop]")
+{
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> ran{false};
+    std::stop_source  source;
+
+    // one blocking thread, which the first call holds.
+    scheduler              sched{make_pool(), scheduler::options{.blocking_threads = 1}};
+    const net::util::defer let_go{[&release] noexcept { set_flag(release); }};
+
+    REQUIRE(sched.spawn(await_blocking(&sched,
+                                       [&started, &release]
+                                       {
+                                           set_flag(started);
+                                           release.wait(false);
+                                       })));
+    REQUIRE(eventually([&] { return started.load(); }));
+
+    auto call = [](scheduler* sched, std::atomic<bool>* ran, std::stop_token stop) -> task<std::error_code>
+    {
+        auto res = co_await sched->run_blocking([ran] { ran->store(true); }, std::move(stop));
+        co_return res.has_value() ? std::error_code{} : res.error();
+    };
+
+    auto caller = call(&sched, &ran, source.get_token());
+    CHECK(caller.resume()); // waits for the thread, from here on
+
+    source.request_stop();
+    set_flag(release);
+
+    REQUIRE(eventually([&] { return caller.get_promise().finished(); }));
+    const auto err = std::move(caller).result();
+    CHECK(err == std::errc::operation_canceled);
+    CHECK_FALSE(ran.load());
+}
+
+TEST_CASE("run_blocking's call converts to a task", "[io][scheduler][run_blocking][task]")
+{
+    std::atomic<bool> ran{false};
+    std::atomic<bool> func_gone{false};
+
+    scheduler sched{make_pool()};
+
+    SECTION("which returns func's result, or throws what it threw")
+    {
+        auto run = [](scheduler* sched) -> task<std::pair<int, bool>>
+        {
+            task<int> result = sched->run_blocking([] { return 42; });
+            task<int> throws = sched->run_blocking([] -> int { throw std::runtime_error{"boom"}; });
+
+            const auto value = co_await std::move(result);
+            bool       threw = false;
+            try
+            {
+                (void)co_await std::move(throws);
+            }
+            catch (const std::runtime_error&)
+            {
+                threw = true;
+            }
+            co_return std::pair{value, threw};
+        };
+
+        auto [value, threw] = sched.run_to_completion(run(&sched));
+        CHECK(value == 42);
+        CHECK(threw);
+    }
+
+    SECTION("which the scheduler can run")
+    {
+        REQUIRE(sched.spawn(sched.run_blocking([&ran] { set_flag(ran); })));
+        REQUIRE(eventually([&] { return ran.load(); }));
+    }
+
+    SECTION("which never runs func if it's destroyed unawaited")
+    {
+        {
+            task<> unawaited = sched.run_blocking([&ran, owned = gone_when_destroyed(&func_gone)] { ran.store(true); });
+        }
+        CHECK(func_gone.load()); // freed with the task, at once
+        CHECK_FALSE(ran.load());
+    }
+
+    SECTION("as does the call itself")
+    {
+        {
+            auto unawaited = sched.run_blocking([&ran, owned = gone_when_destroyed(&func_gone)] { ran.store(true); });
+        }
+        CHECK(func_gone.load());
+        CHECK_FALSE(ran.load());
+    }
+}
+
+TEST_CASE("run_blocking's call as a task leaves func to finish alone if its caller is destroyed meanwhile",
+          "[io][scheduler][run_blocking][task][abandon]")
+{
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> finished{false};
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> func_gone{false};
+
+    scheduler              sched{make_pool()};
+    const net::util::defer let_go{[&release] noexcept { set_flag(release); }};
+
+    // await_task awaits the task, and then sets resumed.
+    auto await_task = [](task<> call, std::atomic<bool>* resumed) -> task<>
+    {
+        co_await std::move(call);
+        resumed->store(true);
+    };
+
+    auto caller = await_task(sched.run_blocking(
+                                 [&started, &release, &finished, owned = gone_when_destroyed(&func_gone)]
+                                 {
+                                     set_flag(started);
+                                     release.wait(false);
+                                     finished.store(true);
+                                 }),
+                             &resumed);
+
+    CHECK(caller.resume());
+    REQUIRE(eventually([&] { return started.load(); }));
+
+    // destroys the task it awaits, and that the call it holds, while it waits.
+    CHECK(caller.destroy());
+    CHECK_FALSE(func_gone.load());
+
+    set_flag(release);
+    REQUIRE(eventually([&] { return func_gone.load(); }));
+    CHECK(finished.load());
+    CHECK_FALSE(resumed.load());
+}
+
+TEST_CASE("shutdown waits for a blocking call whose caller is gone", "[io][scheduler][run_blocking][abandon]")
+{
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> shut{false};     // shutdown() has returned
+    std::atomic<bool> saw_shut{false}; // func saw that it had, as it finished
+    std::atomic<bool> func_gone{false};
+
+    scheduler              sched{make_pool()};
+    std::jthread           shutting;
+    const net::util::defer let_go{[&release] noexcept { set_flag(release); }};
+
+    auto caller = await_blocking(&sched,
+                                 [&started, &release, &shut, &saw_shut, owned = gone_when_destroyed(&func_gone)]
+                                 {
+                                     set_flag(started);
+                                     release.wait(false);
+                                     saw_shut.store(shut.load());
+                                 });
+    CHECK(caller.resume());
+    REQUIRE(eventually([&] { return started.load(); }));
+    CHECK(caller.destroy());
+
+    shutting = std::jthread{[&sched, &shut]
+                            {
+                                sched.shutdown();
+                                shut.store(true);
+                            }};
+
+    // shutdown() has begun once it has requested stop. NOTE: the sleep only gives one that wouldn't wait the time to
+    // return, for the checks below to catch: nothing here relies on it.
+    REQUIRE(eventually([&] { return sched.stop_requested(); }));
+    std::this_thread::sleep_for(10ms);
+
+    set_flag(release);
+    shutting.join();
+
+    CHECK_FALSE(saw_shut.load());
+    CHECK(func_gone.load()); // already: shutdown() returned once the call's state was freed
 }
 
 TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")

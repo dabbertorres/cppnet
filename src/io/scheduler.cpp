@@ -713,7 +713,30 @@ void scheduler::shutdown()
 
     request_stop();
     scope.join_blocking();
+
+    // and the blocking calls under way: those whose awaiting coroutines were destroyed (or aren't the scheduler's
+    // tasks) too, as their funcs still run, and may use what the scheduler's owner is about to destroy.
+    for (auto calls = blocking_calls.load(std::memory_order::acquire); calls != 0;
+         calls      = blocking_calls.load(std::memory_order::acquire))
+    {
+        blocking_calls.wait(calls, std::memory_order::acquire);
+    }
+
     running.wait(true, std::memory_order::acquire);
+}
+
+bool scheduler::begin_blocking(std::coroutine_handle<> job) noexcept
+{
+    blocking_calls.fetch_add(1, std::memory_order::relaxed);
+    if (blocking->resume(job)) return true;
+
+    end_blocking();
+    return false;
+}
+
+void scheduler::end_blocking() noexcept
+{
+    if (blocking_calls.fetch_sub(1, std::memory_order::acq_rel) == 1) blocking_calls.notify_all();
 }
 
 }

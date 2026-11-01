@@ -96,10 +96,16 @@ behind what's queued.
 
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that (4, unless the scheduler is made
-with `io::scheduler::options{.blocking_threads = n}`; the rest wait for one), and returns a task of its result.
-`run_blocking(func, stop)` doesn't run `func` if stop was requested before it starts (its result, a `std::expected`, is
-then `operation_canceled`), and passes the token to a `func` that takes one; nothing interrupts `func` once it has
-started, and `shutdown()` waits for it, as for any task.
+with `io::scheduler::options{.blocking_threads = n}`; the rest wait for one), and returns an awaitable of its result
+(`io::scheduler::blocking_call`, awaited once, as a task), which continues on the workers. Awaited directly, a call
+makes one allocation; where a task is needed (`scheduler.spawn()`, an `async_scope`, or keeping it as a
+`coro::task<R>`), it converts to one, a small coroutine awaiting it (a second allocation). `run_blocking(func, stop)`
+doesn't run `func` if stop was requested before it starts (its result, a `std::expected`, is then
+`operation_canceled`), and passes the token to a `func` that takes one. Nothing interrupts `func` once it has started,
+not even destroying the coroutine awaiting it: then `func` finishes alone, keeping what it owns (its captures by
+value), and its result is dropped (a `func` still waiting for a thread isn't run at all). So what `func` refers to (by
+reference or pointer) must outlive its run, not just the coroutine awaiting it. `shutdown()` waits for the blocking
+calls under way, whether or not their callers are still there.
 
 ## Lifetimes
 
