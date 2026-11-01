@@ -1,7 +1,6 @@
 #include "coro/notifier.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <latch>
 #include <mutex>
 #include <thread>
@@ -89,8 +88,7 @@ TEST_CASE("a notify while the notifier's caller holds a lock the waiter takes do
             done->count_down();
         }(&n, &value, &mu, &done)));
 
-    // give the waiter a chance to wait (whether it has or not, it mustn't deadlock).
-    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    // the waiter's waiting (spawn() runs it until it waits).
     {
         std::scoped_lock lock{mu};
         value.store(1);
@@ -117,7 +115,7 @@ TEST_CASE("close wakes the waiters for good", "[coro][notifier]")
             done->count_down();
         }(&n, &value, &result, &done)));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    // the waiter's waiting (spawn() runs it until it waits).
     n.close();
     done.wait();
     CHECK_FALSE(result.load());

@@ -68,6 +68,10 @@ struct timed
 {
     resolve_result           result{std::unexpected(std::error_code{})};
     net::io::clock::duration elapsed{};
+
+    // what went wrong in the test's own steps, if anything (for the test thread to check: Catch2's assertions aren't
+    // for the scheduler's threads).
+    std::string failed{};
 };
 
 task<timed> timed_resolve(net::io::scheduler*  sched,
@@ -345,13 +349,22 @@ TEST_CASE("trust-ad sets the AD bit", "[dns][native][udp]")
 
 TEST_CASE("single-request asks A and AAAA in turn", "[dns][native][udp]")
 {
-    // A is never answered, so AAAA is asked only once A's timeout has passed, if they're asked in turn.
+    // A is answered only once AAAA has been asked (the answer going to the socket AAAA's came from): asked at once, A
+    // is answered; asked in turn, AAAA is asked only once A's timeout has passed, and A is never answered.
     constexpr auto timeout = 300ms;
 
-    const auto answer_aaaa = [](const test::fake_query& q) -> std::vector<test::fake_reply>
+    std::optional<dns::message> asked_a; // the handler's calls are one at a time
+    const auto answer_a_after_aaaa = [&asked_a](const test::fake_query& q) -> std::vector<test::fake_reply>
     {
-        if (q.msg.questions.front().type == dns::type::a) return {};
-        return {{.msg = test::reply_to(q.msg, {test::aaaa("host.test", addr6)})}};
+        if (q.msg.questions.front().type == dns::type::a)
+        {
+            asked_a = q.msg;
+            return {};
+        }
+
+        std::vector<test::fake_reply> replies{{.msg = test::reply_to(q.msg, {test::aaaa("host.test", addr6)})}};
+        if (asked_a.has_value()) replies.push_back({.msg = test::reply_to(*asked_a, {test::a("host.test", addr4)})});
+        return replies;
     };
 
     struct test_case
@@ -364,7 +377,7 @@ TEST_CASE("single-request asks A and AAAA in turn", "[dns][native][udp]")
     CAPTURE(tc.single_request, tc.single_request_reopen);
 
     net::io::scheduler sched{make_pool()};
-    test::fake_server  server{&sched, answer_aaaa};
+    test::fake_server  server{&sched, answer_a_after_aaaa};
 
     auto conf                  = config_for({server.nameserver()}, timeout);
     conf.single_request        = tc.single_request;
@@ -373,18 +386,24 @@ TEST_CASE("single-request asks A and AAAA in turn", "[dns][native][udp]")
     const auto resolver = native(conf);
     auto       out      = sched.run_to_completion(timed_resolve(&sched, &resolver, "host.test"));
 
-    // A failed, but AAAA was answered.
-    CHECK(out.result == std::vector<net::ip_addr>{addr6});
-
     const auto queries = server.queries();
     REQUIRE(queries.size() == 2);
     CHECK(queries[0].msg.questions.front().type == dns::type::a);
     CHECK(queries[1].msg.questions.front().type == dns::type::aaaa);
 
-    // (as the server saw them: the sends' times are a little apart from the timeout's start, so half of it tells.)
-    const auto gap = queries[1].when - queries[0].when;
-    if (tc.single_request || tc.single_request_reopen) CHECK(gap >= timeout / 2);
-    else CHECK(gap < timeout / 2);
+    if (tc.single_request || tc.single_request_reopen)
+    {
+        // A failed, but AAAA was answered: asked once A's timeout had passed (as the server saw them: the sends' times
+        // are a little apart from the timeout's start, so half of it tells).
+        CHECK(out.result == std::vector<net::ip_addr>{addr6});
+        CHECK(queries[1].when - queries[0].when >= timeout / 2);
+    }
+    else
+    {
+        // A was answered too, as AAAA was asked while A's question was open.
+        REQUIRE(out.result.has_value());
+        CHECK(set_of(*out.result) == set_of({addr4, addr6}));
+    }
 
     // a socket of its own, only with single-request-reopen.
     if (tc.single_request_reopen) CHECK(queries[0].port != queries[1].port);
@@ -946,9 +965,12 @@ TEST_CASE("a native lookup ends at the caller's deadline, or when stopped", "[dn
 
     SECTION("the deadline")
     {
+        // (timed from before the deadline's taken, so it can't seem to end early.)
         const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<timed>
         {
-            co_return co_await timed_resolve(sched, resolver, "host.test", {.deadline = net::io::clock::now() + 100ms});
+            const auto start  = net::io::clock::now();
+            auto       result = co_await resolver->resolve(sched, "host.test", {.deadline = start + 100ms});
+            co_return timed{.result = std::move(result), .elapsed = net::io::clock::now() - start};
         };
 
         const auto out = sched.run_to_completion(test(&sched, &resolver));
@@ -964,11 +986,12 @@ TEST_CASE("a native lookup ends at the caller's deadline, or when stopped", "[dn
             [](net::io::scheduler* sched, const dns::resolver* resolver, const test::fake_server* server) -> task<timed>
         {
             std::stop_source source;
-            REQUIRE(sched->spawn(
-                [](net::io::scheduler* sched, const test::fake_server* server, std::stop_source source) -> task<>
-                {
-                    if (co_await wait_received(sched, server, 1)) source.request_stop();
-                }(sched, server, source)));
+            if (!sched->spawn(
+                    [](net::io::scheduler* sched, const test::fake_server* server, std::stop_source source) -> task<>
+                    {
+                        if (co_await wait_received(sched, server, 1)) source.request_stop();
+                    }(sched, server, source)))
+                co_return timed{.failed = "spawn failed"};
 
             co_return co_await timed_resolve(sched,
                                              resolver,
@@ -977,6 +1000,8 @@ TEST_CASE("a native lookup ends at the caller's deadline, or when stopped", "[dn
         };
 
         const auto out = sched.run_to_completion(test(&sched, &resolver, &server));
+        CAPTURE(out.failed);
+        REQUIRE(out.failed.empty());
         REQUIRE_FALSE(out.result.has_value());
         CHECK(out.result.error() == std::errc::operation_canceled);
         CHECK(out.elapsed < 5s);
@@ -987,16 +1012,19 @@ TEST_CASE("a native lookup ends at the caller's deadline, or when stopped", "[dn
         const auto test =
             [](net::io::scheduler* sched, const dns::resolver* resolver, const test::fake_server* server) -> task<timed>
         {
-            REQUIRE(sched->spawn(
-                [](net::io::scheduler* sched, const test::fake_server* server) -> task<>
-                {
-                    if (co_await wait_received(sched, server, 1)) sched->request_stop();
-                }(sched, server)));
+            if (!sched->spawn(
+                    [](net::io::scheduler* sched, const test::fake_server* server) -> task<>
+                    {
+                        if (co_await wait_received(sched, server, 1)) sched->request_stop();
+                    }(sched, server)))
+                co_return timed{.failed = "spawn failed"};
 
             co_return co_await timed_resolve(sched, resolver, "host.test", {.deadline = net::io::clock::now() + 10s});
         };
 
         const auto out = sched.run_to_completion(test(&sched, &resolver, &server));
+        CAPTURE(out.failed);
+        REQUIRE(out.failed.empty());
         REQUIRE_FALSE(out.result.has_value());
         CHECK(out.result.error() == std::errc::operation_canceled);
         CHECK(out.elapsed < 5s);
@@ -1013,21 +1041,35 @@ TEST_CASE("a native lookup whose callers have all left asks no more", "[dns][nat
     // three attempts, a timeout apart, if it went on.
     const auto resolver = native(config_for({server.nameserver()}, timeout, 3));
 
-    const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<resolve_result>
+    const auto test =
+        [](net::io::scheduler* sched, const dns::resolver* resolver, const test::fake_server* server) -> task<timed>
     {
-        auto result =
-            co_await resolver->resolve(sched,
-                                       "host.test",
-                                       {.proto = net::protocol::ipv4, .deadline = net::io::clock::now() + 50ms});
+        // the caller leaves once the first query's been received (before that, the lookup would be stopped before it
+        // asked anything).
+        std::stop_source source;
+        if (!sched->spawn(
+                [](net::io::scheduler* sched, const test::fake_server* server, std::stop_source source) -> task<>
+                {
+                    if (co_await wait_received(sched, server, 1)) source.request_stop();
+                }(sched, server, source)))
+            co_return timed{.failed = "spawn failed"};
 
-        // long enough for every attempt.
+        auto result = co_await resolver->resolve(
+            sched,
+            "host.test",
+            {.proto = net::protocol::ipv4, .deadline = net::io::clock::now() + 10s, .stop = source.get_token()});
+
+        // long enough for every attempt (from the first, which was before the caller left). NOTE: timed, as nothing
+        // would say that an attempt is still to come.
         (void)co_await sched->sleep_until(net::io::clock::now() + (4 * timeout));
-        co_return result;
+        co_return timed{.result = std::move(result)};
     };
 
-    const auto result = sched.run_to_completion(test(&sched, &resolver));
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error() == std::errc::timed_out);
+    const auto out = sched.run_to_completion(test(&sched, &resolver, &server));
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+    REQUIRE_FALSE(out.result.has_value());
+    CHECK(out.result.error() == std::errc::operation_canceled);
     CHECK(server.queries().size() == 1);
 }
 
@@ -1209,10 +1251,11 @@ TEST_CASE("a native lookup tells of a family's addresses as soon as they're in",
     // what the resolution had found: once the first family's in, and once both are; and when.
     struct seen
     {
-        dns::detail::found         first;
+        dns::detail::found         first{};
         net::io::clock::time_point first_when{};
-        dns::detail::found         done;
+        dns::detail::found         done{};
         net::io::clock::time_point done_when{};
+        std::string                failed{}; // what went wrong in the test's own steps
     };
 
     net::io::scheduler sched{make_pool()};
@@ -1223,7 +1266,7 @@ TEST_CASE("a native lookup tells of a family's addresses as soon as they're in",
     const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<seen>
     {
         auto res = resolver->start_resolving(sched, "host.test", net::protocol::not_care);
-        REQUIRE(res.has_value());
+        if (!res.has_value()) co_return seen{.failed = "start_resolving: " + res.error().message()};
 
         const auto wait = [](net::io::scheduler*            sched,
                              const dns::detail::resolution* res,
@@ -1246,6 +1289,8 @@ TEST_CASE("a native lookup tells of a family's addresses as soon as they're in",
     };
 
     const auto out = sched.run_to_completion(test(&sched, &resolver));
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
 
     const auto early = late_type == dns::type::a ? net::protocol::ipv6 : net::protocol::ipv4;
     REQUIRE_FALSE(out.first.done);
@@ -1268,10 +1313,11 @@ TEST_CASE("a native lookup of one family tells of nothing until it's done", "[dn
 
     const auto resolver = native(config_for({server.nameserver()}));
 
-    const auto test = [](net::io::scheduler* sched, const dns::resolver* resolver) -> task<dns::detail::found>
+    const auto test = [](net::io::scheduler*  sched,
+                         const dns::resolver* resolver) -> task<std::expected<dns::detail::found, std::error_code>>
     {
         auto res = resolver->start_resolving(sched, "host.test", net::protocol::ipv4);
-        REQUIRE(res.has_value());
+        if (!res.has_value()) co_return std::unexpected(res.error());
 
         const auto until = net::io::clock::now() + 10s;
         while (res->news().load() == 0)
@@ -1281,7 +1327,10 @@ TEST_CASE("a native lookup of one family tells of nothing until it's done", "[dn
         co_return res->look();
     };
 
-    const auto found = sched.run_to_completion(test(&sched, &resolver));
+    const auto looked = sched.run_to_completion(test(&sched, &resolver));
+    CAPTURE(looked.error_or({}).message());
+    REQUIRE(looked.has_value());
+    const auto& found = *looked;
     CHECK(found.done);
     CHECK(found.version == 1);
     CHECK(found.addrs == std::vector<net::ip_addr>{addr4});

@@ -83,6 +83,19 @@ std::expected<int, std::error_code> nodelay_of(const connect_result& conn)
     return nodelay(*conn);
 }
 
+// wait_calls waits (in a task) until lookup has started n calls, returning whether it has: not if the scheduler's
+// stopped, or it hasn't within 10 seconds.
+net::coro::task<bool> wait_calls(net::io::scheduler* sched, const test::blocking_lookup* lookup, int n)
+{
+    const auto until = net::io::clock::now() + 10s;
+    while (lookup->started.load() < n)
+    {
+        if (net::io::clock::now() >= until) co_return false;
+        if (auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms); err) co_return false;
+    }
+    co_return true;
+}
+
 std::string closed_port()
 {
     // bind a port, and then let it go: nothing is listening on it afterwards.
@@ -314,10 +327,24 @@ TEST_CASE("connecting's timeout covers resolving", "[tcp][connect][timeout]")
     net::io::scheduler sched{make_pool()};
     net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
 
-    const auto connect =
-        [](net::io::scheduler*    sched,
-           test::blocking_lookup* lookup) -> net::coro::task<std::pair<std::error_code, net::io::clock::duration>>
+    struct outcome
     {
+        std::error_code          err{};
+        net::io::clock::duration elapsed{};
+        std::string              failed{}; // what went wrong in the test's own steps
+    };
+
+    const auto connect = [](net::io::scheduler* sched, test::blocking_lookup* lookup) -> net::coro::task<outcome>
+    {
+        // lets its calls go however this ends (the scheduler waits for them).
+        const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
+
+        // a share of the lookup, held until connecting has given up, so that both families' calls have been given
+        // threads before its timeout can pass: a lookup whose callers have all left before then never makes them.
+        auto held = lookup->resolver.start_resolving(sched, "slow.test", net::protocol::not_care);
+        if (!held.has_value()) co_return outcome{.failed = "start_resolving: " + held.error().message()};
+        if (!co_await wait_calls(sched, lookup, 2)) co_return outcome{.failed = "the lookup's calls didn't start"};
+
         const auto start   = net::io::clock::now();
         auto       conn    = co_await net::tcp_socket::connect(sched,
                                                                "slow.test",
@@ -325,12 +352,13 @@ TEST_CASE("connecting's timeout covers resolving", "[tcp][connect][timeout]")
                                                                {.timeout = 200ms, .resolver = &lookup->resolver});
         const auto elapsed = net::io::clock::now() - start;
 
-        lookup->release();
-        co_return std::pair{conn.has_value() ? std::error_code{} : conn.error(), elapsed};
+        co_return outcome{.err = conn.has_value() ? std::error_code{} : conn.error(), .elapsed = elapsed};
     };
 
-    const auto [err, elapsed] = sched.run_to_completion(connect(&sched, &lookup));
+    const auto [err, elapsed, failed] = sched.run_to_completion(connect(&sched, &lookup));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CAPTURE(err.message());
     CHECK(err == std::errc::timed_out);
     CHECK(elapsed >= 200ms);
@@ -481,13 +509,14 @@ TEST_CASE("requesting stop ends connecting", "[tcp][connect][stop]")
         co_return conn.has_value() ? std::error_code{} : conn.error();
     };
 
-    std::thread stopper{[&]
-                        {
-                            std::this_thread::sleep_for(100ms);
-                            source.request_stop();
-                        }};
+    // (timed from before the stopper's sleep begins, so connecting can't seem to end early.)
+    auto         start = net::io::clock::now();
+    std::jthread stopper{[&]
+                         {
+                             std::this_thread::sleep_for(100ms);
+                             source.request_stop();
+                         }};
 
-    auto start   = net::io::clock::now();
     auto err     = sched.run_to_completion(connect(&sched, source.get_token()));
     auto elapsed = net::io::clock::now() - start;
     stopper.join();
@@ -619,6 +648,8 @@ TEST_CASE("requesting stop ends connecting to addresses", "[tcp][connect][stop]"
 
     const std::vector<net::ip_addr> addresses{non_routable_1, non_routable_2, non_routable_3};
 
+    // (timed from before the stopper's sleep begins, so connecting can't seem to end early.)
+    auto         start = net::io::clock::now();
     std::jthread stopper{[&]
                          {
                              std::this_thread::sleep_for(100ms);
@@ -626,8 +657,7 @@ TEST_CASE("requesting stop ends connecting to addresses", "[tcp][connect][stop]"
                          }};
 
     // each attempt's share is over 3 seconds: stopping ends the first, and the rest aren't tried.
-    auto start = net::io::clock::now();
-    auto err   = sched.run_to_completion(
+    auto err = sched.run_to_completion(
         connect_addresses_error(&sched, addresses, 81, {.timeout = 10s, .stop = source.get_token()}));
     auto elapsed = net::io::clock::now() - start;
 
@@ -1033,10 +1063,11 @@ TEST_CASE("racing attempts starts the next at once when the latest fails", "[tcp
 
     const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
 
-    constexpr auto delay = 500ms;
-
     SECTION("while it's the only one")
     {
+        // (long, as nothing waits for it unless the test fails: the second starting at once is far within it.)
+        constexpr auto delay = 10s;
+
         // the first is refused (once it started, or at once): the second starts then, not after the delay.
         fake_network network{
             {{addr("192.0.2.1"), refuse_later}, {addr("192.0.2.2"), answer}},
@@ -1047,12 +1078,15 @@ TEST_CASE("racing attempts starts the next at once when the latest fails", "[tcp
         auto [conn, elapsed] = sched.run_to_completion(connect_through(&sched, &network, {.attempt_delay = delay}));
 
         REQUIRE(conn.has_value());
-        CHECK(elapsed < delay);
+        CHECK(elapsed < delay / 2);
         CHECK(network.tried().size() == 2);
     }
 
     SECTION("while others go on")
     {
+        // (the second waits for it: long enough that the third's starting at once is far within half of it.)
+        constexpr auto delay = 1000ms;
+
         // the first hangs, so the second starts after the delay; it's refused, so the third starts then, not after
         // another delay.
         fake_network network{
@@ -1074,6 +1108,8 @@ TEST_CASE("racing attempts starts the next at once when the latest fails", "[tcp
 
     SECTION("but not when an earlier one fails")
     {
+        constexpr auto delay = 500ms;
+
         // the second hangs, so the first failing doesn't start the third: it starts after the delay.
         fake_network network{
             {{addr("192.0.2.1"), hang}, {addr("192.0.2.2"), hang}, {addr("192.0.2.3"), answer}},
@@ -1318,14 +1354,15 @@ TEST_CASE("racing attempts ends at the timeout", "[tcp][connect][happy-eyeballs]
             {{addr("2001:db8::1"), hang}, {addr("192.0.2.1"), hang}}
         };
 
+        // (the second attempt is due after 50 ms: well within the timeout, however late.)
         auto [conn, elapsed] =
-            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 300ms, .attempt_delay = 50ms}));
+            sched.run_to_completion(connect_through(&sched, &network, {.timeout = 1s, .attempt_delay = 50ms}));
 
         REQUIRE_FALSE(conn.has_value());
         CAPTURE(conn.error().message());
         CHECK(conn.error() == std::errc::timed_out);
-        CHECK(elapsed >= 300ms);
-        CHECK(elapsed < 3s);
+        CHECK(elapsed >= 1s);
+        CHECK(elapsed < 5s);
         CHECK(network.tried().size() == 2);
     }
 
@@ -1367,6 +1404,9 @@ TEST_CASE("requesting stop ends racing attempts", "[tcp][connect][happy-eyeballs
     std::jthread stopper{[&]
                          {
                              for (auto seen = started.load(); seen < 3; seen = started.load()) started.wait(seen);
+
+                             // NOTE: timed, as nothing says when connecting has begun to wait after the third
+                             //       attempt's start: if it hasn't by then, the stop ends the wait as it begins.
                              std::this_thread::sleep_for(50ms);
                              source.request_stop();
                          }};
@@ -1430,19 +1470,6 @@ net::coro::task<bool> wait_done(net::io::scheduler* sched, const connecting* c)
     co_return true;
 }
 
-// wait_calls waits (in a task) until lookup has started n calls, returning whether it has: not if the scheduler's
-// stopped, or it hasn't within 10 seconds.
-net::coro::task<bool> wait_calls(net::io::scheduler* sched, const test::blocking_lookup* lookup, int n)
-{
-    const auto until = net::io::clock::now() + 10s;
-    while (lookup->started.load() < n)
-    {
-        if (net::io::clock::now() >= until) co_return false;
-        if (auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms); err) co_return false;
-    }
-    co_return true;
-}
-
 // wait_found waits (in a task) until res has found something new after version, returning what it has then: what it
 // had, if the scheduler's stopped, or nothing new came within 10 seconds.
 net::coro::task<net::dns::detail::found>
@@ -1456,7 +1483,9 @@ wait_found(net::io::scheduler* sched, const net::dns::detail::resolution* res, s
     co_return res->look();
 }
 
-// joined starts c's connect, then joins the lookup it starts, so a test sees what it finds as the connect does.
+// joined starts c's connect, then joins the lookup it starts, so a test sees what it finds as the connect does. It
+// fails with operation_canceled if the scheduler refused the connect's task, and timed_out if the lookup's calls didn't
+// start.
 net::coro::task<std::expected<net::dns::detail::resolution, std::error_code>>
 joined(net::io::scheduler*                     sched,
        fake_network*                           network,
@@ -1464,10 +1493,9 @@ joined(net::io::scheduler*                     sched,
        const net::tcp_socket::connect_options& options,
        connecting*                             c)
 {
-    REQUIRE(sched->spawn(connect_named(sched, network, lookup, options, c)));
-
-    const auto calls = co_await wait_calls(sched, lookup, 2);
-    REQUIRE(calls);
+    if (!sched->spawn(connect_named(sched, network, lookup, options, c)))
+        co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+    if (!co_await wait_calls(sched, lookup, 2)) co_return std::unexpected(std::make_error_code(std::errc::timed_out));
     co_return lookup->resolver.start_resolving(sched, "host.test", net::protocol::not_care);
 }
 
@@ -1592,28 +1620,36 @@ TEST_CASE("connecting starts when IPv6's addresses come in within the resolution
 
     static constexpr auto delay = 10s;
 
+    struct seen
+    {
+        net::dns::detail::found    found{};
+        net::io::clock::time_point released{};
+        std::string                failed{}; // what went wrong in the test's own steps
+    };
+
     const auto test = [](net::io::scheduler* sched, fake_network* network, test::blocking_lookup* lookup, connecting* c)
-        -> net::coro::task<std::pair<net::dns::detail::found, net::io::clock::time_point>>
+        -> net::coro::task<seen>
     {
         // lets its calls go however this ends (the scheduler waits for them).
         const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
 
         auto res = co_await joined(sched, network, lookup, {.timeout = 20s, .resolution_delay = delay}, c);
-        REQUIRE(res.has_value());
+        if (!res.has_value()) co_return seen{.failed = "joining: " + res.error().message()};
 
         lookup->release(net::protocol::ipv4);
-        auto found = co_await wait_found(sched, &*res, 0);
+        seen out{.found = co_await wait_found(sched, &*res, 0)};
 
-        const auto released = net::io::clock::now();
+        out.released = net::io::clock::now();
         lookup->release(net::protocol::ipv6);
 
-        const auto done = co_await wait_done(sched, c);
-        REQUIRE(done);
-        co_return std::pair{std::move(found), released};
+        if (!co_await wait_done(sched, c)) out.failed = "connecting didn't return";
+        co_return out;
     };
 
-    const auto [found, released] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
+    const auto [found, released, failed] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CAPTURE(c.err.message());
     CHECK_FALSE(c.err);
 
@@ -1669,13 +1705,13 @@ TEST_CASE("connecting sorts a family's addresses that come in later into the att
                          fake_network*                                     network,
                          test::blocking_lookup*                            lookup,
                          std::atomic<const net::dns::detail::resolution*>* watching,
-                         connecting*                                       c) -> net::coro::task<>
+                         connecting*                                       c) -> net::coro::task<std::string>
     {
         // lets its calls go however this ends (the scheduler waits for them).
         const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
 
         auto res = co_await joined(sched, network, lookup, {.attempt_delay = delay}, c);
-        REQUIRE(res.has_value());
+        if (!res.has_value()) co_return "joining: " + res.error().message();
         watching->store(&*res);
 
         // NOTE: the hook's done with the resolution once connecting is (it's called by connecting's attempts).
@@ -1683,12 +1719,14 @@ TEST_CASE("connecting sorts a family's addresses that come in later into the att
 
         lookup->release(net::protocol::ipv4);
 
-        const auto done = co_await wait_done(sched, c);
-        REQUIRE(done);
+        if (!co_await wait_done(sched, c)) co_return "connecting didn't return";
+        co_return "";
     };
 
-    sched.run_to_completion(test(&sched, &network, &lookup, &watching, &c));
+    const auto failed = sched.run_to_completion(test(&sched, &network, &lookup, &watching, &c));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CAPTURE(c.err.message());
     REQUIRE_FALSE(c.err);
     REQUIRE(ipv6_in.load());
@@ -1719,12 +1757,13 @@ TEST_CASE("connecting waits for a family still to come once every attempt has fa
     static constexpr auto wait = 100ms;
 
     const auto test = [](net::io::scheduler* sched, fake_network* network, test::blocking_lookup* lookup, connecting* c)
-        -> net::coro::task<std::uint64_t>
+        -> net::coro::task<std::pair<std::uint64_t, std::string>>
     {
         // lets its calls go however this ends (the scheduler waits for them).
         const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
+        const auto             fail = [](std::string what) { return std::pair{std::uint64_t{0}, std::move(what)}; };
 
-        REQUIRE(sched->spawn(connect_named(sched, network, lookup, {}, c)));
+        if (!sched->spawn(connect_named(sched, network, lookup, {}, c))) co_return fail("spawn failed");
 
         lookup->release(net::protocol::ipv4);
 
@@ -1732,22 +1771,24 @@ TEST_CASE("connecting waits for a family still to come once every attempt has fa
         const auto until = net::io::clock::now() + 10s;
         while (network->attempts().empty())
         {
-            REQUIRE(net::io::clock::now() < until);
-            const auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms);
-            REQUIRE_FALSE(err);
+            if (net::io::clock::now() >= until) co_return fail("IPv4's address wasn't tried");
+            if (co_await sched->sleep_until(net::io::clock::now() + 1ms)) co_return fail("the scheduler stopped");
         }
-        const auto slept = co_await sched->sleep_until(net::io::clock::now() + wait);
-        REQUIRE_FALSE(slept);
+
+        // NOTE: timed, as nothing says when connecting has begun to wait for IPv6's, once the attempt failed (its
+        //       error, at the end, shows that it didn't end before them).
+        if (co_await sched->sleep_until(net::io::clock::now() + wait)) co_return fail("the scheduler stopped");
         const auto done_then = c->done.load();
 
         lookup->release(net::protocol::ipv6);
-        const auto done = co_await wait_done(sched, c);
-        REQUIRE(done);
-        co_return done_then;
+        if (!co_await wait_done(sched, c)) co_return fail("connecting didn't return");
+        co_return std::pair{done_then, std::string{}};
     };
 
-    const auto done_then = sched.run_to_completion(test(&sched, &network, &lookup, &c));
+    const auto [done_then, failed] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CHECK(done_then == 0);
     CAPTURE(c.err.message());
     CHECK(c.err == std::errc::network_unreachable);
@@ -1792,13 +1833,13 @@ TEST_CASE("connecting tries a family that came in as the other's attempts failed
                          fake_network*                                     network,
                          test::blocking_lookup*                            lookup,
                          std::atomic<const net::dns::detail::resolution*>* watching,
-                         connecting*                                       c) -> net::coro::task<>
+                         connecting*                                       c) -> net::coro::task<std::string>
     {
         // lets its calls go however this ends (the scheduler waits for them).
         const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
 
         auto res = co_await joined(sched, network, lookup, {}, c);
-        REQUIRE(res.has_value());
+        if (!res.has_value()) co_return "joining: " + res.error().message();
         watching->store(&*res);
 
         // NOTE: the hook's done with the resolution once connecting is (it's called by connecting's attempts).
@@ -1806,12 +1847,14 @@ TEST_CASE("connecting tries a family that came in as the other's attempts failed
 
         lookup->release(net::protocol::ipv6);
 
-        const auto done = co_await wait_done(sched, c);
-        REQUIRE(done);
+        if (!co_await wait_done(sched, c)) co_return "connecting didn't return";
+        co_return "";
     };
 
-    sched.run_to_completion(test(&sched, &network, &lookup, &watching, &c));
+    const auto failed = sched.run_to_completion(test(&sched, &network, &lookup, &watching, &c));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     REQUIRE(ipv4_in.load());
     CAPTURE(c.err.message());
     CHECK_FALSE(c.err);
@@ -1821,13 +1864,29 @@ TEST_CASE("connecting tries a family that came in as the other's attempts failed
 TEST_CASE("connecting goes on if one family fails to resolve", "[tcp][connect][happy-eyeballs][resolution]")
 {
     test::blocking_lookup lookup;
-    lookup.release();
-    connecting c; // what the scheduler's tasks write to
+    connecting            c; // what the scheduler's tasks write to
 
     net::io::scheduler sched{make_pool()};
     net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
 
     const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+
+    // connects, letting the lookup's calls go once both have started: let go at once, one family's answer could end
+    // connecting (and so the lookup) before the other's call had been given a thread, and then it's never made.
+    const auto connect = [](net::io::scheduler*    sched,
+                            fake_network*          network,
+                            test::blocking_lookup* lookup,
+                            connecting*            c) -> net::coro::task<std::string>
+    {
+        // lets its calls go however this ends (the scheduler waits for them).
+        const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
+
+        if (!sched->spawn(connect_named(sched, network, lookup, {}, c))) co_return "spawn failed";
+        if (!co_await wait_calls(sched, lookup, 2)) co_return "the lookup's calls didn't start";
+        lookup->release();
+        if (!co_await wait_done(sched, c)) co_return "connecting didn't return";
+        co_return "";
+    };
 
     SECTION("IPv6's")
     {
@@ -1838,8 +1897,10 @@ TEST_CASE("connecting goes on if one family fails to resolve", "[tcp][connect][h
         fake_network network{{{ipv4_1, answer}}, listener->local_port()};
         lookup.answer = network.addresses_given();
 
-        sched.run_to_completion(connect_named(&sched, &network, &lookup, {}, &c));
+        const auto failed = sched.run_to_completion(connect(&sched, &network, &lookup, &c));
 
+        CAPTURE(failed);
+        REQUIRE(failed.empty());
         CAPTURE(c.err.message());
         CHECK_FALSE(c.err);
         CHECK(network.tried() == std::vector{ipv4_1});
@@ -1851,8 +1912,10 @@ TEST_CASE("connecting goes on if one family fails to resolve", "[tcp][connect][h
         fake_network network{{{ipv6_1, refuse}}, 0, closed};
         lookup.answer = network.addresses_given();
 
-        sched.run_to_completion(connect_named(&sched, &network, &lookup, {}, &c));
+        const auto failed = sched.run_to_completion(connect(&sched, &network, &lookup, &c));
 
+        CAPTURE(failed);
+        REQUIRE(failed.empty());
         CHECK(c.err == std::errc::connection_refused);
         CHECK(network.tried() == std::vector{ipv6_1});
     }
@@ -1929,7 +1992,7 @@ TEST_CASE("connecting ends at its deadline or when stopped during the resolution
         const auto test = [](net::io::scheduler*    sched,
                              fake_network*          network,
                              test::blocking_lookup* lookup,
-                             connecting*            c) -> net::coro::task<net::dns::detail::found>
+                             connecting* c) -> net::coro::task<std::pair<net::dns::detail::found, std::string>>
         {
             // lets its calls go however this ends (the scheduler waits for them).
             const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
@@ -1939,18 +2002,20 @@ TEST_CASE("connecting ends at its deadline or when stopped during the resolution
                                        lookup,
                                        {.timeout = timeout, .attempt_delay = 50ms, .resolution_delay = delay},
                                        c);
-            REQUIRE(res.has_value());
+            if (!res.has_value()) co_return std::pair{net::dns::detail::found{}, "joining: " + res.error().message()};
 
             lookup->release(net::protocol::ipv4);
             auto found = co_await wait_found(sched, &*res, 0);
 
-            const auto done = co_await wait_done(sched, c);
-            REQUIRE(done);
-            co_return found;
+            if (!co_await wait_done(sched, c))
+                co_return std::pair{std::move(found), std::string{"connecting didn't return"}};
+            co_return std::pair{std::move(found), std::string{}};
         };
 
-        const auto found = sched.run_to_completion(test(&sched, &network, &lookup, &c));
+        const auto [found, failed] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
 
+        CAPTURE(failed);
+        REQUIRE(failed.empty());
         CHECK(found.family == net::protocol::ipv4);
         CHECK(c.err == std::errc::timed_out);
         CHECK(c.elapsed >= timeout);
@@ -1966,7 +2031,7 @@ TEST_CASE("connecting ends at its deadline or when stopped during the resolution
                              fake_network*          network,
                              test::blocking_lookup* lookup,
                              std::stop_source*      source,
-                             connecting*            c) -> net::coro::task<net::dns::detail::found>
+                             connecting* c) -> net::coro::task<std::pair<net::dns::detail::found, std::string>>
         {
             // lets its calls go however this ends (the scheduler waits for them).
             const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
@@ -1977,19 +2042,21 @@ TEST_CASE("connecting ends at its deadline or when stopped during the resolution
                 lookup,
                 {.timeout = 20s, .attempt_delay = 50ms, .stop = source->get_token(), .resolution_delay = delay},
                 c);
-            REQUIRE(res.has_value());
+            if (!res.has_value()) co_return std::pair{net::dns::detail::found{}, "joining: " + res.error().message()};
 
             lookup->release(net::protocol::ipv4);
             auto found = co_await wait_found(sched, &*res, 0);
             source->request_stop();
 
-            const auto done = co_await wait_done(sched, c);
-            REQUIRE(done);
-            co_return found;
+            if (!co_await wait_done(sched, c))
+                co_return std::pair{std::move(found), std::string{"connecting didn't return"}};
+            co_return std::pair{std::move(found), std::string{}};
         };
 
-        const auto found = sched.run_to_completion(test(&sched, &network, &lookup, &source, &c));
+        const auto [found, failed] = sched.run_to_completion(test(&sched, &network, &lookup, &source, &c));
 
+        CAPTURE(failed);
+        REQUIRE(failed.empty());
         CHECK(found.family == net::protocol::ipv4);
         CHECK(c.err == std::errc::operation_canceled);
         CHECK(c.elapsed < 5s);
@@ -2017,29 +2084,41 @@ TEST_CASE("an attempt delay of 0 waits for both families' addresses", "[tcp][con
 
     static constexpr auto wait = 200ms;
 
+    struct seen
+    {
+        bool                       tried_then = false;
+        net::io::clock::time_point released{};
+        std::string                failed{}; // what went wrong in the test's own steps
+    };
+
     const auto test = [](net::io::scheduler* sched, fake_network* network, test::blocking_lookup* lookup, connecting* c)
-        -> net::coro::task<std::pair<bool, net::io::clock::time_point>>
+        -> net::coro::task<seen>
     {
         // lets its calls go however this ends (the scheduler waits for them).
         const net::util::defer let_go{[lookup] noexcept { lookup->release(); }};
 
-        REQUIRE(sched->spawn(connect_named(sched, network, lookup, {.attempt_delay = 0ms}, c)));
+        auto res = co_await joined(sched, network, lookup, {.attempt_delay = 0ms}, c);
+        if (!res.has_value()) co_return seen{.failed = "joining: " + res.error().message()};
 
+        // IPv4's are in (as the test's own resolution of the same lookup sees), and nothing's tried for a while.
+        // NOTE: timed, as nothing would say that an attempt is still to come.
         lookup->release(net::protocol::ipv4);
-        const auto slept = co_await sched->sleep_until(net::io::clock::now() + wait);
-        REQUIRE_FALSE(slept);
-        const bool tried_then = !network->attempts().empty();
+        const auto found = co_await wait_found(sched, &*res, 0);
+        if (found.addrs.empty()) co_return seen{.failed = "IPv4's addresses didn't come in"};
+        if (co_await sched->sleep_until(net::io::clock::now() + wait))
+            co_return seen{.failed = "the scheduler stopped"};
 
-        const auto released = net::io::clock::now();
+        seen out{.tried_then = !network->attempts().empty(), .released = net::io::clock::now()};
         lookup->release(net::protocol::ipv6);
 
-        const auto done = co_await wait_done(sched, c);
-        REQUIRE(done);
-        co_return std::pair{tried_then, released};
+        if (!co_await wait_done(sched, c)) out.failed = "connecting didn't return";
+        co_return out;
     };
 
-    const auto [tried_then, released] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
+    const auto [tried_then, released, failed] = sched.run_to_completion(test(&sched, &network, &lookup, &c));
 
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CAPTURE(c.err.message());
     CHECK_FALSE(c.err);
     CHECK_FALSE(tried_then);

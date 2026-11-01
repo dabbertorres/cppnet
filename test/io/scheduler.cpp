@@ -36,6 +36,7 @@
 #include "listen.hpp"
 #include "socket.hpp"
 #include "tcp.hpp"
+#include "util/defer.hpp"
 
 namespace
 {
@@ -118,6 +119,83 @@ task<> read_until_failure(net::socket* sock, std::error_code* err, std::atomic<b
     finished->store(true);
 }
 
+// running runs a scheduler on a thread of its own, from when it's made until it's destroyed, which stops the scheduler
+// and joins the thread: so a failing REQUIRE ends the test with its report, rather than std::terminate() (a joinable
+// std::thread's destructor's). Declared after what the scheduler's tasks use, as its destruction waits for them.
+class running
+{
+public:
+    explicit running(scheduler* sched)
+        : sched{sched}
+        , thread{[sched] { sched->run(); }}
+    {}
+
+    running(const running&)            = delete;
+    running& operator=(const running&) = delete;
+    running(running&&)                 = delete;
+    running& operator=(running&&)      = delete;
+
+    ~running()
+    {
+        sched->request_stop();
+        if (thread.joinable()) thread.join();
+    }
+
+    // join waits for run() to return (once the scheduler's stopped, and its tasks have finished).
+    void join()
+    {
+        if (thread.joinable()) thread.join();
+    }
+
+private:
+    scheduler*  sched;
+    std::thread thread;
+};
+
+// held_worker holds a scheduler's only worker in a task, from when it's made until it's released (or destroyed): as
+// nothing else polls for the scheduler (nothing calls run()), no call is made, nor wait ended, meanwhile. Declared
+// after the scheduler, so a failing REQUIRE releases it before the scheduler waits for its task.
+class held_worker
+{
+public:
+    explicit held_worker(scheduler* sched)
+    {
+        REQUIRE(sched->spawn(hold(state)));
+        state->holding.wait(false);
+    }
+
+    held_worker(const held_worker&)            = delete;
+    held_worker& operator=(const held_worker&) = delete;
+    held_worker(held_worker&&)                 = delete;
+    held_worker& operator=(held_worker&&)      = delete;
+
+    ~held_worker() { release(); }
+
+    void release() noexcept
+    {
+        state->released.store(true);
+        state->released.notify_all();
+    }
+
+private:
+    struct flags
+    {
+        std::atomic<bool> holding{false};
+        std::atomic<bool> released{false};
+    };
+
+    // NOTE: shared with the task, which may still be in released's wait() as this goes.
+    static task<> hold(std::shared_ptr<flags> state)
+    {
+        state->holding.store(true);
+        state->holding.notify_all();
+        state->released.wait(false);
+        co_return;
+    }
+
+    std::shared_ptr<flags> state = std::make_shared<flags>();
+};
+
 std::string local_port(const net::listener& listener)
 {
     sockaddr_storage addr{};
@@ -135,6 +213,8 @@ TEST_CASE("reads wait until data arrives", "[io][scheduler]")
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
+    // NOTE: timed, as nothing says when the read has begun to wait: if it hasn't by then, it finds the data at once,
+    //       and the test passes without having waited.
     std::thread later{[fd = writer.native_handle()]
                       {
                           std::this_thread::sleep_for(50ms);
@@ -181,18 +261,21 @@ TEST_CASE("reads time out once their deadline passes", "[io][scheduler]")
 
 TEST_CASE("a deadline earlier than the one the loop is waiting for wakes it up", "[io][scheduler]")
 {
+    // NOTE: before the scheduler, as the idle read uses them.
+    std::error_code   idle_err;
+    std::atomic<bool> idle_finished = false;
+
     scheduler sched{make_pool()};
     auto [idle_reader, idle_writer]   = make_socket_pair(&sched);
     auto [timed_reader, timed_writer] = make_socket_pair(&sched);
 
     // with only this wait, the loop waits without a timeout.
-    std::error_code   idle_err;
-    std::atomic<bool> idle_finished = false;
     REQUIRE(sched.spawn(read_until_failure(&idle_reader, &idle_err, &idle_finished)));
 
     auto timed_read = [](net::socket* sock) -> task<std::pair<net::io::result, net::io::clock::duration>>
     {
-        // give the loop time to start waiting.
+        // give the loop time to start waiting. NOTE: timed, as nothing says when the loop has: if it hasn't by then,
+        // it starts with the deadline, and the test passes without the wakeup it's about.
         std::this_thread::sleep_for(100ms);
 
         auto start = net::io::clock::now();
@@ -277,14 +360,19 @@ TEST_CASE("shutdown from one of the scheduler's tasks throws, rather than waitin
 
 TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][scheduler]")
 {
+    // NOTE: before the scheduler, as the read uses them.
+    std::error_code   err;
+    std::atomic<bool> finished = false;
+
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    std::error_code   err;
-    std::atomic<bool> finished = false;
     REQUIRE(sched.spawn(read_until_failure(&reader, &err, &finished)));
 
-    std::thread run_thread{[&] { sched.run(); }};
+    running run_thread{&sched};
+
+    // NOTE: timed, as nothing says when the read has begun to wait: if it hasn't by then, its wait is canceled as it
+    //       begins (shutdown cancels waits to come too), and the test passes without canceling one that's pending.
     std::this_thread::sleep_for(50ms);
 
     sched.shutdown();
@@ -313,6 +401,8 @@ TEST_CASE("a scheduler that never ran can be destroyed", "[io][scheduler]")
         scheduler sched{make_pool()};
 
         REQUIRE(sched.spawn(sleep(&sched, &err, &finished)));
+
+        // NOTE: timed, as nothing says when the sleep has begun: if it hasn't by then, it's canceled as it begins.
         std::this_thread::sleep_for(20ms);
     }
 
@@ -353,18 +443,19 @@ TEST_CASE("waits on unregistered handles fail", "[io][scheduler]")
 
 TEST_CASE("only one task may wait for each operation on a handle", "[io][scheduler]")
 {
-    scheduler sched{make_pool()};
-    auto [reader, writer] = make_socket_pair(&sched);
-
+    // NOTE: before the scheduler, as the reads use them.
     std::error_code   first_err;
     std::error_code   second_err;
     std::atomic<bool> first_finished  = false;
     std::atomic<bool> second_finished = false;
 
+    scheduler sched{make_pool()};
+    auto [reader, writer] = make_socket_pair(&sched);
+
     REQUIRE(sched.spawn(read_until_failure(&reader, &first_err, &first_finished)));
     REQUIRE(sched.spawn(read_until_failure(&reader, &second_err, &second_finished)));
 
-    std::thread run_thread{[&] { sched.run(); }};
+    running run_thread{&sched};
 
     // one fails straight away, while the other waits until shutdown.
     REQUIRE(eventually([&] { return first_finished.load() || second_finished.load(); }));
@@ -377,6 +468,12 @@ TEST_CASE("only one task may wait for each operation on a handle", "[io][schedul
 
 TEST_CASE("a read and a write can wait on the same socket at once", "[io][scheduler]")
 {
+    // NOTE: before the scheduler, as the reader and writer use them.
+    std::atomic<int> finished = 0;
+    net::io::result  read_res;
+    net::io::result  write_res;
+    std::string      received;
+
     scheduler sched{make_pool()};
     auto [near, far] = make_socket_pair(&sched);
 
@@ -389,11 +486,6 @@ TEST_CASE("a read and a write can wait on the same socket at once", "[io][schedu
         if (num <= 0) break;
         prefilled += static_cast<std::size_t>(num);
     }
-
-    std::atomic<int> finished = 0;
-    net::io::result  read_res;
-    net::io::result  write_res;
-    std::string      received;
 
     auto reader =
         [](net::socket* sock, std::string* received, net::io::result* res, std::atomic<int>* finished) -> task<>
@@ -411,9 +503,10 @@ TEST_CASE("a read and a write can wait on the same socket at once", "[io][schedu
     REQUIRE(sched.spawn(reader(&near, &received, &read_res, &finished)));
     REQUIRE(sched.spawn(writer(&near, &write_res, &finished)));
 
-    std::thread run_thread{[&] { sched.run(); }};
+    running run_thread{&sched};
 
-    // both are waiting: drain the other end so the write can finish, and then reply so the read can.
+    // both are waiting: drain the other end so the write can finish, and then reply so the read can. NOTE: timed, as
+    // nothing says when they've begun to wait; neither can finish before the drain, whether or not they have.
     std::this_thread::sleep_for(50ms);
     CHECK(finished.load() == 0);
 
@@ -445,12 +538,13 @@ TEST_CASE("a read and a write can wait on the same socket at once", "[io][schedu
 
 TEST_CASE("shutting down a listener cancels a pending accept", "[io][scheduler][listener]")
 {
+    // NOTE: before the scheduler, as the accept uses them.
+    std::error_code   accept_err;
+    std::atomic<bool> finished = false;
+
     scheduler     sched{make_pool()};
     net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
-
-    std::error_code   accept_err;
-    std::atomic<bool> finished = false;
 
     auto accept = [](net::listener* listener, std::error_code* err, std::atomic<bool>* finished) -> task<>
     {
@@ -460,7 +554,10 @@ TEST_CASE("shutting down a listener cancels a pending accept", "[io][scheduler][
     };
     REQUIRE(sched.spawn(accept(&listener, &accept_err, &finished)));
 
-    std::thread run_thread{[&] { sched.run(); }};
+    running run_thread{&sched};
+
+    // NOTE: timed, as nothing says when the accept has begun to wait; it can't finish before the shutdown, whether or
+    //       not it has (one begun after it fails too).
     std::this_thread::sleep_for(50ms);
     CHECK_FALSE(finished.load());
 
@@ -545,9 +642,14 @@ TEST_CASE("run_blocking passes exceptions on", "[io][scheduler][run_blocking]")
 
 TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")
 {
-    scheduler                  sched{make_pool()};
     std::atomic<std::uint64_t> word{0};
     std::atomic<int>           woken{0};
+
+    // one worker, which runs one task at a time, in the order they're queued: so the waiters (spawned, and so queued,
+    // before the notifier yields) are waiting by the time the notifier goes on, and it's the notification that wakes
+    // them.
+    const auto pool = std::make_shared<net::coro::thread_pool>(1);
+    scheduler  sched{pool};
 
     auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::atomic<int>* woken) -> task<>
     {
@@ -555,14 +657,13 @@ TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")
         if (!err) ++*woken;
     };
 
-    auto notifier = [&](scheduler* sched) -> task<bool>
+    auto notifier = [&](scheduler* sched, net::coro::thread_pool* pool) -> task<bool>
     {
         // NOTE: no REQUIRE on the worker threads: Catch2's assertions aren't thread-safe.
         for (int i = 0; i < 3; ++i)
             if (!sched->spawn(waiter(sched, &word, &woken))) co_return false;
 
-        // give the waiters time to wait, so it's the notification that wakes them.
-        (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
+        co_await pool->yield();
         bool none_early = woken == 0;
 
         ++word;
@@ -570,7 +671,7 @@ TEST_CASE("wait_on waits for a notification", "[io][scheduler][wait_on]")
         co_return none_early;
     };
 
-    CHECK(sched.run_to_completion(notifier(&sched)));
+    CHECK(sched.run_to_completion(notifier(&sched, pool.get())));
     CHECK(woken == 3);
 }
 
@@ -588,38 +689,54 @@ TEST_CASE("wait_on doesn't wait once the word has changed", "[io][scheduler][wai
 
 TEST_CASE("notify_one wakes waiters in order", "[io][scheduler][wait_on]")
 {
-    scheduler                  sched{make_pool()};
     std::atomic<std::uint64_t> word{0};
     std::mutex                 order_mu;
     std::vector<int>           order;
+    std::atomic<std::uint64_t> woken{0}; // how many waiters have recorded their turn
+
+    // one worker, which runs one task at a time, in the order they're queued: so each waiter (spawned, and so queued,
+    // before the notifier yields) is waiting by the time the notifier spawns the next.
+    const auto pool = std::make_shared<net::coro::thread_pool>(1);
+    scheduler  sched{pool};
 
     auto waiter = [&](scheduler* sched, int id) -> task<>
     {
         auto err = co_await sched->wait_on(word, 0);
         if (err) co_return;
 
-        std::scoped_lock lock{order_mu};
-        order.push_back(id);
+        {
+            std::scoped_lock lock{order_mu};
+            order.push_back(id);
+        }
+        woken.fetch_add(1);
+        sched->notify_all(woken);
     };
 
-    auto notifier = [&](scheduler* sched) -> task<>
+    // notifier returns whether each waiter woke in time, for the test thread to check (Catch2's assertions aren't
+    // thread-safe).
+    auto notifier = [&](scheduler* sched, net::coro::thread_pool* pool) -> task<bool>
     {
-        // one at a time, so they start waiting in order.
         for (int id = 0; id < 3; ++id)
         {
-            if (!sched->spawn(waiter(sched, id))) co_return;
-            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            if (!sched->spawn(waiter(sched, id))) co_return false;
+            co_await pool->yield();
         }
 
-        word = 1;
-        for (int i = 0; i < 3; ++i)
+        // one at a time: each wakes the next waiter, which records its turn before the next is woken.
+        word             = 1;
+        const auto until = net::io::clock::now() + 10s;
+        for (std::uint64_t i = 0; i < 3; ++i)
         {
             sched->notify_one(word);
-            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            for (auto seen = woken.load(); seen < i + 1; seen = woken.load())
+            {
+                if (auto err = co_await sched->wait_on(woken, seen, until); err) co_return false;
+            }
         }
+        co_return true;
     };
 
-    sched.run_to_completion(notifier(&sched));
+    CHECK(sched.run_to_completion(notifier(&sched, pool.get())));
     CHECK(order == std::vector{0, 1, 2});
 }
 
@@ -654,10 +771,14 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
 
     SECTION("stopping")
     {
-        scheduler                  sched{make_pool()};
         std::atomic<std::uint64_t> word{0};
         std::error_code            sleep_err;
         std::error_code            wait_err;
+
+        // one worker, which runs one task at a time, in the order they're queued: so the sleeper and the waiter
+        // (spawned, and so queued, before the stopper yields) are waiting by the time the stopper finishes.
+        const auto pool = std::make_shared<net::coro::thread_pool>(1);
+        scheduler  sched{pool};
 
         auto sleeper = [](scheduler* sched, std::error_code* err) -> task<>
         { *err = co_await sched->sleep_until(net::io::clock::now() + 1h); };
@@ -665,15 +786,15 @@ TEST_CASE("sleep_until sleeps, and stopping cancels sleeps and waits", "[io][sch
         auto waiter = [](scheduler* sched, std::atomic<std::uint64_t>* word, std::error_code* err) -> task<>
         { *err = co_await sched->wait_on(*word, 0); };
 
-        auto stopper = [&](scheduler* sched) -> task<>
+        auto stopper = [&](scheduler* sched, net::coro::thread_pool* pool) -> task<>
         {
             if (!sched->spawn(sleeper(sched, &sleep_err)) || !sched->spawn(waiter(sched, &word, &wait_err))) co_return;
-            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            co_await pool->yield();
         };
 
         // run_to_completion stops the scheduler once the stopper finishes, which must cancel the others.
         auto start = net::io::clock::now();
-        sched.run_to_completion(stopper(&sched));
+        sched.run_to_completion(stopper(&sched, pool.get()));
 
         CHECK(net::io::clock::now() - start < 10s);
         CHECK(sleep_err == std::errc::operation_canceled);
@@ -685,12 +806,14 @@ TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][s
 {
     scheduler sched{make_pool()};
     auto [reader, writer] = make_socket_pair(&sched);
-    reader.set_read_timeout(150ms);
+    reader.set_read_timeout(300ms);
 
-    // a byte every 30ms, for longer than the timeout altogether (with room for a slow machine to be late).
-    auto trickle = [](scheduler* sched, net::socket* writer) -> task<>
+    // a byte every 30ms, for longer than the timeout altogether (with room for a slow machine to be late: each byte
+    // may be 270ms late).
+    constexpr int bytes   = 16;
+    auto          trickle = [](scheduler* sched, net::socket* writer) -> task<>
     {
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < bytes; ++i)
         {
             (void)co_await sched->sleep_until(net::io::clock::now() + 30ms);
             co_await writer->write(std::as_bytes(std::span{"x"sv}));
@@ -709,7 +832,7 @@ TEST_CASE("socket timeouts limit each wait, rather than the whole read", "[io][s
 
     REQUIRE(sched.spawn(trickle(&sched, &writer)));
     auto [got, err] = sched.run_to_completion(read_all(&reader));
-    CHECK(got == "xxxxxxxx");
+    CHECK(got == std::string(bytes, 'x'));
     CHECK(err == std::errc::timed_out);
 }
 
@@ -853,17 +976,31 @@ task<std::error_code> stoppable_wait(
     co_return std::make_error_code(std::errc::invalid_argument);
 }
 
-// record_wait waits as stoppable_wait does, and records how it ended, counting each time it's resumed.
+// record_wait waits as stoppable_wait does, and records how it ended, counting each time it's resumed in finished
+// (notified with the scheduler's notify_all()).
 task<> record_wait(scheduler*                  sched,
                    wait_kind                   kind,
                    std::stop_token             stop,
                    net::io::handle             fd,
                    std::atomic<std::uint64_t>* word,
                    std::error_code*            err,
-                   std::atomic<int>*           finished)
+                   std::atomic<std::uint64_t>* finished)
 {
     *err = co_await stoppable_wait(sched, kind, std::move(stop), fd, word);
     finished->fetch_add(1);
+    sched->notify_all(*finished);
+}
+
+// wait_count waits (in a task) until count reaches n, returning whether it has: not if the scheduler's stopped, or it
+// hasn't within test_timeout.
+task<bool> wait_count(scheduler* sched, const std::atomic<std::uint64_t>* count, std::uint64_t n)
+{
+    const auto until = net::io::clock::now() + test_timeout;
+    for (auto seen = count->load(); seen < n; seen = count->load())
+    {
+        if (auto err = co_await sched->wait_on(*count, seen, until); err) co_return false;
+    }
+    co_return true;
 }
 
 }
@@ -876,19 +1013,37 @@ TEST_CASE("requesting stop ends the wait given its token", "[io][scheduler][stop
     std::stop_source           source;
     std::atomic<std::uint64_t> word{0};
     std::error_code            err;
-    std::atomic<int>           finished{0};
+    std::atomic<std::uint64_t> finished{0};
 
-    scheduler sched{make_pool()};
+    // one worker, which runs one task at a time, in the order they're queued: so the wait (spawned, and so queued,
+    // before the test yields) has begun by the time the test goes on.
+    const auto pool = std::make_shared<net::coro::thread_pool>(1);
+    scheduler  sched{pool};
     auto [reader, writer] = make_socket_pair(&sched);
 
-    REQUIRE(sched.spawn(record_wait(&sched, kind, source.get_token(), reader.native_handle(), &word, &err, &finished)));
+    struct outcome
+    {
+        std::uint64_t finished_then = 0; // before stop was requested
+        bool          ended         = false;
+    };
 
-    // it waits until stop is requested.
-    std::this_thread::sleep_for(50ms);
-    CHECK(finished.load() == 0);
+    const auto test = [&](net::coro::thread_pool* pool) -> task<outcome>
+    {
+        outcome out;
+        if (!sched.spawn(record_wait(&sched, kind, source.get_token(), reader.native_handle(), &word, &err, &finished)))
+            co_return out;
+        co_await pool->yield();
 
-    source.request_stop();
-    REQUIRE(eventually([&] { return finished.load() == 1; }));
+        // it waits until stop is requested.
+        out.finished_then = finished.load();
+        source.request_stop();
+        out.ended = co_await wait_count(&sched, &finished, 1);
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(pool.get()));
+    CHECK(out.finished_then == 0);
+    REQUIRE(out.ended);
     CHECK(err == std::errc::operation_canceled);
 }
 
@@ -947,29 +1102,52 @@ TEST_CASE("requesting stop ends only the waits given its token", "[io][scheduler
     std::error_code            stopped_err;
     std::error_code            other_err;
     std::error_code            none_err;
-    std::atomic<int>           stopped_finished{0};
-    std::atomic<int>           others_finished{0};
+    std::atomic<std::uint64_t> stopped_finished{0};
+    std::atomic<std::uint64_t> others_finished{0};
 
-    scheduler sched{make_pool()};
+    // one worker, which runs one task at a time, in the order they're queued: so the waits (spawned, and so queued,
+    // before the test yields) have begun by the time the test goes on.
+    const auto pool = std::make_shared<net::coro::thread_pool>(1);
+    scheduler  sched{pool};
 
-    REQUIRE(sched.spawn(
-        record_wait(&sched, wait_kind::wait_on, stopped.get_token(), -1, &word, &stopped_err, &stopped_finished)));
-    REQUIRE(sched.spawn(
-        record_wait(&sched, wait_kind::wait_on, other.get_token(), -1, &word, &other_err, &others_finished)));
-    REQUIRE(sched.spawn(record_wait(&sched, wait_kind::wait_on, {}, -1, &word, &none_err, &others_finished)));
-    std::this_thread::sleep_for(50ms);
+    struct outcome
+    {
+        bool stopped_ended = false;
+        bool others_ended  = false;
+    };
 
-    stopped.request_stop();
-    REQUIRE(eventually([&] { return stopped_finished.load() == 1; }));
+    const auto test = [&](net::coro::thread_pool* pool) -> task<outcome>
+    {
+        outcome out;
+        if (!sched.spawn(record_wait(&sched,
+                                     wait_kind::wait_on,
+                                     stopped.get_token(),
+                                     -1,
+                                     &word,
+                                     &stopped_err,
+                                     &stopped_finished))
+            || !sched.spawn(
+                record_wait(&sched, wait_kind::wait_on, other.get_token(), -1, &word, &other_err, &others_finished))
+            || !sched.spawn(record_wait(&sched, wait_kind::wait_on, {}, -1, &word, &none_err, &others_finished)))
+            co_return out;
+        co_await pool->yield();
+
+        stopped.request_stop();
+        out.stopped_ended = co_await wait_count(&sched, &stopped_finished, 1);
+        if (!out.stopped_ended) co_return out;
+
+        // the others wait on, until they're notified: that they end without an error (rather than canceled) shows the
+        // stop didn't end them.
+        word = 1;
+        sched.notify_all(word);
+        out.others_ended = co_await wait_count(&sched, &others_finished, 2);
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(test(pool.get()));
+    REQUIRE(out.stopped_ended);
     CHECK(stopped_err == std::errc::operation_canceled);
-
-    // the others wait on, until they're notified.
-    std::this_thread::sleep_for(50ms);
-    CHECK(others_finished.load() == 0);
-
-    word = 1;
-    sched.notify_all(word);
-    REQUIRE(eventually([&] { return others_finished.load() == 2; }));
+    REQUIRE(out.others_ended);
     CHECK_FALSE(other_err);
     CHECK_FALSE(none_err);
 }
@@ -1057,12 +1235,14 @@ TEST_CASE("a wait racing stop ends once, either way", "[io][scheduler][stop]")
         race_after(started, round, [&] { source.request_stop(); });
         completer.join();
 
-        REQUIRE(eventually([&] { return finished.load() == round + 1; }));
+        // a wait resumed twice counts twice (or crashes): here, or (if late) at the next round's check.
+        REQUIRE(eventually([&] { return finished.load() >= round + 1; }));
         CAPTURE(round, err.message());
+        REQUIRE(finished.load() == round + 1);
         REQUIRE((!err || err == std::errc::operation_canceled));
     }
 
-    // a wait resumed twice would have counted twice (or crashed).
+    // NOTE: timed, as nothing would say that a second resume of the last round's wait is still to come.
     std::this_thread::sleep_for(20ms);
     CHECK(finished.load() == rounds);
 }
@@ -1071,7 +1251,11 @@ TEST_CASE("a socket's read canceled by its stop token reads nothing, so the next
           "[io][socket][stop]")
 {
     std::stop_source source;
-    scheduler        sched{make_pool()};
+
+    // one worker, which runs one task at a time, in the order they're queued: so a task spawned (and so queued) before
+    // a read that waits runs once the read is waiting.
+    const auto pool = std::make_shared<net::coro::thread_pool>(1);
+    scheduler  sched{pool};
     auto [reader, writer] = make_socket_pair(&sched);
 
     const auto check =
@@ -1080,15 +1264,15 @@ TEST_CASE("a socket's read canceled by its stop token reads nothing, so the next
         reader->set_stop_token(source->get_token());
 
         // stop is requested while the read waits.
-        std::thread stopper{[source]
-                            {
-                                std::this_thread::sleep_for(50ms);
-                                source->request_stop();
-                            }};
+        const auto stop_later = [](std::stop_source* source) -> task<>
+        {
+            source->request_stop();
+            co_return;
+        };
+        if (!sched->spawn(stop_later(source))) co_return "spawn failed";
 
         std::string got;
         auto        res = co_await read_some(reader, &got);
-        stopper.join();
         if (res.err != std::errc::operation_canceled) co_return "the first read: " + res.err.message();
         if (res.count != 0 || !got.empty()) co_return "the first read read something";
 
@@ -1103,12 +1287,9 @@ TEST_CASE("a socket's read canceled by its stop token reads nothing, so the next
 
         // and without the token, a read waits for what comes.
         reader->set_stop_token({});
-        const auto write_later = [](scheduler* sched, net::socket* writer) -> task<>
-        {
-            (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
-            co_await writer->write(std::as_bytes(std::span{" world"sv}));
-        };
-        if (!sched->spawn(write_later(sched, writer))) co_return "spawn failed";
+        const auto write_later = [](net::socket* writer) -> task<>
+        { co_await writer->write(std::as_bytes(std::span{" world"sv})); };
+        if (!sched->spawn(write_later(writer))) co_return "spawn failed";
 
         res = co_await read_some(reader, &got);
         if (res.err) co_return "the fourth read: " + res.err.message();
@@ -1263,14 +1444,18 @@ TEST_CASE("run_blocking given a stop token", "[io][scheduler][run_blocking][stop
 
     SECTION("passes the token to a func that takes one")
     {
-        std::stop_source source;
+        std::stop_source  source;
+        std::atomic<bool> started = false; // set once func runs
 
         // it runs until stop is requested, which it only sees through the token.
-        const auto run = [](scheduler* sched, std::stop_token stop) -> task<bool>
+        const auto run = [](scheduler* sched, std::stop_token stop, std::atomic<bool>* started) -> task<bool>
         {
             auto res = co_await sched->run_blocking(
-                [](const std::stop_token& stop)
+                [started](const std::stop_token& stop)
                 {
+                    started->store(true);
+                    started->notify_all();
+
                     const auto give_up_at = std::chrono::steady_clock::now() + test_timeout;
                     while (!stop.stop_requested())
                     {
@@ -1283,14 +1468,20 @@ TEST_CASE("run_blocking given a stop token", "[io][scheduler][run_blocking][stop
             co_return res.value_or(false);
         };
 
-        std::thread stopper{[&]
-                            {
-                                std::this_thread::sleep_for(50ms);
-                                source.request_stop();
-                            }};
-        auto        saw_stop = sched.run_to_completion(run(&sched, source.get_token()));
-        stopper.join();
+        // stop is requested once func runs (were it requested before, func wouldn't be).
+        std::jthread stopper{[&]
+                             {
+                                 started.wait(false);
+                                 source.request_stop();
+                             }};
+        // lets the stopper go, should func never run.
+        const net::util::defer let_go{[&started] noexcept
+                                      {
+                                          started.store(true);
+                                          started.notify_all();
+                                      }};
 
+        const auto saw_stop = sched.run_to_completion(run(&sched, source.get_token(), &started));
         CHECK(saw_stop);
     }
 }
@@ -1349,25 +1540,31 @@ TEST_CASE("call_at calls a function whose deadline has passed at once", "[io][sc
 
 TEST_CASE("a call canceled before its deadline isn't made", "[io][scheduler][call_at]")
 {
-    std::atomic<int> calls = 0;
+    std::atomic<int>  calls = 0;
+    std::atomic<bool> later = false;
 
-    scheduler sched{make_pool()};
+    // one worker, held while the call is canceled, so it can't be made before then, however late this thread is.
+    scheduler   sched{std::make_shared<net::coro::thread_pool>(1)};
+    held_worker worker{&sched};
+
+    const auto deadline = net::io::clock::now() + 50ms;
 
     SECTION("by cancel()")
     {
-        auto call = sched.call_at(net::io::clock::now() + 50ms, [&] noexcept { calls.fetch_add(1); });
+        auto call = sched.call_at(deadline, [&] noexcept { calls.fetch_add(1); });
         CHECK(call.cancel());
         CHECK_FALSE(call.cancel()); // once
     }
 
     SECTION("by destroying it")
     {
-        auto call = sched.call_at(net::io::clock::now() + 50ms, [&] noexcept { calls.fetch_add(1); });
+        auto call = sched.call_at(deadline, [&] noexcept { calls.fetch_add(1); });
     }
 
-    // a call after it is made, so its deadline has passed when this looks.
-    std::atomic<bool> later = false;
-    auto              call  = sched.call_at(net::io::clock::now() + 100ms, [&] noexcept { later.store(true); });
+    // a call after it is made (calls are made in their deadlines' order), so had it been left, it would have been made
+    // by then.
+    auto call = sched.call_at(deadline + 50ms, [&] noexcept { later.store(true); });
+    worker.release();
     REQUIRE(eventually([&] { return later.load(); }));
     CHECK(calls.load() == 0);
 }
@@ -1400,9 +1597,15 @@ TEST_CASE("a call may cancel itself", "[io][scheduler][call_at]")
 
     scheduler sched{make_pool()};
 
-    auto call =
-        sched.call_at(net::io::clock::now() + 20ms, [&] noexcept { canceled.store(self.load()->cancel() ? 1 : 0); });
+    // NOTE: it waits for self, which is only set once call_at() has returned.
+    auto call = sched.call_at(net::io::clock::now() + 20ms,
+                              [&] noexcept
+                              {
+                                  self.wait(nullptr);
+                                  canceled.store(self.load()->cancel() ? 1 : 0);
+                              });
     self.store(&call);
+    self.notify_all();
 
     // it doesn't wait for itself, and wasn't pending, as it's being made.
     REQUIRE(eventually([&] { return canceled.load() != -1; }));
@@ -1413,16 +1616,21 @@ TEST_CASE("a call isn't made once the scheduler is stopped", "[io][scheduler][ca
 {
     std::atomic<int> calls = 0;
 
-    scheduler sched{make_pool()};
+    // one worker, held until the scheduler's stopped, so the first call can't be made before then, however late this
+    // thread is.
+    scheduler   sched{std::make_shared<net::coro::thread_pool>(1)};
+    held_worker worker{&sched};
 
-    auto before = sched.call_at(net::io::clock::now() + 20ms, [&] noexcept { calls.fetch_add(1); });
+    auto before = sched.call_at(net::io::clock::now(), [&] noexcept { calls.fetch_add(1); });
     sched.request_stop();
     auto after = sched.call_at(net::io::clock::now(), [&] noexcept { calls.fetch_add(1); });
+    worker.release();
 
-    std::this_thread::sleep_for(100ms);
-    CHECK(calls.load() == 0);
+    // neither is pending (cancel() would remove one, and return true), and cancel() waits for a call being made: so
+    // neither was made, nor will be.
     CHECK_FALSE(before.cancel());
     CHECK_FALSE(after.cancel());
+    CHECK(calls.load() == 0);
 }
 
 TEST_CASE("a call may request stop, ending the waits given the source's token", "[io][scheduler][call_at][stop]")

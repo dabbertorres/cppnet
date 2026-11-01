@@ -277,7 +277,8 @@ TEST_CASE("a worker that's stuck running a coroutine doesn't hold up polling", "
     thread_pool pool{3};
     test_poller poller;
 
-    // NOTE: the workers fall asleep before the poller's attached, as a scheduler's usually do.
+    // NOTE: the workers fall asleep before the poller's attached, as a scheduler's usually do. Timed, as nothing says
+    //       when they have: if they haven't, the test passes without starting from there.
     std::this_thread::sleep_for(std::chrono::milliseconds{50});
     REQUIRE(pool.attach(&poller));
 
@@ -694,7 +695,8 @@ TEST_CASE("a coroutine in a busy worker's slot is run by another, in time", "[co
 
         // NOTE: the workers fall asleep before the poller's attached, as a scheduler's usually do. Then one polls,
         //       without a timeout once the other is asleep (the standby), which hog's start wakes: the poll is given
-        //       one then, to watch the slots in its place.
+        //       one then, to watch the slots in its place. Timed, as nothing says when the workers are asleep, or
+        //       polling: if they aren't yet, the test passes without starting from there.
         std::this_thread::sleep_for(std::chrono::milliseconds{50});
         REQUIRE(pool.attach(&poller));
         std::this_thread::sleep_for(std::chrono::milliseconds{50});

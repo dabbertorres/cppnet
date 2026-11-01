@@ -370,23 +370,31 @@ TEST_CASE("automatic's choice follows the configuration's changes, and lookups o
                          const dns::detail::config_files* files,
                          std::atomic<int>*                started,
                          std::atomic<bool>*               released,
-                         first_caller*                    first) -> task<resolve_result>
+                         first_caller*                    first) -> task<std::pair<resolve_result, std::string>>
     {
+        // lets the system's lookups go however this ends (the scheduler waits for them).
+        const net::util::defer let_go{[released] noexcept
+                                      {
+                                          released->store(true);
+                                          released->notify_all();
+                                      }};
+        const auto             fail = [](std::string what)
+        { return std::pair{resolve_result{std::unexpected(std::error_code{})}, std::move(what)}; };
+
         const auto call = [](net::io::scheduler* sched, const dns::resolver* resolver, first_caller* out) -> task<>
         {
             out->result = co_await resolver->resolve(sched, "moving.test");
             out->done.store(1);
             sched->notify_all(out->done);
         };
-        REQUIRE(sched->spawn(call(sched, resolver, first)));
+        if (!sched->spawn(call(sched, resolver, first))) co_return fail("spawn failed");
 
         // the system's lookup has started, and waits.
         const auto until = net::io::clock::now() + 10s;
         while (started->load() < 1)
         {
-            REQUIRE(net::io::clock::now() < until);
-            const auto err = co_await sched->sleep_until(net::io::clock::now() + 1ms);
-            REQUIRE_FALSE(err);
+            if (net::io::clock::now() >= until) co_return fail("the system's lookup didn't start");
+            if (co_await sched->sleep_until(net::io::clock::now() + 1ms)) co_return fail("the scheduler stopped");
         }
 
         // the native's, now: not the system's lookup in flight, which is still blocked (and would hold it until the
@@ -398,13 +406,14 @@ TEST_CASE("automatic's choice follows the configuration's changes, and lookups o
         released->notify_all();
         while (first->done.load() == 0)
         {
-            const auto err = co_await sched->wait_on(first->done, 0, until);
-            REQUIRE_FALSE(err);
+            if (co_await sched->wait_on(first->done, 0, until)) co_return fail("the first caller didn't return");
         }
-        co_return second;
+        co_return std::pair{std::move(second), std::string{}};
     };
 
-    auto second = sched.run_to_completion(test(&sched, &resolver, &files, &started, &released, &first));
+    const auto [second, failed] = sched.run_to_completion(test(&sched, &resolver, &files, &started, &released, &first));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
     CHECK(second == resolve_result{std::vector<net::ip_addr>{hosts_addr}});
     CHECK(first.result == resolve_result{std::vector<net::ip_addr>{system_addr}});
     CHECK(started.load() == 2); // a call for each family
