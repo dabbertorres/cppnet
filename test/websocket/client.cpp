@@ -918,6 +918,8 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
         else (void)co_await server.send(server_close(ws::close_code::normal_closure));
 
         // the client doesn't end the connection first.
+        // NOTE: timed. When the server's close came first, from the client's answer, which an end would follow; when
+        //       the client's did, from the server's answer, as nothing the client sends tells that it has taken that.
         served.push_back("then: " + describe(co_await server.quiet(pause)));
         if (server_ends) server.conn->shutdown_write();
 
@@ -982,17 +984,17 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
             const auto                 closer = [](net::io::scheduler*               sched,
                                                    ws::connection*                   conn,
                                                    const std::atomic<std::uint64_t>* answered,
+                                                   net::io::clock::time_point        start,
                                                    std::error_code*                  closed,
                                                    net::io::clock::duration*         took,
                                                    std::atomic<std::uint64_t>*       done) -> task<void>
             {
                 (void)co_await reach(sched, *answered);
-                const auto start = net::io::clock::now();
-                *closed          = co_await conn->close();
-                *took            = net::io::clock::now() - start;
+                *closed = co_await conn->close();
+                *took   = net::io::clock::now() - start;
                 raise(sched, *done);
             };
-            if (!sched.spawn(closer(&sched, &*conn, &answered, &closed, &close_took, &done))) co_return;
+            if (!sched.spawn(closer(&sched, &*conn, &answered, start, &closed, &close_took, &done))) co_return;
 
             const auto read = co_await conn->read_message(message);
             (void)co_await reach(&sched, done);
@@ -1015,8 +1017,9 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
     case first::server_then_close:
         CHECK(lines == std::vector<std::string>{"read: 1000 peer", "close: ok"});
 
-        // close() came as the server held back its end (pause), and returned with it, or with close_timeout.
-        CHECK(close_took >= (server_ends ? pause / 2 : close_timeout / 2));
+        // close() came as the server held back its end (pause), and returned with it, or with close_timeout (from when
+        // the read took the server's close): both after start, however late the closer ran.
+        CHECK(close_took >= (server_ends ? pause : close_timeout));
         break;
     }
     CHECK(served

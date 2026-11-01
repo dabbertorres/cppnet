@@ -556,13 +556,14 @@ TEST_CASE("closing the server lets a switched connection's handler finish, telli
         }
 
         server->close();
-        REQUIRE(sched.spawn(
-            [](http::server* server, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined) -> task<void>
-            {
-                co_await server->join();
-                joined->store(1);
-                sched->notify_all(*joined);
-            }(server.get(), &sched, &joined)));
+        if (!sched.spawn(
+                [](http::server* server, net::io::scheduler* sched, std::atomic<std::uint64_t>* joined) -> task<void>
+                {
+                    co_await server->join();
+                    joined->store(1);
+                    sched->notify_all(*joined);
+                }(server.get(), &sched, &joined)))
+            co_return std::pair{received, std::make_error_code(std::errc::resource_unavailable_try_again)};
 
         // the tunnel goes on: the server's close() leaves it to its handler.
         (void)co_await net::io::write_all(*conn, "ping\n"sv);
@@ -620,6 +621,9 @@ TEST_CASE("a switched connection counts against max_connections until its handle
         if (!second.has_value()) co_return "connect failed";
 
         (void)co_await net::io::write_all(*second, "GET /plain HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"sv);
+
+        // NOTE: timed, from once the first's 101 has come (so the server's accepted it): nothing the server does tells
+        //       that it has seen the second and is holding it back.
         second->set_read_deadline(net::io::clock::now() + 300ms);
         const auto waited = co_await test::read_until(*second, received, "plain"sv);
         if (waited != std::errc::timed_out) co_return "served while the first was open: " + waited.message();
@@ -1078,12 +1082,17 @@ TEST_CASE("an HTTP/2 tunnel's read deadline, set from another task, ends a waiti
                    auto& t = **switched;
 
                    // a deadline of now, set while the read waits, as the server's close() has a WebSocket do.
-                   REQUIRE(sched.spawn(
-                       [](http::detail::tunnel* t, net::io::scheduler* sched) -> task<void>
-                       {
-                           (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
-                           t->set_read_deadline(net::io::clock::now());
-                       }(&t, &sched)));
+                   if (!sched.spawn(
+                           [](http::detail::tunnel* t, net::io::scheduler* sched) -> task<void>
+                           {
+                               (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+                               t->set_read_deadline(net::io::clock::now());
+                           }(&t, &sched)))
+                   {
+                       (void)co_await net::io::write_all(t.writer(), "spawn failed\n"sv);
+                       (void)co_await t.writer().flush();
+                       co_return;
+                   }
 
                    const auto interrupted = co_await t.reader().fill();
                    (void)co_await net::io::write_all(
@@ -1167,31 +1176,32 @@ TEST_CASE(
 
     auto server = make_server(&sched, std::move(router));
 
-    const auto result = sched.run_to_completion(over_h2(
-        &sched,
-        server->local_port(),
-        "/echo",
-        [&](h2_tunnels& /*t*/, net::http::http2::stream_id /*id*/, h2_tunnels::stream& s, tunnel_result& r) -> task<>
-        {
-            if (co_await test::read_until(s, r.received, "ready\n"sv)) co_return;
-            read_stop.request_stop();
-            if (co_await test::read_until(s, r.received, "0\n"sv)) co_return;
+    const auto result = sched.run_to_completion(
+        over_h2(&sched,
+                server->local_port(),
+                "/echo",
+                [&](h2_tunnels& t, net::http::http2::stream_id id, h2_tunnels::stream& s, tunnel_result& r) -> task<>
+                {
+                    if (co_await test::read_until(s, r.received, "ready\n"sv)) co_return;
+                    read_stop.request_stop();
+                    if (co_await test::read_until(s, r.received, "0\n"sv)) co_return;
 
-            // the write waits for the window (only what fits has come): then it's stopped, and returns without the
-            // client reading anything more; then the rest's read.
-            (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
-            write_stop.request_stop();
-            const auto deadline = net::io::clock::now() + 10s;
-            while (written.load() == 0)
-            {
-                if (co_await sched.wait_on(written, 0, deadline)) co_return;
-            }
-            if (co_await test::read_until(s, r.received, "write "sv)) co_return;
-            if (co_await test::read_until(s, r.received, "\n"sv)) co_return;
+                    // the write waits for the window once it has used up the client's stream window (what the client
+                    // has read so far is too little for it to give any back): then it's stopped, and returns without
+                    // the client reading anything more; then the rest's read.
+                    if (co_await t.wait_received(id, 65'535) < 65'535) co_return;
+                    write_stop.request_stop();
+                    const auto deadline = net::io::clock::now() + 10s;
+                    while (written.load() == 0)
+                    {
+                        if (co_await sched.wait_on(written, 0, deadline)) co_return;
+                    }
+                    if (co_await test::read_until(s, r.received, "write "sv)) co_return;
+                    if (co_await test::read_until(s, r.received, "\n"sv)) co_return;
 
-            (void)co_await net::io::write_all(s, "after\nbye\n"sv);
-            r.err = co_await test::read_to_end(s, r.received);
-        }));
+                    (void)co_await net::io::write_all(s, "after\nbye\n"sv);
+                    r.err = co_await test::read_to_end(s, r.received);
+                }));
 
     const auto first_line = result.received.substr(0, result.received.find('\n') + 1);
     const auto rest       = result.received.substr(result.received.find("canceled 0\n"sv) + 11);
@@ -1362,7 +1372,9 @@ TEST_CASE("an HTTP/2 tunnel's stream holds 256 KiB its handler hasn't read, and 
                [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
                {
                    auto switched = co_await http::detail::switch_protocols(rw, upgrade_fields());
-                   if (!switched.has_value() || !co_await wait_for_word(&sched, go)) co_return;
+                   if (!switched.has_value()) co_return;
+                   const bool going = co_await wait_for_word(&sched, go);
+                   if (!going) co_return;
                    auto& t = **switched;
 
                    // larger than the tunnel's buffer: straight from the stream, as it comes.
@@ -1402,7 +1414,11 @@ TEST_CASE("an HTTP/2 tunnel's stream holds 256 KiB its handler hasn't read, and 
                         wrote->store(1);
                         sched->notify_all(*wrote);
                     };
-                    REQUIRE(sched.spawn(write_in(&s, &in, &sched, &wrote)));
+                    if (!sched.spawn(write_in(&s, &in, &sched, &wrote)))
+                    {
+                        r.err = std::make_error_code(std::errc::resource_unavailable_try_again);
+                        co_return;
+                    }
 
                     // the client sends what the window allows, which the server holds unread, then waits for it to
                     // grow.

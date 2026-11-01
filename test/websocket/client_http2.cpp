@@ -576,16 +576,28 @@ TEST_CASE("a WebSocket client doesn't use an HTTP/2 connection whose server's SE
     // preface: the WebSocket goes over HTTP/1.1 on a second, which the server accepts.
     const auto test = [&] -> task<void>
     {
-        REQUIRE(sched.spawn(get()));
+        if (!sched.spawn(get()))
+        {
+            out.add("spawn failed");
+            co_return;
+        }
 
         auto first = co_await listener.accept();
-        REQUIRE(first.has_value());
+        if (!first.has_value())
+        {
+            out.add("accept: " + first.error().message());
+            co_return;
+        }
         std::array<std::byte, 24> preface{};
         std::size_t               read = 0;
         while (read < preface.size())
         {
             const auto res = co_await first->read(std::span{preface}.subspan(read));
-            REQUIRE_FALSE(res.err);
+            if (res.err)
+            {
+                out.add("preface: " + res.err.message());
+                co_return;
+            }
             read += res.count;
         }
 
@@ -852,12 +864,20 @@ TEST_CASE("a WebSocket client's extended CONNECT, and its stream's end", "[webso
         const std::vector<http::hpack::field> early{
             {.name = ":status", .value = "103"}
         };
-        REQUIRE_FALSE(s.s.submit_headers(3, early, false));
         const std::vector<http::hpack::field> head{
             {               .name = ":status", .value = "200"},
             {.name = "sec-websocket-protocol",   .value = "b"}
         };
-        REQUIRE_FALSE(s.s.submit_headers(3, head, false));
+        if (auto err = s.s.submit_headers(3, early, false))
+        {
+            out.add("submit: " + err.message());
+            co_return;
+        }
+        if (auto err = s.s.submit_headers(3, head, false))
+        {
+            out.add("submit: " + err.message());
+            co_return;
+        }
         server.send(server_frame(opcode::text, "hi"));
 
         // the client's message (its first frame: its close may have come with it, if it closes first).
@@ -988,7 +1008,11 @@ TEST_CASE("a WebSocket client over HTTP/2 refuses a response that isn't the serv
     {
         if (!co_await server.open()) co_return;
         auto& s = server.conn->server;
-        REQUIRE_FALSE(s.s.submit_headers(3, tc.head, tc.end));
+        if (auto err = s.s.submit_headers(3, tc.head, tc.end))
+        {
+            reset = "submit: " + err.message();
+            co_return;
+        }
 
         // the client resets the stream (a 2xx's, or one whose request it hasn't ended).
         const bool done = co_await s.pump([&] { return !!s.responses[3].reset; });
@@ -1115,14 +1139,19 @@ TEST_CASE(
     // an interim response says the server processed it: REFUSED_STREAM after that can't mean it never saw it, and
     // HTTP_1_1_REQUIRED after it isn't taken as asking before anything's been done.
     std::atomic<std::uint64_t> connections = 1;
-    const auto                 serve       = [&] -> task<void>
+    std::error_code            submitted; // the 103's submitting, if it failed
+    const auto                 serve = [&] -> task<void>
     {
         if (!co_await server.open()) co_return;
         auto&                                 s = server.conn->server;
         const std::vector<http::hpack::field> early{
             {.name = ":status", .value = "103"}
         };
-        REQUIRE_FALSE(s.s.submit_headers(3, early, false));
+        if (auto err = s.s.submit_headers(3, early, false))
+        {
+            submitted = err;
+            co_return;
+        }
         (void)co_await s.sync();
         s.s.reset(3, code);
         (void)co_await s.sync();
@@ -1138,6 +1167,7 @@ TEST_CASE(
 
     sched.run_to_completion(both(&sched, serve, run));
     CHECK(err == (code == http2::error_code::refused_stream ? http2::error_code::cancel : code));
+    CHECK_FALSE(submitted);
     CHECK(connections.load() == 1);
 }
 
@@ -1310,7 +1340,11 @@ TEST_CASE("a WebSocket client's stream holds 256 KiB it hasn't read, and its lar
         const std::vector<http::hpack::field> head{
             {.name = ":status", .value = "200"}
         };
-        REQUIRE_FALSE(s.s.submit_headers(3, head, false));
+        if (auto err = s.s.submit_headers(3, head, false))
+        {
+            out.add("submit: " + err.message());
+            co_return;
+        }
 
         // the client widens the stream's window as it opens the tunnel.
         const bool widened = co_await s.pump([&] { return s.s.send_window(3) == 262'144; });
@@ -1424,7 +1458,11 @@ TEST_CASE("a WebSocket client over HTTP/2 widens its stream's window to http2_wi
         const std::vector<http::hpack::field> head{
             {.name = ":status", .value = "200"}
         };
-        REQUIRE_FALSE(s.s.submit_headers(3, head, false));
+        if (auto err = s.s.submit_headers(3, head, false))
+        {
+            out.add("submit: " + err.message());
+            co_return;
+        }
 
         // the client's close comes after the window's WINDOW_UPDATE, if any, which it sent as it opened the tunnel.
         (void)co_await s.pump([&] { return !server.frames().empty(); });
