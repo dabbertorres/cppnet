@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -105,36 +106,56 @@ struct handshake
     std::optional<std::expected<tls::stream, std::error_code>> result;
     std::atomic<std::uint64_t>                                 done{0};
 
-    static task<> run(handshake* self, net::tcp_socket accepted)
+    // ends the handshake, should it have to be given up on (see settle()).
+    std::stop_source abandon;
+
+    static task<> run(handshake* self, net::tcp_socket accepted, tls::server_context ctx)
     {
-        self->result = co_await tls::stream::accept(std::move(accepted),
-                                                    server_with(pki().names_chain, pki().names_key),
-                                                    net::io::clock::now() + 5s,
-                                                    {.alpn = std::vector<std::string>{"h2"}});
+        self->result =
+            co_await tls::stream::accept(std::move(accepted),
+                                         std::move(ctx),
+                                         net::io::clock::now() + 5s,
+                                         {.stop = self->abandon.get_token(), .alpn = std::vector<std::string>{"h2"}});
         self->done.store(1);
         self->sched->notify_all(self->done);
     }
 
-    task<> wait()
+    // wait waits (up to 10 seconds) for run() to finish, returning whether it has.
+    task<bool> wait()
     {
         const auto deadline = net::io::clock::now() + 10s;
         while (done.load() == 0)
         {
-            if (co_await sched->wait_on(done, 0, deadline)) co_return;
+            if (co_await sched->wait_on(done, 0, deadline)) break;
         }
+        co_return done.load() != 0;
+    }
+
+    // settle ends the handshake and waits for run() to finish, without a deadline: as the handshake is in the caller's
+    // frame, which mustn't go while run() uses it.
+    task<> settle()
+    {
+        abandon.request_stop();
+        while (done.load() == 0) (void)co_await sched->wait_on(done, 0);
     }
 };
 
-// connect connects a client's HTTP/2 connection to the server the test plays (with names_chain's certificate), as
-// a.test (its own origin given as own_host's, with the port), telling of its Origin Set to known.
-task<connected> connect(net::io::scheduler* sched, transport how, told* known, std::string own_host = "a.test")
+// connect connects a client's HTTP/2 connection to the server the test plays (with names_chain's certificate, server),
+// as a.test (its own origin given as own_host's, with the port), telling of its Origin Set to known; or says what
+// failed.
+task<std::expected<connected, std::string>> connect(net::io::scheduler* sched,
+                                                    transport           how,
+                                                    told*               known,
+                                                    tls::server_context server,
+                                                    tls::client_context client_ctx,
+                                                    std::string         own_host = "a.test")
 {
     auto       listener = net::listener::make(sched, "127.0.0.1", "0").value();
     const auto port     = listener.local_port();
     auto       client   = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
-    REQUIRE(client.has_value());
+    if (!client.has_value()) co_return std::unexpected("connect: " + client.error().message());
     auto accepted = co_await listener.accept();
-    REQUIRE(accepted.has_value());
+    if (!accepted.has_value()) co_return std::unexpected("accept: " + accepted.error().message());
 
     connected                                 out{.server = nullptr, .conn = nullptr, .port = port};
     std::unique_ptr<http::detail::connection> client_side;
@@ -145,20 +166,22 @@ task<connected> connect(net::io::scheduler* sched, transport how, told* known, s
     }
     else
     {
-        handshake server{sched};
-        REQUIRE(sched->spawn(handshake::run(&server, std::move(*accepted))));
+        handshake server_side{sched};
+        if (!sched->spawn(handshake::run(&server_side, std::move(*accepted), std::move(server))))
+            co_return std::unexpected("the server's handshake didn't start");
 
-        auto ctx = tls::client_context::make({.trusted_ca_file            = pki().ca,
-                                              .insecure_skip_verification = how == transport::insecure_tls,
-                                              .alpn                       = {"h2"}});
-        REQUIRE(ctx.has_value());
-        auto stream = co_await tls::stream::connect(std::move(*client), *ctx, "a.test", net::io::clock::now() + 5s);
-        co_await server.wait();
+        auto stream =
+            co_await tls::stream::connect(std::move(*client), client_ctx, "a.test", net::io::clock::now() + 5s);
+        if (!co_await server_side.wait())
+        {
+            co_await server_side.settle();
+            co_return std::unexpected("the server's handshake didn't finish");
+        }
 
-        REQUIRE(stream.has_value());
-        REQUIRE(server.result.has_value());
-        REQUIRE(server.result->has_value());
-        out.server  = std::make_unique<http::detail::connection>(std::move(**server.result));
+        if (!stream.has_value()) co_return std::unexpected("the client's handshake: " + stream.error().message());
+        if (!server_side.result->has_value())
+            co_return std::unexpected("the server's handshake: " + server_side.result->error().message());
+        out.server  = std::make_unique<http::detail::connection>(std::move(**server_side.result));
         client_side = std::make_unique<http::detail::connection>(std::move(*stream));
     }
 
@@ -178,8 +201,24 @@ task<connected> connect(net::io::scheduler* sched, transport how, told* known, s
         http::detail::http2_client_options{},
         std::move(on),
         http::detail::origin_text(own_host, std::to_string(port)));
-    REQUIRE(out.conn->start());
+    if (!out.conn->start()) co_return std::unexpected("the client's connection didn't start");
     co_return out;
+}
+
+// contexts are the server's and the client's TLS contexts for connect(), made on the test's thread (as they check what
+// they made with REQUIRE).
+struct contexts
+{
+    tls::server_context server;
+    tls::client_context client;
+};
+
+contexts contexts_for(transport how)
+{
+    auto client = tls::client_context::make(
+        {.trusted_ca_file = pki().ca, .insecure_skip_verification = how == transport::insecure_tls, .alpn = {"h2"}});
+    REQUIRE(client.has_value());
+    return {.server = server_with(pki().names_chain, pki().names_key), .client = std::move(*client)};
 }
 
 // played is the server the test plays, over a connection's server side.
@@ -218,7 +257,8 @@ std::vector<bool> answers(http::detail::http2_client_connection& conn, const std
 TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the server's ORIGIN frames",
           "[tls][http][client][http2][origin]")
 {
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(transport::tls);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
@@ -232,6 +272,7 @@ TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the s
         std::vector<bool> later{}; // after a later one
         std::uint64_t     told_count = 0;
         std::uint16_t     port       = 0;
+        std::string       failed{}; // what went wrong with the test's own steps, if anything
     };
 
     // origins whose hosts the certificate has, asked about: its own (as the set has it, normalized), ones the first
@@ -247,18 +288,22 @@ TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the s
     };
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known, auto asked) -> task<seen>
+        [](net::io::scheduler* sched, told* known, contexts ctxs, auto asked) -> task<seen>
         {
             // its own origin as the pool gives it: the host as the URL had it.
-            auto c      = co_await connect(sched, transport::tls, known, "A.Test");
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, transport::tls, known, ctxs.server, ctxs.client, "A.Test");
+            if (!c.has_value()) co_return seen{.failed = c.error()};
+            auto server = played(*c->server);
 
-            seen out{.port = c.port};
+            seen out{.port = c->port};
 
             // uninitialized until the server sends ORIGIN.
-            const bool synced = co_await server.sync();
-            REQUIRE(synced);
-            out.before      = answers(*c.conn, asked(c.port));
+            if (!co_await server.sync())
+            {
+                out.failed = "no answer to a PING";
+                co_return out;
+            }
+            out.before      = answers(*c->conn, asked(c->port));
             out.told_before = known->count.load() != 0;
 
             // initialized with its own origin and the entries, normalized (lowercase, without 443); what isn't an
@@ -273,20 +318,29 @@ TEST_CASE("an HTTP/2 client's connection over TLS keeps an Origin Set from the s
                                               "https://x.w.test:8443",
                                               "",
                                               "https://127.0.0.1:443"});
-            REQUIRE(first);
-            out.first      = answers(*c.conn, asked(c.port));
+            if (!first)
+            {
+                out.failed = "the first ORIGIN wasn't taken in";
+                co_return out;
+            }
+            out.first      = answers(*c->conn, asked(c->port));
             out.told_first = co_await known->wait();
 
             // later ones add to it; told once only.
             const bool later = co_await send(server, {"https://Y.w.test"});
-            REQUIRE(later);
-            out.later      = answers(*c.conn, asked(c.port));
+            if (!later)
+            {
+                out.failed = "the later ORIGIN wasn't taken in";
+                co_return out;
+            }
+            out.later      = answers(*c->conn, asked(c->port));
             out.told_count = known->count.load();
 
-            c.conn->close();
+            c->conn->close();
             co_return out;
-        }(&sched, &known, asked));
+        }(&sched, &known, ctxs, asked));
 
+    REQUIRE(out.failed.empty());
     CHECK(out.before == std::vector<bool>(6, false));
     CHECK_FALSE(out.told_before);
 
@@ -301,7 +355,8 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
           "is valid for its host",
           "[tls][http][client][http2][origin]")
 {
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(transport::tls);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
@@ -315,28 +370,37 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
     {
         bool                before = true; // asked before ORIGIN
         std::vector<answer> answers{};
-        std::vector<answer> again{}; // asked again
+        std::vector<answer> again{};  // asked again
+        std::string         failed{}; // what went wrong with the test's own steps, if anything
     };
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<seen>
+        [](net::io::scheduler* sched, told* known, contexts ctxs) -> task<seen>
         {
-            auto c      = co_await connect(sched, transport::tls, known);
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, transport::tls, known, ctxs.server, ctxs.client);
+            if (!c.has_value()) co_return seen{.failed = c.error()};
+            auto server = played(*c->server);
 
             seen out;
 
-            const bool synced = co_await server.sync();
-            REQUIRE(synced);
-            out.before = c.conn->authoritative_for(own(c.port));
+            if (!co_await server.sync())
+            {
+                out.failed = "no answer to a PING";
+                co_return out;
+            }
+            out.before = c->conn->authoritative_for(own(c->port));
 
             const bool sent = co_await send(
                 server,
                 {"https://b.test", "https://c.test", "https://x.w.test:8443", "https://127.0.0.1", "https://[::1]"});
-            REQUIRE(sent);
+            if (!sent)
+            {
+                out.failed = "ORIGIN wasn't taken in";
+                co_return out;
+            }
 
             const std::vector<std::string> asked{
-                own(c.port),             // its own
+                own(c->port),            // its own
                 "https://b.test",        // the certificate has it
                 "https://B.TEST:443",    // the same, normalized
                 "https://b.test:8443",   // not in the set (though the certificate has its host)
@@ -348,14 +412,15 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
                 "not an origin",
             };
             for (const auto& origin : asked)
-                out.answers.push_back({.origin = origin, .authoritative = c.conn->authoritative_for(origin)});
+                out.answers.push_back({.origin = origin, .authoritative = c->conn->authoritative_for(origin)});
             for (const auto& origin : asked)
-                out.again.push_back({.origin = origin, .authoritative = c.conn->authoritative_for(origin)});
+                out.again.push_back({.origin = origin, .authoritative = c->conn->authoritative_for(origin)});
 
-            c.conn->close();
+            c->conn->close();
             co_return out;
-        }(&sched, &known));
+        }(&sched, &known, ctxs));
 
+    REQUIRE(out.failed.empty());
     CHECK_FALSE(out.before);
 
     const std::vector<bool> want{true, true, true, false, false, true, true, false, false, false};
@@ -371,7 +436,8 @@ TEST_CASE("an HTTP/2 client's connection is authoritative for an origin in its O
 
 TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http][client][http2][origin]")
 {
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(transport::tls);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
@@ -381,13 +447,15 @@ TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http
         std::vector<bool> first;       // after 300 entries
         bool              full = true; // another, while it's full
         std::vector<bool> room;        // after two more, once there's room for one
+        std::string       failed;      // what went wrong with the test's own steps, if anything
     };
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<seen>
+        [](net::io::scheduler* sched, told* known, contexts ctxs) -> task<seen>
         {
-            auto c      = co_await connect(sched, transport::tls, known);
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, transport::tls, known, ctxs.server, ctxs.client);
+            if (!c.has_value()) co_return seen{.first = {}, .room = {}, .failed = c.error()};
+            auto server = played(*c->server);
 
             const auto host = [](int i) { return "https://h" + std::to_string(i) + ".w.test"; };
 
@@ -395,26 +463,36 @@ TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http
             many.reserve(300);
             for (int i = 0; i < 300; ++i) many.push_back(host(i));
 
-            seen       out;
-            const bool first = co_await send(server, many);
-            REQUIRE(first);
+            seen out;
+            if (!co_await send(server, many))
+            {
+                out.failed = "the first ORIGIN wasn't taken in";
+                co_return out;
+            }
 
             // its own, and the first 255 entries.
-            out.first = answers(*c.conn, {own(c.port), host(0), host(254), host(255), host(299)});
+            out.first = answers(*c->conn, {own(c->port), host(0), host(254), host(255), host(299)});
 
-            const bool full = co_await send(server, {"https://more.w.test"});
-            REQUIRE(full);
-            out.full = c.conn->authoritative_for("https://more.w.test");
+            if (!co_await send(server, {"https://more.w.test"}))
+            {
+                out.failed = "the second ORIGIN wasn't taken in";
+                co_return out;
+            }
+            out.full = c->conn->authoritative_for("https://more.w.test");
 
-            c.conn->remove_origin(host(0));
-            const bool room = co_await send(server, {"https://most.w.test", "https://more.w.test"});
-            REQUIRE(room);
-            out.room = answers(*c.conn, {"https://most.w.test", "https://more.w.test", host(0)});
+            c->conn->remove_origin(host(0));
+            if (!co_await send(server, {"https://most.w.test", "https://more.w.test"}))
+            {
+                out.failed = "the third ORIGIN wasn't taken in";
+                co_return out;
+            }
+            out.room = answers(*c->conn, {"https://most.w.test", "https://more.w.test", host(0)});
 
-            c.conn->close();
+            c->conn->close();
             co_return out;
-        }(&sched, &known));
+        }(&sched, &known, ctxs));
 
+    REQUIRE(out.failed.empty());
     CHECK(out.first == std::vector<bool>{true, true, true, false, false});
     CHECK_FALSE(out.full);
     CHECK(out.room == std::vector<bool>{true, false, false});
@@ -423,16 +501,18 @@ TEST_CASE("an HTTP/2 client's Origin Set keeps at most 256 origins", "[tls][http
 TEST_CASE("an HTTP/2 client's Origin Set doesn't count entries it ignores, nor repeats, against its limit",
           "[tls][http][client][http2][origin]")
 {
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(transport::tls);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<std::vector<bool>>
+        [](net::io::scheduler* sched, told* known, contexts ctxs) -> task<std::expected<std::vector<bool>, std::string>>
         {
-            auto c      = co_await connect(sched, transport::tls, known);
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, transport::tls, known, ctxs.server, ctxs.client);
+            if (!c.has_value()) co_return std::unexpected(c.error());
+            auto server = played(*c->server);
 
             // 300 that aren't https origins, 300 repeats (as written, and normalized), then one more.
             std::vector<std::string> entries;
@@ -445,52 +525,57 @@ TEST_CASE("an HTTP/2 client's Origin Set doesn't count entries it ignores, nor r
             }
             entries.emplace_back("https://x.w.test");
 
-            const bool sent = co_await send(server, entries);
-            REQUIRE(sent);
+            if (!co_await send(server, entries)) co_return std::unexpected("ORIGIN wasn't taken in");
 
-            auto out = answers(*c.conn, {"https://b.test", "https://x.w.test"});
-            c.conn->close();
+            auto out = answers(*c->conn, {"https://b.test", "https://x.w.test"});
+            c->conn->close();
             co_return out;
-        }(&sched, &known));
+        }(&sched, &known, ctxs));
 
-    CHECK(out == std::vector<bool>{true, true});
+    CAPTURE(out.error_or(std::string{}));
+    REQUIRE(out.has_value());
+    CHECK(*out == std::vector<bool>{true, true});
 }
 
 TEST_CASE("an HTTP/2 client's connection removes origins from its Origin Set", "[tls][http][client][http2][origin]")
 {
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(transport::tls);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
 
     const auto out = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known) -> task<std::vector<bool>>
+        [](net::io::scheduler* sched, told* known, contexts ctxs) -> task<std::expected<std::vector<bool>, std::string>>
         {
-            auto c      = co_await connect(sched, transport::tls, known);
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, transport::tls, known, ctxs.server, ctxs.client);
+            if (!c.has_value()) co_return std::unexpected(c.error());
+            auto server = played(*c->server);
 
             // uninitialized: nothing to remove, and nothing's kept from trying.
-            c.conn->remove_origin("https://b.test");
+            c->conn->remove_origin("https://b.test");
 
-            const bool sent = co_await send(server, {"https://b.test", "https://x.w.test"});
-            REQUIRE(sent);
+            if (!co_await send(server, {"https://b.test", "https://x.w.test"}))
+                co_return std::unexpected("ORIGIN wasn't taken in");
 
-            std::vector<bool> out{c.conn->authoritative_for("https://b.test")};
+            std::vector<bool> out{c->conn->authoritative_for("https://b.test")};
 
             // normalized as the entries are; what isn't an origin, nothing.
-            c.conn->remove_origin("https://B.test:443");
-            c.conn->remove_origin("not an origin");
-            c.conn->remove_origin(own(c.port));
+            c->conn->remove_origin("https://B.test:443");
+            c->conn->remove_origin("not an origin");
+            c->conn->remove_origin(own(c->port));
 
             // b.test's certificate check is remembered, but the origin's gone; and its own.
-            const auto after = answers(*c.conn, {"https://b.test", "https://x.w.test", own(c.port)});
+            const auto after = answers(*c->conn, {"https://b.test", "https://x.w.test", own(c->port)});
             out.insert(out.end(), after.begin(), after.end());
 
-            c.conn->close();
+            c->conn->close();
             co_return out;
-        }(&sched, &known));
+        }(&sched, &known, ctxs));
 
-    CHECK(out == std::vector<bool>{true, false, true, false});
+    CAPTURE(out.error_or(std::string{}));
+    REQUIRE(out.has_value());
+    CHECK(*out == std::vector<bool>{true, false, true, false});
 }
 
 TEST_CASE("an HTTP/2 client's connection keeps no Origin Set over cleartext, nor without verifying the server's "
@@ -500,26 +585,30 @@ TEST_CASE("an HTTP/2 client's connection keeps no Origin Set over cleartext, nor
     const auto how = GENERATE(transport::cleartext, transport::insecure_tls);
     CAPTURE(how == transport::cleartext ? "cleartext" : "insecure_skip_verification");
 
-    told known;
+    told       known;
+    const auto ctxs = contexts_for(how);
 
     net::io::scheduler sched{make_pool()};
     known.sched = &sched;
 
     const auto authoritative = sched.run_to_completion(
-        [](net::io::scheduler* sched, told* known, transport how) -> task<bool>
+        [](net::io::scheduler* sched, told* known, transport how, contexts ctxs)
+            -> task<std::expected<bool, std::string>>
         {
-            auto c      = co_await connect(sched, how, known);
-            auto server = played(*c.server);
+            auto c = co_await connect(sched, how, known, ctxs.server, ctxs.client);
+            if (!c.has_value()) co_return std::unexpected(c.error());
+            auto server = played(*c->server);
 
-            const bool sent = co_await send(server, {"https://b.test"});
-            REQUIRE(sent);
+            if (!co_await send(server, {"https://b.test"})) co_return std::unexpected("ORIGIN wasn't taken in");
 
-            const bool out = c.conn->authoritative_for("https://b.test");
-            c.conn->close();
+            const bool out = c->conn->authoritative_for("https://b.test");
+            c->conn->close();
             co_return out;
-        }(&sched, &known, how));
+        }(&sched, &known, how, ctxs));
 
-    CHECK_FALSE(authoritative);
+    CAPTURE(authoritative.error_or(std::string{}));
+    REQUIRE(authoritative.has_value());
+    CHECK_FALSE(*authoritative);
     CHECK(known.count.load() == 0);
 }
 
@@ -545,19 +634,20 @@ TEST_CASE("the HTTP/2 client's pool gives a connection over TLS its own origin, 
 
     const auto port = std::to_string(server.local_port());
     const auto out  = sched.run_to_completion(
-        [](http::detail::connection_pool* pool, std::string port) -> task<std::vector<bool>>
+        [](http::detail::connection_pool* pool, std::string port) -> task<std::expected<std::vector<bool>, std::string>>
         {
             auto leased = co_await pool->acquire("https", "127.0.0.1", port, true);
-            REQUIRE(leased.has_value());
-            REQUIRE(leased->http2 != nullptr);
+            if (!leased.has_value()) co_return std::unexpected("acquire: " + leased.error().message());
+            if (leased->http2 == nullptr) co_return std::unexpected("the connection isn't HTTP/2");
             const auto conn = leased->http2;
 
             // by the time a response has come, the ORIGIN (sent before the server read anything) has.
             http::client_request req{.method = http::request_method::GET,
                                      .uri    = net::url::parse("https://127.0.0.1:" + port + "/").value()};
             auto                 resp = co_await conn->send(req);
-            REQUIRE(resp.has_value());
-            CHECK(resp->status_code == http::status::NO_CONTENT);
+            if (!resp.has_value()) co_return std::unexpected("send: " + resp.error().message());
+            if (resp->status_code != http::status::NO_CONTENT)
+                co_return std::unexpected(std::format("status {}", static_cast<int>(resp->status_code)));
             resp->body.reset();
 
             // its own (as the pool gave it), the server's two, and one the server didn't list.
@@ -565,5 +655,7 @@ TEST_CASE("the HTTP/2 client's pool gives a connection over TLS its own origin, 
                               {"https://127.0.0.1:" + port, "https://b.test", "https://x.w.test", "https://a.test"});
         }(pool.get(), port));
 
-    CHECK(out == std::vector<bool>{true, true, true, false});
+    CAPTURE(out.error_or(std::string{}));
+    REQUIRE(out.has_value());
+    CHECK(*out == std::vector<bool>{true, true, true, false});
 }

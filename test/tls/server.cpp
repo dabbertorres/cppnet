@@ -630,8 +630,8 @@ TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 share
         // the connection agrees on HTTP/2, and its two streams are taken.
         auto first  = co_await client->get(base + "/held");
         auto second = co_await client->get(base + "/held");
-        REQUIRE(first.has_value());
-        REQUIRE(second.has_value());
+        if (!first.has_value()) co_return std::vector<std::string>{"first: " + first.error().message()};
+        if (!second.has_value()) co_return std::vector<std::string>{"second: " + second.error().message()};
         std::vector<std::string> out{std::format("open {}", client->stats().open)};
 
         // then a burst of two: the first connects, and the second, as the host's known to speak HTTP/2 (its connection
@@ -641,17 +641,23 @@ TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 share
         std::atomic<std::uint64_t> done{0};
         for (int i = 0; i < n; ++i)
         {
-            REQUIRE(sched->spawn(
-                [](net::io::scheduler*         sched,
-                   http::client*               client,
-                   std::string                 url,
-                   std::string*                result,
-                   std::atomic<std::uint64_t>* done) -> task<>
-                {
-                    *result = co_await fetch(client, url);
-                    done->fetch_add(1);
-                    sched->notify_all(*done);
-                }(sched, client, base + "/", &results[static_cast<std::size_t>(i)], &done)));
+            auto* result = &results[static_cast<std::size_t>(i)];
+            if (!sched->spawn(
+                    [](net::io::scheduler*         sched,
+                       http::client*               client,
+                       std::string                 url,
+                       std::string*                result,
+                       std::atomic<std::uint64_t>* done) -> task<>
+                    {
+                        *result = co_await fetch(client, url);
+                        done->fetch_add(1);
+                        sched->notify_all(*done);
+                    }(sched, client, base + "/", result, &done)))
+            {
+                // (counted as done, as nothing else will.)
+                *result = "didn't start";
+                done.fetch_add(1);
+            }
         }
 
         for (auto seen = done.load(); seen < n; seen = done.load()) (void)co_await sched->wait_on(done, seen);
@@ -764,30 +770,33 @@ TEST_CASE("closing an HTTPS server ends handshakes in progress", "[tls][http][se
 
 TEST_CASE("an HTTPS server serves HTTP/2 to clients that agree on h2", "[tls][http][server][http2]")
 {
+    const auto         ctx = trusting_client({"h2", "http/1.1"});
     net::io::scheduler sched{make_pool()};
     https_server       server{&sched, tls_config()};
 
-    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::pair<std::string, std::string>>
+    // the response's status and body, or what failed (as the status).
+    const auto test = [](net::io::scheduler* sched,
+                         std::string         port,
+                         tls::client_context ctx) -> task<std::pair<std::string, std::string>>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-        REQUIRE(conn.has_value());
+        if (!conn.has_value()) co_return std::pair{"connect: " + conn.error().message(), std::string{}};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"h2", "http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
-        REQUIRE(s.has_value());
+        auto s =
+            co_await tls::stream::connect(std::move(*conn), std::move(ctx), "localhost", net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return std::pair{"handshake: " + s.error().message(), std::string{}};
         if (s->alpn() != "h2") co_return std::pair{"ALPN: " + std::string{s->alpn()}, std::string{}};
 
         test::h2_client client{&*s, &*s, &s->socket()};
-        const auto      id = client.request("GET", "/");
-        REQUIRE(co_await client.wait_for(id));
+        const auto      id       = client.request("GET", "/");
+        const bool      answered = co_await client.wait_for(id);
+        if (!answered) co_return std::pair{"no response", std::string{}};
 
         co_await s->close();
         co_return std::pair{client.responses[id].status, client.responses[id].body};
     };
 
-    auto [status, body] = sched.run_to_completion(test(&sched, server.port()));
+    auto [status, body] = sched.run_to_completion(test(&sched, server.port(), ctx));
     CHECK(status == "200");
     CHECK(body == "hello over TLS");
 }
@@ -811,38 +820,46 @@ TEST_CASE("an HTTPS server's HTTP/2 connections send ORIGIN with its origins, af
         test_case{.name = "none", .origins = {}, .want = {}});
     CAPTURE(tc.name);
 
+    const auto         ctx = trusting_client({"h2"});
     net::io::scheduler sched{make_pool()};
     auto               cfg = tls_config();
     cfg.http2_origins      = tc.origins;
     https_server server{&sched, cfg};
 
-    // what the client received: the frames' types, and the ORIGIN frames' entries.
-    using received = std::pair<std::vector<http2::frame_type>, std::vector<std::vector<std::string>>>;
+    // what the client received: the frames' types, and the ORIGIN frames' entries; or what failed.
+    struct received
+    {
+        std::vector<http2::frame_type>        types;
+        std::vector<std::vector<std::string>> origins;
+        std::string                           failed;
+    };
 
-    const auto test = [](net::io::scheduler* sched, std::string port) -> task<received>
+    const auto test = [](net::io::scheduler* sched, std::string port, tls::client_context ctx) -> task<received>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-        REQUIRE(conn.has_value());
+        if (!conn.has_value()) co_return received{.types = {}, .origins = {}, .failed = "connect"};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"h2"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
-        REQUIRE(s.has_value());
-        REQUIRE(s->alpn() == "h2");
+        auto s =
+            co_await tls::stream::connect(std::move(*conn), std::move(ctx), "localhost", net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return received{.types = {}, .origins = {}, .failed = "handshake"};
+        if (s->alpn() != "h2") co_return received{.types = {}, .origins = {}, .failed = "ALPN"};
 
         // by the time a request's answered, the ORIGIN (sent before the server read anything) has come.
         test::h2_client client{&*s, &*s, &s->socket()};
         const auto      id   = client.request("GET", "/");
         const bool      done = co_await client.wait_for(id);
-        REQUIRE(done);
-        CHECK(client.responses[id].body == "hello over TLS");
+        std::string     failed;
+        if (!done) failed = "no response";
+        else if (client.responses[id].body != "hello over TLS") failed = "the body: " + client.responses[id].body;
 
         co_await s->close();
-        co_return received{std::move(client.frame_types), std::move(client.origins)};
+        co_return received{.types   = std::move(client.frame_types),
+                           .origins = std::move(client.origins),
+                           .failed  = failed};
     };
 
-    const auto [types, origins] = sched.run_to_completion(test(&sched, server.port()));
+    const auto [types, origins, failed] = sched.run_to_completion(test(&sched, server.port(), ctx));
+    CHECK(failed.empty());
     REQUIRE_FALSE(types.empty());
     CHECK(types.front() == http2::frame_type::settings);
 
@@ -887,27 +904,27 @@ TEST_CASE("without http2, an HTTPS server doesn't agree on h2", "[tls][http][ser
 {
     net::io::scheduler sched{make_pool()};
 
-    auto cfg  = tls_config();
-    cfg.http2 = false;
+    auto cfg         = tls_config();
+    cfg.http2        = false;
+    const auto   ctx = trusting_client({"h2"});
     https_server server{&sched, cfg};
 
-    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::string>
+    // the protocol agreed on with ALPN (none: ""), or what failed.
+    const auto test = [](net::io::scheduler* sched, std::string port, tls::client_context ctx) -> task<std::string>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-        REQUIRE(conn.has_value());
+        if (!conn.has_value()) co_return "connect: " + conn.error().message();
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"h2"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
-        REQUIRE(s.has_value());
+        auto s =
+            co_await tls::stream::connect(std::move(*conn), std::move(ctx), "localhost", net::io::clock::now() + 5s);
+        if (!s.has_value()) co_return "handshake: " + s.error().message();
 
         const std::string alpn{s->alpn()};
         co_await s->close();
         co_return alpn;
     };
 
-    CHECK(sched.run_to_completion(test(&sched, server.port())).empty());
+    CHECK(sched.run_to_completion(test(&sched, server.port(), ctx)).empty());
 }
 
 TEST_CASE("an HTTPS server sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP sockets, not on HTTP/1.1's",
@@ -1017,23 +1034,26 @@ TEST_CASE("an HTTPS client sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP
 
 TEST_CASE("an HTTPS server's error responses end with close_notify", "[tls][http][server]")
 {
+    const auto         ctx = trusting_client();
     net::io::scheduler sched{make_pool()};
     https_server       server{&sched, tls_config()};
 
-    const auto test = [](net::io::scheduler* sched, std::string port) -> task<std::pair<std::string, std::error_code>>
+    const auto test = [](net::io::scheduler* sched,
+                         std::string         port,
+                         tls::client_context ctx) -> task<std::pair<std::string, std::error_code>>
     {
         auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
         if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
 
         auto s =
-            co_await tls::stream::connect(std::move(*conn), trusting_client(), "localhost", net::io::clock::now() + 5s);
+            co_await tls::stream::connect(std::move(*conn), std::move(ctx), "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
 
         co_await net::io::write_all(*s, "NOT HTTP\r\n\r\n"sv);
         co_return co_await read_to_end(*s);
     };
 
-    auto [received, err] = sched.run_to_completion(test(&sched, server.port()));
+    auto [received, err] = sched.run_to_completion(test(&sched, server.port(), ctx));
     CAPTURE(received, err.message());
     CHECK(received.starts_with("HTTP/1.1 400 "));
     CHECK(err == net::io::errc::end_of_stream);
@@ -1060,6 +1080,7 @@ TEST_CASE("closing an HTTPS server lets a request in progress finish", "[tls][ht
                     co_await net::io::write_all(*writer, out);
                 });
 
+    const auto   ctx = trusting_client({"http/1.1"});
     http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
     REQUIRE(sched.spawn(server.serve()));
 
@@ -1069,10 +1090,7 @@ TEST_CASE("closing an HTTPS server lets a request in progress finish", "[tls][ht
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
         if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
 
         (void)co_await net::io::write_all(*s, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nhello"sv);
@@ -1102,26 +1120,6 @@ TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is sti
           "close_notify",
           "[tls][http][server][cancel][watch]")
 {
-    // NOTE: before the scheduler, as the handler sets them.
-    std::atomic<int> stopped = -1;
-
-    net::io::scheduler sched{make_pool()};
-
-    http::router router;
-    router.GET("/wait",
-               [&](const http::server_request& req, http::response_writer& resp) -> task<void>
-               {
-                   const auto err = co_await sched.sleep_until(net::io::clock::now() + 5s, req.stop);
-                   stopped.store(err ? 1 : 0);
-
-                   const auto msg  = err ? "stopped"sv : "slept"sv;
-                   auto*      body = co_await resp.send(http::status::OK, msg.size());
-                   co_await net::io::write_all(*body, msg);
-               });
-
-    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
-    REQUIRE(sched.spawn(server.serve()));
-
     // with close_notify (which, over TLS 1.3, the server answers only once it has responded), or just the end of the
     // TCP stream (a TLS stream cut short).
     const bool close_notify = GENERATE(true, false);
@@ -1134,43 +1132,82 @@ TEST_CASE("an HTTPS client leaving stops its waiting handler's token, and is sti
     auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .alpn = {"http/1.1"}, .max_version = version});
     REQUIRE(ctx.has_value());
 
-    const auto test = [&] -> task<std::pair<std::string, std::error_code>>
+    // how the handler's wait ended: 0 until it has, then 1 stopped, 2 slept to its end. NOTE: before the scheduler, as
+    // the handler sets it.
+    std::atomic<std::uint64_t> stopped{0};
+
+    net::io::scheduler sched{make_pool()};
+
+    http::router router;
+    router.GET("/wait",
+               [&](const http::server_request& req, http::response_writer& resp) -> task<void>
+               {
+                   const auto err = co_await sched.sleep_until(net::io::clock::now() + 5s, req.stop);
+                   stopped.store(err ? 1 : 2);
+                   sched.notify_all(stopped);
+
+                   const auto msg  = err ? "stopped"sv : "slept"sv;
+                   auto*      body = co_await resp.send(http::status::OK, msg.size());
+                   co_await net::io::write_all(*body, msg);
+               });
+
+    http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
+    REQUIRE(sched.spawn(server.serve()));
+
+    struct outcome
+    {
+        std::string     received;
+        std::error_code err;
+        std::uint64_t   stopped = 0; // how the handler's wait had ended once the client was done (see stopped)
+    };
+
+    const auto test = [&] -> task<outcome>
     {
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
-        if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
+        if (!conn.has_value()) co_return outcome{.received = "connect failed", .err = conn.error()};
 
         auto s = co_await tls::stream::connect(std::move(*conn), *ctx, "localhost", net::io::clock::now() + 5s);
-        if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
-        if (s->version() != version) co_return std::pair{"another version", std::error_code{}};
+        if (!s.has_value()) co_return outcome{.received = "handshake failed", .err = s.error()};
+        if (s->version() != version) co_return outcome{.received = "another version", .err = {}};
 
         (void)co_await net::io::write_all(*s, "GET /wait HTTP/1.1\r\nHost: x\r\n\r\n"sv);
 
         if (close_notify) (void)co_await s->shutdown();
         else s->socket().shutdown_write();
 
-        co_return co_await read_to_end(*s);
+        auto [received, err] = co_await read_to_end(*s);
+
+        // the handler's stop is waited for while the scheduler runs, as its stopping would end the handler's wait (or
+        // the server would never call it) as well. NOTE: over TLS 1.2, the server's close_notify (all the client
+        // reads) is sent as the server reads the client's, before the handler's even begun.
+        const auto deadline = net::io::clock::now() + 5s;
+        while (stopped.load() == 0)
+        {
+            if (co_await sched.wait_on(stopped, 0, deadline)) break;
+        }
+        co_return outcome{.received = std::move(received), .err = err, .stopped = stopped.load()};
     };
 
-    const auto start     = std::chrono::steady_clock::now();
-    auto [received, err] = sched.run_to_completion(test());
-    CAPTURE(received, err.message());
+    const auto start = std::chrono::steady_clock::now();
+    const auto out   = sched.run_to_completion(test());
+    CAPTURE(out.received, out.err.message());
 
-    CHECK(stopped.load() == 1);
+    CHECK(out.stopped == 1);
     CHECK(std::chrono::steady_clock::now() - start < 3s);
 
     // over TLS 1.2, the server answered the client's close_notify as it read it, so it couldn't respond: only its
     // close_notify came.
     if (close_notify && version == tls::version::tls12)
     {
-        CHECK(received.empty());
+        CHECK(out.received.empty());
     }
     else
     {
         // and then close_notify.
-        CHECK(received.starts_with("HTTP/1.1 200 OK\r\n"));
-        CHECK(received.ends_with("\r\n\r\nstopped"));
+        CHECK(out.received.starts_with("HTTP/1.1 200 OK\r\n"));
+        CHECK(out.received.ends_with("\r\n\r\nstopped"));
     }
-    CHECK(err == net::io::errc::end_of_stream);
+    CHECK(out.err == net::io::errc::end_of_stream);
 }
 
 TEST_CASE("an HTTPS handler switches protocols, and the connection ends with close_notify",
@@ -1188,6 +1225,9 @@ TEST_CASE("an HTTPS handler switches protocols, and the connection ends with clo
     router.GET("/echo",
                [&](http::server_request& /*req*/, http::response_writer& rw) -> task<void>
                {
+                   // NOTE: timed. Nothing a test sees says the watch has begun (its read waiting), which the wait
+                   //       usually lets it; if it hasn't, the switch finds none to end, and the test passes all the
+                   //       same, having covered that path instead.
                    if (waits) (void)co_await sched.sleep_until(net::io::clock::now() + 50ms);
 
                    http::headers fields;
@@ -1201,6 +1241,7 @@ TEST_CASE("an HTTPS handler switches protocols, and the connection ends with clo
                    (void)co_await net::io::write_all((*switched)->writer(), echoed ? echoed.message() : "ok");
                });
 
+    const auto   ctx = trusting_client({"http/1.1"});
     http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
     REQUIRE(sched.spawn(server.serve()));
 
@@ -1211,10 +1252,7 @@ TEST_CASE("an HTTPS handler switches protocols, and the connection ends with clo
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
         if (!conn.has_value()) co_return std::pair{"connect failed", conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{"handshake failed", s.error()};
 
         (void)co_await net::io::write_all(
@@ -1263,6 +1301,7 @@ TEST_CASE("a WebSocket over HTTPS echoes, and closes with the close handshake, t
                    }
                });
 
+    const auto   ctx = trusting_client({"http/1.1"});
     http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
     REQUIRE(sched.spawn(server.serve()));
 
@@ -1273,10 +1312,7 @@ TEST_CASE("a WebSocket over HTTPS echoes, and closes with the close handshake, t
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
         if (!conn.has_value()) co_return std::tuple{"connect failed", frames, conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::tuple{"handshake failed", frames, s.error()};
 
         test::websocket::raw_peer peer{*s, *s};
@@ -1352,6 +1388,7 @@ TEST_CASE("a WebSocket over HTTPS pings when idle, and goes away when the server
                    }
                });
 
+    const auto   ctx = trusting_client({"http/1.1"});
     http::server server{&sched, net::listener::make(&sched, "127.0.0.1", "0").value(), std::move(router), tls_config()};
     REQUIRE(sched.spawn(server.serve()));
 
@@ -1362,10 +1399,7 @@ TEST_CASE("a WebSocket over HTTPS pings when idle, and goes away when the server
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
         if (!conn.has_value()) co_return std::pair{frames, conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"http/1.1"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{frames, s.error()};
 
         test::websocket::raw_peer peer{*s, *s};
@@ -1457,7 +1491,10 @@ TEST_CASE("a WebSocket client opens wss:// over HTTP/1.1, from a server that wou
                    }
                });
 
-    https_server server{&sched, tls_config(), std::move(router)};
+    // NOTE: a handshake deadline far longer than the default 5 s: the untrusting client's pool makes its context, so
+    //       loads the system's trust store (a second or more, the first time in a process, on macOS), only once it has
+    //       connected, which counts against the server's deadline for the handshake.
+    https_server server{&sched, tls_config(60s), std::move(router)};
 
     auto options  = trusting_options();
     options.http2 = http2;
@@ -1619,6 +1656,7 @@ TEST_CASE("a WebSocket over an HTTP/2 stream of an HTTPS connection (ALPN h2) ec
                    }
                });
 
+    const auto   ctx = trusting_client({"h2"});
     https_server server{&sched, tls_config(), std::move(router)};
 
     const auto test = [&] -> task<std::pair<std::vector<std::string>, std::error_code>>
@@ -1629,10 +1667,7 @@ TEST_CASE("a WebSocket over an HTTP/2 stream of an HTTPS connection (ALPN h2) ec
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", server.port());
         if (!conn.has_value()) co_return std::pair{frames, conn.error()};
 
-        auto s = co_await tls::stream::connect(std::move(*conn),
-                                               trusting_client({"h2"}),
-                                               "localhost",
-                                               net::io::clock::now() + 5s);
+        auto s = co_await tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
         if (!s.has_value()) co_return std::pair{frames, s.error()};
         if (s->alpn() != "h2") co_return std::pair{std::vector<std::string>{"ALPN: " + std::string{s->alpn()}}, ended};
 

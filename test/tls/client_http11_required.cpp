@@ -89,14 +89,15 @@ task<> get(net::io::scheduler* sched, http::client* c, std::string url, fetched*
     stop->shutdown();
 }
 
-// accept accepts a connection on listener, and runs a server's handshake over it, offering h2 and http/1.1 by ALPN.
-task<std::optional<tls::stream>> accept(const net::listener& listener)
+// accept accepts a connection on listener, and runs a server's handshake over it (with ctx), offering h2 and http/1.1
+// by ALPN.
+task<std::optional<tls::stream>> accept(const net::listener& listener, tls::server_context ctx)
 {
     auto accepted = co_await listener.accept();
     if (!accepted.has_value()) co_return std::nullopt;
 
     auto stream = co_await tls::stream::accept(std::move(*accepted),
-                                               server_with(pki().names_chain, pki().names_key),
+                                               std::move(ctx),
                                                net::io::clock::now() + 5s,
                                                {
                                                    .alpn = std::vector<std::string>{"h2", "http/1.1"}
@@ -133,42 +134,43 @@ TEST_CASE("over TLS, a request reset with HTTP_1_1_REQUIRED goes again on a conn
     options.response_header_timeout = 10s;
     http::client client{&sched, options};
 
-    const auto test = [&] -> task<>
+    const auto ctx = server_with(pki().names_chain, pki().names_key);
+
+    // what went wrong with the test's own steps, if anything.
+    const auto test = [&] -> task<std::string>
     {
         const auto url = std::format("https://127.0.0.1:{}/x", listener.local_port());
-        REQUIRE(sched.spawn(get(&sched, &client, url, &out, &listener)));
+        if (!sched.spawn(get(&sched, &client, url, &out, &listener))) co_return "the request didn't start";
 
         // HTTP/2 first, as ALPN agrees.
-        auto first = co_await accept(listener);
-        REQUIRE(first.has_value());
-        CHECK(first->alpn() == "h2");
+        auto first = co_await accept(listener, ctx);
+        if (!first.has_value()) co_return "the first connection wasn't made";
+        if (first->alpn() != "h2") co_return "the first connection's ALPN: " + std::string{first->alpn()};
 
         http::detail::connection side{std::move(*first)};
         test::h2_client          played{&http::detail::as_reader(side),
                                         &http::detail::as_writer(side),
                                         &http::detail::socket_of(side),
                                         http2::role::server};
-        bool                     got = co_await played.pump([&] { return played.responses.contains(1); });
-        REQUIRE(got);
+        if (!co_await played.pump([&] { return played.responses.contains(1); })) co_return "no request over HTTP/2";
         played.s.reset(1, http2::error_code::http_1_1_required);
-        got = co_await played.pump([] { return true; });
-        REQUIRE(got);
+        if (!co_await played.pump([] { return true; })) co_return "the reset wasn't sent";
 
         // then a connection whose client offered only http/1.1, though the server offers h2 first.
-        auto second = co_await accept(listener);
-        REQUIRE(second.has_value());
-        CHECK(second->alpn() == "http/1.1");
+        auto second = co_await accept(listener, ctx);
+        if (!second.has_value()) co_return "the second connection wasn't made";
+        if (second->alpn() != "http/1.1") co_return "the second connection's ALPN: " + std::string{second->alpn()};
 
         const auto head = co_await read_head(*second);
-        REQUIRE(head.has_value());
-        CHECK(head->starts_with("GET /x HTTP/1.1\r\n"));
+        if (!head.has_value()) co_return "no request over HTTP/1.1";
+        if (!head->starts_with("GET /x HTTP/1.1\r\n")) co_return "the request: " + *head;
         const auto res = co_await net::io::write_all(*second, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"sv);
-        REQUIRE_FALSE(res.err);
+        if (res.err) co_return "the response: " + res.err.message();
 
-        got = co_await out.wait(&sched);
-        REQUIRE(got);
+        if (!co_await out.wait(&sched)) co_return "the request didn't finish";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    CHECK(sched.run_to_completion(test()).empty());
     CHECK(out.line == "1 200 ok");
 }

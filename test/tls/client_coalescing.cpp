@@ -499,12 +499,13 @@ TEST_CASE("a request whose host has an idle connection takes it, rather than bei
 namespace
 {
 
-// played_server is a server the test plays, over TLS with the certificate for a.test and b.test: it accepts one
+// played_server is a server the test plays, over TLS with the certificate for a.test and b.test (ctx): it accepts one
 // connection on its listener (which run() owns), and runs the handshake, as a task of its own while the client's pool
 // connects. NOTE: declared before the scheduler, as its task uses it.
 struct played_server
 {
     net::io::scheduler*                                        sched = nullptr;
+    tls::server_context                                        ctx;
     std::optional<std::expected<tls::stream, std::error_code>> result;
     std::atomic<std::uint64_t>                                 done{0};
 
@@ -514,7 +515,7 @@ struct played_server
         if (accepted.has_value())
         {
             self->result = co_await tls::stream::accept(std::move(*accepted),
-                                                        server_with(pki().names_chain, pki().names_key),
+                                                        self->ctx,
                                                         net::io::clock::now() + 5s,
                                                         {.alpn = std::vector<std::string>{"h2"}});
         }
@@ -523,13 +524,15 @@ struct played_server
         self->sched->notify_all(self->done);
     }
 
-    task<> wait()
+    // wait waits (up to 10 s) for run() to finish, returning whether it has: until it has, result isn't to be read.
+    task<bool> wait()
     {
         const auto deadline = net::io::clock::now() + 10s;
         while (done.load() == 0)
         {
-            if (co_await sched->wait_on(done, 0, deadline)) co_return;
+            if (co_await sched->wait_on(done, 0, deadline)) break;
         }
+        co_return done.load() != 0;
     }
 };
 
@@ -541,7 +544,7 @@ TEST_CASE("a request isn't coalesced onto a connection whose server listed its o
 {
     dns::resolver resolver{names()};
 
-    played_server server;
+    played_server server{.sched = nullptr, .ctx = server_with(pki().names_chain, pki().names_key), .result = {}};
 
     net::io::scheduler sched{make_pool()};
     server.sched       = &sched;
@@ -558,17 +561,28 @@ TEST_CASE("a request isn't coalesced onto a connection whose server listed its o
         std::string                    key;
         std::optional<std::error_code> c_error; // c.test's acquire's error, if it failed
         bool                           c_coalesced = false;
+        std::string                    failed; // what went wrong with the test's own steps, if anything
     };
 
     const auto out = sched.run_to_completion(
         [](http::detail::connection_pool* pool, played_server* server, std::string port) -> task<outcome>
         {
+            outcome    out;
+            const auto failed = [&out](std::string what)
+            {
+                out.failed = std::move(what);
+                return out;
+            };
+
             auto a = co_await pool->acquire("https", "a.test", port, true);
-            REQUIRE(a.has_value());
-            REQUIRE(a->http2 != nullptr);
-            co_await server->wait();
-            REQUIRE(server->result.has_value());
-            REQUIRE(server->result->has_value());
+            if (!a.has_value()) co_return failed("a.test: " + a.error().message());
+            if (a->http2 == nullptr) co_return failed("a.test's connection isn't HTTP/2");
+
+            const bool accepted = co_await server->wait();
+            if (!accepted) co_return failed("the server's handshake didn't finish");
+            if (!server->result.has_value()) co_return failed("the server accepted no connection");
+            if (!server->result->has_value())
+                co_return failed("the server's handshake: " + server->result->error().message());
 
             http::detail::connection side{std::move(**server->result)};
             test::h2_client          played{&http::detail::as_reader(side),
@@ -579,17 +593,15 @@ TEST_CASE("a request isn't coalesced onto a connection whose server listed its o
             // c.test is listed, but the certificate doesn't have it (cppnet's server would refuse to list it). The
             // PINGs make sure the client's done with the receive the ORIGIN came in (see client_origin.cpp).
             const std::vector<std::string> origins{"https://b.test:" + port, "https://c.test:" + port};
-            REQUIRE(!played.s.submit_origin(origins));
+            if (played.s.submit_origin(origins)) co_return failed("ORIGIN wasn't submitted");
             const bool synced = co_await played.sync();
-            REQUIRE(synced);
+            if (!synced) co_return failed("no answer to the first PING");
             const bool synced_again = co_await played.sync();
-            REQUIRE(synced_again);
-
-            outcome out;
+            if (!synced_again) co_return failed("no answer to the second PING");
 
             // b.test's is coalesced.
             auto b = co_await pool->acquire("https", "b.test", port, true);
-            REQUIRE(b.has_value());
+            if (!b.has_value()) co_return failed("b.test: " + b.error().message());
             out.same      = b->http2 == a->http2;
             out.coalesced = b->coalesced;
             out.key       = b->key;
@@ -603,6 +615,7 @@ TEST_CASE("a request isn't coalesced onto a connection whose server listed its o
             co_return out;
         }(pool.get(), &server, port));
 
+    CHECK(out.failed.empty());
     CHECK(out.same);
     CHECK(out.coalesced);
     CHECK(out.key == "https://a.test " + port);
@@ -898,12 +911,13 @@ namespace
 {
 
 // dropping_server is b.test's server, played (test::h2_client in its server role, over TLS with the certificate for
-// a.test, b.test and *.w.test, HTTP/2 by ALPN): it ends its first connection (close_notify, then the socket closed, but
-// no GOAWAY) once a request's head has come on it, and answers the request on its second. It accepts on its listener
-// (which run() owns). NOTE: declared before the scheduler, as its task uses it.
+// a.test, b.test and *.w.test, ctx, HTTP/2 by ALPN): it ends its first connection (close_notify, then the socket
+// closed, but no GOAWAY) once a request's head has come on it, and answers the request on its second. It accepts on
+// its listener (which run() owns). NOTE: declared before the scheduler, as its task uses it.
 struct dropping_server
 {
-    std::atomic<int> heads{0}; // requests' heads, on either connection
+    tls::server_context ctx;
+    std::atomic<int>    heads{0}; // requests' heads, on either connection
 
     static task<> run(dropping_server* self, net::listener listener)
     {
@@ -913,7 +927,7 @@ struct dropping_server
             if (!accepted.has_value()) co_return;
 
             auto stream = co_await tls::stream::accept(std::move(*accepted),
-                                                       server_with(pki().names_chain, pki().names_key),
+                                                       self->ctx,
                                                        net::io::clock::now() + 5s,
                                                        {.alpn = std::vector<std::string>{"h2"}});
             if (!stream.has_value()) co_return;
@@ -950,7 +964,7 @@ TEST_CASE("a coalesced request's 421 sends it again as a first attempt, which is
     dns::resolver resolver{names()};
     served        a_seen;
     a_seen.misdirect = 1;
-    dropping_server b_server;
+    dropping_server b_server{.ctx = server_with(pki().names_chain, pki().names_key)};
 
     net::io::scheduler sched{make_pool()};
     auto               lb      = listen(&sched);
@@ -1056,18 +1070,22 @@ TEST_CASE("a coalesced request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 t
     const auto   b_server = serve(&sched, std::move(lb), &b_seen, {});
     http::client client{&sched, options_for(&resolver, true)};
 
-    const auto test = [&] -> task<>
+    const auto ctx = server_with(pki().names_chain, pki().names_key);
+
+    // what went wrong with the test's own steps, if anything.
+    const auto test = [&] -> task<std::string>
     {
         // a.test's connection, to the server the test plays, which lists b.test's origin. The PINGs make sure the
         // client's done with the receive the ORIGIN came in (see client_origin.cpp).
-        REQUIRE(sched.spawn(get(&client, url_of("a.test", pa), false, &out, &la)));
+        if (!sched.spawn(get(&client, url_of("a.test", pa), false, &out, &la)))
+            co_return "a.test's request didn't start";
         auto accepted = co_await la.accept();
-        REQUIRE(accepted.has_value());
+        if (!accepted.has_value()) co_return "accept: " + accepted.error().message();
         auto stream = co_await tls::stream::accept(std::move(*accepted),
-                                                   server_with(pki().names_chain, pki().names_key),
+                                                   ctx,
                                                    net::io::clock::now() + 5s,
                                                    {.alpn = std::vector<std::string>{"h2"}});
-        REQUIRE(stream.has_value());
+        if (!stream.has_value()) co_return "handshake: " + stream.error().message();
 
         http::detail::connection side{std::move(*stream)};
         test::h2_client          played{&http::detail::as_reader(side),
@@ -1075,44 +1093,37 @@ TEST_CASE("a coalesced request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 t
                                         &http::detail::socket_of(side),
                                         http2::role::server};
 
-        bool done = co_await played.pump([&] { return played.responses.contains(1); });
-        REQUIRE(done);
-        REQUIRE_FALSE(played.s.submit_origin(std::vector<std::string>{origin("b.test", pb)}));
+        if (!co_await played.pump([&] { return played.responses.contains(1); })) co_return "no request for a.test";
+        if (played.s.submit_origin(std::vector<std::string>{origin("b.test", pb)})) co_return "ORIGIN wasn't submitted";
         played.respond(1, "200", "a.test");
-        done = co_await played.sync();
-        REQUIRE(done);
-        done = co_await played.sync();
-        REQUIRE(done);
-        done = co_await out.reached(1);
-        REQUIRE(done);
+        if (!co_await played.sync()) co_return "no answer to the first PING";
+        if (!co_await played.sync()) co_return "no answer to the second PING";
+        if (!co_await out.reached(1)) co_return "a.test's request didn't finish";
 
         // b.test's request is coalesced onto it, and reset: it goes to b.test's own server, which closes the
         // connection after it, so the next request to b.test has none.
-        REQUIRE(sched.spawn(get(&client, url_of("b.test", pb), true, &out)));
-        done = co_await played.pump([&] { return played.responses.contains(3); });
-        REQUIRE(done);
-        CHECK(std::ranges::find(played.responses[3].headers,
-                                std::pair<std::string, std::string>{":authority", std::format("b.test:{}", pb)})
-              != played.responses[3].headers.end());
+        if (!sched.spawn(get(&client, url_of("b.test", pb), true, &out))) co_return "b.test's request didn't start";
+        if (!co_await played.pump([&] { return played.responses.contains(3); })) co_return "b.test's wasn't coalesced";
+        const auto& headers = played.responses[3].headers;
+        if (std::ranges::find(headers, std::pair<std::string, std::string>{":authority", std::format("b.test:{}", pb)})
+            == headers.end())
+            co_return "b.test's request had another :authority";
         played.s.reset(3, http2::error_code::http_1_1_required);
-        done = co_await played.pump([] { return true; });
-        REQUIRE(done);
-        done = co_await out.reached(2);
-        REQUIRE(done);
+        if (!co_await played.pump([] { return true; })) co_return "the reset wasn't sent";
+        if (!co_await out.reached(2)) co_return "b.test's request didn't finish";
 
         // 0xd says nothing of whose the origin is: the connection's Origin Set still has b.test's, so the next is
         // coalesced again.
-        REQUIRE(sched.spawn(get(&client, url_of("b.test", pb), false, &out)));
-        done = co_await played.pump([&] { return played.responses.contains(5); });
-        REQUIRE(done);
+        if (!sched.spawn(get(&client, url_of("b.test", pb), false, &out))) co_return "the next request didn't start";
+        if (!co_await played.pump([&] { return played.responses.contains(5); }))
+            co_return "the next request wasn't coalesced";
         played.respond(5, "200", "coalesced");
-        done = co_await played.pump([] { return true; });
-        REQUIRE(done);
-        done = co_await out.reached(3);
-        REQUIRE(done);
+        if (!co_await played.pump([] { return true; })) co_return "the response wasn't sent";
+        if (!co_await out.reached(3)) co_return "the next request didn't finish";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    CHECK(sched.run_to_completion(test()).empty());
     CHECK(out.all() == std::vector<std::string>{"2 200 a.test", "1 200 b.test", "2 200 coalesced"});
     CHECK(b_seen.count("b.test") == 1);
 }

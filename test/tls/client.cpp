@@ -104,6 +104,7 @@ struct scripted_server
 {
     net::io::scheduler* sched;
     net::listener       listener;
+    tls::server_context ctx;
     Respond             respond;
     std::atomic<int>    accepted{0};
     std::atomic<int>    requests{0};
@@ -111,6 +112,7 @@ struct scripted_server
     scripted_server(net::io::scheduler* sched, Respond respond)
         : sched{sched}
         , listener{net::listener::make(sched, "127.0.0.1", "0").value()}
+        , ctx{server_with(pki().localhost_chain, pki().localhost_key)}
         , respond{std::move(respond)}
     {
         REQUIRE(sched->spawn(serve(this)));
@@ -126,9 +128,7 @@ struct scripted_server
             if (!conn.has_value()) co_return;
             ++self->accepted;
 
-            auto s = co_await tls::stream::accept(std::move(*conn),
-                                                  server_with(pki().localhost_chain, pki().localhost_key),
-                                                  net::io::clock::now() + 5s);
+            auto s = co_await tls::stream::accept(std::move(*conn), self->ctx, net::io::clock::now() + 5s);
             if (!s.has_value()) continue;
 
             std::string                  head;
@@ -275,12 +275,14 @@ TEST_CASE("a request canceled during its TLS handshake fails, and counts its con
                          std::string         port) -> task<std::pair<std::error_code, net::io::clock::duration>>
     {
         std::stop_source source;
-        REQUIRE(sched->spawn(
-            [](net::io::scheduler* sched, std::stop_source source) -> task<>
-            {
-                (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
-                source.request_stop();
-            }(sched, source)));
+        if (!sched->spawn(
+                [](net::io::scheduler* sched, std::stop_source source) -> task<>
+                {
+                    (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+                    source.request_stop();
+                }(sched, source)))
+            co_return std::pair{std::make_error_code(std::errc::resource_unavailable_try_again),
+                                net::io::clock::duration{}};
 
         const auto start = net::io::clock::now();
         auto       resp  = co_await client->get("https://localhost:" + port + "/", source.get_token());
