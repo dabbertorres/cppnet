@@ -710,6 +710,46 @@ TEST_CASE("the server follows the request's version and Connection header", "[ht
 namespace
 {
 
+// flag is set once, by one task, for others to wait for.
+struct flag
+{
+    void set(net::io::scheduler* sched)
+    {
+        word.store(1);
+        sched->notify_all(word);
+    }
+
+    // wait waits (up to 5s) for the flag to be set, returning whether it was.
+    task<bool> wait(net::io::scheduler* sched)
+    {
+        const auto deadline = net::io::clock::now() + 5s;
+        while (word.load() == 0)
+        {
+            if (co_await sched->wait_on(word, 0, deadline)) co_return word.load() != 0;
+        }
+        co_return true;
+    }
+
+    std::atomic<std::uint64_t> word = 0;
+};
+
+// serving runs a server's serve() task until the server's closed, then sets done (which must outlive the scheduler,
+// as this may still be setting it after the server's destroyed). It takes the task, rather than calling serve() when
+// it starts: the server waits for the task from when serve() is called, and could otherwise be destroyed first.
+task<> serving(net::io::scheduler* sched, task<> serve, flag* done)
+{
+    co_await std::move(serve);
+    done->set(sched);
+}
+
+// set_by_deadline waits (up to 5s, on the test's thread) for f to be set, returning whether it was.
+bool set_by_deadline(const flag& f)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (f.word.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    return f.word.load() != 0;
+}
+
 // blocking_client is a plain, blocking connection to the server, for tests that need a client on its own thread (e.g.
 // one that doesn't read).
 class blocking_client
@@ -829,6 +869,10 @@ TEST_CASE("a server can be destroyed while the scheduler runs", "[http][server][
 
 TEST_CASE("a server can be destroyed before its serve() task starts", "[http][server][lifetime]")
 {
+    // NOTE: before the scheduler, which waits for the tasks that use them.
+    flag              serve_done;
+    std::atomic<bool> closed = false;
+
     // one worker, kept busy for a moment: serve()'s task waits behind it.
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(1)};
 
@@ -866,13 +910,29 @@ TEST_CASE("a server can be destroyed before its serve() task starts", "[http][se
             router(),
             {.host = "127.0.0.1", .port = "0"}
         };
-        REQUIRE(sched.spawn(busy(100ms)));
-        REQUIRE(sched.spawn(server.serve()));
+        // the worker's held until the server's closed, so serve()'s task can't start before.
+        const auto held = [](std::atomic<bool>* closed) -> task<>
+        {
+            // NOTE: blocking the worker, deliberately.
+            closed->wait(false);
+            co_return;
+        };
+        const auto release = [&closed] noexcept
+        {
+            closed.store(true);
+            closed.notify_all();
+        };
+        REQUIRE(sched.spawn(held(&closed)));
+        const net::util::defer released{release}; // (should a REQUIRE fail first)
+        REQUIRE(sched.spawn(serving(&sched, server.serve(), &serve_done)));
         server.close();
+        release();
 
-        // the connection's queued (the server listens from when it's constructed), but not served.
+        // once serve()'s task has returned, nothing accepts: the connection's queued (the server listens from when it's
+        // constructed), but never served.
+        REQUIRE(set_by_deadline(serve_done));
         blocking_client conn{server.local_port()};
-        conn.set_receive_timeout(500ms);
+        conn.set_receive_timeout(200ms);
         conn.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
         CHECK(conn.read_some().empty());
     }
@@ -880,6 +940,16 @@ TEST_CASE("a server can be destroyed before its serve() task starts", "[http][se
 
 TEST_CASE("the server closes connections that make no progress", "[http][server][timeout]")
 {
+    // counts the connections the server's done with, which it logs (before the scheduler, whose workers log).
+    std::atomic<int> closed = 0;
+    auto             sink   = std::make_shared<spdlog::sinks::callback_sink_mt>(
+        [&](const spdlog::details::log_msg& msg)
+        {
+            if (std::string_view{msg.payload.data(), msg.payload.size()} == "connection closing") ++closed;
+        });
+    auto logger = std::make_shared<spdlog::logger>("no-progress", sink);
+    logger->set_level(spdlog::level::trace);
+
     running_scheduler running;
 
     // a handler with a long body.
@@ -897,17 +967,19 @@ TEST_CASE("the server closes connections that make no progress", "[http][server]
     http::server server{
         &running.sched,
         std::move(router),
-        {.host = "127.0.0.1", .port = "0", .body_read_timeout = 1s, .write_timeout = 1s}
+        {.host = "127.0.0.1", .port = "0", .body_read_timeout = 1s, .write_timeout = 1s, .logger = logger}
     };
     REQUIRE(running.sched.spawn(server.serve()));
 
     SECTION("a body that doesn't come")
     {
+        // (before the request, which the server's wait for the body follows.)
+        const auto start = std::chrono::steady_clock::now();
+
         blocking_client conn{server.local_port()};
         conn.send("POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n");
 
-        auto start = std::chrono::steady_clock::now();
-        auto out   = conn.read_to_end();
+        auto out = conn.read_to_end();
         CAPTURE(out);
 
         // the server answers (the handler doesn't read the body), then gives up skipping the rest of it.
@@ -921,8 +993,11 @@ TEST_CASE("the server closes connections that make no progress", "[http][server]
         blocking_client conn{server.local_port()};
         conn.send("GET /lots HTTP/1.1\r\nHost: x\r\n\r\n");
 
-        // had the server waited, the client would get all of it now.
-        std::this_thread::sleep_for(3s);
+        // once the server's given up on its write (and so on the connection), what the client reads is what it wrote
+        // before: had it waited, the client would get all of it.
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (closed.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+        REQUIRE(closed.load() == 1);
         auto out = conn.read_to_end();
 
         CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -945,14 +1020,14 @@ TEST_CASE("a cleartext connection that sends nothing is closed at header_read_ti
     };
     REQUIRE(running.sched.spawn(server.serve()));
 
+    // (before connecting, which the server's deadline follows.)
+    const auto      start = std::chrono::steady_clock::now();
     blocking_client conn{server.local_port()};
-
-    const auto start = std::chrono::steady_clock::now();
     CHECK(conn.read_to_end().empty());
 
     const auto took = std::chrono::steady_clock::now() - start;
-    CHECK(took >= 900ms);
-    CHECK(took < 1'800ms);
+    CHECK(took >= 1s);
+    CHECK(took < 3s);
 }
 
 TEST_CASE("the server serves at most max_connections at once", "[http][server][limits]")
@@ -973,7 +1048,8 @@ TEST_CASE("the server serves at most max_connections at once", "[http][server][l
     first.send("GET /first HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(first.read_some().ends_with("\r\n\r\nfirst"));
 
-    // the second connects (the kernel accepts it), but isn't served while the first is open.
+    // the second connects (the kernel accepts it), but isn't served while the first is open. NOTE: timed, as nothing
+    // the test can see says the server is waiting for room rather than about to accept.
     blocking_client second{server.local_port()};
     second.send("GET /second HTTP/1.1\r\nHost: x\r\n\r\n");
     second.set_receive_timeout(300ms);
@@ -1054,6 +1130,10 @@ TEST_CASE("the server backs off when accepting fails, e.g. as it's out of file d
         // the connection is made (the kernel accepts it), but the server can't accept it: there's no descriptor left.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
         REQUIRE(::connect(client, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+
+        // once it's failed, it goes on for 300ms.
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (failures.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
         std::this_thread::sleep_for(300ms);
     }
 
@@ -1070,38 +1150,6 @@ TEST_CASE("the server backs off when accepting fails, e.g. as it's out of file d
 
 namespace
 {
-
-// flag is set once, by one task, for others to wait for.
-struct flag
-{
-    void set(net::io::scheduler* sched)
-    {
-        word.store(1);
-        sched->notify_all(word);
-    }
-
-    // wait waits (up to 5s) for the flag to be set, returning whether it was.
-    task<bool> wait(net::io::scheduler* sched)
-    {
-        const auto deadline = net::io::clock::now() + 5s;
-        while (word.load() == 0)
-        {
-            if (co_await sched->wait_on(word, 0, deadline)) co_return word.load() != 0;
-        }
-        co_return true;
-    }
-
-    std::atomic<std::uint64_t> word = 0;
-};
-
-// serving runs a server's serve() task until the server's closed, then sets done (which must outlive the scheduler,
-// as this may still be setting it after the server's destroyed). It takes the task, rather than calling serve() when
-// it starts: the server waits for the task from when serve() is called, and could otherwise be destroyed first.
-task<> serving(net::io::scheduler* sched, task<> serve, flag* done)
-{
-    co_await std::move(serve);
-    done->set(sched);
-}
 
 // read_to_end reads conn until it ends (or fails), returning what it read and why it stopped.
 task<std::pair<std::string, std::error_code>> read_to_end(net::io::reader& conn)
@@ -1187,7 +1235,8 @@ TEST_CASE("closing the server lets the requests in progress finish, then closes 
         const auto test = [&] -> task<outcome>
         {
             auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
-            REQUIRE(conn.has_value());
+            if (!conn.has_value())
+                co_return outcome{.received = "error: " + conn.error().message(), .err = {}, .served_all = false};
             conn->set_read_timeout(5s);
 
             // half the body, then the rest once the server's closed, as its handler reads it.
@@ -1217,7 +1266,8 @@ TEST_CASE("closing the server lets the requests in progress finish, then closes 
         const auto test = [&] -> task<outcome>
         {
             auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
-            REQUIRE(conn.has_value());
+            if (!conn.has_value())
+                co_return outcome{.received = "error: " + conn.error().message(), .err = {}, .served_all = false};
             conn->set_read_timeout(5s);
 
             (void)co_await net::io::write_all(*conn,
@@ -1248,7 +1298,8 @@ TEST_CASE("closing the server lets the requests in progress finish, then closes 
         const auto test = [&] -> task<outcome>
         {
             auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
-            REQUIRE(conn.has_value());
+            if (!conn.has_value())
+                co_return outcome{.received = "error: " + conn.error().message(), .err = {}, .served_all = false};
             conn->set_read_timeout(5s);
 
             (void)co_await net::io::write_all(*conn,
@@ -1312,8 +1363,12 @@ TEST_CASE("closing the server closes idle connections at once", "[http][server][
         // next, after one.
         auto silent = co_await net::tcp_socket::connect(&sched, "127.0.0.1", port);
         auto kept   = co_await net::tcp_socket::connect(&sched, "127.0.0.1", port);
-        REQUIRE(silent.has_value());
-        REQUIRE(kept.has_value());
+        if (!silent.has_value() || !kept.has_value())
+        {
+            outcome failed;
+            failed.silent = "error: not connected";
+            co_return failed;
+        }
         silent->set_read_timeout(5s);
         kept->set_read_timeout(5s);
 
@@ -1390,7 +1445,9 @@ task<std::string> race_close(net::io::scheduler*      sched,
     (void)co_await net::io::write_all(*conn, "world"sv);
 
     auto [received, err] = co_await read_to_end(*conn);
-    if (!co_await closed.wait(sched)) co_return "error: not closed";
+
+    // NOTE: without a deadline, as close_after() uses closed, in this frame (and only sleeps for close_delay first).
+    while (closed.word.load() == 0) (void)co_await sched->wait_on(closed.word, 0);
     co_return received;
 }
 
@@ -1583,16 +1640,23 @@ TEST_CASE("aborting the server stops its HTTP/1.1 handlers' tokens; closing it d
 TEST_CASE("an HTTP/1.1 handler that's stopped without answering gets no answer from the server",
           "[http][server][cancel]")
 {
+    // NOTE: before the scheduler, as the handlers use it.
+    std::atomic<bool> started = false;
+
     running_scheduler running;
 
     // NOTE: a scheduler wait, which abort() ends, as the token's stopped.
     http::router router;
     router.GET("/silent",
-               [&running](const http::server_request& req, http::response_writer&) -> task<void>
-               { (void)co_await running.sched.sleep_until(net::io::clock::now() + 60s, req.stop); });
-    router.GET("/throws",
-               [&running](const http::server_request& req, http::response_writer&) -> task<void>
+               [&](const http::server_request& req, http::response_writer&) -> task<void>
                {
+                   started.store(true);
+                   (void)co_await running.sched.sleep_until(net::io::clock::now() + 60s, req.stop);
+               });
+    router.GET("/throws",
+               [&](const http::server_request& req, http::response_writer&) -> task<void>
+               {
+                   started.store(true);
                    if (co_await running.sched.sleep_until(net::io::clock::now() + 60s, req.stop))
                        throw std::runtime_error{"canceled"};
                });
@@ -1610,8 +1674,10 @@ TEST_CASE("an HTTP/1.1 handler that's stopped without answering gets no answer f
     blocking_client conn{server.local_port()};
     conn.send(std::format("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", path));
 
-    // NOTE: the handler's wait may start after abort(), and is then stopped at once.
-    std::this_thread::sleep_for(50ms);
+    // the handler has started. NOTE: its wait may begin just after abort(), and is then stopped at once.
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    REQUIRE(started.load());
     server.abort();
 
     // neither an empty 200, nor a 500: the connection's closed, once the handler's returned (rather than when a read
@@ -1663,6 +1729,7 @@ TEST_CASE("join() waits for the server's connections", "[http][server][cancel]")
     // NOTE: before the scheduler, which waits for the tasks that use them.
     flag started;
     flag release;
+    flag joining;
     flag joined;
 
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
@@ -1690,66 +1757,76 @@ TEST_CASE("join() waits for the server's connections", "[http][server][cancel]")
     };
     REQUIRE(sched.spawn(server.serve()));
 
-    // join_then_set sets joined once the server's joined.
-    const auto join_then_set = [](net::io::scheduler* sched, http::server* server, flag* joined) -> task<>
+    // join_then_set sets joining as it joins the server, and joined once it has.
+    const auto join_then_set =
+        [](net::io::scheduler* sched, http::server* server, flag* joining, flag* joined) -> task<>
     {
+        joining->set(sched);
         co_await server->join();
         joined->set(sched);
     };
 
-    // request sends a request for path, and waits for its handler to start.
+    // request sends a request for path, and waits for its handler to start: nothing, if it doesn't.
     const auto request = [&](std::string_view path) -> task<std::optional<net::tcp_socket>>
     {
         auto conn = co_await net::tcp_socket::connect(&sched, "127.0.0.1", std::to_string(server.local_port()));
-        REQUIRE(conn.has_value());
+        if (!conn.has_value()) co_return std::nullopt;
         conn->set_read_timeout(5s);
         (void)co_await net::io::write_all(*conn, std::format("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", path));
-        REQUIRE(co_await started.wait(&sched));
+        if (!co_await started.wait(&sched)) co_return std::nullopt;
         co_return std::move(*conn);
+    };
+
+    struct outcome
+    {
+        bool        started = false; // the handler started
+        bool        early   = false; // join() returned while the request was still in progress
+        bool        joined  = false; // and once it wasn't
+        std::string received;
+    };
+
+    // test closes the server while a request for path is in progress, and joins it, then ends the request (aborting
+    // the server, or releasing the handler).
+    const auto test = [&](std::string_view path, bool abort) -> task<outcome>
+    {
+        outcome out;
+        auto    conn = co_await request(path);
+        if (!conn.has_value()) co_return out;
+        out.started = true;
+
+        server.close();
+        if (!sched.spawn(join_then_set(&sched, &server, &joining, &joined))) co_return out;
+
+        // NOTE: timed, once join() has been called: nothing says when it would have returned, had it not waited.
+        if (!co_await joining.wait(&sched)) co_return out;
+        (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
+        out.early = joined.word.load() != 0;
+
+        if (abort) server.abort();
+        else release.set(&sched);
+        out.received = (co_await read_to_end(*conn)).first;
+        out.joined   = co_await joined.wait(&sched);
+        co_return out;
     };
 
     SECTION("until its requests in progress finish, after close()")
     {
-        const auto test = [&] -> task<std::string>
-        {
-            auto conn = co_await request("/held");
-            server.close();
-            REQUIRE(sched.spawn(join_then_set(&sched, &server, &joined)));
-
-            (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
-            CHECK(joined.word.load() == 0);
-
-            release.set(&sched);
-            auto [received, err] = co_await read_to_end(*conn);
-            CHECK(co_await joined.wait(&sched));
-            co_return received;
-        };
-
-        const auto out = sched.run_to_completion(test());
-        CAPTURE(out);
-        CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+        const auto out = sched.run_to_completion(test("/held", false));
+        CAPTURE(out.received);
+        CHECK(out.started);
+        CHECK_FALSE(out.early);
+        CHECK(out.joined);
+        CHECK(out.received.starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     SECTION("or until abort() stops them")
     {
-        const auto test = [&] -> task<std::string>
-        {
-            auto conn = co_await request("/stoppable");
-            server.close();
-            REQUIRE(sched.spawn(join_then_set(&sched, &server, &joined)));
-
-            (void)co_await sched.sleep_until(net::io::clock::now() + 200ms);
-            CHECK(joined.word.load() == 0);
-
-            server.abort();
-            auto [received, err] = co_await read_to_end(*conn);
-            CHECK(co_await joined.wait(&sched));
-            co_return received;
-        };
-
-        const auto out = sched.run_to_completion(test());
-        CAPTURE(out);
-        CHECK(out.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        const auto out = sched.run_to_completion(test("/stoppable", true));
+        CAPTURE(out.received);
+        CHECK(out.started);
+        CHECK_FALSE(out.early);
+        CHECK(out.joined);
+        CHECK(out.received.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
     }
 }
 
@@ -1878,7 +1955,7 @@ TEST_CASE("requests that arrive while an HTTP/1.1 handler waits are served after
     if (spaced)
     {
         conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
-        std::this_thread::sleep_for(50ms);
+        REQUIRE(handler.wait_started());
         conn.send("GET /wait HTTP/1.1\r\nHost: x\r\n\r\n");
     }
     else
@@ -1908,16 +1985,23 @@ TEST_CASE("requests that arrive while an HTTP/1.1 handler waits are served after
 
 TEST_CASE("an HTTP/1.1 request is watched once its body has been read to its end", "[http][server][cancel][watch]")
 {
-    running_scheduler running;
+    // NOTE: before the scheduler, as the handler uses them.
+    std::atomic<bool>          waiting     = false; // the handler waits before reading the body
+    std::atomic<std::uint64_t> release     = 0;     // until this is set
+    std::atomic<int>           before_body = -1;    // whether the wait before reading the body was stopped
+    std::atomic<int>           after_body  = -1;    // and the one after
 
-    std::atomic<int> before_body = -1; // whether the wait before reading the body was stopped
-    std::atomic<int> after_body  = -1; // and the one after
+    running_scheduler running;
 
     http::router router;
     router.POST("/read",
                 [&](http::server_request& req, http::response_writer& resp) -> task<void>
                 {
-                    const auto first = co_await running.sched.sleep_until(net::io::clock::now() + 300ms, req.stop);
+                    waiting.store(true);
+                    const auto      deadline = net::io::clock::now() + 5s;
+                    std::error_code first;
+                    while (release.load() == 0 && !first)
+                        first = co_await running.sched.wait_on(release, 0, deadline, req.stop);
                     before_body.store(first ? 1 : 0);
 
                     auto body = co_await net::io::read_all(*req.body);
@@ -1941,8 +2025,16 @@ TEST_CASE("an HTTP/1.1 request is watched once its body has been read to its end
     // body, which is the handler's: it isn't watched), then reads it, and waits again (now watched).
     blocking_client conn{server.local_port()};
     conn.send("POST /read HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
-    std::this_thread::sleep_for(100ms);
+
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!waiting.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    REQUIRE(waiting.load());
     conn.shutdown_write();
+
+    // NOTE: timed, as nothing says when a watch would have seen the client's end.
+    std::this_thread::sleep_for(200ms);
+    release.store(1);
+    running.sched.notify_all(release);
 
     const auto out = conn.read_to_end();
     CAPTURE(out);
@@ -1953,10 +2045,12 @@ TEST_CASE("an HTTP/1.1 request is watched once its body has been read to its end
 
 TEST_CASE("an HTTP/1.1 handler that doesn't suspend isn't watched", "[http][server][cancel][watch]")
 {
-    running_scheduler running;
-
+    // NOTE: before the scheduler, as the handler uses them.
     std::atomic<bool> started = false;
+    std::atomic<bool> release = false; // ends the handler, if its token isn't stopped first
     std::atomic<int>  stopped = -1;
+
+    running_scheduler running;
 
     // NOTE: it blocks its worker, deliberately, checking its token, but never waits for anything: a watch would only
     //       delay the responses of handlers that don't, so the server doesn't watch it.
@@ -1965,8 +2059,8 @@ TEST_CASE("an HTTP/1.1 handler that doesn't suspend isn't watched", "[http][serv
                [&](const http::server_request& req, http::response_writer& /*resp*/) -> task<void>
                {
                    started.store(true);
-                   const auto until = std::chrono::steady_clock::now() + 500ms;
-                   while (!req.stop.stop_requested() && std::chrono::steady_clock::now() < until)
+                   const auto until = std::chrono::steady_clock::now() + 5s;
+                   while (!req.stop.stop_requested() && !release.load() && std::chrono::steady_clock::now() < until)
                        std::this_thread::sleep_for(1ms);
                    stopped.store(req.stop.stop_requested() ? 1 : 0);
                    co_return;
@@ -1982,25 +2076,22 @@ TEST_CASE("an HTTP/1.1 handler that doesn't suspend isn't watched", "[http][serv
     blocking_client conn{server.local_port()};
     conn.send("GET /busy HTTP/1.1\r\nHost: x\r\n\r\n");
 
-    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    auto deadline = std::chrono::steady_clock::now() + 5s;
     while (!started.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     REQUIRE(started.load());
     conn.close();
 
+    // NOTE: timed, as nothing says when a watch would have seen the connection close.
+    std::this_thread::sleep_for(200ms);
+    release.store(true);
+
+    deadline = std::chrono::steady_clock::now() + 5s;
     while (stopped.load() == -1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     CHECK(stopped.load() == 0);
 }
 
 namespace
 {
-
-// set_by waits (up to 5s, on the test's thread) for f to be set, returning whether it was.
-bool set_by_deadline(const flag& f)
-{
-    const auto deadline = std::chrono::steady_clock::now() + 5s;
-    while (f.word.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
-    return f.word.load() != 0;
-}
 
 // read_head reads from conn until it has read a whole head (up to the empty line after its fields), returning it.
 std::string read_head(const blocking_client& conn)

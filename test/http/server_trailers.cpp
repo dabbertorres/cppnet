@@ -218,15 +218,21 @@ std::string chunk(std::string_view msg) { return std::format("{:x}\r\n{}\r\n", m
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
-// with_client connects to port, and runs test with an h2_client over the connection.
+// responses are the responses an h2_client got, by stream.
+using responses = std::map<http2::stream_id, h2_client::response>;
+
+// with_client connects to port, and runs test with an h2_client over the connection, keeping the responses it got in
+// got. It returns what went wrong, if anything: test returns what went wrong with its own steps.
 template<typename Test>
-task<> with_client(net::io::scheduler* sched, std::uint16_t port, Test test)
+task<std::string> with_client(net::io::scheduler* sched, std::uint16_t port, responses* got, Test test)
 {
     auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
-    REQUIRE(conn.has_value());
+    if (!conn.has_value()) co_return "not connected: " + conn.error().message();
 
-    h2_client client{&*conn, &*conn, &*conn};
-    co_await test(client);
+    h2_client  client{&*conn, &*conn, &*conn};
+    const auto failed = co_await test(client);
+    *got              = client.responses;
+    co_return failed;
 }
 
 }
@@ -391,40 +397,50 @@ TEST_CASE("an HTTP/2 handler reads a request's trailers once it's read its body"
     };
     REQUIRE(sched.spawn(server.serve()));
 
-    sched.run_to_completion(with_client(&sched,
-                                        server.local_port(),
-                                        [](h2_client& c) -> task<>
-                                        {
-                                            const std::array<hpack::field, 3> trailers{
-                                                hpack::field{.name = "x-checksum",   .value = "abc"},
-                                                hpack::field{  .name = "if-match", .value = "\"x\""},
-                                                hpack::field{.name = "x-checksum",   .value = "def"},
-                                            };
+    const std::array<hpack::field, 3> trailers{
+        hpack::field{.name = "x-checksum",   .value = "abc"},
+        hpack::field{  .name = "if-match", .value = "\"x\""},
+        hpack::field{.name = "x-checksum",   .value = "def"},
+    };
 
-                                            // the trailers come after the body, but before the handler reads it: it
-                                            // still finds them only once it's read it to its end.
-                                            const auto id = c.request("POST", "/echo", "hello", false);
-                                            c.send_trailers(id, trailers);
-                                            const bool done = co_await c.wait_for(id);
-                                            REQUIRE(done);
+    responses        got;
+    http2::stream_id id   = 0;
+    http2::stream_id bare = 0;
 
-                                            const auto& r = c.responses[id];
-                                            CAPTURE(r.reset.message());
-                                            CHECK(r.status == "200");
-                                            CHECK(r.body == "hello|x-checksum=abc,def;");
-                                            CHECK(r.trailers
-                                                  == std::vector<std::pair<std::string, std::string>>{
-                                                      {"x-checksum", "abc"},
-                                                      {"x-checksum", "def"},
-                                            });
+    const auto failed = sched.run_to_completion(with_client(&sched,
+                                                            server.local_port(),
+                                                            &got,
+                                                            [&](h2_client& c) -> task<std::string>
+                                                            {
+                                                                // the trailers come after the body, but before the
+                                                                // handler reads it: it still finds them only once it's
+                                                                // read it to its end.
+                                                                id = c.request("POST", "/echo", "hello", false);
+                                                                c.send_trailers(id, trailers);
+                                                                const bool done = co_await c.wait_for(id);
+                                                                if (!done) co_return "the first didn't end";
 
-                                            // and a request whose trailers come straight after its head.
-                                            const auto bare = c.request("POST", "/echo", {}, false);
-                                            c.send_trailers(bare, std::span{trailers}.first(1));
-                                            const bool done_bare = co_await c.wait_for(bare);
-                                            REQUIRE(done_bare);
-                                            CHECK(c.responses[bare].body == "|x-checksum=abc;");
-                                        }));
+                                                                // and a request whose trailers come straight after its
+                                                                // head.
+                                                                bare = c.request("POST", "/echo", {}, false);
+                                                                c.send_trailers(bare, std::span{trailers}.first(1));
+                                                                const bool done_bare = co_await c.wait_for(bare);
+                                                                if (!done_bare) co_return "the second didn't end";
+                                                                co_return std::string{};
+                                                            }));
+    CAPTURE(failed);
+    CHECK(failed.empty());
+
+    const auto& r = got[id];
+    CAPTURE(r.reset.message());
+    CHECK(r.status == "200");
+    CHECK(r.body == "hello|x-checksum=abc,def;");
+    CHECK(r.trailers
+          == std::vector<std::pair<std::string, std::string>>{
+              {"x-checksum", "abc"},
+              {"x-checksum", "def"},
+    });
+    CHECK(got[bare].body == "|x-checksum=abc;");
 }
 
 TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[http][http2][server][trailers]")
@@ -437,85 +453,97 @@ TEST_CASE("an HTTP/2 response's trailers end its stream, whatever its body", "[h
     };
     REQUIRE(sched.spawn(server.serve()));
 
-    sched.run_to_completion(with_client(&sched,
-                                        server.local_port(),
-                                        [](h2_client& c) -> task<>
-                                        {
-                                            const auto chunked  = c.request("GET", "/chunked");
-                                            const auto length   = c.request("GET", "/length-declared");
-                                            const auto empty    = c.request("GET", "/empty");
-                                            const auto declared = c.request("GET", "/declared");
-                                            const auto head     = c.request("HEAD", "/chunked");
-                                            const auto invalid  = c.request("GET", "/invalid");
-                                            const auto thrown   = c.request("GET", "/throw");
-                                            const auto early    = c.request("GET", "/length-early");
-                                            const auto late     = c.request("GET", "/length");
-                                            const bool finished = co_await c.pump([&] { return c.finished == 9; });
-                                            REQUIRE(finished);
+    // the streams of the requests, by path (and HEAD's).
+    responses                               got;
+    std::map<std::string, http2::stream_id> ids;
 
-                                            const std::vector<std::pair<std::string, std::string>> expected{
-                                                {"server-timing", "db;dur=53"},
-                                                {  "grpc-status",         "0"},
-                                            };
+    const auto failed = sched.run_to_completion(
+        with_client(&sched,
+                    server.local_port(),
+                    &got,
+                    [&](h2_client& c) -> task<std::string>
+                    {
+                        for (const auto* path : {"/chunked",
+                                                 "/length-declared",
+                                                 "/empty",
+                                                 "/declared",
+                                                 "HEAD",
+                                                 "/invalid",
+                                                 "/throw",
+                                                 "/length-early",
+                                                 "/length"})
+                        {
+                            const std::string_view p{path};
+                            ids[path] = p == "HEAD" ? c.request("HEAD", "/chunked") : c.request("GET", p);
+                        }
 
-                                            // after a body of unknown length, without those that can't be trailers.
-                                            const auto& r1 = c.responses[chunked];
-                                            CHECK(r1.status == "200");
-                                            CHECK(r1.body == "hello");
-                                            CHECK(r1.trailers == expected);
+                        const bool finished = co_await c.pump([&] { return c.finished == 9; });
+                        if (!finished) co_return "not all of them ended";
+                        co_return std::string{};
+                    }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
 
-                                            // after a body with a Content-Length, declared before its head (so its
-                                            // last DATA doesn't end the stream)...
-                                            const auto& r2 = c.responses[length];
-                                            CHECK(header(r2, "content-length") == "5");
-                                            CHECK(r2.body == "hello");
-                                            CHECK_FALSE(r2.ended_by_data.has_value());
-                                            CHECK(r2.trailers == expected);
+    const std::vector<std::pair<std::string, std::string>> expected{
+        {"server-timing", "db;dur=53"},
+        {  "grpc-status",         "0"},
+    };
 
-                                            // ...or set before it.
-                                            const auto& r8 = c.responses[early];
-                                            CHECK(r8.body == "hello");
-                                            CHECK_FALSE(r8.ended_by_data.has_value());
-                                            CHECK(r8.trailers == expected);
+    // after a body of unknown length, without those that can't be trailers.
+    const auto& r1 = got[ids["/chunked"]];
+    CHECK(r1.status == "200");
+    CHECK(r1.body == "hello");
+    CHECK(r1.trailers == expected);
 
-                                            // set after its head, undeclared: dropped, as its last DATA ended the
-                                            // stream.
-                                            const auto& r9 = c.responses[late];
-                                            CHECK(r9.body == "hello");
-                                            CHECK(r9.ended_by_data == 5U);
-                                            CHECK(r9.data_frames == 1);
-                                            CHECK(r9.trailers.empty());
+    // after a body with a Content-Length, declared before its head (so its last DATA doesn't end the stream)...
+    const auto& r2 = got[ids["/length-declared"]];
+    CHECK(header(r2, "content-length") == "5");
+    CHECK(r2.body == "hello");
+    CHECK_FALSE(r2.ended_by_data.has_value());
+    CHECK(r2.trailers == expected);
 
-                                            // straight after a head without a body.
-                                            const auto& r3 = c.responses[empty];
-                                            CHECK(r3.status == "200");
-                                            CHECK_FALSE(r3.head_ended);
-                                            CHECK(r3.data_frames == 0);
-                                            CHECK(r3.trailers == expected);
+    // ...or set before it.
+    const auto& r8 = got[ids["/length-early"]];
+    CHECK(r8.body == "hello");
+    CHECK_FALSE(r8.ended_by_data.has_value());
+    CHECK(r8.trailers == expected);
 
-                                            // declared, but none set: an empty DATA frame ends the stream.
-                                            const auto& r4 = c.responses[declared];
-                                            CHECK(header(r4, "trailer") == "Grpc-Status");
-                                            CHECK_FALSE(r4.head_ended);
-                                            CHECK(r4.data_frames == 1);
-                                            CHECK(r4.trailers.empty());
+    // set after its head, undeclared: dropped, as its last DATA ended the stream.
+    const auto& r9 = got[ids["/length"]];
+    CHECK(r9.body == "hello");
+    CHECK(r9.ended_by_data == 5U);
+    CHECK(r9.data_frames == 1);
+    CHECK(r9.trailers.empty());
 
-                                            // none for HEAD, whose head ends the stream.
-                                            const auto& r5 = c.responses[head];
-                                            CHECK(r5.head_ended);
-                                            CHECK(r5.trailers.empty());
+    // straight after a head without a body.
+    const auto& r3 = got[ids["/empty"]];
+    CHECK(r3.status == "200");
+    CHECK_FALSE(r3.head_ended);
+    CHECK(r3.data_frames == 0);
+    CHECK(r3.trailers == expected);
 
-                                            // an invalid one: the stream's reset, not ended.
-                                            const auto& r6 = c.responses[invalid];
-                                            CHECK(r6.reset == http2::error_code::internal_error);
-                                            CHECK(r6.trailers.empty());
+    // declared, but none set: an empty DATA frame ends the stream.
+    const auto& r4 = got[ids["/declared"]];
+    CHECK(header(r4, "trailer") == "Grpc-Status");
+    CHECK_FALSE(r4.head_ended);
+    CHECK(r4.data_frames == 1);
+    CHECK(r4.trailers.empty());
 
-                                            // the 500 for a handler that throws has none.
-                                            const auto& r7 = c.responses[thrown];
-                                            CHECK(r7.status == "500");
-                                            CHECK(r7.head_ended);
-                                            CHECK(r7.trailers.empty());
-                                        }));
+    // none for HEAD, whose head ends the stream.
+    const auto& r5 = got[ids["HEAD"]];
+    CHECK(r5.head_ended);
+    CHECK(r5.trailers.empty());
+
+    // an invalid one: the stream's reset, not ended.
+    const auto& r6 = got[ids["/invalid"]];
+    CHECK(r6.reset == http2::error_code::internal_error);
+    CHECK(r6.trailers.empty());
+
+    // the 500 for a handler that throws has none.
+    const auto& r7 = got[ids["/throw"]];
+    CHECK(r7.status == "500");
+    CHECK(r7.head_ended);
+    CHECK(r7.trailers.empty());
 }
 
 TEST_CASE("middleware adds an HTTP/2 response's trailers after the handler", "[http][http2][server][trailers]")
@@ -529,16 +557,23 @@ TEST_CASE("middleware adds an HTTP/2 response's trailers after the handler", "[h
     };
     REQUIRE(sched.spawn(server.serve()));
 
-    sched.run_to_completion(with_client(&sched,
-                                        server.local_port(),
-                                        [](h2_client& c) -> task<>
-                                        {
-                                            const auto id   = c.request("GET", "/length");
-                                            const bool done = co_await c.wait_for(id);
-                                            REQUIRE(done);
+    responses        got;
+    http2::stream_id id = 0;
 
-                                            const auto& r = c.responses[id];
-                                            CHECK(trailer(r, "server-timing") == "db;dur=53");
-                                            CHECK(trailer(r, "x-served-by") == "middleware");
-                                        }));
+    const auto failed = sched.run_to_completion(with_client(&sched,
+                                                            server.local_port(),
+                                                            &got,
+                                                            [&](h2_client& c) -> task<std::string>
+                                                            {
+                                                                id              = c.request("GET", "/length");
+                                                                const bool done = co_await c.wait_for(id);
+                                                                if (!done) co_return "the response didn't end";
+                                                                co_return std::string{};
+                                                            }));
+    CAPTURE(failed);
+    CHECK(failed.empty());
+
+    const auto& r = got[id];
+    CHECK(trailer(r, "server-timing") == "db;dur=53");
+    CHECK(trailer(r, "x-served-by") == "middleware");
 }

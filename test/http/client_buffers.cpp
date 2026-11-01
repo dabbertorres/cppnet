@@ -175,6 +175,7 @@ TEST_CASE("an HTTP/1.1 response goes through the client's read buffer whatever i
     const auto size = GENERATE(std::size_t{1'024}, std::size_t{4'096}, std::size_t{65'536});
     CAPTURE(size);
 
+    outcome            out; // (before the scheduler, whose task uses it)
     net::io::scheduler sched{make_pool()};
     auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
 
@@ -187,25 +188,25 @@ TEST_CASE("an HTTP/1.1 response goes through the client's read buffer whatever i
     const std::string cookie(5'000, 'c');
     const auto        body = letters(100'000);
 
-    outcome out;
-    sched.run_to_completion(
+    // what went wrong with the test's own steps, if anything.
+    const auto failed = sched.run_to_completion(
         [](net::io::scheduler* sched,
            net::listener*      listener,
            http::client*       client,
            const std::string*  cookie,
            const std::string*  body,
-           outcome*            out) -> task<>
+           outcome*            out) -> task<std::string>
         {
             auto url = std::format("http://127.0.0.1:{}/", listener->local_port());
-            REQUIRE(
-                sched->spawn(send_with(sched, client, http::client_request{.uri = net::url::parse(url).value()}, out)));
+            if (!sched->spawn(send_with(sched, client, http::client_request{.uri = net::url::parse(url).value()}, out)))
+                co_return "the request didn't start";
 
             auto accepted = co_await listener->accept();
-            REQUIRE(accepted.has_value());
+            if (!accepted.has_value()) co_return "no connection";
 
             std::string request;
             const bool  read = co_await read_until(*accepted, request, "\r\n\r\n");
-            REQUIRE(read);
+            if (!read) co_return "no request";
 
             std::string response =
                 "HTTP/1.1 200 OK\r\nSet-Cookie: " + *cookie + "\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -216,12 +217,15 @@ TEST_CASE("an HTTP/1.1 response goes through the client's read buffer whatever i
             }
             response += "0\r\n\r\n";
             const auto written = co_await net::io::write_all(*accepted, response);
-            REQUIRE_FALSE(written.err);
+            if (written.err) co_return "the response wasn't written: " + written.err.message();
 
             const bool finished = co_await out->wait(sched);
-            REQUIRE(finished);
+            if (!finished) co_return "the request didn't finish";
+            co_return std::string{};
         }(&sched, &listener, &client, &cookie, &body, &out));
 
+    CAPTURE(failed);
+    CHECK(failed.empty());
     CHECK_FALSE(out.err);
     CHECK(out.status == 200);
     CHECK(out.cookie == cookie);
@@ -234,8 +238,10 @@ TEST_CASE("an HTTP/1.1 request's body is read write_buffer_size at a time", "[ht
     const auto size = GENERATE(std::size_t{1'024}, std::size_t{4'096}, std::size_t{16'384}, std::size_t{65'536});
     CAPTURE(size);
 
-    net::io::scheduler sched{make_pool()};
-    auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
+    outcome                  out; // (before the scheduler, whose task uses it)
+    std::vector<std::size_t> sizes;
+    net::io::scheduler       sched{make_pool()};
+    auto                     listener = net::listener::make(&sched, "127.0.0.1", "0").value();
 
     http::client_options options;
     options.write_buffer_size = size;
@@ -243,29 +249,37 @@ TEST_CASE("an HTTP/1.1 request's body is read write_buffer_size at a time", "[ht
 
     // chunked, so each read of the body is a chunk.
     constexpr std::size_t length = 50'000;
-    const auto            sizes  = sched.run_to_completion(
-        [](net::io::scheduler* sched, net::listener* listener, http::client* client) -> task<std::vector<std::size_t>>
+    const auto            failed = sched.run_to_completion(
+        [](net::io::scheduler*       sched,
+           net::listener*            listener,
+           http::client*             client,
+           outcome*                  out,
+           std::vector<std::size_t>* sizes) -> task<std::string>
         {
-            outcome out;
-            auto    url = std::format("http://127.0.0.1:{}/", listener->local_port());
-            REQUIRE(sched->spawn(send_with(sched, client, upload(url, std::string(length, 'x'), false), &out)));
+            auto url = std::format("http://127.0.0.1:{}/", listener->local_port());
+            if (!sched->spawn(send_with(sched, client, upload(url, std::string(length, 'x'), false), out)))
+                co_return "the request didn't start";
 
             auto accepted = co_await listener->accept();
-            REQUIRE(accepted.has_value());
+            if (!accepted.has_value()) co_return "no connection";
 
             std::string request;
             const bool  read = co_await read_until(*accepted, request, "\r\n0\r\n\r\n");
-            REQUIRE(read);
+            if (!read) co_return "no request";
 
             const auto written =
                 co_await net::io::write_all(*accepted, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"sv);
-            REQUIRE_FALSE(written.err);
-            const bool finished = co_await out.wait(sched);
-            REQUIRE(finished);
-            CHECK(out.status == 200);
+            if (written.err) co_return "the response wasn't written: " + written.err.message();
+            const bool finished = co_await out->wait(sched);
+            if (!finished) co_return "the request didn't finish";
 
-            co_return chunk_sizes(std::string_view{request}.substr(request.find("\r\n\r\n") + 4));
-        }(&sched, &listener, &client));
+            *sizes = chunk_sizes(std::string_view{request}.substr(request.find("\r\n\r\n") + 4));
+            co_return std::string{};
+        }(&sched, &listener, &client, &out, &sizes));
+
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.status == 200);
 
     std::vector<std::size_t> want(length / std::min(size, length), std::min(size, length));
     if (length % size != 0 && size < length) want.push_back(length % size);
@@ -299,8 +313,11 @@ TEST_CASE("an HTTP/2 request's body is read write_buffer_size at a time", "[http
     const auto size = GENERATE(std::size_t{1'024}, std::size_t{4'096}, std::size_t{16'384}, std::size_t{65'536});
     CAPTURE(size);
 
-    net::io::scheduler sched{make_pool()};
-    auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
+    outcome                  out; // (before the scheduler, whose task uses it)
+    std::vector<std::size_t> frames;
+    std::string              received;
+    net::io::scheduler       sched{make_pool()};
+    auto                     listener = net::listener::make(&sched, "127.0.0.1", "0").value();
 
     http::client_options options;
     options.http2_prior_knowledge = true;
@@ -310,32 +327,39 @@ TEST_CASE("an HTTP/2 request's body is read write_buffer_size at a time", "[http
     // within the server's windows (65535 each), so each read of the body is written at once, as its DATA frames (of at
     // most 16 KiB, the server's MAX_FRAME_SIZE).
     constexpr std::size_t length = 50'000;
-    const auto            frames = sched.run_to_completion(
-        [](net::io::scheduler* sched, net::listener* listener, http::client* client) -> task<std::vector<std::size_t>>
+    const auto            failed = sched.run_to_completion(
+        [](net::io::scheduler*       sched,
+           net::listener*            listener,
+           http::client*             client,
+           outcome*                  out,
+           std::vector<std::size_t>* frames,
+           std::string*              received) -> task<std::string>
         {
-            outcome out;
-            auto    url = std::format("http://127.0.0.1:{}/", listener->local_port());
-            REQUIRE(sched->spawn(send_with(sched, client, upload(url, std::string(length, 'x'), true), &out)));
+            auto url = std::format("http://127.0.0.1:{}/", listener->local_port());
+            if (!sched->spawn(send_with(sched, client, upload(url, std::string(length, 'x'), true), out)))
+                co_return "the request didn't start";
 
             auto accepted = co_await listener->accept();
-            REQUIRE(accepted.has_value());
+            if (!accepted.has_value()) co_return "no connection";
             test::h2_client server{&*accepted, &*accepted, &*accepted, http2::role::server};
 
             bool ok = co_await server.pump([&] { return server.responses[1].done; });
-            REQUIRE(ok);
+            if (!ok) co_return "no request";
             server.respond(1, "200");
             ok = co_await server.pump([] { return true; });
-            REQUIRE(ok);
-            const bool finished = co_await out.wait(sched);
-            REQUIRE(finished);
-            CHECK(out.status == 200);
-            CHECK(server.responses[1].body == std::string(length, 'x'));
+            if (!ok) co_return "the response wasn't written";
+            const bool finished = co_await out->wait(sched);
+            if (!finished) co_return "the request didn't finish";
 
-            std::vector<std::size_t> sizes;
-            sizes.reserve(server.data_log.size());
-            for (const auto& [id, n] : server.data_log) sizes.push_back(n);
-            co_return sizes;
-        }(&sched, &listener, &client));
+            *received = server.responses[1].body;
+            for (const auto& [id, n] : server.data_log) frames->push_back(n);
+            co_return std::string{};
+        }(&sched, &listener, &client, &out, &frames, &received));
+
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.status == 200);
+    CHECK(received == std::string(length, 'x'));
 
     const auto               each = std::min(size, std::size_t{16'384});
     std::vector<std::size_t> want(length / each, each);
@@ -374,6 +398,7 @@ TEST_CASE("the client's HTTP/2 stream window is its SETTINGS'", "[http][http2][c
     const auto window = GENERATE(std::uint32_t{65'535}, std::uint32_t{1} << 20, std::uint32_t{0x7fff'ffff});
     CAPTURE(window);
 
+    outcome            out; // (before the scheduler, whose task uses it)
     net::io::scheduler sched{make_pool()};
     auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
 
@@ -382,32 +407,46 @@ TEST_CASE("the client's HTTP/2 stream window is its SETTINGS'", "[http][http2][c
     options.http2_stream_window   = window;
     http::client client{&sched, options};
 
-    sched.run_to_completion(
-        [](net::io::scheduler* sched, net::listener* listener, http::client* client, std::uint32_t window) -> task<>
+    // what the server saw: the stream window in the client's SETTINGS, and the window to send the response in.
+    struct seen
+    {
+        std::uint32_t initial_window = 0;
+        std::int64_t  send_window    = 0;
+    };
+    seen saw;
+
+    const auto failed = sched.run_to_completion(
+        [](net::io::scheduler* sched, net::listener* listener, http::client* client, outcome* out, seen* saw)
+            -> task<std::string>
         {
-            outcome out;
-            auto    url = std::format("http://127.0.0.1:{}/", listener->local_port());
-            REQUIRE(sched->spawn(
-                send_with(sched, client, http::client_request{.uri = net::url::parse(url).value()}, &out)));
+            auto url = std::format("http://127.0.0.1:{}/", listener->local_port());
+            if (!sched->spawn(send_with(sched, client, http::client_request{.uri = net::url::parse(url).value()}, out)))
+                co_return "the request didn't start";
 
             auto accepted = co_await listener->accept();
-            REQUIRE(accepted.has_value());
+            if (!accepted.has_value()) co_return "no connection";
             test::h2_client server{&*accepted, &*accepted, &*accepted, http2::role::server};
 
             bool ok = co_await server.pump([&] { return server.responses[1].done; });
-            REQUIRE(ok);
-            CHECK(server.s.peer_settings().initial_window_size == window);
-
-            // the response may send as much as the stream's window, or the connection's (1 GiB), if that's less.
-            CHECK(server.s.send_window(1) == std::min(window, std::uint32_t{1} << 30));
+            if (!ok) co_return "no request";
+            saw->initial_window = server.s.peer_settings().initial_window_size;
+            saw->send_window    = server.s.send_window(1);
 
             server.respond(1, "200");
             ok = co_await server.pump([] { return true; });
-            REQUIRE(ok);
-            const bool finished = co_await out.wait(sched);
-            REQUIRE(finished);
-            CHECK(out.status == 200);
-        }(&sched, &listener, &client, window));
+            if (!ok) co_return "the response wasn't written";
+            const bool finished = co_await out->wait(sched);
+            if (!finished) co_return "the request didn't finish";
+            co_return std::string{};
+        }(&sched, &listener, &client, &out, &saw));
+
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.status == 200);
+    CHECK(saw.initial_window == window);
+
+    // the response may send as much as the stream's window, or the connection's (1 GiB), if that's less.
+    CHECK(std::cmp_equal(saw.send_window, std::min(window, std::uint32_t{1} << 30)));
 }
 
 TEST_CASE("the client refuses buffer and window sizes out of their ranges", "[http][client][buffers][limits]")

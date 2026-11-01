@@ -356,40 +356,54 @@ TEST_CASE("an exception from on_informational fails the request, abandoning its 
     served             server{&sched};
     http::client       client{&sched, options_for(http2)};
 
-    const auto test = [](net::io::scheduler* sched, http::client* client, served* server, bool http2) -> task<>
+    struct result
     {
+        std::string thrown;
+        bool        stopped = false; // the server saw its client go
+        std::size_t open    = 0;     // the client's connections then
+        outcome     next;            // the next request
+        std::size_t open_after = 0;  // and the client's connections after it
+    };
+
+    const auto test = [](net::io::scheduler* sched, http::client* client, served* server) -> task<result>
+    {
+        result out;
+
         auto req             = get(server->url("/hints-then-wait"));
         req.on_informational = [](http::status /*code*/, const http::headers& /*fields*/)
         { throw std::runtime_error{"enough"}; };
 
-        std::string thrown;
         try
         {
             (void)co_await client->send(std::move(req));
         }
         catch (const std::runtime_error& e)
         {
-            thrown = e.what();
+            out.thrown = e.what();
         }
-        CHECK(thrown == "enough");
 
         // the server sees its client go: the connection closed (HTTP/1.1), or the stream reset (HTTP/2).
-        const bool stopped = co_await test::stop_probe::reach(sched, server->probe.woke, 1);
-        CHECK(stopped);
-        CHECK(server->probe.canceled.load() == 1);
-
-        // HTTP/1.1's connection is gone; HTTP/2's is kept, for the next request.
-        CHECK(client->stats().open == (http2 ? 1U : 0U));
+        out.stopped = co_await test::stop_probe::reach(sched, server->probe.woke, 1);
+        out.open    = client->stats().open;
 
         // and the pool's sound: the next request is answered.
-        const auto out = co_await send(client, get(server->url("/hints")));
-        CAPTURE(out.err.message());
-        CHECK(out.status == 200);
-        CHECK(out.body == "done");
-        CHECK(client->stats().open == 1);
+        out.next       = co_await send(client, get(server->url("/hints")));
+        out.open_after = client->stats().open;
+        co_return out;
     };
 
-    sched.run_to_completion(test(&sched, &client, &server, http2));
+    const auto out = sched.run_to_completion(test(&sched, &client, &server));
+    CHECK(out.thrown == "enough");
+    CHECK(out.stopped);
+    CHECK(server.probe.canceled.load() == 1);
+
+    // HTTP/1.1's connection is gone; HTTP/2's is kept, for the next request.
+    CHECK(out.open == (http2 ? 1U : 0U));
+
+    CAPTURE(out.next.err.message());
+    CHECK(out.next.status == 200);
+    CHECK(out.next.body == "done");
+    CHECK(out.open_after == 1);
 }
 
 TEST_CASE("an interim response doesn't put off response_header_timeout", "[http][client][interim][timeout]")
@@ -556,15 +570,20 @@ namespace
 {
 
 // past_limit_hints sends eleven Early Hints of about 100 KB each (their Link's value is 100000 bytes) on stream 1:
-// more than the client takes of a response's informational heads altogether (1 MiB, and 32 bytes a field).
-void past_limit_hints(test::h2_client& server)
+// more than the client takes of a response's informational heads altogether (1 MiB, and 32 bytes a field). It returns
+// whether they were all submitted.
+bool past_limit_hints(test::h2_client& server)
 {
     const std::string                     link(100'000, 'x');
     const std::vector<http::hpack::field> head{
         {.name = ":status", .value = "103"},
         {   .name = "link",  .value = link}
     };
-    for (int i = 0; i < 11; ++i) REQUIRE_FALSE(server.s.submit_headers(1, head, false));
+    for (int i = 0; i < 11; ++i)
+    {
+        if (server.s.submit_headers(1, head, false)) return false;
+    }
+    return true;
 }
 
 // sent is a request sent in the background: what its callback saw, and what it came to. Declared before the
@@ -596,24 +615,29 @@ TEST_CASE("an HTTP/2 response's interim heads past the limit fail it, resetting 
     auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
     http::client       client{&sched, options_for(true)};
 
-    const auto test = [](net::io::scheduler* sched, net::listener* listener, sent* request) -> task<>
+    // what went wrong with the test's own steps, if anything.
+    const auto test = [](net::io::scheduler* sched, net::listener* listener, sent* request) -> task<std::string>
     {
         auto accepted = co_await listener->accept();
-        REQUIRE(accepted.has_value());
+        if (!accepted.has_value()) co_return "no connection";
         test::h2_client server{&*accepted, &*accepted, &*accepted, http2::role::server};
 
         const bool requested = co_await server.pump([&] { return server.responses.contains(1); });
-        REQUIRE(requested);
-        past_limit_hints(server);
+        if (!requested) co_return "no request";
+        if (!past_limit_hints(server)) co_return "the hints weren't submitted";
 
-        // the client resets the stream alone, keeping the connection.
+        // the client resets the stream alone, keeping the connection (open after the reset, as a PING round trip
+        // shows).
         const bool reset = co_await server.pump([&] { return static_cast<bool>(server.responses[1].reset); });
-        REQUIRE(reset);
-        CHECK(server.responses[1].reset == http2::error_code::protocol_error);
-        CHECK_FALSE(server.closed);
+        if (!reset) co_return "not reset";
+        if (server.responses[1].reset != http2::error_code::protocol_error)
+            co_return "reset: " + server.responses[1].reset.message();
+        const bool synced = co_await server.sync();
+        if (!synced || server.closed) co_return "the connection ended";
 
         const bool done = co_await test::stop_probe::reach(sched, request->finished, 1);
-        REQUIRE(done);
+        if (!done) co_return "the request didn't finish";
+        co_return std::string{};
     };
 
     // the client's request, against a server the test plays.
@@ -622,8 +646,9 @@ TEST_CASE("an HTTP/2 response's interim heads past the limit fail it, resetting 
     const bool spawned = sched.spawn(send_in_background(&sched, &client, std::move(req), &request));
     REQUIRE(spawned);
 
-    sched.run_to_completion(test(&sched, &listener, &request));
-
+    const auto failed = sched.run_to_completion(test(&sched, &listener, &request));
+    CAPTURE(failed);
+    CHECK(failed.empty());
     CHECK(request.out.err == std::errc::value_too_large);
 
     // the heads that came before the limit are passed on: ten of them (by HTTP/2's count, 100078 bytes each, 1000780

@@ -99,10 +99,11 @@ struct played
     test::h2_client server;
 };
 
+// accept_h2 accepts a connection, to play the server on: null, if it fails.
 task<std::unique_ptr<played>> accept_h2(fake_host* host)
 {
     auto accepted = co_await host->listener.accept();
-    REQUIRE(accepted.has_value());
+    if (!accepted.has_value()) co_return nullptr;
     co_return std::make_unique<played>(std::move(*accepted));
 }
 
@@ -216,6 +217,19 @@ http::client_request request(http::request_method method, const std::string& url
 
 const auto http11_required = http2::error_code::http_1_1_required;
 
+// connections describes the client's connections.
+std::string connections(const http::client& client)
+{
+    const auto stats = client.stats();
+    return std::format("{} open, {} idle", stats.open, stats.idle);
+}
+
+// stats_are is what's wrong with the client's connections, if they're not as wanted.
+std::string stats_are(const http::client& client, http::connection_stats want)
+{
+    return client.stats() == want ? std::string{} : connections(client);
+}
+
 }
 
 TEST_CASE("a request the server resets with HTTP_1_1_REQUIRED goes over HTTP/1.1, and the HTTP/2 connection goes on",
@@ -231,68 +245,76 @@ TEST_CASE("a request the server resets with HTTP_1_1_REQUIRED goes over HTTP/1.1
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    // what went wrong with the test's own steps, if anything.
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/a")), &first)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/a")), &first)))
+            co_return "the first request didn't start";
 
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; }); // (just written)
-        REQUIRE(got);
+        if (!got) co_return "stream 1's reset wasn't written";
 
         // sent again on a connection of its own, in HTTP/1.1 from its first byte (no preface).
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         auto req = co_await h1->read_request();
-        REQUIRE(req.has_value());
-        CHECK(req->first.starts_with("GET /a HTTP/1.1\r\n"));
+        if (!req.has_value()) co_return "no HTTP/1.1 request";
+        if (!req->first.starts_with("GET /a HTTP/1.1\r\n")) co_return "the first request: " + req->first;
         got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none"sv);
-        REQUIRE(got);
+        if (!got) co_return "the first response wasn't written";
 
         got = co_await first.wait(&sched);
-        REQUIRE(got);
-        CHECK(first.err == std::error_code{});
-        CHECK(first.body == "one");
+        if (!got) co_return "the first request didn't finish";
 
         // both connections are kept: the next request goes on the HTTP/2 one.
-        CHECK(client.stats() == http::connection_stats{.open = 2, .idle = 2});
+        if (auto wrong = stats_are(client, {.open = 2, .idle = 2}); !wrong.empty()) co_return "after one: " + wrong;
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/b")), &second)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/b")), &second)))
+            co_return "the second request didn't start";
         got = co_await h2->server.pump([&] { return h2->server.responses.contains(3); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 3";
         h2->server.respond(3, "200", "two");
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "stream 3's response wasn't written";
 
         got = co_await second.wait(&sched);
-        REQUIRE(got);
-        CHECK(second.body == "two");
+        if (!got) co_return "the second request didn't finish";
 
         // one the server asks for HTTP/1.1 again takes the idle HTTP/1.1 connection, rather than making another.
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/c")), &third)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/c")), &third)))
+            co_return "the third request didn't start";
         got = co_await h2->server.pump([&] { return h2->server.responses.contains(5); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 5";
         h2->server.s.reset(5, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "stream 5's reset wasn't written";
 
         req = co_await h1->read_request();
-        REQUIRE(req.has_value());
-        CHECK(req->first.starts_with("GET /c HTTP/1.1\r\n"));
+        if (!req.has_value()) co_return "no second HTTP/1.1 request";
+        if (!req->first.starts_with("GET /c HTTP/1.1\r\n")) co_return "the third request: " + req->first;
         got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nthree"sv);
-        REQUIRE(got);
+        if (!got) co_return "the third response wasn't written";
 
         got = co_await third.wait(&sched);
-        REQUIRE(got);
-        CHECK(third.body == "three");
-        CHECK(client.stats().open == 2);
+        if (!got) co_return "the third request didn't finish";
+        if (client.stats().open != 2) co_return "after three: " + connections(client);
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(first.err == std::error_code{});
+    CHECK(first.body == "one");
+    CHECK(second.body == "two");
+    CHECK(third.body == "three");
 }
 
 TEST_CASE("a request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 if it's safe to repeat, and its body can be",
@@ -329,7 +351,7 @@ TEST_CASE("a request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 if it's saf
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
@@ -345,49 +367,55 @@ TEST_CASE("a request reset with HTTP_1_1_REQUIRED goes over HTTP/1.1 if it's saf
         }
 
         const bool spawned = sched.spawn(send_with(&sched, &client, std::move(req), &out));
-        REQUIRE(spawned);
+        if (!spawned) co_return "the request didn't start";
 
         // reset once the request (and its body, if it has one) has all come.
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump(
             [&]
             {
                 const auto it = h2->server.responses.find(1);
                 return it != h2->server.responses.end() && (tc.body == body_kind::none || it->second.done);
             });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         if (tc.again)
         {
             auto h1 = co_await accept_h1(host.listener);
-            REQUIRE(h1.has_value());
+            if (!h1.has_value()) co_return "no HTTP/1.1 connection";
             auto sent = co_await h1->read_request();
-            REQUIRE(sent.has_value());
-            CHECK(sent->first.starts_with(std::format("{} /r HTTP/1.1\r\n", http::method_string(tc.method))));
-            CHECK(sent->second == (tc.body == body_kind::none ? "" : "payload"));
+            if (!sent.has_value()) co_return "no HTTP/1.1 request";
+            if (!sent->first.starts_with(std::format("{} /r HTTP/1.1\r\n", http::method_string(tc.method))))
+                co_return "the request: " + sent->first;
+            if (sent->second != (tc.body == body_kind::none ? "" : "payload")) co_return "its body: " + sent->second;
             got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"sv);
-            REQUIRE(got);
+            if (!got) co_return "the response wasn't written";
         }
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        if (tc.again)
-        {
-            CHECK(out.err == std::error_code{});
-            CHECK(out.body == "ok");
-        }
-        else
-        {
-            // the server may have processed it, or its body can't be read again: the caller's told why.
-            CHECK(out.err == http11_required);
-            CHECK(client.stats().open == 1);
-        }
+        if (!got) co_return "the request didn't finish";
+
+        // the server may have processed it, or its body can't be read again: the caller's told why.
+        if (!tc.again && client.stats().open != 1) co_return "after it: " + connections(client);
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    if (tc.again)
+    {
+        CHECK(out.err == std::error_code{});
+        CHECK(out.body == "ok");
+    }
+    else
+    {
+        CHECK(out.err == http11_required);
+    }
 }
 
 TEST_CASE("a request reset with HTTP_1_1_REQUIRED after an interim response isn't sent again",
@@ -402,7 +430,7 @@ TEST_CASE("a request reset with HTTP_1_1_REQUIRED after an interim response isn'
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
@@ -410,27 +438,31 @@ TEST_CASE("a request reset with HTTP_1_1_REQUIRED after an interim response isn'
         req.on_informational = [&](http::status, const http::headers&) { interims.fetch_add(1); };
 
         const bool spawned = sched.spawn(send_with(&sched, &client, std::move(req), &out));
-        REQUIRE(spawned);
+        if (!spawned) co_return "the request didn't start";
 
         // the server's had the request, as its 103 says.
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.respond(1, "103", {}, false);
         got = co_await h2->server.sync();
-        REQUIRE(got);
+        if (!got) co_return "no PING ACK after the 103";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        CHECK(out.err == http11_required);
-        CHECK(interims.load() == 1);
-        CHECK(client.stats().open == 1);
+        if (!got) co_return "the request didn't finish";
+        if (client.stats().open != 1) co_return "after it: " + connections(client);
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.err == http11_required);
+    CHECK(interims.load() == 1);
 }
 
 TEST_CASE("a response reset with HTTP_1_1_REQUIRED after its head fails its body's read, and isn't sent again",
@@ -444,30 +476,35 @@ TEST_CASE("a response reset with HTTP_1_1_REQUIRED after its head fails its body
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)))
+            co_return "the request didn't start";
 
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.respond(1, "200", "part", false);
         got = co_await h2->server.sync();
-        REQUIRE(got);
+        if (!got) co_return "no PING ACK after the head";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        CHECK(out.status == 200);
-        CHECK(out.err == http11_required);
-        CHECK(client.stats().open == 1);
+        if (!got) co_return "the request didn't finish";
+        if (client.stats().open != 1) co_return "after it: " + connections(client);
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.status == 200);
+    CHECK(out.err == http11_required);
 }
 
 TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, the streams after its last go over HTTP/1.1, and the others finish",
@@ -482,57 +519,62 @@ TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, the streams after its last go ov
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/one")), &one)));
-        auto h2  = co_await accept_h2(&host);
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/one")), &one)))
+            co_return "the first request didn't start";
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
 
         // a POST, which the server didn't process, so it's sent again whatever its method, with its body read again.
         auto post = request(http::request_method::POST, host.url("/three"));
         post.set_body("posted");
         const bool spawned = sched.spawn(send_with(&sched, &client, std::move(post), &three));
-        REQUIRE(spawned);
+        if (!spawned) co_return "the POST didn't start";
         got =
             co_await h2->server.pump([&] { return h2->server.responses.contains(3) && h2->server.responses[3].done; });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 3";
 
         h2->server.s.goaway(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the GOAWAY wasn't written";
 
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         auto req = co_await h1->read_request();
-        REQUIRE(req.has_value());
-        CHECK(req->first.starts_with("POST /three HTTP/1.1\r\n"));
-        CHECK(req->second == "posted");
+        if (!req.has_value()) co_return "no HTTP/1.1 request";
+        if (!req->first.starts_with("POST /three HTTP/1.1\r\n")) co_return "the POST: " + req->first;
+        if (req->second != "posted") co_return "the POST's body: " + req->second;
         got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nthree"sv);
-        REQUIRE(got);
+        if (!got) co_return "the POST's response wasn't written";
 
         got = co_await three.wait(&sched);
-        REQUIRE(got);
-        CHECK(three.err == std::error_code{});
-        CHECK(three.body == "three");
+        if (!got) co_return "the POST didn't finish";
 
         // the stream at the last is answered as it was going to be.
         h2->server.respond(1, "200", "one");
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "stream 1's response wasn't written";
         got = co_await one.wait(&sched);
-        REQUIRE(got);
-        CHECK(one.err == std::error_code{});
-        CHECK(one.body == "one");
+        if (!got) co_return "the first request didn't finish";
 
         // and with that, the HTTP/2 connection's done.
         got = co_await h2->server.pump([&] { return h2->server.closed; });
-        CHECK(got);
+        if (!got) co_return "the HTTP/2 connection didn't end";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(three.err == std::error_code{});
+    CHECK(three.body == "three");
+    CHECK(one.err == std::error_code{});
+    CHECK(one.body == "one");
 }
 
 TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, a stream the connection's end cuts off goes over HTTP/1.1 if it's safe "
@@ -550,7 +592,7 @@ TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, a stream the connection's end cu
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
@@ -558,17 +600,18 @@ TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, a stream the connection's end cu
         if (method == http::request_method::POST) req.set_body("posted");
 
         const bool spawned = sched.spawn(send_with(&sched, &client, std::move(req), &out));
-        REQUIRE(spawned);
+        if (!spawned) co_return "the request didn't start";
 
         // the stream's the last the server may have processed; then the connection ends without its response.
         {
-            auto h2  = co_await accept_h2(&host);
+            auto h2 = co_await accept_h2(&host);
+            if (h2 == nullptr) co_return "no HTTP/2 connection";
             bool got = co_await h2->server.pump(
                 [&] { return h2->server.responses.contains(1) && h2->server.responses[1].done; });
-            REQUIRE(got);
+            if (!got) co_return "no request on stream 1";
             h2->server.s.goaway(1, http11_required);
             got = co_await h2->server.sync();
-            REQUIRE(got);
+            if (!got) co_return "no PING ACK after the GOAWAY";
             h2->socket.shutdown_write();
             (void)co_await h2->server.pump([&] { return h2->server.closed; });
         }
@@ -576,30 +619,33 @@ TEST_CASE("after GOAWAY with HTTP_1_1_REQUIRED, a stream the connection's end cu
         if (method == http::request_method::GET)
         {
             auto h1 = co_await accept_h1(host.listener);
-            REQUIRE(h1.has_value());
+            if (!h1.has_value()) co_return "no HTTP/1.1 connection";
             auto sent = co_await h1->read_request();
-            REQUIRE(sent.has_value());
-            CHECK(sent->first.starts_with("GET / HTTP/1.1\r\n"));
+            if (!sent.has_value()) co_return "no HTTP/1.1 request";
+            if (!sent->first.starts_with("GET / HTTP/1.1\r\n")) co_return "the request: " + sent->first;
             const bool got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"sv);
-            REQUIRE(got);
+            if (!got) co_return "the response wasn't written";
         }
 
         const bool got = co_await out.wait(&sched);
-        REQUIRE(got);
-        if (method == http::request_method::GET)
-        {
-            CHECK(out.err == std::error_code{});
-            CHECK(out.body == "ok");
-        }
-        else
-        {
-            // it may have been processed: the caller's told the server asked for HTTP/1.1, rather than that the
-            // connection was cut off.
-            CHECK(out.err == http11_required);
-        }
+        if (!got) co_return "the request didn't finish";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    if (method == http::request_method::GET)
+    {
+        CHECK(out.err == std::error_code{});
+        CHECK(out.body == "ok");
+    }
+    else
+    {
+        // it may have been processed: the caller's told the server asked for HTTP/1.1, rather than that the
+        // connection was cut off.
+        CHECK(out.err == http11_required);
+    }
 }
 
 TEST_CASE("a request refused, then reset with HTTP_1_1_REQUIRED on its second HTTP/2 connection, goes over HTTP/1.1",
@@ -613,43 +659,49 @@ TEST_CASE("a request refused, then reset with HTTP_1_1_REQUIRED on its second HT
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)))
+            co_return "the request didn't start";
 
         auto first = co_await accept_h2(&host);
-        bool got   = co_await first->server.pump([&] { return first->server.responses.contains(1); });
-        REQUIRE(got);
+        if (first == nullptr) co_return "no first HTTP/2 connection";
+        bool got = co_await first->server.pump([&] { return first->server.responses.contains(1); });
+        if (!got) co_return "no request on the first connection";
         first->server.s.reset(1, http2::error_code::refused_stream);
         got = co_await first->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the refusal wasn't written";
 
         // the retry (not a first attempt) is asked for HTTP/1.1.
         auto second = co_await accept_h2(&host);
-        got         = co_await second->server.pump([&] { return second->server.responses.contains(1); });
-        REQUIRE(got);
+        if (second == nullptr) co_return "no second HTTP/2 connection";
+        got = co_await second->server.pump([&] { return second->server.responses.contains(1); });
+        if (!got) co_return "no request on the second connection";
         second->server.s.reset(1, http11_required);
         got = co_await second->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         auto req = co_await h1->read_request();
-        REQUIRE(req.has_value());
-        CHECK(req->first.starts_with("GET / HTTP/1.1\r\n"));
+        if (!req.has_value()) co_return "no HTTP/1.1 request";
+        if (!req->first.starts_with("GET / HTTP/1.1\r\n")) co_return "the request: " + req->first;
         got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"sv);
-        REQUIRE(got);
+        if (!got) co_return "the response wasn't written";
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        CHECK(out.err == std::error_code{});
-        CHECK(out.body == "ok");
-        CHECK(client.stats().open == 3);
+        if (!got) co_return "the request didn't finish";
+        if (client.stats().open != 3) co_return "after it: " + connections(client);
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.err == std::error_code{});
+    CHECK(out.body == "ok");
 }
 
 TEST_CASE("a request whose HTTP/1.1 attempt fails, after HTTP_1_1_REQUIRED, fails with that attempt's error",
@@ -667,7 +719,7 @@ TEST_CASE("a request whose HTTP/1.1 attempt fails, after HTTP_1_1_REQUIRED, fail
     http::client       client{&sched, prior_knowledge()};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
@@ -675,30 +727,34 @@ TEST_CASE("a request whose HTTP/1.1 attempt fails, after HTTP_1_1_REQUIRED, fail
         req.stop = stop.get_token();
 
         const bool spawned = sched.spawn(send_with(&sched, &client, std::move(req), &out));
-        REQUIRE(spawned);
+        if (!spawned) co_return "the request didn't start";
 
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         // the server closes the HTTP/1.1 connection without answering, or the caller stops the request first.
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         const auto sent = co_await h1->read_request();
-        REQUIRE(sent.has_value());
+        if (!sent.has_value()) co_return "no HTTP/1.1 request";
         if (cancel) stop.request_stop();
         else h1->socket.shutdown_write();
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        if (cancel) CHECK(out.err == std::errc::operation_canceled);
-        else CHECK(out.err == net::io::status_condition::closed);
+        if (!got) co_return "the request didn't finish";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    if (cancel) CHECK(out.err == std::errc::operation_canceled);
+    else CHECK(out.err == net::io::status_condition::closed);
 }
 
 TEST_CASE("at max_connections_per_host, a request for HTTP/1.1 closes its host's idle HTTP/2 connection",
@@ -717,38 +773,43 @@ TEST_CASE("at max_connections_per_host, a request for HTTP/1.1 closes its host's
     http::client client{&sched, options};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/")), &out)))
+            co_return "the request didn't start";
 
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         auto req = co_await h1->read_request();
-        REQUIRE(req.has_value());
+        if (!req.has_value()) co_return "no HTTP/1.1 request";
         got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"sv);
-        REQUIRE(got);
+        if (!got) co_return "the response wasn't written";
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        CHECK(out.body == "ok");
+        if (!got) co_return "the request didn't finish";
 
         // the HTTP/2 connection was closed to make room.
         got = co_await h2->server.pump([&] { return h2->server.closed; });
-        CHECK(got);
-        CHECK(h2->server.goaway);
-        CHECK(client.stats() == http::connection_stats{.open = 1, .idle = 1});
+        if (!got) co_return "the HTTP/2 connection didn't end";
+        if (!h2->server.goaway) co_return "no GOAWAY";
+        if (auto wrong = stats_are(client, {.open = 1, .idle = 1}); !wrong.empty()) co_return "after it: " + wrong;
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.body == "ok");
 }
 
 TEST_CASE("after HTTP_1_1_REQUIRED, a redirect to the same origin goes over HTTP/1.1, and to another tries HTTP/2",
@@ -769,29 +830,31 @@ TEST_CASE("after HTTP_1_1_REQUIRED, a redirect to the same origin goes over HTTP
     http::client client{&sched, options};
     REQUIRE(sched.spawn(watch(&sched, &done, {&host.listener, &other.listener})));
 
-    const auto test = [&] -> task<>
+    const auto test = [&] -> task<std::string>
     {
         const net::util::defer finished{[&] noexcept { test::stop_probe::bump(&sched, done); }};
 
-        REQUIRE(sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/start")), &out)));
+        if (!sched.spawn(send_with(&sched, &client, request(http::request_method::GET, host.url("/start")), &out)))
+            co_return "the request didn't start";
 
-        auto h2  = co_await accept_h2(&host);
+        auto h2 = co_await accept_h2(&host);
+        if (h2 == nullptr) co_return "no HTTP/2 connection";
         bool got = co_await h2->server.pump([&] { return h2->server.responses.contains(1); });
-        REQUIRE(got);
+        if (!got) co_return "no request on stream 1";
         h2->server.s.reset(1, http11_required);
         got = co_await h2->server.pump([] { return true; });
-        REQUIRE(got);
+        if (!got) co_return "the reset wasn't written";
 
         auto h1 = co_await accept_h1(host.listener);
-        REQUIRE(h1.has_value());
+        if (!h1.has_value()) co_return "no HTTP/1.1 connection";
         auto req = co_await h1->read_request();
-        REQUIRE(req.has_value());
-        CHECK(req->first.starts_with("GET /start HTTP/1.1\r\n"));
+        if (!req.has_value()) co_return "no HTTP/1.1 request";
+        if (!req->first.starts_with("GET /start HTTP/1.1\r\n")) co_return "the request: " + req->first;
 
         const auto location = same ? std::string{"/next"} : other.url("/there");
         got =
             co_await h1->send(std::format("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n", location));
-        REQUIRE(got);
+        if (!got) co_return "the redirect wasn't written";
 
         // NOTE: kept until the client has its response: closing a socket with unread data resets the connection
         //       (on Linux), dropping a response the client hasn't read yet.
@@ -800,35 +863,40 @@ TEST_CASE("after HTTP_1_1_REQUIRED, a redirect to the same origin goes over HTTP
         {
             // on the same HTTP/1.1 connection, rather than the HTTP/2 one.
             req = co_await h1->read_request();
-            REQUIRE(req.has_value());
-            CHECK(req->first.starts_with("GET /next HTTP/1.1\r\n"));
+            if (!req.has_value()) co_return "no second HTTP/1.1 request";
+            if (!req->first.starts_with("GET /next HTTP/1.1\r\n")) co_return "the redirect's request: " + req->first;
             got = co_await h1->send("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext"sv);
-            REQUIRE(got);
+            if (!got) co_return "the redirect's response wasn't written";
         }
         else
         {
             // another origin: HTTP/2, as any request to it.
             there = co_await accept_h2(&other);
-            got   = co_await there->server.pump([&] { return there->server.responses.contains(1); });
-            REQUIRE(got);
-            CHECK(field(there->server.responses[1], ":path") == "/there");
+            if (there == nullptr) co_return "no HTTP/2 connection to the other origin";
+            got = co_await there->server.pump([&] { return there->server.responses.contains(1); });
+            if (!got) co_return "no request to the other origin";
+            const auto path = field(there->server.responses[1], ":path");
+            if (path != "/there") co_return "the redirect's :path: " + path;
             there->server.respond(1, "200", "there");
             got = co_await there->server.pump([] { return true; });
-            REQUIRE(got);
+            if (!got) co_return "the redirect's response wasn't written";
         }
 
         got = co_await out.wait(&sched);
-        REQUIRE(got);
-        CHECK(out.err == std::error_code{});
-        CHECK(out.body == (same ? "next" : "there"));
+        if (!got) co_return "the request didn't finish";
 
         // nothing more came on the first HTTP/2 connection.
         got = co_await h2->server.sync();
-        REQUIRE(got);
-        CHECK_FALSE(h2->server.responses.contains(3));
+        if (!got) co_return "no PING ACK on the first connection";
+        if (h2->server.responses.contains(3)) co_return "a request on the first connection's stream 3";
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test());
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CHECK(out.err == std::error_code{});
+    CHECK(out.body == (same ? "next" : "there"));
 }
 
 TEST_CASE("an HTTP/2 request opened after GOAWAY with HTTP_1_1_REQUIRED says so, unsent",
@@ -836,41 +904,86 @@ TEST_CASE("an HTTP/2 request opened after GOAWAY with HTTP_1_1_REQUIRED says so,
 {
     net::io::scheduler sched{make_pool()};
 
-    const auto test = [](net::io::scheduler* sched) -> task<>
+    struct result
     {
-        auto listener = net::listener::make(sched, "127.0.0.1", "0").value();
-        auto client   = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(listener.local_port()));
-        REQUIRE(client.has_value());
-        auto accepted = co_await listener.accept();
-        REQUIRE(accepted.has_value());
+        std::string     failed; // what went wrong with the test's own steps, if anything
+        bool            accepting = true;
+        std::error_code err;
+        bool            unsent = false;
+        bool            closed = false;
+    };
+
+    const auto test = [](net::io::scheduler* sched) -> task<result>
+    {
+        result out;
+
+        auto listener = net::listener::make(sched, "127.0.0.1", "0");
+        if (!listener.has_value())
+        {
+            out.failed = "no listener";
+            co_return out;
+        }
+        auto client = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(listener->local_port()));
+        if (!client.has_value())
+        {
+            out.failed = "not connected";
+            co_return out;
+        }
+        auto accepted = co_await listener->accept();
+        if (!accepted.has_value())
+        {
+            out.failed = "not accepted";
+            co_return out;
+        }
 
         auto conn = std::make_shared<http::detail::http2_client_connection>(
             sched,
             std::make_unique<http::detail::connection>(std::move(*client)),
             http::detail::http2_client_options{},
             http::detail::http2_client_connection::callbacks{});
-        REQUIRE(conn->start());
+        if (!conn->start())
+        {
+            out.failed = "not started";
+            co_return out;
+        }
         test::h2_client server{&*accepted, &*accepted, &*accepted, http2::role::server};
 
         // a stream reserved, then the server's GOAWAY.
-        REQUIRE(conn->reserve());
+        if (!conn->reserve())
+        {
+            out.failed = "not reserved";
+            co_return out;
+        }
         server.s.goaway(0, http11_required);
-        bool got = co_await server.sync();
-        REQUIRE(got);
-        CHECK_FALSE(conn->accepting());
+        const bool synced = co_await server.sync();
+        if (!synced)
+        {
+            out.failed = "no PING ACK after the GOAWAY";
+            co_return out;
+        }
+        out.accepting = conn->accepting();
 
         auto req = request(http::request_method::POST, "http://127.0.0.1/");
         req.set_body("unread");
 
         http::detail::http2_client_connection::send_state state;
         const auto                                        resp = co_await conn->send(req, &state);
-        REQUIRE_FALSE(resp.has_value());
-        CHECK(resp.error() == http11_required);
-        CHECK(state.unsent);
-
-        got = co_await server.pump([&] { return server.closed; }, 3s);
-        CHECK(got);
+        if (resp.has_value())
+        {
+            out.failed = "sent";
+            co_return out;
+        }
+        out.err    = resp.error();
+        out.unsent = state.unsent;
+        out.closed = co_await server.pump([&] { return server.closed; }, 3s);
+        co_return out;
     };
 
-    sched.run_to_completion(test(&sched));
+    const auto out = sched.run_to_completion(test(&sched));
+    CAPTURE(out.failed);
+    CHECK(out.failed.empty());
+    CHECK_FALSE(out.accepting);
+    CHECK(out.err == http11_required);
+    CHECK(out.unsent);
+    CHECK(out.closed);
 }

@@ -207,23 +207,49 @@ TEST_CASE("the server's HTTP/2 stream window is its SETTINGS', and its connectio
     };
     REQUIRE(sched.spawn(server.serve()));
 
-    sched.run_to_completion(
-        [](net::io::scheduler* sched, std::uint16_t port, test_case tc) -> task<>
+    // what the client saw: the stream window in the server's SETTINGS, the connection's window, and a stream's.
+    struct seen
+    {
+        std::string   failed; // what went wrong with the test's own steps, if anything
+        std::uint32_t initial_window    = 0;
+        std::int64_t  connection_window = 0;
+        std::int64_t  stream_window     = 0;
+    };
+
+    const auto saw = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::uint16_t port) -> task<seen>
         {
+            seen out;
+
             auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
-            REQUIRE(conn.has_value());
+            if (!conn.has_value())
+            {
+                out.failed = "not connected: " + conn.error().message();
+                co_return out;
+            }
             test::h2_client c{&*conn, &*conn, &*conn};
 
             // the server's SETTINGS, and the WINDOW_UPDATE that raises its connection's window after them.
             const bool synced = co_await c.sync();
-            REQUIRE(synced);
-            CHECK(c.s.peer_settings().initial_window_size == tc.window);
-            CHECK(c.s.send_window(0) == tc.want);
+            if (!synced)
+            {
+                out.failed = "no PING ACK";
+                co_return out;
+            }
+            out.initial_window    = c.s.peer_settings().initial_window_size;
+            out.connection_window = c.s.send_window(0);
 
             // a stream may send as much as its window, which the connection's holds.
-            const auto id = c.request("POST", "/echo", {}, false);
-            CHECK(c.s.send_window(id) == tc.window);
-        }(&sched, server.local_port(), tc));
+            const auto id     = c.request("POST", "/echo", {}, false);
+            out.stream_window = c.s.send_window(id);
+            co_return out;
+        }(&sched, server.local_port()));
+
+    CAPTURE(saw.failed);
+    CHECK(saw.failed.empty());
+    CHECK(saw.initial_window == tc.window);
+    CHECK(saw.connection_window == tc.want);
+    CHECK(std::cmp_equal(saw.stream_window, tc.window));
 }
 
 TEST_CASE("the server refuses buffer and window sizes out of their ranges", "[http][server][buffers][limits]")

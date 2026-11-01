@@ -410,29 +410,35 @@ TEST_CASE("a response's trailers that can't be trailers are dropped", "[http][cl
     const bool http2 = GENERATE(false, true);
     CAPTURE(http2);
 
+    background         bg; // (before the scheduler, whose task uses it)
     net::io::scheduler sched{make_pool()};
     auto               listener = net::listener::make(&sched, "127.0.0.1", "0").value();
     http::client       client{&sched, options_for(http2)};
 
-    // the test plays the server: cppnet's drops those itself.
-    const auto test = [](net::io::scheduler* sched, http::client* client, net::listener* listener, bool http2) -> task<>
+    // the test plays the server: cppnet's drops those itself. It returns what went wrong with its own steps, if
+    // anything.
+    const auto test = [](net::io::scheduler* sched,
+                         http::client*       client,
+                         net::listener*      listener,
+                         background*         bg,
+                         bool                http2) -> task<std::string>
     {
-        background bg;
-        REQUIRE(sched->spawn(send_in_background(
+        const bool spawned = sched->spawn(send_in_background(
             sched,
             client,
             request(http::request_method::GET, std::format("http://127.0.0.1:{}/", listener->local_port())),
-            &bg)));
+            bg));
+        if (!spawned) co_return "the request didn't start";
 
         auto conn = co_await listener->accept();
-        REQUIRE(conn.has_value());
+        if (!conn.has_value()) co_return "no connection";
 
         if (http2)
         {
             test::h2_client server{&*conn, &*conn, &*conn, http2::role::server};
 
             const bool requested = co_await server.pump([&] { return server.responses.contains(1); });
-            REQUIRE(requested);
+            if (!requested) co_return "no request";
 
             server.respond(1, "200", "hello", false);
             const std::vector<hpack::field> trailers{
@@ -444,32 +450,34 @@ TEST_CASE("a response's trailers that can't be trailers are dropped", "[http][cl
             };
             server.send_trailers(1, trailers);
             const bool written = co_await server.pump([] { return true; }); // (just written)
-            REQUIRE(written);
+            if (!written) co_return "the response wasn't written";
 
             // NOTE: the connection's kept until the client's done with it.
-            const bool sent = co_await bg.wait(sched);
-            REQUIRE(sent);
+            const bool sent = co_await bg->wait(sched);
+            if (!sent) co_return "the request didn't finish";
         }
         else
         {
             const bool head = co_await read_head(*conn);
-            REQUIRE(head);
+            if (!head) co_return "no request";
             const auto response =
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n"
                 "Content-Length: 5\r\nHost: x\r\nIf-Match: y\r\nAuthorization: z\r\nX-Ok: 1\r\n\r\n"sv;
             const auto wrote = co_await net::io::write_all(*conn, response);
-            REQUIRE_FALSE(wrote.err);
-            const bool sent = co_await bg.wait(sched);
-            REQUIRE(sent);
+            if (wrote.err) co_return "the response wasn't written: " + wrote.err.message();
+            const bool sent = co_await bg->wait(sched);
+            if (!sent) co_return "the request didn't finish";
         }
-
-        CAPTURE(bg.out.err.message());
-        CHECK(bg.out.status == 200);
-        CHECK(bg.out.body == "hello");
-        CHECK(bg.out.trailers == "x-ok=1;");
+        co_return std::string{};
     };
 
-    sched.run_to_completion(test(&sched, &client, &listener, http2));
+    const auto failed = sched.run_to_completion(test(&sched, &client, &listener, &bg, http2));
+    CAPTURE(failed);
+    CHECK(failed.empty());
+    CAPTURE(bg.out.err.message());
+    CHECK(bg.out.status == 200);
+    CHECK(bg.out.body == "hello");
+    CHECK(bg.out.trailers == "x-ok=1;");
 }
 
 TEST_CASE("make_trailers' fields reach the handler", "[http][client][trailers]")
@@ -552,29 +560,39 @@ TEST_CASE("a trailer that can't be sent fails the request, cut short", "[http][c
     served             server{&sched};
     http::client       client{&sched, options_for(http2)};
 
-    const auto test = [](net::io::scheduler* sched, http::client* client, served* server) -> task<>
+    struct result
     {
+        outcome out;          // the request with the trailer
+        bool    sunk = false; // the server's handler saw what came of it
+        outcome next;         // the request after it
+    };
+
+    const auto test = [](net::io::scheduler* sched, http::client* client, served* server) -> task<result>
+    {
+        result r;
+
         // more than the client's buffer, so the server has the head (and handler) before the request fails.
         auto req          = request(http::request_method::POST, server->url("/sink"));
         req.body          = chunked_body(std::string(100'000, 'x'));
         req.make_trailers = [](http::trailer_fields& trailers) { trailers.set("X-Bad", "a\r\nb"); };
 
-        const auto out = co_await send(client, std::move(req));
-        CHECK(out.err == std::errc::invalid_argument);
+        r.out = co_await send(client, std::move(req));
 
         // the server didn't take it as complete: its connection was closed (HTTP/1.1), or its stream reset (HTTP/2).
-        const bool sunk = co_await server->sunk.wait(sched);
-        REQUIRE(sunk);
-        CHECK(server->sunk.err);
-        CHECK(server->sunk.body.empty());
+        r.sunk = co_await server->sunk.wait(sched);
 
         // and the client goes on.
-        const auto next = co_await send(client, request(http::request_method::GET, server->url("/plain")));
-        CAPTURE(next.err.message());
-        CHECK(next.body == "plain");
+        r.next = co_await send(client, request(http::request_method::GET, server->url("/plain")));
+        co_return r;
     };
 
-    sched.run_to_completion(test(&sched, &client, &server));
+    const auto r = sched.run_to_completion(test(&sched, &client, &server));
+    CHECK(r.out.err == std::errc::invalid_argument);
+    REQUIRE(r.sunk);
+    CHECK(server.sunk.err);
+    CHECK(server.sunk.body.empty());
+    CAPTURE(r.next.err.message());
+    CHECK(r.next.body == "plain");
 }
 
 TEST_CASE("TE: trailers set by the caller is sent, as each version has it", "[http][client][trailers][te]")
@@ -641,30 +659,31 @@ TEST_CASE("a connection's next response after one with trailers has its own", "[
     served             server{&sched};
     http::client       client{&sched, options_for(http2)};
 
+    // the responses' trailers, then the client's connections (or what failed).
     const auto test = [](http::client* client, served* server) -> task<std::vector<std::string>>
     {
         std::vector<std::string> out;
 
         // the first response is kept (with its trailers) as the others are read.
         auto first = co_await client->send(request(http::request_method::GET, server->url("/chunked")));
-        REQUIRE(first.has_value());
+        if (!first.has_value()) co_return std::vector<std::string>{"error: " + first.error().message()};
         const auto first_body = co_await net::io::read_all(*first->body);
-        REQUIRE(first_body.has_value());
+        if (!first_body.has_value()) co_return std::vector<std::string>{"error: " + first_body.error().message()};
         out.push_back(describe(first->trailers()));
 
         for (const auto* path : {"/other", "/plain"})
         {
             auto resp = co_await client->send(request(http::request_method::GET, server->url(path)));
-            REQUIRE(resp.has_value());
+            if (!resp.has_value()) co_return std::vector<std::string>{"error: " + resp.error().message()};
             const auto resp_body = co_await net::io::read_all(*resp->body);
-            REQUIRE(resp_body.has_value());
+            if (!resp_body.has_value()) co_return std::vector<std::string>{"error: " + resp_body.error().message()};
             out.push_back(describe(resp->trailers()));
         }
 
         out.push_back(describe(first->trailers()));
 
         // one connection, reused for each.
-        CHECK(client->stats().open == 1);
+        out.push_back(std::format("{} open", client->stats().open));
         co_return out;
     };
 
@@ -673,5 +692,6 @@ TEST_CASE("a connection's next response after one with trailers has its own", "[
           == std::vector<std::string>{"server-timing=db;dur=53;grpc-status=0;",
                                       "x-second=2;",
                                       "",
-                                      "server-timing=db;dur=53;grpc-status=0;"});
+                                      "server-timing=db;dur=53;grpc-status=0;",
+                                      "1 open"});
 }

@@ -62,6 +62,8 @@ struct observed
     std::error_code err{};           // its wait's
     bool            stopped = false; // whether its token was stopped once the wait ended
     clock::duration waited  = {};
+
+    std::atomic<bool> waiting = false; // set as it begins its wait
 };
 
 // then is what a sleeper does once its wait ends.
@@ -82,7 +84,8 @@ struct sleeper
 
     task<void> operator()(http::server_request& req, http::response_writer& resp) const
     {
-        seen->token      = req.stop;
+        seen->token = req.stop;
+        seen->waiting.store(true);
         const auto start = clock::now();
         seen->err        = co_await sched->sleep_until(start + wait, req.stop);
         seen->waited     = clock::now() - start;
@@ -257,8 +260,16 @@ TEST_CASE("a handler that finishes before the timeout is unaffected", "[http][mi
     CHECK(res.response.starts_with("HTTP/1.1 200 OK\r\n"));
 
     // its timer was canceled: the token it kept (a copy stays valid) isn't stopped after the deadline. (A call made
-    // then would use the timeout's source, gone with its frame, which ASan would report.)
-    std::this_thread::sleep_for(200ms);
+    // then would use the timeout's source, gone with its frame, which ASan would report.) Calls are made in the order
+    // of their deadlines, so once one due after the timeout's has been, the timeout's would have been too.
+    std::atomic<bool> later = false;
+    const auto        made  = [&later] noexcept
+    {
+        later.store(true);
+        later.notify_all();
+    };
+    const auto call = sched.call_at(clock::now() + 100ms, made);
+    later.wait(false);
     CHECK_FALSE(seen.token.stop_requested());
 }
 
@@ -278,9 +289,12 @@ TEST_CASE("the request's own stop reaches the handler through the timeout's toke
         const bool by_abort = GENERATE(false, true);
         CAPTURE(by_abort);
 
+        // once the handler's begun its wait (or is about to: it's then stopped at once).
         std::jthread stopper{[&]
                              {
-                                 std::this_thread::sleep_for(50ms);
+                                 const auto deadline = std::chrono::steady_clock::now() + 5s;
+                                 while (!seen.waiting.load() && std::chrono::steady_clock::now() < deadline)
+                                     std::this_thread::sleep_for(1ms);
                                  if (by_abort) aborted.request_stop();
                                  request.request_stop();
                              }};

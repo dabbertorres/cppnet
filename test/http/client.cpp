@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -98,11 +99,12 @@ task<std::string> read_all(net::io::reader* body)
 
 TEST_CASE("the client sends a request, and reads the response", "[http][client]")
 {
+    std::string request_head; // (before the scheduler, whose task writes it)
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
-
-    std::string request_head;
+    const auto port = local_port(listener);
     REQUIRE(sched.spawn(serve_once(&listener, &request_head)));
 
     auto get = [](net::io::scheduler* sched, std::string url) -> task<std::pair<net::http::status, std::string>>
@@ -125,7 +127,6 @@ TEST_CASE("the client sends a request, and reads the response", "[http][client]"
         co_return std::pair{resp->status_code, body};
     };
 
-    auto port           = local_port(listener);
     auto [status, body] = sched.run_to_completion(get(&sched, "http://127.0.0.1:" + port + "/path?q=1"));
 
     CHECK(status == net::http::status::OK);
@@ -136,11 +137,12 @@ TEST_CASE("the client sends a request, and reads the response", "[http][client]"
 
 TEST_CASE("get() sends a GET, over HTTP/1.1", "[http][client]")
 {
+    std::string request_head; // (before the scheduler, whose task writes it)
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
     net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
     listener.listen(8);
-
-    std::string request_head;
+    const auto port = local_port(listener);
     REQUIRE(sched.spawn(serve_once(&listener, &request_head)));
 
     auto get = [](net::io::scheduler* sched, std::string url) -> task<std::string>
@@ -154,7 +156,6 @@ TEST_CASE("get() sends a GET, over HTTP/1.1", "[http][client]")
         co_return body.has_value() ? *body : "error: " + body.error().message();
     };
 
-    auto port = local_port(listener);
     CHECK(sched.run_to_completion(get(&sched, "http://127.0.0.1:" + port + "/path?q=1")) == "hello");
     CHECK(request_head.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
 }
@@ -341,9 +342,7 @@ struct keepalive_server
     task<> handle(net::tcp_socket conn)
     {
         ++accepted;
-        auto now_active = ++active;
-        for (auto seen = max_active.load(); now_active > seen && !max_active.compare_exchange_weak(seen, now_active);)
-        {}
+        opened(conn.native_handle());
 
         std::string                  pending;
         std::array<std::byte, 1'024> buf{};
@@ -359,7 +358,8 @@ struct keepalive_server
                 if (res.err) goto done;
             }
             pending.erase(0, pending.find("\r\n\r\n") + 4);
-            ++requests;
+            requests.fetch_add(1);
+            sched->notify_all(requests);
 
             if (when == closing::on_second && ++on_connection == 2)
             {
@@ -369,6 +369,13 @@ struct keepalive_server
             }
 
             if (delay > 0ms) (void)co_await sched->sleep_until(net::io::clock::now() + delay);
+            if (hold)
+            {
+                while (released.load() == 0)
+                {
+                    if (co_await sched->wait_on(released, 0)) break;
+                }
+            }
 
             auto response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"sv;
             if (when == closing::with_header)
@@ -380,7 +387,39 @@ struct keepalive_server
         }
 
 done:
-        --active;
+        {
+            const std::scoped_lock lock{mu};
+            std::erase(open, conn.native_handle());
+        }
+        conn.close();
+        closed.fetch_add(1);
+        sched->notify_all(closed);
+    }
+
+    // opened counts a connection (fd) as open, with those before it that the client hasn't closed: one whose task
+    // hasn't read its end yet is told apart by peeking (the client closes a connection before it makes another, so its
+    // end has come before the next connection is accepted).
+    void opened(int fd)
+    {
+        const std::scoped_lock lock{mu};
+
+        int now_open = 1;
+        for (const int other : open)
+        {
+            char byte = 0;
+            // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): MSG_DONTWAIT, so it doesn't block.
+            const int read = static_cast<int>(::recv(other, &byte, 1, MSG_PEEK | MSG_DONTWAIT));
+            if (read != 0) ++now_open;
+        }
+        open.push_back(fd);
+        max_active = std::max(max_active, now_open);
+    }
+
+    // release lets the responses held (see hold) go.
+    void release()
+    {
+        released.store(1);
+        sched->notify_all(released);
     }
 
     net::io::scheduler* sched;
@@ -389,13 +428,29 @@ done:
 
     closing                   when           = closing::never;
     std::chrono::milliseconds delay          = 0ms;
+    bool                      hold           = false;   // responses wait for release()
     std::stop_source*         stop_on_second = nullptr; // stopped by closing::on_second as it closes
 
-    std::atomic<int> accepted{0};
-    std::atomic<int> active{0};
-    std::atomic<int> max_active{0};
-    std::atomic<int> requests{0};
+    std::atomic<int>           accepted{0};
+    std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> closed{0}; // connections the server's closed
+    std::atomic<std::uint64_t> released{0};
+
+    std::mutex       mu;
+    std::vector<int> open;           // the connections' fds, until they're closed
+    int              max_active = 0; // the most open at once, as the client saw them
 };
+
+// reached waits (up to 5 seconds) for word to reach n, returning whether it did.
+task<bool> reached(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t n)
+{
+    const auto deadline = net::io::clock::now() + 5s;
+    for (auto seen = word.load(); seen < n; seen = word.load())
+    {
+        if (co_await sched->wait_on(word, seen, deadline)) co_return word.load() >= n;
+    }
+    co_return true;
+}
 
 net::http::client_request get_request(const std::string& host, const std::string& port)
 {
@@ -419,6 +474,19 @@ task<std::string> fetch(net::http::client* client, std::string host, std::string
     co_return co_await read_all(resp->body.get());
 }
 
+// fetch_into fetches as fetch() does, into result, then bumps done.
+task<> fetch_into(net::io::scheduler*         sched,
+                  net::http::client*          client,
+                  std::string                 host,
+                  std::string                 port,
+                  std::string*                result,
+                  std::atomic<std::uint64_t>* done)
+{
+    *result = co_await fetch(client, std::move(host), std::move(port));
+    done->fetch_add(1);
+    sched->notify_all(*done);
+}
+
 // fetch_all fetches from each host at once, and returns the results in order.
 task<std::vector<std::string>>
 fetch_all(net::io::scheduler* sched, net::http::client* client, std::vector<std::string> hosts, std::string port)
@@ -426,20 +494,8 @@ fetch_all(net::io::scheduler* sched, net::http::client* client, std::vector<std:
     std::vector<std::string>   results(hosts.size());
     std::atomic<std::uint64_t> finished{0};
 
-    auto one = [](net::io::scheduler*         sched,
-                  net::http::client*          client,
-                  std::string                 host,
-                  std::string                 port,
-                  std::string*                result,
-                  std::atomic<std::uint64_t>* finished) -> task<>
-    {
-        *result = co_await fetch(client, host, port);
-        ++*finished;
-        sched->notify_all(*finished);
-    };
-
     for (std::size_t i = 0; i < hosts.size(); ++i)
-        if (!sched->spawn(one(sched, client, hosts[i], port, &results[i], &finished)))
+        if (!sched->spawn(fetch_into(sched, client, hosts[i], port, &results[i], &finished)))
             co_return std::vector<std::string>{"spawn failed"};
 
     for (auto seen = finished.load(); seen < hosts.size(); seen = finished.load())
@@ -570,21 +626,23 @@ TEST_CASE("idle connections the server closed aren't reused", "[http][client][po
 
     net::http::client client{&sched};
 
-    auto test = [](net::io::scheduler* sched, net::http::client* client, std::string port) -> task<std::string>
+    auto test = [](net::io::scheduler* sched, net::http::client* client, keepalive_server* server) -> task<std::string>
     {
         std::string bodies;
-        for (int i = 0; i < 5; ++i)
+        for (std::uint64_t i = 0; i < 5; ++i)
         {
-            bodies += co_await fetch(client, "127.0.0.1", port);
+            bodies += co_await fetch(client, "127.0.0.1", server->port);
 
-            // every other time, give the server's close time to arrive, so it's seen before reusing the connection.
-            // Otherwise, the request fails on the closed connection, and is retried.
-            if (i % 2 == 0) (void)co_await sched->sleep_until(net::io::clock::now() + 20ms);
+            // every other time, once the server's closed the connection, so its close is seen before reusing it.
+            // Otherwise, the request may fail on the closed connection, and is retried.
+            if (i % 2 != 0) continue;
+            const bool closed = co_await reached(sched, server->closed, i + 1);
+            if (!closed) bodies += " [not closed]";
         }
         co_return bodies;
     };
 
-    CHECK(run(sched, server, test(&sched, &client, server.port)) == "hellohellohellohellohello");
+    CHECK(run(sched, server, test(&sched, &client, &server)) == "hellohellohellohellohello");
     CHECK(server.accepted == 5);
     CHECK(server.requests == 5);
 }
@@ -639,20 +697,39 @@ TEST_CASE("connections altogether are limited", "[http][client][pool]")
 
 TEST_CASE("waiting for a connection times out", "[http][client][pool]")
 {
+    // NOTE: before the scheduler, whose task uses them.
+    std::string                busy;
+    std::atomic<std::uint64_t> busy_done{0};
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     keepalive_server   server{&sched};
-    server.delay = 500ms;
+    server.hold = true;
 
     net::http::client client{
         &sched,
         {.connect_timeout = 100ms, .max_connections_per_host = 1}
     };
 
-    auto results = run(sched, server, fetch_all(&sched, &client, {"127.0.0.1", "127.0.0.1"}, server.port));
+    // the one connection is busy (its response held until the test lets it go), so the next request waits for it.
+    const auto test = [](net::io::scheduler*         sched,
+                         net::http::client*          client,
+                         keepalive_server*           server,
+                         std::string*                busy,
+                         std::atomic<std::uint64_t>* busy_done) -> task<std::string>
+    {
+        if (!sched->spawn(fetch_into(sched, client, "127.0.0.1", server->port, busy, busy_done)))
+            co_return "not spawned";
+        if (!co_await reached(sched, server->requests, 1)) co_return "not requested";
 
-    std::ranges::sort(results);
-    CHECK(results
-          == std::vector<std::string>{"error: " + std::make_error_code(std::errc::timed_out).message(), "hello"});
+        auto waited = co_await fetch(client, "127.0.0.1", server->port);
+        server->release();
+        if (!co_await reached(sched, *busy_done, 1)) co_return "not done";
+        co_return waited;
+    };
+
+    CHECK(run(sched, server, test(&sched, &client, &server, &busy, &busy_done))
+          == "error: " + std::make_error_code(std::errc::timed_out).message());
+    CHECK(busy == "hello");
 }
 
 TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool]")
@@ -664,18 +741,18 @@ TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool
 
     auto test = [](net::io::scheduler* sched,
                    net::http::client*  client,
-                   keepalive_server*   server) -> task<std::pair<net::http::connection_stats, int>>
+                   keepalive_server*   server) -> task<std::pair<std::string, net::http::connection_stats>>
     {
-        co_await fetch(client, "127.0.0.1", server->port);
-        (void)co_await sched->sleep_until(net::io::clock::now() + 300ms);
+        auto body = co_await fetch(client, "127.0.0.1", server->port);
 
-        // the server has seen it close.
-        co_return std::pair{client->stats(), server->active.load()};
+        // the server's seen the client close it (so the client's done with it).
+        if (!co_await reached(sched, server->closed, 1)) body += " [not closed]";
+        co_return std::pair{body, client->stats()};
     };
 
-    auto [stats, active] = run(sched, server, test(&sched, &client, &server));
+    auto [body, stats] = run(sched, server, test(&sched, &client, &server));
+    CHECK(body == "hello");
     CHECK(stats == net::http::connection_stats{});
-    CHECK(active == 0);
 }
 
 TEST_CASE("requests are retried if a reused connection was closed", "[http][client][pool]")
@@ -963,11 +1040,12 @@ public:
     [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
 };
 
-// timed runs test, and returns its result, and how long it took.
+// timed runs test, and returns its result, and how long it took since start (by default, now: a test that spawns a
+// task to stop it later passes the time from before then).
 template<typename T>
-std::pair<T, net::io::clock::duration> timed(net::io::scheduler& sched, task<T> test)
+std::pair<T, net::io::clock::duration>
+timed(net::io::scheduler& sched, task<T> test, net::io::clock::time_point start = net::io::clock::now())
 {
-    auto start  = net::io::clock::now();
     auto result = sched.run_to_completion(std::move(test));
     return {std::move(result), net::io::clock::now() - start};
 }
@@ -1089,51 +1167,47 @@ TEST_CASE("a request stopped before it's sent fails without a connection", "[htt
 
 TEST_CASE("a request canceled while it waits for a connection gives up its place", "[http][client][cancel]")
 {
+    // NOTE: before the scheduler, whose task uses them.
+    std::string                busy;
+    std::atomic<std::uint64_t> busy_done{0};
+
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     keepalive_server   server{&sched};
-    server.delay = 300ms;
+    server.hold = true;
 
     net::http::client client{
         &sched,
         {.connect_timeout = 10s, .max_connections_per_host = 1}
     };
 
-    const auto test = [](net::io::scheduler* sched,
-                         net::http::client*  client,
-                         keepalive_server*   server) -> task<std::vector<std::string>>
+    const auto test = [](net::io::scheduler*         sched,
+                         net::http::client*          client,
+                         keepalive_server*           server,
+                         std::string*                busy,
+                         std::atomic<std::uint64_t>* busy_done) -> task<std::vector<std::string>>
     {
-        // the one connection is busy (its response delayed), so the next request waits for it, until it's canceled.
-        std::string                busy;
-        std::atomic<std::uint64_t> done{0};
-        REQUIRE(sched->spawn(
-            [](net::http::client*          client,
-               std::string                 port,
-               std::string*                out,
-               std::atomic<std::uint64_t>* done,
-               net::io::scheduler*         sched) -> task<>
-            {
-                *out = co_await fetch(client, "127.0.0.1", port);
-                done->store(1);
-                sched->notify_all(*done);
-            }(client, server->port, &busy, &done, sched)));
-
-        while (server->requests.load() == 0) (void)co_await sched->sleep_until(net::io::clock::now() + 1ms);
+        // the one connection is busy (its response held until the test lets it go), so the next request waits for
+        // it, until it's canceled.
+        if (!sched->spawn(fetch_into(sched, client, "127.0.0.1", server->port, busy, busy_done)))
+            co_return std::vector<std::string>{"not spawned"};
+        if (!co_await reached(sched, server->requests, 1)) co_return std::vector<std::string>{"not requested"};
 
         std::stop_source source;
-        REQUIRE(sched->spawn(stop_after(sched, source, 50ms)));
+        if (!sched->spawn(stop_after(sched, source, 50ms))) co_return std::vector<std::string>{"not spawned"};
         std::vector<std::string> out{co_await fetch_until(client, "127.0.0.1", server->port, source.get_token())};
 
-        // canceled before the busy one finished.
-        out.emplace_back(done.load() == 0 ? "first still busy" : "first done");
-        while (done.load() == 0) (void)co_await sched->wait_on(done, 0);
-        out.push_back(busy);
+        // canceled while the busy one still was.
+        out.emplace_back(busy_done->load() == 0 ? "first still busy" : "first done");
+        server->release();
+        if (!co_await reached(sched, *busy_done, 1)) co_return std::vector<std::string>{"not done"};
+        out.push_back(*busy);
 
         // and the connection's free for the next.
         out.push_back(co_await fetch(client, "127.0.0.1", server->port));
         co_return out;
     };
 
-    const auto results = run(sched, server, test(&sched, &client, &server));
+    const auto results = run(sched, server, test(&sched, &client, &server, &busy, &busy_done));
     CHECK(results == std::vector<std::string>{canceled(), "first still busy", "hello", "hello"});
     CHECK(server.accepted == 1);
     CHECK(client.stats() == net::http::connection_stats{.open = 1, .idle = 1});
@@ -1144,12 +1218,14 @@ TEST_CASE("a request canceled while it connects counts its connection out", "[ht
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
     net::http::client  client{&sched};
 
+    // (before stop_after() starts its wait.)
+    const auto start = net::io::clock::now();
+
     std::stop_source source;
     REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
 
     // a non-routable address: depending on the network, connecting either hangs (until stop is requested), or fails
     // straight away.
-    const auto start   = net::io::clock::now();
     const auto result  = sched.run_to_completion(fetch_until(&client, "10.255.255.1", "81", source.get_token()));
     const auto elapsed = net::io::clock::now() - start;
 
@@ -1176,7 +1252,7 @@ TEST_CASE("a request canceled while its host is resolved fails at once", "[http]
         std::stop_source source;
 
         // stops once the lookup has started, a call for each family (or the scheduler has stopped).
-        REQUIRE(sched->spawn(
+        const bool spawned = sched->spawn(
             [](net::io::scheduler* sched, test::blocking_lookup* lookup, std::stop_source source) -> task<>
             {
                 while (lookup->started.load() < 2)
@@ -1184,7 +1260,12 @@ TEST_CASE("a request canceled while its host is resolved fails at once", "[http]
                     if (co_await sched->sleep_until(net::io::clock::now() + 1ms)) co_return;
                 }
                 source.request_stop();
-            }(sched, lookup, source)));
+            }(sched, lookup, source));
+        if (!spawned)
+        {
+            lookup->release();
+            co_return std::pair{std::string{"not spawned"}, net::io::clock::duration{}};
+        }
 
         const auto start  = net::io::clock::now();
         auto       result = co_await fetch_until(client, "slow.test", "80", source.get_token());
@@ -1245,8 +1326,10 @@ TEST_CASE("an HTTP/1.1 request canceled closes its connection", "[http][client][
 
         std::stop_source source;
         REQUIRE(sched.spawn(server.serve()));
+        const auto start = net::io::clock::now(); // (before stop_after() starts its wait)
         REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
-        auto [result, elapsed] = timed(sched, fetch_until(&client, "127.0.0.1", server.port, source.get_token()));
+        auto [result, elapsed] =
+            timed(sched, fetch_until(&client, "127.0.0.1", server.port, source.get_token()), start);
 
         CHECK(result == canceled());
         CHECK(elapsed >= 100ms);
@@ -1271,7 +1354,7 @@ TEST_CASE("an HTTP/1.1 request canceled closes its connection", "[http][client][
 
             // the token still cancels the body's reads, after send() returned: what arrived, then why the rest
             // didn't, and again for the read after.
-            REQUIRE(sched->spawn(stop_after(sched, source, 100ms)));
+            if (!sched->spawn(stop_after(sched, source, 100ms))) co_return "not spawned";
             auto out = co_await read_all(resp->body.get());
 
             std::array<std::byte, 16> buf{};
@@ -1294,23 +1377,22 @@ TEST_CASE("an HTTP/1.1 request canceled closes its connection", "[http][client][
         keepalive_server  server{&sched};
         net::http::client client{&sched};
 
-        const auto test =
-            [](net::io::scheduler* sched, net::http::client* client, std::string port) -> task<std::string>
+        const auto test = [](net::http::client* client, std::string port) -> task<std::string>
         {
             std::stop_source source;
             auto             req = get_request("127.0.0.1", port);
             req.stop             = source.get_token();
 
+            // (the server writes the body with the head, and the body's reads look at the token before what's
+            // buffered.)
             auto resp = co_await client->send(std::move(req));
             if (!resp.has_value()) co_return "error: " + resp.error().message();
 
-            // (time for all of it to arrive.)
-            (void)co_await sched->sleep_until(net::io::clock::now() + 50ms);
             source.request_stop();
             co_return co_await read_all(resp->body.get());
         };
 
-        const auto result = run(sched, server, test(&sched, &client, server.port));
+        const auto result = run(sched, server, test(&client, server.port));
         CHECK(result == " [" + std::make_error_code(std::errc::operation_canceled).message() + "]");
         CHECK(client.stats() == net::http::connection_stats{});
     }
@@ -1326,8 +1408,9 @@ TEST_CASE("an HTTP/1.1 request canceled closes its connection", "[http][client][
         req.stop             = source.get_token();
 
         REQUIRE(sched.spawn(server.serve()));
+        const auto start = net::io::clock::now(); // (before stop_after() starts its wait)
         REQUIRE(sched.spawn(stop_after(&sched, source, 100ms)));
-        auto [result, elapsed] = timed(sched, post(&client, std::move(req)));
+        auto [result, elapsed] = timed(sched, post(&client, std::move(req)), start);
 
         CHECK(result == canceled());
         CHECK(elapsed >= 100ms);
