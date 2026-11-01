@@ -32,7 +32,7 @@ namespace net::http
 struct client_options
 {
     // How long to wait for a connection: both to connect (resolving the host's name, then connecting to its
-    // addresses), and for one to be free when at a limit.
+    // addresses), and for one to be free when at a limit. Making the TLS context (see tls) doesn't count towards it.
     std::chrono::milliseconds connect_timeout = std::chrono::seconds{10};
 
     // How long an attempt to connect to one of a host's addresses has before the next starts alongside it (Happy
@@ -156,6 +156,15 @@ struct client_options
     // certificates, for testing; and a certificate (and its key) for servers that ask for one (mutual TLS), the
     // client's for every host (the connections' keys don't change). Its ALPN protocols are ignored: the client offers
     // h2 (if http2 is on) and http/1.1.
+    //
+    // The TLS context is made from these when the first https connection needs it (and once more, offering only
+    // http/1.1, for the first wss:// WebSocket of a client with http2 on): before that connection resolves or connects
+    // anything, so what's wrong with them (e.g. a CA file that can't be read, or a key that isn't its certificate's)
+    // fails the request with tls::client_context::make()'s error, rather than a network's. Making it may take a while
+    // (reading the system's trust store, the first time in a process), so it's made on a thread set aside for blocking
+    // calls (io::scheduler::run_blocking()), not holding up the scheduler's workers, and it doesn't count towards
+    // connect_timeout. A request stopped before it starts gets std::errc::operation_canceled (making nothing); once
+    // it's started, it isn't cut short.
     tls::client_options tls{};
 
     // How long a TLS handshake may take, once connected (separately from connect_timeout, so an error says which
@@ -309,13 +318,15 @@ namespace detail
 
         static std::string make_key(const std::string& scheme, const std::string& host, const std::string& port);
 
-        // connect connects to host, within deadline, and for https, runs a TLS handshake (offering only http/1.1 with
-        // ALPN if http1_only, otherwise as tls_context()'s): either ended by stop.
-        coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connect(bool                  tls,
-                                                                                        std::string           host,
-                                                                                        std::string           port,
-                                                                                        io::clock::time_point deadline,
-                                                                                        std::stop_token       stop,
+        // connect connects to host, within timeout, and for https, runs a TLS handshake (offering only http/1.1 with
+        // ALPN if http1_only, otherwise as tls_context()'s): either ended by stop. For https, the TLS context comes
+        // first (see context()), so its errors are reported before anything's resolved or connected, and the timeout's
+        // deadline is taken once it's made: making it (the first time) never counts against the timeout.
+        coro::task<std::expected<std::unique_ptr<connection>, std::error_code>> connect(bool                tls,
+                                                                                        std::string         host,
+                                                                                        std::string         port,
+                                                                                        io::clock::duration timeout,
+                                                                                        std::stop_token     stop,
                                                                                         bool http1_only = false);
 
         // wants_http2 is whether a new connection is to speak HTTP/2: it agreed on h2 (or it's cleartext, with prior
@@ -433,20 +444,36 @@ namespace detail
         std::atomic<std::size_t>   waiting  = 0;
 
 #ifdef NET_HAS_TLS
+        // context returns the TLS context for a connection: http1_context()'s if http1_only, otherwise tls_context()'s.
+        // Making one may block for a while (e.g. reading the system's trust store, the first time in a process), so
+        // connect() calls it on a thread set aside for blocking calls (scheduler::run_blocking()) unless
+        // context_ready(): connections that want it while it's being made wait for it, each on one of those threads.
+        std::expected<tls::client_context, std::error_code> context(bool http1_only);
+
+        // context_ready is whether context(http1_only) has been made, so it returns at once.
+        [[nodiscard]] bool context_ready(bool http1_only) const noexcept;
+
         // tls_context returns the TLS context for https connections, made (once) the first time one is needed: e.g.
-        // loading the system's trust store isn't worth it for a client that never uses https.
+        // loading the system's trust store isn't worth it for a client that never uses https. It may block (see
+        // context()): making it, then its trust store's first lookup (tls::detail::warm_up()), so that the first
+        // handshake doesn't.
         std::expected<tls::client_context, std::error_code> tls_context();
 
         std::once_flag                                      tls_made;
         std::expected<tls::client_context, std::error_code> tls_ctx{std::unexpect}; // set once, by tls_context()
 
+        // set (release) once tls_ctx is, so a connection that reads it set (acquire) may read tls_ctx without
+        // call_once, which could block a worker while another thread makes it.
+        std::atomic<bool> tls_ready = false;
+
         // http1_context returns the TLS context for connect_apart()'s connections, which offers only http/1.1 with
         // ALPN: tls_context()'s, if that's all it offers (with http2 off), or one of its own, made (once) the first
-        // time one is needed.
+        // time one is needed. It may block (see context()).
         std::expected<tls::client_context, std::error_code> http1_context();
 
         std::once_flag                                      http1_made;
         std::expected<tls::client_context, std::error_code> http1_ctx{std::unexpect}; // set once, by http1_context()
+        std::atomic<bool>                                   http1_ready = false;      // as tls_ready, for http1_ctx
 #endif
     };
 

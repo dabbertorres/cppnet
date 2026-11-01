@@ -102,6 +102,13 @@ namespace detail
     std::expected<client_context, std::error_code> make_client_context(const client_options& options,
                                                                        const policy_limits&  limits);
 
+    // warm_up has ctx's trust store look up a certificate (by a name none has), as a handshake's verification does: the
+    // first lookup in a process is most of what reading the system's store costs (on macOS, Security.framework getting
+    // ready; making the context is the rest), so a client that makes a context off its workers (as http::client's
+    // pool does) has it then, rather than in its first handshake. It may block for that long; what fails is ignored
+    // (the handshake would find it).
+    void warm_up(const client_context& ctx) noexcept;
+
     // handshake_details are what a server's handshake agreed on, for tests.
     struct handshake_details
     {
@@ -177,6 +184,8 @@ private:
     friend class stream;
     friend std::expected<client_context, std::error_code>
     detail::make_client_context(const client_options& options, const detail::policy_limits& limits);
+
+    friend void detail::warm_up(const client_context& ctx) noexcept;
 
     explicit client_context(std::shared_ptr<detail::client_state> state) noexcept;
 

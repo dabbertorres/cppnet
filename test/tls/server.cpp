@@ -678,6 +678,55 @@ TEST_CASE("a burst of requests to a host whose connection agreed on HTTP/2 share
           == std::vector<std::string>{"open 1", "hello over TLS", "hello over TLS", "open 2", "held", "held"});
 }
 
+TEST_CASE("a client's first https requests at once all make their connections, sharing the TLS context",
+          "[tls][http][client][context]")
+{
+    const bool http2 = GENERATE(true, false);
+    CAPTURE(http2);
+
+    net::io::scheduler sched{make_pool()};
+    https_server       server{&sched, tls_config()};
+    auto               options = trusting_options();
+    options.http2              = http2;
+    http::client client{&sched, options};
+
+    // more than run_blocking()'s threads (4), so some wait for one, while the context's being made.
+    constexpr int n = 8;
+
+    const auto test =
+        [](net::io::scheduler* sched, http::client* client, std::string url) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string>   results(n);
+        std::atomic<std::uint64_t> done{0};
+        for (int i = 0; i < n; ++i)
+        {
+            auto* result = &results[static_cast<std::size_t>(i)];
+            if (!sched->spawn(
+                    [](net::io::scheduler*         sched,
+                       http::client*               client,
+                       std::string                 url,
+                       std::string*                result,
+                       std::atomic<std::uint64_t>* done) -> task<>
+                    {
+                        *result = co_await fetch(client, url);
+                        done->fetch_add(1);
+                        sched->notify_all(*done);
+                    }(sched, client, url, result, &done)))
+            {
+                // (counted as done, as nothing else will.)
+                *result = "didn't start";
+                done.fetch_add(1);
+            }
+        }
+
+        for (auto seen = done.load(); seen < n; seen = done.load()) (void)co_await sched->wait_on(done, seen);
+        co_return results;
+    };
+
+    CHECK(sched.run_to_completion(test(&sched, &client, "https://localhost:" + server.port() + "/"))
+          == std::vector<std::string>(n, "hello over TLS"));
+}
+
 TEST_CASE("an HTTPS server closes connections that don't speak TLS", "[tls][http][server]")
 {
     net::io::scheduler sched{make_pool()};
@@ -1491,10 +1540,7 @@ TEST_CASE("a WebSocket client opens wss:// over HTTP/1.1, from a server that wou
                    }
                });
 
-    // NOTE: a handshake deadline far longer than the default 5 s: the untrusting client's pool makes its context, so
-    //       loads the system's trust store (a second or more, the first time in a process, on macOS), only once it has
-    //       connected, which counts against the server's deadline for the handshake.
-    https_server server{&sched, tls_config(60s), std::move(router)};
+    https_server server{&sched, tls_config(), std::move(router)};
 
     auto options  = trusting_options();
     options.http2 = http2;

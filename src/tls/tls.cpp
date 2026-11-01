@@ -1819,6 +1819,18 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
     }
 }
 
+void detail::warm_up(const client_context& ctx) noexcept
+{
+    try
+    {
+        const Botan::X509_DN nobody{{{"X520.CommonName", "net warm-up"}}};
+        for (const auto* store : ctx.state->credentials->trusted_certificate_authorities("tls-client", ""))
+            (void)store->find_cert(nobody, {});
+    }
+    catch (const std::exception&) // NOLINT(bugprone-empty-catch): a handshake finds it, if it's still so.
+    {}
+}
+
 server_context::server_context(std::shared_ptr<detail::server_state> state) noexcept
     : state{std::move(state)}
 {}

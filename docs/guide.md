@@ -615,6 +615,16 @@ options.tls.private_key = "client.key";`): one identity per client. A server tha
 request with its alert, e.g. `tls::alert::certificate_required` or `bad_certificate`. Without TLS (`NET_TLS` off),
 `https://` fails with `std::errc::protocol_not_supported`.
 
+The client makes its TLS context from `client_options::tls` when its first `https://` connection needs it (and, with
+`http2` on, a second one offering only `http/1.1` for its first `wss://` WebSocket's connection), before that connection
+resolves or connects anything: so options that can't make a context (e.g. a CA file that isn't there, or a key that
+isn't its certificate's) fail the request with `tls::client_context::make()`'s error, whatever the network would have
+said. Reading the system's trust store may take a while (the first time in a process), so the
+context is made on one of the scheduler's threads for blocking calls (`run_blocking()`), never holding up its workers,
+and doesn't count towards `connect_timeout`. A request whose stop was requested before then fails with
+`std::errc::operation_canceled` without making it; once it's being made, it's made, and requests waiting for it go on
+once it is.
+
 ## HTTP server
 
 ```cpp

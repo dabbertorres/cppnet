@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include <catch2/catch_message.hpp>
@@ -34,6 +35,8 @@
 #include "tls/test_pki.hpp"
 #include "tls/tls.hpp"
 #include "url.hpp"
+#include "util/defer.hpp"
+#include "websocket/websocket.hpp"
 
 namespace tls = net::tls;
 
@@ -160,6 +163,35 @@ net::http::client_options trusting_options()
     net::http::client_options options;
     options.tls.trusted_ca_file = pki().ca;
     return options;
+}
+
+// closed_port is a port nothing listens on, on 127.0.0.1: bound, then let go.
+std::string closed_port()
+{
+    net::io::scheduler sched{make_pool()};
+    auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+    return std::to_string(listener->local_port());
+}
+
+// unreadable_ca_options are a client's whose TLS context can't be made: its CA file isn't there.
+net::http::client_options unreadable_ca_options()
+{
+    net::http::client_options options;
+    options.tls.trusted_ca_file = pki().ca.parent_path() / "missing-ca.pem";
+    return options;
+}
+
+// wait_for waits until flag is set, for up to limit, returning whether it was.
+bool wait_for(const std::atomic<bool>& flag, std::chrono::milliseconds limit)
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!flag.load())
+    {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(1ms);
+    }
+    return true;
 }
 
 // fetch GETs url, returning the body, or the error.
@@ -506,4 +538,129 @@ TEST_CASE("an https body with Content-Length cut short fails to read, even with 
     if (notify) CHECK(err == std::errc::connection_aborted);
     else CHECK(err == tls::errc::stream_truncated);
     CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("an https request fails with its TLS context's error, before resolving or connecting",
+          "[tls][http][client][context]")
+{
+    // nothing listens on the port: were the context made after connecting, connection_refused would come first.
+    const auto port = closed_port();
+
+    const bool http2 = GENERATE(true, false);
+    CAPTURE(http2);
+
+    net::io::scheduler sched{make_pool()};
+    auto               options = unreadable_ca_options();
+    options.http2              = http2;
+    net::http::client client{&sched, options};
+
+    // a request's (the context offering h2 and http/1.1, or with http2 off http/1.1), then a WebSocket's (a connection
+    // of its own, whose context offers only http/1.1: another one, with http2 on), each tried twice.
+    const auto test = [](net::http::client* client, std::string port) -> task<std::vector<std::error_code>>
+    {
+        std::vector<std::error_code> errors;
+        for (int i = 0; i < 2; ++i)
+        {
+            auto resp = co_await client->get("https://127.0.0.1:" + port + "/");
+            errors.push_back(resp.has_value() ? std::error_code{} : resp.error());
+        }
+        for (int i = 0; i < 2; ++i)
+        {
+            auto ws = co_await net::websocket::connect(*client, "wss://127.0.0.1:" + port + "/");
+            errors.push_back(ws.has_value() ? std::error_code{} : ws.error());
+        }
+        co_return errors;
+    };
+
+    const auto errors = sched.run_to_completion(test(&client, port));
+    REQUIRE(errors.size() == 4);
+    for (const auto& err : errors)
+    {
+        CAPTURE(err.message());
+        CHECK(err == std::errc::no_such_file_or_directory);
+    }
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("an https request stopped before its TLS context is made fails with operation_canceled, without making it",
+          "[tls][http][client][context][cancel]")
+{
+    // were the context made (or anything connected), its error (or connection_refused) would come instead.
+    const auto port = closed_port();
+
+    net::io::scheduler sched{make_pool()};
+    net::http::client  client{&sched, unreadable_ca_options()};
+
+    const auto test = [](net::http::client* client,
+                         std::string        port) -> task<std::pair<std::error_code, std::error_code>>
+    {
+        std::stop_source stop;
+        stop.request_stop();
+
+        auto resp = co_await client->get("https://127.0.0.1:" + port + "/", stop.get_token());
+        auto ws =
+            co_await net::websocket::connect(*client, "wss://127.0.0.1:" + port + "/", {.stop = stop.get_token()});
+        co_return std::pair{resp.has_value() ? std::error_code{} : resp.error(),
+                            ws.has_value() ? std::error_code{} : ws.error()};
+    };
+
+    const auto [request, websocket] = sched.run_to_completion(test(&client, port));
+    CAPTURE(request.message(), websocket.message());
+    CHECK(request == std::errc::operation_canceled);
+    CHECK(websocket == std::errc::operation_canceled);
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
+TEST_CASE("a request destroyed while its client's TLS context waits to be made never makes it, and lets the pool go",
+          "[tls][http][client][context][abandon]")
+{
+    // NOTE: only before the load starts: there's no holding a load once it's running, without a hook in the library,
+    //       so a request destroyed while the context's being made isn't tested here (run_blocking()'s own [abandon]
+    //       tests have a caller destroyed while its func runs). Nor does this test catch the load's call holding the
+    //       pool by this rather than a share of it: a call never run never touches the pool.
+
+    std::atomic<bool> holding{false}; // the blocker has the blocking thread
+    std::atomic<bool> release{false}; // the blocker may return
+    std::atomic<bool> probed{false};  // the probe, queued after the load, has run
+
+    const auto set = [](std::atomic<bool>& flag) noexcept
+    {
+        flag.store(true);
+        flag.notify_all();
+    };
+
+    // one blocking thread, which the blocker holds until the test releases it: the load waits behind it.
+    net::io::scheduler     sched{make_pool(), {.blocking_threads = 1}};
+    const net::util::defer let_go{[&] noexcept { set(release); }};
+
+    REQUIRE(sched.spawn(sched.run_blocking(
+        [&]
+        {
+            set(holding);
+            release.wait(false);
+        })));
+    REQUIRE(wait_for(holding, 10s));
+
+    // a context that can't be made (its CA file isn't there), to a port nothing listens on: had its load run, the
+    // request would have failed, nothing connected.
+    auto                         client = std::make_unique<net::http::client>(&sched, unreadable_ca_options());
+    net::coro::task<std::string> caller = [](net::http::client* client, std::string url) -> net::coro::task<std::string>
+    { co_return co_await fetch(client, std::move(url)); }(client.get(), "https://127.0.0.1:" + closed_port() + "/");
+
+    // the request starts here, and suspends once it has handed the context's load to the blocking thread, behind the
+    // blocker: counted as a connection being made meanwhile.
+    REQUIRE(caller.resume());
+    CHECK(client->stats() == net::http::connection_stats{.open = 1, .idle = 0});
+    REQUIRE(sched.spawn(sched.run_blocking([&] { set(probed); })));
+
+    // the request's frame goes (counting its connection out), then the client: the load's call, not yet run, holds the
+    // last share of the pool.
+    CHECK(caller.destroy());
+    CHECK(client->stats() == net::http::connection_stats{});
+    client.reset();
+
+    // the blocking thread takes the load's call, finds its caller gone, and drops it unrun (with the pool: ASan would
+    // see what's left), then runs the probe.
+    set(release);
+    REQUIRE(wait_for(probed, 10s));
 }

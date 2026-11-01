@@ -193,7 +193,8 @@ connection_pool::acquire(std::string                    scheme,
                               if (!settled) not_connected(key, http1_only);
                           }};
 
-    auto conn = co_await connect(tls, host, port, deadline, std::move(stop), http1_only);
+    // NOTE: what's left of the timeout, as waiting for a connection to be free counts against it too.
+    auto conn = co_await connect(tls, host, port, deadline - io::clock::now(), std::move(stop), http1_only);
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
     settled = true;
@@ -519,50 +520,67 @@ connection_pool::connect_apart(const std::string& scheme, std::string host, std:
         return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::protocol_not_supported)));
 #endif
 
-    return connect(tls,
-                   std::move(host),
-                   std::move(port),
-                   io::clock::now() + config.connect_timeout,
-                   std::move(stop),
-                   true);
+    return connect(tls, std::move(host), std::move(port), config.connect_timeout, std::move(stop), true);
 }
 
 coro::task<std::expected<std::unique_ptr<connection>, std::error_code>>
 connection_pool::connect(bool                  tls,
                          std::string           host,
                          std::string           port,
-                         io::clock::time_point deadline,
+                         io::clock::duration   timeout,
                          std::stop_token       stop,
                          [[maybe_unused]] bool http1_only)
 {
-    // connect (resolving the host, then connecting to its addresses) within what's left of the timeout: rounded up, so
-    // it doesn't give up before the deadline.
-    auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - io::clock::now());
-    auto conn      = co_await tcp_socket::connect(scheduler,
-                                                  host,
-                                                  port,
-                                                  {
-                                                      .timeout       = std::max(remaining, std::chrono::milliseconds{1}),
-                                                      .attempt_delay = config.attempt_delay,
-                                                      .keepalive     = config.tcp_keepalive,
-                                                      .stop          = stop,
-                                                      .resolver      = config.resolver,
-                                                  });
+#ifdef NET_HAS_TLS
+    // the TLS context first, so that its errors (e.g. a CA file that can't be read) are reported before any of the
+    // network's: made off the workers the first time (see context()), and not counted against the timeout.
+    std::expected<tls::client_context, std::error_code> ctx{std::unexpect};
+    if (tls)
+    {
+        if (context_ready(http1_only))
+        {
+            ctx = context(http1_only);
+        }
+        else
+        {
+            // NOTE: a share of the pool, not this: if this coroutine's destroyed while the context's being made (e.g.
+            //       its request abandoned), the call finishes alone, keeping the pool until it's done.
+            auto made = co_await scheduler->run_blocking([self = shared_from_this(), http1_only]
+                                                         { return self->context(http1_only); },
+                                                         stop);
+            if (!made.has_value()) co_return std::unexpected(made.error());
+            ctx = std::move(*made);
+        }
+
+        if (!ctx.has_value()) co_return std::unexpected(ctx.error());
+    }
+#endif
+
+    // connect (resolving the host, then connecting to its addresses) within the timeout: rounded up, so it doesn't give
+    // up before its deadline.
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(timeout);
+    auto       conn = co_await tcp_socket::connect(scheduler,
+                                                   host,
+                                                   port,
+                                                   {
+                                                       .timeout = std::max(remaining, std::chrono::milliseconds{1}),
+                                                       .attempt_delay = config.attempt_delay,
+                                                       .keepalive     = config.tcp_keepalive,
+                                                       .stop          = stop,
+                                                       .resolver      = config.resolver,
+                                                   });
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
     if (!tls) co_return std::make_unique<connection>(std::move(*conn));
 
 #ifdef NET_HAS_TLS
-    auto ctx = http1_only ? http1_context() : tls_context();
-    if (!ctx.has_value()) co_return std::unexpected(ctx.error());
-
     // NOTE: 0 is no limit, but the handshake needs a deadline.
     const auto handshake_timeout = config.tls_handshake_timeout > std::chrono::milliseconds::zero()
                                      ? io::clock::duration{config.tls_handshake_timeout}
                                      : io::clock::duration{std::chrono::hours{24} * 365};
 
     auto stream = co_await tls::stream::connect(std::move(*conn),
-                                                *ctx,
+                                                std::move(*ctx),
                                                 host,
                                                 io::clock::now() + handshake_timeout,
                                                 std::move(stop));
@@ -575,8 +593,22 @@ connection_pool::connect(bool                  tls,
 }
 
 #ifdef NET_HAS_TLS
+std::expected<tls::client_context, std::error_code> connection_pool::context(bool http1_only)
+{
+    return http1_only ? http1_context() : tls_context();
+}
+
+bool connection_pool::context_ready(bool http1_only) const noexcept
+{
+    // NOTE: with http2 off, http1_context() is tls_context().
+    const auto& ready = http1_only && config.http2 ? http1_ready : tls_ready;
+    return ready.load(std::memory_order::acquire);
+}
+
 std::expected<tls::client_context, std::error_code> connection_pool::tls_context()
 {
+    if (tls_ready.load(std::memory_order::acquire)) return tls_ctx;
+
     std::call_once(tls_made,
                    [this]
                    {
@@ -584,7 +616,9 @@ std::expected<tls::client_context, std::error_code> connection_pool::tls_context
                        options.alpn = config.http2 ? std::vector<std::string>{"h2", "http/1.1"}
                                                    : std::vector<std::string>{"http/1.1"};
                        tls_ctx      = tls::client_context::make(options);
+                       if (tls_ctx.has_value()) tls::detail::warm_up(*tls_ctx);
                    });
+    tls_ready.store(true, std::memory_order::release);
 
     return tls_ctx;
 }
@@ -592,6 +626,7 @@ std::expected<tls::client_context, std::error_code> connection_pool::tls_context
 std::expected<tls::client_context, std::error_code> connection_pool::http1_context()
 {
     if (!config.http2) return tls_context();
+    if (http1_ready.load(std::memory_order::acquire)) return http1_ctx;
 
     std::call_once(http1_made,
                    [this]
@@ -599,7 +634,9 @@ std::expected<tls::client_context, std::error_code> connection_pool::http1_conte
                        auto options = config.tls;
                        options.alpn = std::vector<std::string>{"http/1.1"};
                        http1_ctx    = tls::client_context::make(options);
+                       if (http1_ctx.has_value()) tls::detail::warm_up(*http1_ctx);
                    });
+    http1_ready.store(true, std::memory_order::release);
 
     return http1_ctx;
 }
