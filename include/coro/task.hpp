@@ -18,6 +18,9 @@ class promise;
 
 class promise_base;
 
+template<typename Owner, typename In, typename Out, auto Finish>
+class adapter;
+
 // operation_base is what every operation<T> has: claiming it for a task, and cancelling it (see operation).
 class operation_base
 {
@@ -29,6 +32,9 @@ public:
 
     // try_claim claims the operation, for a task, returning false if one already has it.
     [[nodiscard]] bool try_claim() noexcept { return !claimed.exchange(true, std::memory_order::acq_rel); }
+
+    // is_claimed is whether a task has the operation now.
+    [[nodiscard]] bool is_claimed() const noexcept { return claimed.load(std::memory_order::acquire); }
 
     // release releases the operation, for the next task to claim.
     // NOTE: a task's destructor calls it. The call needn't be cheap, nor visible to the compiler, for the frames of
@@ -340,6 +346,10 @@ public:
 
     template<typename U>
     friend task<U> operation_task(operation<U>& op) noexcept;
+
+    // (an adapter starts its inner task in place: see adapter.)
+    template<typename Owner, typename In, typename Out, auto Finish>
+    friend class adapter;
 
 private:
     // from_ready is the result a ready task holds.

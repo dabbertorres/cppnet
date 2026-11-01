@@ -7,6 +7,7 @@
 #include <tuple>
 #include <vector>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "reader.hpp"
@@ -48,7 +49,8 @@ public:
 
     // fill reads more into the buffer: as much as one read of what it wraps gives (after moving what's buffered to the
     // front, to make room). It returns the error that read failed with, if any, which error() also returns after. It
-    // does nothing if the buffer is full.
+    // does nothing if the buffer is full. One fill at a time: another while one waits fails with
+    // std::errc::device_or_resource_busy (reading nothing).
     coro::task<std::error_code> fill();
 
     // buffered returns what's buffered, without reading any more. Unlike read(), looking through it doesn't need a
@@ -84,9 +86,6 @@ private:
     // read_more reads what's buffered, and then more.
     coro::task<result> read_more(std::span<std::byte> data);
 
-    // fill_after finishes fill(), once the read (which needed a coroutine) does.
-    coro::task<std::error_code> fill_after(coro::task<result> reading);
-
     // filled adds what a read for fill() read, returning its error.
     std::error_code filled(const result& res) noexcept;
 
@@ -97,6 +96,9 @@ private:
     std::size_t            start = 0;
     std::size_t            end   = 0;
     std::error_code        err;
+
+    // filling finishes a fill whose read has to wait (with filled()), without a coroutine.
+    coro::adapter<buffered_reader, result, std::error_code, &buffered_reader::filled> filling{this};
 };
 
 }

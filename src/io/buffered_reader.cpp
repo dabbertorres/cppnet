@@ -133,26 +133,21 @@ coro::task<std::error_code> buffered_reader::fill()
 {
     if (size() == capacity()) return coro::ready_task<std::error_code>();
 
-    // make as much room as there can be.
-    if (start != 0)
-    {
-        std::ranges::copy(buffered(), buf.begin());
-        end -= start;
-        start = 0;
-    }
-
-    // usually, the read doesn't wait (e.g. the data's there): then there's no need for a coroutine (see
-    // coro::ready_task).
-    auto reading = impl->read(std::span{buf}.subspan(end));
-    if (reading.finished_without_coroutine())
-        return coro::ready_task<std::error_code>(filled(std::move(reading).result()));
-
-    return fill_after(std::move(reading));
-}
-
-coro::task<std::error_code> buffered_reader::fill_after(coro::task<result> reading)
-{
-    co_return filled(co_await std::move(reading));
+    // usually, the read doesn't wait (e.g. the data's there): then it's finished at once. One that waits is the
+    // adapter's, which finishes it with filled() when it's awaited, rather than a coroutine's.
+    return filling.adapt(
+        [this]
+        {
+            // make as much room as there can be.
+            if (start != 0)
+            {
+                std::ranges::copy(buffered(), buf.begin());
+                end -= start;
+                start = 0;
+            }
+            return impl->read(std::span{buf}.subspan(end));
+        },
+        std::make_error_code(std::errc::device_or_resource_busy));
 }
 
 std::error_code buffered_reader::filled(const result& res) noexcept
