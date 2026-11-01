@@ -44,6 +44,7 @@
 #include "io/scheduler.hpp"
 #include "io/util.hpp"
 #include "tcp.hpp"
+#include "util/linked_stop_source.hpp"
 #include "websocket/frame.hpp"
 #include "websocket/frames.hpp"
 #include "websocket/raw_peer.hpp"
@@ -181,6 +182,14 @@ task<bool> reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& wo
         if (seen >= value) co_return true;
         if (co_await sched->wait_on(word, seen, deadline)) co_return false;
     }
+}
+
+// settle waits for word to reach value, with no deadline: for tasks that use what's about to go (a handler's frame, or
+// a test's), once what they wait for has been ended (as when a wait for them with a deadline has timed out), so that
+// it doesn't go while they run, and the test fails with its own message.
+task<void> settle(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    for (auto seen = word.load(); seen < value; seen = word.load()) (void)co_await sched->wait_on(word, seen);
 }
 
 // echo accepts a WebSocket and echoes its messages whole, until a read or write fails, which it records.
@@ -826,7 +835,9 @@ TEST_CASE("a WebSocket's close waits for the task that's reading to see the peer
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw);
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
                    if (!sched.spawn(
@@ -854,7 +865,10 @@ TEST_CASE("a WebSocket's close waits for the task that's reading to see the peer
                                }
                                raise(sched, *finished);
                            }(&*conn, &out, &sched, &reads, &finished)))
+                   {
                        out.add("spawn failed");
+                       raise(&sched, finished);
+                   }
 
                    // the reader has read the first message, and is reading the next: one read at a time.
                    if (!co_await reach(&sched, reads, 2)) out.add("the reader didn't read again");
@@ -863,7 +877,12 @@ TEST_CASE("a WebSocket's close waits for the task that's reading to see the peer
                    out.add("busy: " + describe(busy.error_or(std::error_code{})));
 
                    out.add("close: " + describe(co_await conn->close()));
-                   if (!co_await reach(&sched, finished)) out.add("the reader didn't finish");
+                   if (!co_await reach(&sched, finished))
+                   {
+                       out.add("the reader didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, finished);
+                   }
                });
     auto server = make_server(&sched, std::move(router));
 
@@ -1078,7 +1097,9 @@ TEST_CASE("a WebSocket's writers take turns a message at a time", "[websocket][s
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw);
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
                    const auto writer = [](ws::connection*             conn,
@@ -1098,7 +1119,11 @@ TEST_CASE("a WebSocket's writers take turns a message at a time", "[websocket][s
                    };
                    for (int id = 0; id < tasks; ++id)
                    {
-                       if (!sched.spawn(writer(&*conn, id, &sched, &finished))) out.add("spawn failed");
+                       if (!sched.spawn(writer(&*conn, id, &sched, &finished)))
+                       {
+                           out.add("spawn failed");
+                           finished.fetch_add(1);
+                       }
                    }
 
                    // a message a frame at a time, alongside, with pings between its frames.
@@ -1113,10 +1138,11 @@ TEST_CASE("a WebSocket's writers take turns a message at a time", "[websocket][s
                        out.add("end: " + describe(co_await streamed->end_message()));
                    }
 
-                   const auto deadline = net::io::clock::now() + 10s;
-                   while (finished.load() < tasks)
+                   if (!co_await reach(&sched, finished, tasks))
                    {
-                       if (co_await sched.wait_on(finished, finished.load(), deadline)) break;
+                       out.add("the writers didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, finished, tasks);
                    }
                    out.add("close: " + describe(co_await conn->close()));
                });
@@ -1204,54 +1230,69 @@ TEST_CASE("a WebSocket's control frames go between a streamed message's frames, 
     net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
 
     http::router router;
-    router.GET(
-        "/ws",
-        [&](http::server_request& req, http::response_writer& rw) -> task<void>
-        {
-            auto conn = co_await ws::accept(req, rw);
-            if (!conn.has_value()) co_return;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
+                   if (!conn.has_value()) co_return;
 
-            auto streamed = co_await conn->begin_message(ws::message_type::text);
-            if (!streamed.has_value()) co_return;
-            (void)co_await streamed->write("one"sv);
+                   auto streamed = co_await conn->begin_message(ws::message_type::text);
+                   if (!streamed.has_value()) co_return;
+                   (void)co_await streamed->write("one"sv);
 
-            // a whole message waits for the streamed one's end; and so does another streamed one.
-            (void)sched.spawn(
-                [](ws::connection* conn, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* finished)
-                    -> task<void>
-                {
-                    out->add("whole: " + describe(co_await conn->write_message(ws::message_type::binary, "whole"sv)));
-                    finished->fetch_add(1);
-                    sched->notify_all(*finished);
-                }(&*conn, &out, &sched, &finished));
-            (void)sched.spawn(
-                [](ws::connection* conn, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* finished)
-                    -> task<void>
-                {
-                    auto second = co_await conn->begin_message(ws::message_type::text);
-                    if (second.has_value())
-                    {
-                        (void)co_await second->write("second"sv);
-                        out->add("second: " + describe(co_await second->end_message()));
-                    }
-                    finished->fetch_add(1);
-                    sched->notify_all(*finished);
-                }(&*conn, &out, &sched, &finished));
-            (void)co_await sched.sleep_until(net::io::clock::now() + 50ms);
+                   // a whole message waits for the streamed one's end; and so does another streamed one.
+                   if (!sched.spawn(
+                           [](ws::connection*             conn,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* finished) -> task<void>
+                           {
+                               out->add("whole: "
+                                        + describe(co_await conn->write_message(ws::message_type::binary, "whole"sv)));
+                               finished->fetch_add(1);
+                               sched->notify_all(*finished);
+                           }(&*conn, &out, &sched, &finished)))
+                   {
+                       out.add("spawn failed");
+                       finished.fetch_add(1);
+                   }
+                   if (!sched.spawn(
+                           [](ws::connection*             conn,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* finished) -> task<void>
+                           {
+                               auto second = co_await conn->begin_message(ws::message_type::text);
+                               if (second.has_value())
+                               {
+                                   (void)co_await second->write("second"sv);
+                                   out->add("second: " + describe(co_await second->end_message()));
+                               }
+                               finished->fetch_add(1);
+                               sched->notify_all(*finished);
+                           }(&*conn, &out, &sched, &finished)))
+                   {
+                       out.add("spawn failed");
+                       finished.fetch_add(1);
+                   }
+                   (void)co_await sched.sleep_until(net::io::clock::now() + 50ms);
 
-            out.add("ping: " + describe(co_await conn->ping(std::as_bytes(std::span{"between"sv}))));
-            out.add("too long: " + describe(co_await conn->ping(std::vector<std::byte>(126))));
-            (void)co_await streamed->write("two"sv);
-            out.add("end: " + describe(co_await streamed->end_message()));
-            out.add("ended: " + describe(co_await streamed->end_message()));
+                   out.add("ping: " + describe(co_await conn->ping(std::as_bytes(std::span{"between"sv}))));
+                   out.add("too long: " + describe(co_await conn->ping(std::vector<std::byte>(126))));
+                   (void)co_await streamed->write("two"sv);
+                   out.add("end: " + describe(co_await streamed->end_message()));
+                   out.add("ended: " + describe(co_await streamed->end_message()));
 
-            const auto deadline = net::io::clock::now() + 5s;
-            while (finished.load() < 2)
-            {
-                if (co_await sched.wait_on(finished, finished.load(), deadline)) break;
-            }
-            (void)co_await conn->close();
-        });
+                   if (!co_await reach(&sched, finished, 2))
+                   {
+                       out.add("the writers didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, finished, 2);
+                   }
+                   (void)co_await conn->close();
+               });
     auto server = make_server(&sched, std::move(router));
 
     const auto client = [&] -> task<peer_result>
@@ -1319,20 +1360,27 @@ TEST_CASE("a WebSocket answers only the latest ping while a write holds the conn
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw);
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
-                   (void)sched.spawn(
-                       [](ws::connection*             conn,
-                          const std::string*          large,
-                          record*                     out,
-                          net::io::scheduler*         sched,
-                          std::atomic<std::uint64_t>* wrote) -> task<void>
-                       {
-                           out->add("large: " + describe(co_await conn->write_message(ws::message_type::text, *large)));
-                           wrote->store(1);
-                           sched->notify_all(*wrote);
-                       }(&*conn, &large, &out, &sched, &wrote));
+                   if (!sched.spawn(
+                           [](ws::connection*             conn,
+                              const std::string*          large,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* wrote) -> task<void>
+                           {
+                               out->add("large: "
+                                        + describe(co_await conn->write_message(ws::message_type::text, *large)));
+                               wrote->store(1);
+                               sched->notify_all(*wrote);
+                           }(&*conn, &large, &out, &sched, &wrote)))
+                   {
+                       out.add("spawn failed");
+                       raise(&sched, wrote);
+                   }
 
                    // the pings come before this message, so they've been read once it is: with the write still
                    // waiting, as the peer doesn't read until it's told.
@@ -1342,10 +1390,11 @@ TEST_CASE("a WebSocket answers only the latest ping while a write holds the conn
                    pinged.store(1);
                    sched.notify_all(pinged);
 
-                   const auto deadline = net::io::clock::now() + 10s;
-                   while (wrote.load() == 0)
+                   if (!co_await reach(&sched, wrote))
                    {
-                       if (co_await sched.wait_on(wrote, 0, deadline)) break;
+                       out.add("the large write didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, wrote);
                    }
                    (void)co_await conn->close();
                });
@@ -1415,7 +1464,9 @@ TEST_CASE("a WebSocket's write after its close has gone fails", "[websocket][ser
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw);
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
                    auto streamed = co_await conn->begin_message(ws::message_type::text);
@@ -1423,22 +1474,22 @@ TEST_CASE("a WebSocket's write after its close has gone fails", "[websocket][ser
                    (void)co_await streamed->write("part"sv);
 
                    // close() waits for the peer's close, which waits for the writes below.
-                   (void)sched.spawn(
-                       [](ws::connection*             conn,
-                          record*                     out,
-                          net::io::scheduler*         sched,
-                          std::atomic<std::uint64_t>* closing) -> task<void>
-                       {
-                           out->add("close: " + describe(co_await conn->close()));
-                           closing->store(2);
-                           sched->notify_all(*closing);
-                       }(&*conn, &out, &sched, &closing));
-
-                   const auto deadline = net::io::clock::now() + 5s;
-                   while (closing.load() == 0)
+                   if (!sched.spawn(
+                           [](ws::connection*             conn,
+                              record*                     out,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* closing) -> task<void>
+                           {
+                               out->add("close: " + describe(co_await conn->close()));
+                               closing->store(2);
+                               sched->notify_all(*closing);
+                           }(&*conn, &out, &sched, &closing)))
                    {
-                       if (co_await sched.wait_on(closing, 0, deadline)) break;
+                       out.add("spawn failed");
+                       raise(&sched, closing, 2);
                    }
+
+                   if (!co_await reach(&sched, closing)) out.add("the client didn't see the close");
 
                    out.add("message: " + describe(co_await conn->write_message(ws::message_type::text, "late"sv)));
                    const auto part = co_await streamed->write("late"sv);
@@ -1447,9 +1498,11 @@ TEST_CASE("a WebSocket's write after its close has gone fails", "[websocket][ser
                    wrote.store(1);
                    sched.notify_all(wrote);
 
-                   while (closing.load() != 2)
+                   if (!co_await reach(&sched, closing, 2))
                    {
-                       if (co_await sched.wait_on(closing, closing.load(), deadline)) break;
+                       out.add("the close didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, closing, 2);
                    }
                });
     auto server = make_server(&sched, std::move(router));
@@ -1507,22 +1560,28 @@ TEST_CASE("a WebSocket's writes to a peer that doesn't read fail at the server's
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw);
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn = co_await ws::accept(req, rw, {.stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
                    // a read waiting meanwhile, for a message that never comes: the failed write ends it.
                    std::error_code read_err;
-                   (void)sched.spawn(
-                       [](ws::connection*             conn,
-                          std::error_code*            err,
-                          net::io::scheduler*         sched,
-                          std::atomic<std::uint64_t>* read) -> task<void>
-                       {
-                           std::string message;
-                           *err = (co_await conn->read_message(message)).error_or(std::error_code{});
-                           read->store(1);
-                           sched->notify_all(*read);
-                       }(&*conn, &read_err, &sched, &read));
+                   if (!sched.spawn(
+                           [](ws::connection*             conn,
+                              std::error_code*            err,
+                              net::io::scheduler*         sched,
+                              std::atomic<std::uint64_t>* read) -> task<void>
+                           {
+                               std::string message;
+                               *err = (co_await conn->read_message(message)).error_or(std::error_code{});
+                               read->store(1);
+                               sched->notify_all(*read);
+                           }(&*conn, &read_err, &sched, &read)))
+                   {
+                       out.add("spawn failed");
+                       raise(&sched, read);
+                   }
 
                    const std::string message(1 << 20, 'x');
                    std::error_code   err;
@@ -1532,10 +1591,11 @@ TEST_CASE("a WebSocket's writes to a peer that doesn't read fail at the server's
                    out.add(std::format("write timed out: {}", err == std::errc::timed_out));
                    out.add(std::format("then: {}", (co_await conn->ping()) == std::errc::timed_out));
 
-                   const auto deadline = net::io::clock::now() + 5s;
-                   while (read.load() == 0)
+                   if (!co_await reach(&sched, read))
                    {
-                       if (co_await sched.wait_on(read, 0, deadline)) break;
+                       out.add("the read didn't finish");
+                       abandon.request_stop();
+                       co_await settle(&sched, read);
                    }
                    out.add(std::format("read: {}", read_err == std::errc::timed_out));
                    failed.store(1);
@@ -1876,44 +1936,57 @@ TEST_CASE("stopping a WebSocket's stop token cancels its writes", "[websocket][s
     CAPTURE(for_turn);
 
     http::router router;
-    router.GET(
-        "/ws",
-        [&](http::server_request& req, http::response_writer& rw) -> task<void>
-        {
-            auto conn = co_await ws::accept(req, rw, {.stop = stop.get_token()});
-            if (!conn.has_value()) co_return;
+    router.GET("/ws",
+               [&](http::server_request& req, http::response_writer& rw) -> task<void>
+               {
+                   auto conn = co_await ws::accept(req, rw, {.stop = stop.get_token()});
+                   if (!conn.has_value()) co_return;
 
-            if (!for_turn)
-            {
-                raise(&sched, started);
-                const std::string message(1 << 20, 'x');
-                std::error_code   err;
-                for (int i = 0; i < 1'000 && !err; ++i)
-                    err = co_await conn->write_message(ws::message_type::binary, message);
-                out.add("write: " + describe(err));
-            }
-            else
-            {
-                auto streamed = co_await conn->begin_message(ws::message_type::text);
-                if (!streamed.has_value()) co_return;
-                (void)co_await streamed->write("part"sv);
+                   if (!for_turn)
+                   {
+                       raise(&sched, started);
+                       const std::string message(1 << 20, 'x');
+                       std::error_code   err;
+                       for (int i = 0; i < 1'000 && !err; ++i)
+                           err = co_await conn->write_message(ws::message_type::binary, message);
+                       out.add("write: " + describe(err));
+                   }
+                   else
+                   {
+                       auto streamed = co_await conn->begin_message(ws::message_type::text);
+                       if (!streamed.has_value()) co_return;
+                       (void)co_await streamed->write("part"sv);
 
-                (void)sched.spawn(
-                    [](ws::connection* conn, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* whole)
-                        -> task<void>
-                    {
-                        out->add("whole: " + describe(co_await conn->write_message(ws::message_type::text, "whole"sv)));
-                        raise(sched, *whole);
-                    }(&*conn, &out, &sched, &whole));
-                raise(&sched, started);
+                       if (!sched.spawn(
+                               [](ws::connection*             conn,
+                                  record*                     out,
+                                  net::io::scheduler*         sched,
+                                  std::atomic<std::uint64_t>* whole) -> task<void>
+                               {
+                                   out->add(
+                                       "whole: "
+                                       + describe(co_await conn->write_message(ws::message_type::text, "whole"sv)));
+                                   raise(sched, *whole);
+                               }(&*conn, &out, &sched, &whole)))
+                       {
+                           out.add("spawn failed");
+                           raise(&sched, whole);
+                       }
+                       raise(&sched, started);
 
-                if (!co_await reach(&sched, whole)) out.add("the whole message's write wasn't woken");
-                out.add("end: " + describe(co_await streamed->end_message()));
-            }
+                       if (!co_await reach(&sched, whole))
+                       {
+                           // (stop, which the test requests anyway, ends the write.)
+                           out.add("the whole message's write wasn't woken");
+                           stop.request_stop();
+                           co_await settle(&sched, whole);
+                       }
+                       out.add("end: " + describe(co_await streamed->end_message()));
+                   }
 
-            out.add("then: " + describe(co_await conn->ping()));
-            raise(&sched, done);
-        });
+                   out.add("then: " + describe(co_await conn->ping()));
+                   raise(&sched, done);
+               });
     auto server = make_server(&sched, std::move(router));
 
     const auto client = [&] -> task<std::error_code>
@@ -1966,23 +2039,27 @@ TEST_CASE("stopping a WebSocket's stop token cancels its close", "[websocket][se
 
                    if (other_reads)
                    {
-                       (void)sched.spawn(
-                           [](ws::connection*             conn,
-                              record*                     out,
-                              net::io::scheduler*         sched,
-                              std::atomic<std::uint64_t>* reading,
-                              std::atomic<std::uint64_t>* finished) -> task<void>
-                           {
-                               // NOTE: read_message() claims the read side as it's called, so the handler, told of
-                               //       the read, finds it taken.
-                               std::string message;
-                               auto        pending = conn->read_message(message);
-                               raise(sched, *reading);
+                       if (!sched.spawn(
+                               [](ws::connection*             conn,
+                                  record*                     out,
+                                  net::io::scheduler*         sched,
+                                  std::atomic<std::uint64_t>* reading,
+                                  std::atomic<std::uint64_t>* finished) -> task<void>
+                               {
+                                   // NOTE: read_message() claims the read side as it's called, so the handler, told of
+                                   //       the read, finds it taken.
+                                   std::string message;
+                                   auto        pending = conn->read_message(message);
+                                   raise(sched, *reading);
 
-                               const auto read = co_await std::move(pending);
-                               out->add("reader: " + describe(read.error_or(std::error_code{})));
-                               raise(sched, *finished);
-                           }(&*conn, &out, &sched, &reading, &finished));
+                                   const auto read = co_await std::move(pending);
+                                   out->add("reader: " + describe(read.error_or(std::error_code{})));
+                                   raise(sched, *finished);
+                               }(&*conn, &out, &sched, &reading, &finished)))
+                       {
+                           out.add("spawn failed");
+                           raise(&sched, finished);
+                       }
 
                        // one read at a time.
                        if (!co_await reach(&sched, reading)) out.add("the reader didn't read");
@@ -1996,7 +2073,12 @@ TEST_CASE("stopping a WebSocket's stop token cancels its close", "[websocket][se
                    if (other_reads)
                    {
                        const bool finished_reading = co_await reach(&sched, finished);
-                       if (!finished_reading) out.add("the reader didn't finish");
+                       if (!finished_reading)
+                       {
+                           out.add("the reader didn't finish");
+                           stop.request_stop();
+                           co_await settle(&sched, finished);
+                       }
                    }
                });
     auto server = make_server(&sched, std::move(router));
@@ -2361,12 +2443,20 @@ TEST_CASE("the server's close reaches a WebSocket whose peer never lets its read
             break;
         }
 
+        // ends the sender's writes, should it have to be given up on.
+        std::stop_source abandon;
+        conn->set_stop_token(abandon.get_token());
         if (!sched.spawn(send_nonstop(&peer, std::move(batch), &sched, &sending))) co_return result;
         co_await steps(peer, result);
 
         // the sender's done with the connection before it goes (its writes fail, once the server has ended it).
         raise(&sched, sending.stop);
-        if (!co_await reach(&sched, sending.done)) out.add("the sender didn't stop");
+        if (!co_await reach(&sched, sending.done))
+        {
+            out.add("the sender didn't stop");
+            abandon.request_stop();
+            co_await settle(&sched, sending.done);
+        }
         co_return result;
     };
 
@@ -2492,28 +2582,35 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
     router.GET("/ws",
                [&](http::server_request& req, http::response_writer& rw) -> task<void>
                {
-                   auto conn = co_await ws::accept(req, rw, {.connection = {.close_timeout = 5s}});
+                   // ends the WebSocket, should its tasks have to be given up on.
+                   net::util::linked_stop_source abandon{req.stop};
+                   auto                          conn =
+                       co_await ws::accept(req, rw, {.connection = {.close_timeout = 5s}, .stop = abandon.get_token()});
                    if (!conn.has_value()) co_return;
 
                    if (other_reads)
                    {
-                       (void)sched.spawn(
-                           [](ws::connection*             conn,
-                              record*                     out,
-                              net::io::scheduler*         sched,
-                              std::atomic<std::uint64_t>* reading,
-                              std::atomic<std::uint64_t>* finished) -> task<void>
-                           {
-                               // NOTE: read_message() claims the read side as it's called, so the handler, told of
-                               //       the read, finds it taken.
-                               std::string message;
-                               auto        pending = conn->read_message(message);
-                               raise(sched, *reading);
+                       if (!sched.spawn(
+                               [](ws::connection*             conn,
+                                  record*                     out,
+                                  net::io::scheduler*         sched,
+                                  std::atomic<std::uint64_t>* reading,
+                                  std::atomic<std::uint64_t>* finished) -> task<void>
+                               {
+                                   // NOTE: read_message() claims the read side as it's called, so the handler, told of
+                                   //       the read, finds it taken.
+                                   std::string message;
+                                   auto        pending = conn->read_message(message);
+                                   raise(sched, *reading);
 
-                               const auto read = co_await std::move(pending);
-                               out->add("reader: " + describe(read.error_or(std::error_code{})));
-                               raise(sched, *finished);
-                           }(&*conn, &out, &sched, &reading, &finished));
+                                   const auto read = co_await std::move(pending);
+                                   out->add("reader: " + describe(read.error_or(std::error_code{})));
+                                   raise(sched, *finished);
+                               }(&*conn, &out, &sched, &reading, &finished)))
+                       {
+                           out.add("spawn failed");
+                           raise(&sched, finished);
+                       }
                        if (!co_await reach(&sched, reading)) out.add("the reader didn't read");
                    }
 
@@ -2521,7 +2618,12 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
                    if (other_reads)
                    {
                        const bool finished_reading = co_await reach(&sched, finished);
-                       if (!finished_reading) out.add("the reader didn't finish");
+                       if (!finished_reading)
+                       {
+                           out.add("the reader didn't finish");
+                           abandon.request_stop();
+                           co_await settle(&sched, finished);
+                       }
                    }
                });
     auto server = make_server(&sched, std::move(router));
@@ -2541,8 +2643,11 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
         if (!close.has_value()) co_return result;
         result.frames.push_back(std::move(*close));
 
+        // ends the sender's writes, should it have to be given up on.
+        std::stop_source abandon;
         if (busy)
         {
+            conn->set_stop_token(abandon.get_token());
             if (!sched.spawn(send_nonstop(&peer, batch_of(client_frame(opcode::text, "hello"sv)), &sched, &sending)))
                 co_return result;
             (void)co_await reach(&sched, sending.sent, std::uint64_t{1} << 20);
@@ -2553,7 +2658,13 @@ TEST_CASE("the server's close leaves a WebSocket's close in progress to finish",
         if (busy)
         {
             raise(&sched, sending.stop);
-            if (!co_await reach(&sched, sending.done)) co_return result;
+            if (!co_await reach(&sched, sending.done))
+            {
+                out.add("the sender didn't stop");
+                abandon.request_stop();
+                co_await settle(&sched, sending.done);
+                co_return result;
+            }
         }
         (void)co_await peer.send(close_frame(ws::close_code{4001}));
 
@@ -3606,7 +3717,7 @@ TEST_CASE("the server's close reaches a WebSocket over HTTP/2 whose peer never l
     net::io::clock::duration to_end{};
     net::io::clock::duration to_join{};
 
-    const auto steps = [&](h2_tunnels& /*t*/, http2::stream_id /*id*/, raw_peer& peer, h2_result& result) -> task<>
+    const auto steps = [&](h2_tunnels& t, http2::stream_id id, raw_peer& peer, h2_result& result) -> task<>
     {
         std::vector<std::byte> batch;
         switch (shape)
@@ -3667,7 +3778,13 @@ TEST_CASE("the server's close reaches a WebSocket over HTTP/2 whose peer never l
 
         // the sender's done with the stream before it goes (its writes fail, once the server has ended it).
         raise(&sched, sending.stop);
-        if (!co_await reach(&sched, sending.done)) out.add("the sender didn't stop");
+        if (!co_await reach(&sched, sending.done))
+        {
+            // (a reset stream's writes fail.)
+            out.add("the sender didn't stop");
+            t.reset(id, http2::error_code::cancel);
+            co_await settle(&sched, sending.done);
+        }
     };
 
     const auto result = sched.run_to_completion(over_h2(&sched, server->local_port(), ws_fields(), steps));
@@ -3695,32 +3812,43 @@ TEST_CASE("the server's close reaches a WebSocket over HTTP/2 whose peer never r
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
     http::router router;
-    router.GET("/ws",
-               [&](http::server_request& req, http::response_writer& rw) -> task<void>
-               {
-                   auto conn = co_await ws::accept(req, rw, {.connection = {.close_timeout = 300ms}});
-                   if (!conn.has_value()) co_return;
+    router.GET(
+        "/ws",
+        [&](http::server_request& req, http::response_writer& rw) -> task<void>
+        {
+            // ends the WebSocket, should its tasks have to be given up on.
+            net::util::linked_stop_source abandon{req.stop};
+            auto                          conn =
+                co_await ws::accept(req, rw, {.connection = {.close_timeout = 300ms}, .stop = abandon.get_token()});
+            if (!conn.has_value()) co_return;
 
-                   // a writer, writing until a write fails: the client never reads, so it soon waits for the window.
-                   std::atomic<std::uint64_t> wrote = 0;
-                   (void)sched.spawn(
-                       [](ws::connection*             conn,
-                          record*                     out,
-                          net::io::scheduler*         sched,
-                          std::atomic<std::uint64_t>* wrote) -> task<void>
-                       {
-                           const std::string message(std::size_t{16} * 1'024, 'x');
-                           std::error_code   err;
-                           while (!err) err = co_await conn->write_message(ws::message_type::text, message);
-                           out->add("write: " + describe(err));
-                           raise(sched, *wrote);
-                       }(&*conn, &out, &sched, &wrote));
+            // a writer, writing until a write fails: the client never reads, so it soon waits for the window.
+            std::atomic<std::uint64_t> wrote = 0;
+            if (!sched.spawn(
+                    [](ws::connection* conn, record* out, net::io::scheduler* sched, std::atomic<std::uint64_t>* wrote)
+                        -> task<void>
+                    {
+                        const std::string message(std::size_t{16} * 1'024, 'x');
+                        std::error_code   err;
+                        while (!err) err = co_await conn->write_message(ws::message_type::text, message);
+                        out->add("write: " + describe(err));
+                        raise(sched, *wrote);
+                    }(&*conn, &out, &sched, &wrote)))
+            {
+                out.add("spawn failed");
+                raise(&sched, wrote);
+            }
 
-                   std::string message;
-                   const auto  read = co_await conn->read_message(message);
-                   out.add("read: " + describe(read.error_or(std::error_code{})));
-                   if (!co_await reach(&sched, wrote)) out.add("the writer didn't stop");
-               });
+            std::string message;
+            const auto  read = co_await conn->read_message(message);
+            out.add("read: " + describe(read.error_or(std::error_code{})));
+            if (!co_await reach(&sched, wrote))
+            {
+                out.add("the writer didn't stop");
+                abandon.request_stop();
+                co_await settle(&sched, wrote);
+            }
+        });
 
     // a write_timeout longer than the test, so it's close_timeout that ends the WebSocket.
     auto server = make_server(&sched, std::move(router), {.write_timeout = 30s});

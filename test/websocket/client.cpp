@@ -127,6 +127,14 @@ task<bool> reach(net::io::scheduler* sched, const std::atomic<std::uint64_t>& wo
     }
 }
 
+// settle waits for word to reach value, with no deadline: for tasks that use what's about to go (a test's frame), once
+// what they wait for has been ended (as when a wait for them with a deadline has timed out), so that it doesn't go
+// while they run, and the test fails with its own message.
+task<void> settle(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    for (auto seen = word.load(); seen < value; seen = word.load()) (void)co_await sched->wait_on(word, seen);
+}
+
 // echo accepts a WebSocket and echoes its messages whole, until a read or write fails, which it records (with the
 // subprotocol chosen, first).
 // NOTE: options is taken by value, as handlers return echo()'s task rather than await it.
@@ -931,7 +939,11 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
     net::io::clock::duration close_took{};
     const auto               run = [&] -> task<void>
     {
-        auto conn = co_await ws::connect(client, server.url(), {.connection = {.close_timeout = close_timeout}});
+        // ends the WebSocket, should the closer have to be given up on.
+        std::stop_source abandon;
+        auto conn = co_await ws::connect(client,
+                                         server.url(),
+                                         {.connection = {.close_timeout = close_timeout}, .stop = abandon.get_token()});
         if (!conn.has_value())
         {
             lines.push_back("connect: " + conn.error().message());
@@ -962,7 +974,12 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
             if (!sched.spawn(closer(&sched, &*conn, &closed, &done))) co_return;
 
             const auto read = co_await std::move(reading);
-            (void)co_await reach(&sched, done);
+            if (!co_await reach(&sched, done))
+            {
+                lines.emplace_back("the closer didn't finish");
+                abandon.request_stop();
+                co_await settle(&sched, done);
+            }
             took = net::io::clock::now() - start;
 
             lines.push_back("read: " + describe(read.error_or(std::error_code{})));
@@ -997,7 +1014,12 @@ TEST_CASE("a WebSocket client ends TCP only after the server, once the close han
             if (!sched.spawn(closer(&sched, &*conn, &answered, start, &closed, &close_took, &done))) co_return;
 
             const auto read = co_await conn->read_message(message);
-            (void)co_await reach(&sched, done);
+            if (!co_await reach(&sched, done))
+            {
+                lines.emplace_back("the closer didn't finish");
+                abandon.request_stop();
+                co_await settle(&sched, done);
+            }
             took = net::io::clock::now() - start;
 
             lines.push_back("read: " + describe(read.error_or(std::error_code{})));
@@ -1052,7 +1074,9 @@ TEST_CASE("a WebSocket client's writes time out at the client's io_timeout", "[w
     const auto               run = [&] -> task<void>
     {
         {
-            auto conn = co_await ws::connect(client, server.url());
+            // ends the WebSocket, should the reader have to be given up on.
+            std::stop_source abandon;
+            auto             conn = co_await ws::connect(client, server.url(), {.stop = abandon.get_token()});
             if (!conn.has_value())
             {
                 lines.push_back("connect: " + conn.error().message());
@@ -1085,6 +1109,11 @@ TEST_CASE("a WebSocket client's writes time out at the client's io_timeout", "[w
                 lines.push_back("write: " + describe(err));
                 lines.push_back("then: " + describe(co_await conn->write_message(ws::message_type::text, "x"sv)));
                 const bool ended = co_await reach(&sched, read_done);
+                if (!ended)
+                {
+                    abandon.request_stop();
+                    co_await settle(&sched, read_done);
+                }
                 lines.push_back(ended ? "read: " + describe(read.error_or(std::error_code{})) : "read: still waiting");
             }
         }

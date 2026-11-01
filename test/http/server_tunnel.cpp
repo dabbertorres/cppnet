@@ -118,6 +118,13 @@ std::string failure_text(const std::expected<http::detail::tunnel*, std::error_c
     return switched.error().message();
 }
 
+// settle waits for word to reach value, with no deadline: for tasks that use what's about to go (a handler's frame, or
+// a test's), once what they wait for has been ended (or will end by itself), so that it doesn't go while they run.
+task<void> settle(net::io::scheduler* sched, const std::atomic<std::uint64_t>& word, std::uint64_t value = 1)
+{
+    for (auto seen = word.load(); seen < value; seen = word.load()) (void)co_await sched->wait_on(word, seen);
+}
+
 // respond responds with 200 and text.
 task<void> respond(http::response_writer& rw, std::string text)
 {
@@ -1071,7 +1078,8 @@ TEST_CASE("an HTTP/2 tunnel's reads have only the tunnel's timeout, which leaves
 TEST_CASE("an HTTP/2 tunnel's read deadline, set from another task, ends a waiting read, which reads nothing",
           "[http][server][tunnel][http2][timeout]")
 {
-    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    std::atomic<std::uint64_t> deadline_set = 0; // the task that sets the deadline is done with the tunnel
+    net::io::scheduler         sched{std::make_shared<net::coro::thread_pool>(4)};
 
     http::router router;
     router.GET("/echo",
@@ -1083,11 +1091,14 @@ TEST_CASE("an HTTP/2 tunnel's read deadline, set from another task, ends a waiti
 
                    // a deadline of now, set while the read waits, as the server's close() has a WebSocket do.
                    if (!sched.spawn(
-                           [](http::detail::tunnel* t, net::io::scheduler* sched) -> task<void>
+                           [](http::detail::tunnel* t, net::io::scheduler* sched, std::atomic<std::uint64_t>* done)
+                               -> task<void>
                            {
                                (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
                                t->set_read_deadline(net::io::clock::now());
-                           }(&t, &sched)))
+                               done->store(1);
+                               sched->notify_all(*done);
+                           }(&t, &sched, &deadline_set)))
                    {
                        (void)co_await net::io::write_all(t.writer(), "spawn failed\n"sv);
                        (void)co_await t.writer().flush();
@@ -1095,6 +1106,10 @@ TEST_CASE("an HTTP/2 tunnel's read deadline, set from another task, ends a waiti
                    }
 
                    const auto interrupted = co_await t.reader().fill();
+
+                   // the task's done with the tunnel (its deadline's past) before it's cleared, and before the
+                   // handler can return, should the read have ended some other way first.
+                   co_await settle(&sched, deadline_set);
                    (void)co_await net::io::write_all(
                        t.writer(),
                        std::format("{} {}\n",
@@ -1425,7 +1440,14 @@ TEST_CASE("an HTTP/2 tunnel's stream holds 256 KiB its handler hasn't read, and 
                     if (co_await t.wait_send_window(id, 0)) held_in = 262'144;
                     go.store(1);
                     sched.notify_all(go);
-                    (void)co_await wait_for_word(&sched, wrote);
+                    if (!co_await wait_for_word(&sched, wrote))
+                    {
+                        // (a reset stream's writes fail.)
+                        r.err = std::make_error_code(std::errc::timed_out);
+                        t.reset(id, net::http::http2::error_code::cancel);
+                        co_await settle(&sched, wrote);
+                        co_return;
+                    }
 
                     // the handler's write sends what the client's window allows, then waits for it to grow.
                     held_out = co_await t.wait_received(id, 65'535);
