@@ -1,5 +1,6 @@
-// bench_client measures cppnet's client against cppnet's server, over loopback: the time and the heap allocations (the
-// client's and the server's together, as they share the process) per request.
+// bench_client measures cppnet's client against cppnet's server, over loopback: the time, the process's CPU time (user
+// and system) and the heap allocations (the client's and the server's together, as they share the process) per
+// request.
 //
 // By default, HTTP/1.1, for each size of the client's response reader (client_options::read_buffer_size: 1, 4 and
 // 16 KiB), three ways:
@@ -39,6 +40,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "cpu_time.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -157,15 +159,17 @@ task<std::size_t> get_all(http::client& client, std::string url)
     }
 }
 
-// measured is a run's: how long it took, and the allocations it made.
+// measured is a run's: how long it took, the CPU time it used, and the allocations it made.
 struct measured
 {
     std::chrono::steady_clock::duration took{};
+    bench::cpu_time                     cpu{};
     std::size_t                         allocations = 0;
     bool                                failed      = false;
 };
 
-// run sends l's requests one at a time, after warming up, and returns the best of repeats runs.
+// run sends l's requests one at a time, after warming up, and returns the best of repeats runs (the least time, and the
+// least CPU time, each of its own run).
 task<measured> run(http::client* client, std::string url, load l)
 {
     for (int i = 0; i < std::min(l.requests, 100); ++i)
@@ -173,11 +177,13 @@ task<measured> run(http::client* client, std::string url, load l)
         if (co_await get_all(*client, url) != l.size) co_return measured{.failed = true};
     }
 
-    measured best{.took = std::chrono::steady_clock::duration::max()};
+    measured        best{.took = std::chrono::steady_clock::duration::max()};
+    bench::cpu_time least;
     for (int r = 0; r < repeats; ++r)
     {
         measured   m;
         const auto at    = allocations.load();
+        const auto cpu   = bench::cpu_time::now();
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < l.requests; ++i)
         {
@@ -185,10 +191,13 @@ task<measured> run(http::client* client, std::string url, load l)
             if (m.failed) break;
         }
         m.took        = std::chrono::steady_clock::now() - start;
+        m.cpu         = bench::cpu_time::now() - cpu;
         m.allocations = allocations.load() - at;
         if (m.failed) co_return m;
         if (m.took < best.took) best = m;
+        least = least.least(m.cpu);
     }
+    best.cpu = least;
     co_return best;
 }
 
@@ -257,11 +266,12 @@ int measure_http11()
         }
 
         const auto per = std::chrono::duration<double, std::micro>(m.took).count() / l.requests;
-        std::println("a {:>5} B reader, {}: {:.2f} us per request ({:.1f} MiB/s), {:.2f} allocations per request",
+        std::println("a {:>5} B reader, {}: {:.2f} us per request ({:.1f} MiB/s), {}, {:.2f} allocations per request",
                      size,
                      l.name,
                      per,
                      static_cast<double>(l.size) / per * 1e6 / (1'024.0 * 1'024.0),
+                     m.cpu.per(l.requests),
                      static_cast<double>(m.allocations) / l.requests);
     }
 

@@ -6,7 +6,9 @@
 # They aren't tests: nothing runs them automatically.
 function(add_benchmark name)
   add_executable(${name} ${ARGN})
-  target_include_directories(${name} PRIVATE "${PROJECT_SOURCE_DIR}/include/")
+  target_include_directories(
+    ${name} PRIVATE "${PROJECT_SOURCE_DIR}/include/" "${PROJECT_SOURCE_DIR}/bench/"
+  )
   target_compile_features(${name} PRIVATE cxx_std_23)
 endfunction()
 

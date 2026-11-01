@@ -1,9 +1,9 @@
 // bench_websocket measures WebSocket messages over loopback, cppnet's client against cppnet's server (a handler that
-// echoes each message whole): the time per message, and the heap allocations per message (the client's and the
-// server's together, as they share the process), for small messages (16 bytes of text), medium ones (8 KiB, binary:
-// past an HTTP/2 WebSocket's 4 KiB buffers, within HTTP/1.1's 16 KiB ones and a DATA frame) and large ones (64 KiB,
-// binary: past both sides' 16 KiB buffers, so the client masks them a buffer's worth at a time, and the server reads
-// them straight into the message). Two ways:
+// echoes each message whole): the time per message, the process's CPU time per message (user and system), and the heap
+// allocations per message (the client's and the server's together, as they share the process), for small messages (16
+// bytes of text), medium ones (8 KiB, binary: past an HTTP/2 WebSocket's 4 KiB buffers, within HTTP/1.1's 16 KiB ones
+// and a DATA frame) and large ones (64 KiB, binary: past both sides' 16 KiB buffers, so the client masks them a
+// buffer's worth at a time, and the server reads them straight into the message). Two ways:
 // - one at a time: the client writes a message, and reads its echo, before the next (a round trip each), as a client
 //   waiting for each answer does;
 // - in flight: one task writes the messages while another reads their echoes, so as many are on the way as the
@@ -46,6 +46,7 @@
 #include "config.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "cpu_time.hpp"
 #include "http/client.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -119,10 +120,11 @@ constexpr std::array widths{std::size_t{8}, std::size_t{64}};
 // How long a parallel run's WebSockets are left idle after the runs, before the heap's measured again.
 constexpr auto idle_for = std::chrono::milliseconds{2'500};
 
-// measured is a run's: how long it took, and the allocations it made.
+// measured is a run's: how long it took, the CPU time it used, and the allocations it made.
 struct measured
 {
     std::chrono::steady_clock::duration took{};
+    bench::cpu_time                     cpu{};
     std::size_t                         allocations = 0;
     bool                                failed      = false;
 };
@@ -183,6 +185,7 @@ task<measured> round_trips(ws::connection* conn, load l, int count)
 
     measured   result;
     const auto at    = allocations.load();
+    const auto cpu   = bench::cpu_time::now();
     const auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < count; ++i)
     {
@@ -191,6 +194,7 @@ task<measured> round_trips(ws::connection* conn, load l, int count)
         if (result.failed) break;
     }
     result.took        = std::chrono::steady_clock::now() - start;
+    result.cpu         = bench::cpu_time::now() - cpu;
     result.allocations = allocations.load() - at;
     co_return result;
 }
@@ -217,6 +221,7 @@ task<measured> in_flight(net::io::scheduler* sched, ws::connection* conn, load l
 
     measured   result;
     const auto at    = allocations.load();
+    const auto cpu   = bench::cpu_time::now();
     const auto start = std::chrono::steady_clock::now();
     if (!sched->spawn(write_all(sched, conn, l, count, &done))) co_return measured{.failed = true};
 
@@ -229,6 +234,7 @@ task<measured> in_flight(net::io::scheduler* sched, ws::connection* conn, load l
         }
     }
     result.took        = std::chrono::steady_clock::now() - start;
+    result.cpu         = bench::cpu_time::now() - cpu;
     result.allocations = allocations.load() - at;
 
     while (done.load() == 0) (void)co_await sched->wait_on(done, 0);
@@ -236,7 +242,8 @@ task<measured> in_flight(net::io::scheduler* sched, ws::connection* conn, load l
 }
 
 // run opens a WebSocket (over HTTP/2 if warm, the URL of a request to send first, so the client has an HTTP/2
-// connection for it), and measures each load both ways, repeats times, returning the best (by time) of each.
+// connection for it), and measures each load both ways, repeats times, returning the best of each (the least time, and
+// the least CPU time, each of its own run).
 task<std::vector<measured>> run(net::io::scheduler* sched, http::client* client, std::string url, std::string warm = {})
 {
     std::vector<measured> best;
@@ -265,14 +272,17 @@ task<std::vector<measured>> run(net::io::scheduler* sched, http::client* client,
         {
             (void)co_await round_trips(&*conn, l, warm_up);
 
-            measured fastest{.took = std::chrono::steady_clock::duration::max()};
+            measured        fastest{.took = std::chrono::steady_clock::duration::max()};
+            bench::cpu_time least;
             for (int r = 0; r < repeats; ++r)
             {
                 const auto m =
                     flight ? co_await in_flight(sched, &*conn, l, l.count) : co_await round_trips(&*conn, l, l.count);
                 if (m.failed) std::println(stderr, "{}: a run failed", l.name);
                 if (m.took < fastest.took) fastest = m;
+                least = least.least(m.cpu);
             }
+            fastest.cpu = least;
             best.push_back(fastest);
         }
     }
@@ -305,6 +315,7 @@ task<measured> together(net::io::scheduler* sched, std::vector<ws::connection>* 
 
     measured   result;
     const auto at    = allocations.load();
+    const auto cpu   = bench::cpu_time::now();
     const auto start = std::chrono::steady_clock::now();
     for (auto& conn : *conns)
     {
@@ -316,12 +327,13 @@ task<measured> together(net::io::scheduler* sched, std::vector<ws::connection>* 
     }
     for (auto seen = g.left.load(); seen != 0; seen = g.left.load()) (void)co_await sched->wait_on(g.left, seen);
     result.took        = std::chrono::steady_clock::now() - start;
+    result.cpu         = bench::cpu_time::now() - cpu;
     result.allocations = allocations.load() - at;
     result.failed      = g.failed.load();
     co_return result;
 }
 
-// in_parallel is a parallel run's: the best (by time) of each load both ways, and the heap each WebSocket held once
+// in_parallel is a parallel run's: the best of each load both ways (as run()'s), and the heap each WebSocket held once
 // open and after the runs, in bytes.
 struct in_parallel
 {
@@ -383,13 +395,16 @@ run_parallel(net::io::scheduler* sched, http::client* client, std::string url, s
         {
             (void)co_await together(sched, &conns, l, per_websocket(warm_up, n), false);
 
-            measured fastest{.took = std::chrono::steady_clock::duration::max()};
+            measured        fastest{.took = std::chrono::steady_clock::duration::max()};
+            bench::cpu_time least;
             for (int r = 0; r < repeats; ++r)
             {
                 const auto m = co_await together(sched, &conns, l, per_websocket(l.count, n), flight);
                 if (m.failed) std::println(stderr, "{}: a run failed", l.name);
                 if (m.took < fastest.took) fastest = m;
+                least = least.least(m.cpu);
             }
+            fastest.cpu = least;
             result.best.push_back(fastest);
         }
     }
@@ -402,16 +417,18 @@ run_parallel(net::io::scheduler* sched, http::client* client, std::string url, s
     co_return result;
 }
 
-// print_measured prints a run's time and allocations per message, of count messages of l.
+// print_measured prints a run's time, CPU time and allocations per message, of count messages of l.
 void print_measured(const measured& m, load l, std::size_t count)
 {
     const auto per    = std::chrono::duration<double, std::micro>(m.took).count() / static_cast<double>(count);
     const auto allocs = static_cast<double>(m.allocations) / static_cast<double>(count);
     const auto mib    = static_cast<double>(l.size) / per * 1e6 / (1'024.0 * 1'024.0);
-    std::println("{:>10.2f} us per message ({:.0f} messages/s, {:.1f} MiB/s each way), {:.2f} allocations per message",
+    std::println("{:>10.2f} us per message ({:.0f} messages/s, {:.1f} MiB/s each way), {}, {:.2f} allocations per "
+                 "message",
                  per,
                  1e6 / per,
                  mib,
+                 m.cpu.per(static_cast<double>(count)),
                  allocs);
 }
 

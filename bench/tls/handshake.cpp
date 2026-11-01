@@ -33,6 +33,12 @@
 // write over 64 KiB is encrypted and sent a batch at a time, so the peak stays about 360 KiB whatever its size (a
 // 16 MiB write's was 48 MiB when it was encrypted whole); about 420 MiB/s, the encryption's pace, for every size.
 //
+// Then small and medium messages (alone with "echo" as its argument): over one connection, the client writes a message
+// of 16 B (or 16 KiB) and reads it back, which the server reads whole and writes back: per round trip (two writes and
+// two reads that wait, one each side), the time, the process's CPU time (user and system: both sides') and the
+// allocations (both sides'), best of 3 connections. Its wall time is mostly the round trip's, so what a change saves
+// in the streams' work shows in CPU time.
+//
 // Not run by default, the TLS context's first load: with "context" as its argument, then what to measure, each run in a
 // process of its own (so the system's trust store is read for the first time, as a program's first https request
 // does):
@@ -110,6 +116,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "cpu_time.hpp"
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
 #include "io/io.hpp"
@@ -539,6 +546,122 @@ writes measure_writes(const net::tls::server_options& server, const net::tls::cl
     return out;
 }
 
+// echoes is what a run of round trips cost: time, CPU time and allocations per round trip.
+struct echoes
+{
+    double          us_per_round_trip = -1;
+    bench::cpu_time cpu{};
+    double          allocs_per_round_trip = 0;
+};
+
+// echo_warm_up is how many round trips a connection makes before it's measured.
+constexpr std::size_t echo_warm_up = 1'000;
+
+// echo_back has the server's stream read messages of size bytes, and write each back, until the client closes.
+task<> echo_back(net::listener* listener, net::tls::server_context ctx, std::size_t size)
+{
+    auto accepted = co_await listener->accept();
+    if (!accepted.has_value()) co_return;
+    nodelay(*accepted);
+
+    auto s = co_await net::tls::stream::accept(std::move(*accepted), ctx, net::io::clock::now() + 5s);
+    if (!s.has_value()) co_return;
+
+    std::vector<std::byte> message(size);
+    while (true)
+    {
+        std::size_t got = 0;
+        while (got < size)
+        {
+            const auto res = co_await s->read(std::span{message}.subspan(got));
+            got += res.count;
+            if (res.err)
+            {
+                co_await s->close();
+                co_return;
+            }
+        }
+        if ((co_await s->write(message)).err) co_return;
+    }
+}
+
+// round_trips connects, and writes count messages of size bytes, reading each back before the next (after warming up),
+// measuring them.
+task<echoes> round_trips(
+    net::io::scheduler* sched, std::uint16_t port, net::tls::client_context ctx, std::size_t size, std::size_t count)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+    if (!conn.has_value()) co_return echoes{};
+    nodelay(*conn);
+
+    auto s = co_await net::tls::stream::connect(std::move(*conn), ctx, "localhost", net::io::clock::now() + 5s);
+    if (!s.has_value()) co_return echoes{};
+
+    std::vector<std::byte>                message(size, std::byte{'x'});
+    std::size_t                           at = 0;
+    bench::cpu_time                       cpu;
+    std::chrono::steady_clock::time_point start;
+
+    // NOTE: the round trips inline (not a coroutine of their own), so the bench's own frames aren't counted.
+    for (std::size_t i = 0; i < echo_warm_up + count; ++i)
+    {
+        if (i == echo_warm_up)
+        {
+            at    = allocations.load();
+            cpu   = bench::cpu_time::now();
+            start = std::chrono::steady_clock::now();
+        }
+
+        if ((co_await s->write(message)).err) co_return echoes{};
+
+        std::size_t got = 0;
+        while (got < size)
+        {
+            const auto res = co_await s->read(std::span{message}.subspan(got));
+            got += res.count;
+            if (res.err) co_return echoes{};
+        }
+    }
+
+    const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    const auto used    = bench::cpu_time::now() - cpu;
+    const auto counted = allocations.load() - at;
+    co_await s->close();
+    co_return echoes{
+        .us_per_round_trip     = elapsed / static_cast<double>(count),
+        .cpu                   = used,
+        .allocs_per_round_trip = static_cast<double>(counted) / static_cast<double>(count),
+    };
+}
+
+// measure_echoes is a run of count round trips of size bytes (best of 3 connections: the least time, and the least
+// CPU time, each of its own run).
+echoes measure_echoes(const net::tls::server_options& server,
+                      const net::tls::client_options& client,
+                      std::size_t                     size,
+                      std::size_t                     count)
+{
+    auto sctx = net::tls::server_context::make(server);
+    auto cctx = net::tls::client_context::make(client);
+    if (!sctx.has_value() || !cctx.has_value()) return {};
+
+    echoes          out;
+    bench::cpu_time least;
+    for (int round = 0; round < 3; ++round)
+    {
+        net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+        auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
+        if (!listener.has_value() || !sched.spawn(echo_back(&*listener, *sctx, size))) return {};
+
+        const auto e = sched.run_to_completion(round_trips(&sched, listener->local_port(), *cctx, size, count));
+        if (e.us_per_round_trip < 0) return {};
+        if (out.us_per_round_trip < 0 || e.us_per_round_trip < out.us_per_round_trip) out = e;
+        least = least.least(e.cpu);
+    }
+    out.cpu = least;
+    return out;
+}
+
 // ms_since is how long it's been since start, in ms.
 double ms_since(std::chrono::steady_clock::time_point start)
 {
@@ -795,6 +918,7 @@ int main(int argc, char** argv)
     // (only the large writes, with "writes".)
     const auto args         = std::span{argv, static_cast<std::size_t>(argc)};
     const bool writes_alone = args.size() > 1 && std::string_view{args[1]} == "writes";
+    const bool echo_alone   = args.size() > 1 && std::string_view{args[1]} == "echo";
 
     const auto dir =
         std::filesystem::temp_directory_path() / ("cppnet-bench-tls-" + std::to_string(std::random_device{}()));
@@ -858,7 +982,7 @@ int main(int argc, char** argv)
     // NOTE: each "time / CPU time", in us.
     const auto show = [](cost c) { return std::format("{:.0f} / {:.0f}", c.wall, c.cpu); };
 
-    if (!writes_alone)
+    if (!writes_alone && !echo_alone)
     {
         std::println("{:<24} {:>18} {:>18} {:>18}", "server key", "full, no tickets", "full", "resumed");
         for (const auto& s : setups)
@@ -870,6 +994,33 @@ int main(int argc, char** argv)
         }
 
         std::println("{:<24} {:>18}", "TCP alone", show(measure_tcp()));
+    }
+
+    // messages: the client writes each, and reads it back from the server (ECDSA, TLS 1.3).
+    if (!writes_alone)
+    {
+        std::println("\n{:<14} {:>18} {:>42} {:>22}",
+                     "message",
+                     "us per round trip",
+                     "CPU per round trip",
+                     "allocs per round trip");
+        for (const auto [size, count] : {
+                 std::pair{      std::size_t{16}, std::size_t{20'000}},
+                 std::pair{std::size_t{16} << 10,  std::size_t{5'000}}
+        })
+        {
+            const auto e = measure_echoes(setups[0].server, setups[0].client, size, count);
+            std::println("{:<14} {:>18.2f} {:>42} {:>22.2f}",
+                         size < 1'024 ? std::format("{} B", size) : std::format("{} KiB", size >> 10),
+                         e.us_per_round_trip,
+                         e.cpu.per(static_cast<double>(count)),
+                         e.allocs_per_round_trip);
+        }
+    }
+    if (echo_alone)
+    {
+        std::filesystem::remove_all(dir);
+        return 0;
     }
 
     // large writes: the server writes 256 MiB in writes of each size, the client reads it (ECDSA, TLS 1.3).

@@ -7,7 +7,8 @@
 // - over a socket: the server itself, and a client on another thread sending a request at a time (as TechEmpower's
 //   JSON test does), so with the socket, scheduler and kernel's round trip too. And again with a handler that waits
 //   once (for another pool, as for a database's driver), whose connection the server watches meanwhile, to notice the
-//   client leaving.
+//   client leaving. And a connection per request: the client connects, sends a request with Connection: close, reads
+//   the response to the connection's end, and closes, so the server accepts, serves and closes a connection each.
 // - over HTTP/2: the same over cleartext HTTP/2 (prior knowledge), a stream at a time from cppnet's own client, whose
 //   allocations are counted with the server's (as they share the process): for what a stream costs. And the bytes a
 //   request and its response come to each way (frames, HPACK's blocks and all), counted by a relay between another
@@ -15,6 +16,8 @@
 //   each a larger response (written in pieces, as a file's served), so they contend for the connection: for what the
 //   server's scheduling of their DATA by priority costs. And the other way: several request bodies at once from
 //   cppnet's client, which contend for the connection in the client's scheduler.
+// The rows over sockets give the process's CPU time per request too (user and system: both sides', as they share the
+// process), as their wall time is mostly the kernel's round trip.
 // And pipelined again, through a chain of middleware (instrument::http_metrics) around the router: for what a chain
 // costs, with the metrics' own work; and with the metrics on the route instead (use()), with each router: for what
 // middleware on routes costs. And through http::timeout on the route, pipelined and over a socket, with a deadline that
@@ -55,6 +58,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "cpu_time.hpp"
 #include "http/client.hpp"
 #include "http/connection_pool.hpp"
 #include "http/http.hpp"
@@ -123,6 +127,14 @@ constexpr auto waiting_request =
     "Connection: keep-alive\r\n"
     "\r\n"sv;
 
+// closing_request is request, but asking the server to close the connection after its response.
+constexpr auto closing_request =
+    "GET /plaintext HTTP/1.1\r\n"
+    "Host: localhost\r\n"
+    "Accept: text/plain,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.7\r\n"
+    "Connection: close\r\n"
+    "\r\n"sv;
+
 constexpr auto body = "Hello, World!"sv;
 
 constexpr std::size_t pipelined       = 16;
@@ -130,6 +142,7 @@ constexpr int         batches         = 50'000;
 constexpr int         repeats         = 7;
 constexpr std::size_t date_bytes      = 29; // e.g. "Sun, 06 Nov 1994 08:49:37 GMT"
 constexpr int         socket_requests = 50'000;
+constexpr int         connections     = 5'000;
 constexpr int         http2_requests  = 20'000;
 constexpr int         counted_bytes   = 1'000; // requests
 
@@ -423,6 +436,7 @@ void measure_socket(std::string_view name, MakeRouter make_router, std::string_v
         }
 
         const auto at    = allocations.load();
+        const auto cpu   = bench::cpu_time::now();
         const auto start = std::chrono::steady_clock::now();
 
         for (int i = 0; i < socket_requests; ++i)
@@ -435,14 +449,106 @@ void measure_socket(std::string_view name, MakeRouter make_router, std::string_v
         }
 
         const auto took    = std::chrono::steady_clock::now() - start;
+        const auto used    = bench::cpu_time::now() - cpu;
         const auto counted = allocations.load() - at;
 
         std::println("{} ({} workers):", name, workers->concurrency());
         std::println("{:>10.1f} us per request",
                      std::chrono::duration<double, std::micro>(took).count() / socket_requests);
+        std::println("{}", used.line(socket_requests, "request"));
         std::println("{:>10.1f} allocations per request",
                      static_cast<double>(counted) / static_cast<double>(socket_requests));
     }
+
+    server.close();
+    scheduler.shutdown();
+    runner.join();
+}
+
+// one_connection connects to port, sends request (which says Connection: close), reads the response until the server
+// closes the connection, and closes it, returning whether the response ended with body. Blocking, allocating nothing.
+bool one_connection(std::uint16_t port, std::string_view request)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    const int one = 1;
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    std::array<char, 4'096> buf{};
+    std::size_t             got = 0;
+    bool                    ok  = false;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API.
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0
+        && ::send(fd, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()))
+    {
+        while (got < buf.size())
+        {
+            const auto n = ::recv(fd, buf.data() + got, buf.size() - got, 0);
+            if (n < 0) break;
+            if (n == 0)
+            {
+                ok = std::string_view{buf.data(), got}.ends_with(body);
+                break;
+            }
+            got += static_cast<std::size_t>(n);
+        }
+    }
+
+    ::close(fd);
+    return ok;
+}
+
+// measure_connections serves a connection per request (each request, with Connection: close, from a blocking client),
+// and prints the time, CPU time and allocations per connection: accepting, serving the request, and closing.
+template<typename Router>
+void measure_connections(const Router& router)
+{
+    auto               workers = std::make_shared<net::coro::thread_pool>(2);
+    net::io::scheduler scheduler{workers};
+
+    http::server server{
+        &scheduler,
+        router,
+        {.host = "127.0.0.1", .port = "0"}
+    };
+
+    scheduler.spawn(server.serve());
+    std::thread runner{[&] { scheduler.run(); }};
+
+    // warms up: e.g. the server's accept loop, and the allocator.
+    for (int i = 0; i < 500; ++i)
+    {
+        if (!one_connection(server.local_port(), closing_request)) std::println(stderr, "warm-up connection failed");
+    }
+
+    const auto at    = allocations.load();
+    const auto cpu   = bench::cpu_time::now();
+    const auto start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < connections; ++i)
+    {
+        if (!one_connection(server.local_port(), closing_request))
+        {
+            std::println(stderr, "connection {} failed", i);
+            break;
+        }
+    }
+
+    const auto took    = std::chrono::steady_clock::now() - start;
+    const auto used    = bench::cpu_time::now() - cpu;
+    const auto counted = allocations.load() - at;
+
+    std::println("a connection per request (accept, the request, close; {} workers):", workers->concurrency());
+    std::println("{:>10.1f} us per connection", std::chrono::duration<double, std::micro>(took).count() / connections);
+    std::println("{}", used.line(connections, "connection"));
+    std::println("{:>10.1f} allocations per connection",
+                 static_cast<double>(counted) / static_cast<double>(connections));
 
     server.close();
     scheduler.shutdown();
@@ -591,6 +697,7 @@ struct http2_outcome
 {
     std::size_t              allocations = 0;
     std::chrono::nanoseconds took{};
+    bench::cpu_time          cpu{};
     int                      failed = -1; // the request that failed, if one did
 };
 
@@ -619,6 +726,7 @@ task<http2_outcome> send_http2_requests(http::client* client, std::string url)
 
     http2_outcome out;
     const auto    at    = allocations.load();
+    const auto    cpu   = bench::cpu_time::now();
     const auto    start = std::chrono::steady_clock::now();
 
     for (int i = 0; i < http2_requests; ++i)
@@ -631,6 +739,7 @@ task<http2_outcome> send_http2_requests(http::client* client, std::string url)
     }
 
     out.took        = std::chrono::steady_clock::now() - start;
+    out.cpu         = bench::cpu_time::now() - cpu;
     out.allocations = allocations.load() - at;
     co_return out;
 }
@@ -721,6 +830,7 @@ send_contending(net::io::scheduler* scheduler, http::client* client, std::string
 
     http2_outcome out;
     const auto    at    = allocations.load();
+    const auto    cpu   = bench::cpu_time::now();
     const auto    start = std::chrono::steady_clock::now();
 
     for (int i = 0; i < contended_rounds; ++i)
@@ -733,6 +843,7 @@ send_contending(net::io::scheduler* scheduler, http::client* client, std::string
     }
 
     out.took        = std::chrono::steady_clock::now() - start;
+    out.cpu         = bench::cpu_time::now() - cpu;
     out.allocations = allocations.load() - at;
     co_return out;
 }
@@ -768,6 +879,7 @@ void measure_contended(const Router& router)
                  bulk_write / 1'024,
                  workers->concurrency());
     std::println("{:>10.1f} us per round ({:.0f} MiB/s)", per_round, bytes / per_round * 1e6 / (1'024.0 * 1'024.0));
+    std::println("{}", out.cpu.line(contended_rounds, "round"));
     std::println("{:>10.1f} allocations per response",
                  static_cast<double>(out.allocations) / (static_cast<double>(contended_rounds) * contending));
 
@@ -806,6 +918,7 @@ void measure_uploads(const Router& router)
                  upload_size / 1'024,
                  workers->concurrency());
     std::println("{:>10.1f} us per round ({:.0f} MiB/s)", per_round, bytes / per_round * 1e6 / (1'024.0 * 1'024.0));
+    std::println("{}", out.cpu.line(contended_rounds, "round"));
     std::println("{:>10.1f} allocations per request",
                  static_cast<double>(out.allocations) / (static_cast<double>(contended_rounds) * contending));
 
@@ -909,6 +1022,7 @@ void measure_http2(const Router& router)
     std::println("over HTTP/2 (a stream at a time, {} workers; the client's allocations too):", workers->concurrency());
     std::println("{:>10.1f} us per request",
                  std::chrono::duration<double, std::micro>(out.took).count() / http2_requests);
+    std::println("{}", out.cpu.line(http2_requests, "request"));
     std::println("{:>10.1f} allocations per request",
                  static_cast<double>(out.allocations) / static_cast<double>(http2_requests));
     std::println("{:>10} bytes up, {} down: the first request (with the connection's preface and SETTINGS)",
@@ -945,6 +1059,7 @@ int main()
         "over a socket, to a handler that waits once",
         [&](net::io::scheduler* /*sched*/) { return waiting; },
         waiting_request);
+    measure_connections(router);
     measure_http2(router);
     measure_contended(http::make_static_router(http::GET("/bulk"_route, bulk)));
     measure_uploads(http::make_static_router(http::POST("/upload"_route, consume)));
