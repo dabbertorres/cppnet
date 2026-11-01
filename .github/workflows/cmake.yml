@@ -1,10 +1,15 @@
 name: CMake
 
+# Pull requests only, not pushes to master: master is fast-forwarded to a pull request's commit once it has passed here,
+# so a push run would test the same commit again. Master runs weekly (and by hand) instead, which saves the caches new
+# pull requests start from (a pull request's own are scoped to it), and catches a new compiler (neither is pinned)
+# between pull requests.
 on:
-  push:
-    branches: [ master ]
   pull_request:
     branches: [ master ]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   test:
@@ -163,26 +168,17 @@ jobs:
           ctest --test-dir build --output-on-failure
         fi
 
-    # clang-tidy, with warnings as errors, on the C++ files the change touches: a pull request's against its base, a
-    # push's against what it replaced (or, for a new branch, or a force push whose old commit isn't in the clone, its
-    # parent). The sources in the compile database, and the headers of the project's own directories, whose commands
-    # clang-tidy infers from it (a nearby source's, as a header). Once, with Clang on Linux, after the build (which made
-    # the compile database), even if the tests failed.
+    # clang-tidy, with warnings as errors, on the C++ files a pull request touches, against its base: the sources in the
+    # compile database, and the headers of the project's own directories, whose commands clang-tidy infers from it (a
+    # nearby source's, as a header). Once, with Clang on Linux, after the build (which made the compile database), even
+    # if the tests failed. Not in master's weekly runs, which change nothing.
     - name: Lint the changed files
-      if: always() && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang' && matrix.variant == 'default'
+      if: always() && github.event_name == 'pull_request' && steps.build.outcome == 'success' && runner.os == 'Linux' && matrix.compiler == 'clang' && matrix.variant == 'default'
       env:
-        EVENT: ${{ github.event_name }}
         BASE_REF: ${{ github.base_ref }}
-        BEFORE: ${{ github.event.before }}
       run: |
         git config --global --add safe.directory '*'
-        if [ "$EVENT" = pull_request ]; then
-          base="origin/$BASE_REF"
-        elif [ -n "$BEFORE" ] && [ -n "${BEFORE//0/}" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-          base="$BEFORE"
-        else
-          base="HEAD^"
-        fi
+        base="origin/$BASE_REF"
         echo "Changes since: $base"
 
         git diff --name-only --diff-filter=d "$base"...HEAD -- '*.cpp' '*.hpp' '*.h' > changed.txt
