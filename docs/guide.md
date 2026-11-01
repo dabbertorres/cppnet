@@ -619,11 +619,11 @@ The client makes its TLS context from `client_options::tls` when its first `http
 `http2` on, a second one offering only `http/1.1` for its first `wss://` WebSocket's connection), before that connection
 resolves or connects anything: so options that can't make a context (e.g. a CA file that isn't there, or a key that
 isn't its certificate's) fail the request with `tls::client_context::make()`'s error, whatever the network would have
-said. Reading the system's trust store may take a while (the first time in a process), so the
-context is made on one of the scheduler's threads for blocking calls (`run_blocking()`), never holding up its workers,
-and doesn't count towards `connect_timeout`. A request whose stop was requested before then fails with
-`std::errc::operation_canceled` without making it; once it's being made, it's made, and requests waiting for it go on
-once it is.
+said. Reading the system's trust store may take a while (the first time in a process: it's then shared, see
+[TLS](#tls)), so the context is made on one of the scheduler's threads for blocking calls (`run_blocking()`), never
+holding up its workers, and doesn't count towards `connect_timeout`. A request whose stop was requested before then
+fails with `std::errc::operation_canceled` without making it; once it's being made, it's made, and requests waiting for
+it go on once it is.
 
 ## HTTP server
 
@@ -1146,7 +1146,11 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
 ```
 
 - The server's certificate is verified against the host name. `tls::client_options::insecure_skip_verification` (the
-  HTTP client's `client_options::tls.insecure_skip_verification`) turns that off, for testing.
+  HTTP client's `client_options::tls.insecure_skip_verification`) turns that off, for testing; such a context loads no
+  trust store (a `trusted_ca_file` given is still read, so `make()` fails if it can't be).
+- The system's trust store is loaded once per process, by the first context that verifies with it, and shared by every
+  context after (as Go's is): changes to it while the process runs aren't seen. A `trusted_ca_file` is read by each
+  context made with it.
 - Errors compare with `tls::alert` conditions (e.g. `err == tls::alert::bad_certificate`), whichever side sent the
   alert; `tls::from_peer(err)` says which. A certificate that failed verification says why in its message (e.g.
   "Certificate does not match provided name").

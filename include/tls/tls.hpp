@@ -34,11 +34,14 @@ namespace net::tls
 struct client_options
 {
     // The certificate authorities to trust: the system's (by default), or those in this PEM file instead (e.g. a
-    // private CA's).
+    // private CA's), read by each context made with it. The system's trust store is loaded once per process (by the
+    // first context that verifies with it), then shared by every context: changes to it while the process runs aren't
+    // seen (as in Go).
     std::optional<std::filesystem::path> trusted_ca_file{};
 
     // Skip verifying the server's certificate (and its name): for testing against self-signed servers only. Named so
-    // that it's never set by accident.
+    // that it's never set by accident. The context then loads no trust store (though a trusted_ca_file given is still
+    // read, so make() fails if it can't be).
     bool insecure_skip_verification = false;
 
     // The ALPN protocols to offer (e.g. {"http/1.1"}), in order of preference. Empty offers none.
@@ -104,9 +107,10 @@ namespace detail
 
     // warm_up has ctx's trust store look up a certificate (by a name none has), as a handshake's verification does: the
     // first lookup in a process is most of what reading the system's store costs (on macOS, Security.framework getting
-    // ready; making the context is the rest), so a client that makes a context off its workers (as http::client's
-    // pool does) has it then, rather than in its first handshake. It may block for that long; what fails is ignored
-    // (the handshake would find it).
+    // ready; making the first context is the rest), so a client that makes a context off its workers (as
+    // http::client's pool does) has it then, rather than in its first handshake. It may block for that long (the first
+    // time in a process, as contexts share the system's store); what fails is ignored (the handshake would find it). A
+    // context that doesn't verify has no store, and nothing to do.
     void warm_up(const client_context& ctx) noexcept;
 
     // handshake_details are what a server's handshake agreed on, for tests.

@@ -370,9 +370,10 @@ class credentials final : public Botan::Credentials_Manager
 {
 public:
     // side is "tls-client" or "tls-server"; trusted the certificate authorities it trusts (for a server, those for its
-    // clients' certificates: null if it doesn't ask for them, so it doesn't); chain and key its own, if any.
+    // clients' certificates: null if it doesn't ask for them, so it doesn't; for a client, null if it doesn't verify,
+    // or the system's, shared: see system_store()); chain and key its own, if any.
     credentials(std::string                               side,
-                std::unique_ptr<Botan::Certificate_Store> trusted,
+                std::shared_ptr<Botan::Certificate_Store> trusted,
                 std::vector<Botan::X509_Certificate>      chain = {},
                 std::shared_ptr<Botan::Private_Key>       key   = nullptr) noexcept
         : side{std::move(side)}
@@ -419,8 +420,10 @@ public:
     }
 
 private:
-    std::string                               side;
-    std::unique_ptr<Botan::Certificate_Store> trusted;
+    std::string side;
+    // NOTE: not const, as Botan takes stores by non-const pointers; only looked up in (Certificate_Store's lookups are
+    //       const), from any number of threads at once (see system_store()).
+    std::shared_ptr<Botan::Certificate_Store> trusted;
     std::vector<Botan::X509_Certificate>      chain;
     std::shared_ptr<Botan::Private_Key>       key;
 };
@@ -477,6 +480,21 @@ std::expected<std::unique_ptr<Botan::Certificate_Store>, std::error_code> load_s
     auto certs = load_certificates(path);
     if (!certs.has_value()) return std::unexpected(certs.error());
     return store_of(*certs);
+}
+
+// system_store is the system's trust store (Botan's: the keychain's on macOS, built with Clang; the system's bundle of
+// CAs elsewhere, read whole), made the first time it's asked for, and shared by every client context that verifies with
+// it, as Go's systemRoots is: so it's read once per process, and changes to it while the process runs aren't seen.
+// A load that succeeds is the only one; one that fails (it throws, e.g. if there's no bundle) isn't cached, so the next
+// context to need it tries again.
+// NOTE: its lookups are safe from several threads at once, as a context's store's always had to be (a context is
+//       shared by its connections, whichever threads they handshake on): a Flatfile_Certificate_Store's only read the
+//       maps it filled when made, and Certificate_Store_MacOS's make each query apart, over immutable Core Foundation
+//       objects, for SecItemCopyMatching(), an atomic keychain call, which Apple's DTS says is thread-safe.
+std::shared_ptr<Botan::Certificate_Store> system_store()
+{
+    static const std::shared_ptr<Botan::Certificate_Store> store = std::make_shared<Botan::System_Certificate_Store>();
+    return store;
 }
 
 // rfc4514_name is RFC 4514's name for an attribute type (section 3), by its OID: empty if it has none.
@@ -1782,16 +1800,19 @@ std::expected<client_context, std::error_code> detail::make_client_context(const
 
     try
     {
-        std::unique_ptr<Botan::Certificate_Store> store;
+        // the certificate authorities to verify servers with: a CA file's, the context's own; or the system's, shared.
+        // A context that doesn't verify has none, as nothing would look in them; but a CA file it's given is still
+        // read, so that one that can't be fails make() either way.
+        std::shared_ptr<Botan::Certificate_Store> store;
         if (options.trusted_ca_file)
         {
             auto loaded = load_store(*options.trusted_ca_file);
             if (!loaded.has_value()) return std::unexpected(loaded.error());
-            store = std::move(*loaded);
+            if (!options.insecure_skip_verification) store = std::move(*loaded);
         }
-        else
+        else if (!options.insecure_skip_verification)
         {
-            store = std::make_unique<Botan::System_Certificate_Store>();
+            store = system_store();
         }
 
         auto rng   = std::make_shared<Botan::System_RNG>();

@@ -37,11 +37,15 @@
 // process of its own (so the system's trust store is read for the first time, as a program's first https request
 // does):
 //
-// - "make": client_context::make() with the system's trust store, then again.
+// - "make": client_context::make() with the system's trust store, then again. "make-insecure" does the same with
+//   insecure_skip_verification, which needs no store.
 // - "verify": a handshake with a context trusting the server's CA (a file), for what isn't the store's, then two with
 //   the system's store, which doesn't trust it (bad_certificate), so they verify against it: the first in the process,
 //   and the next. "verify-warm" does the same with the store's first lookup before the handshakes
 //   (tls::detail::warm_up(), as http::client's pool has it).
+// - "second": a context with the system's store, warmed up, then a handshake verifying against it; then a second
+//   context's make(), warm-up and first handshake: what another context (e.g. http::client's for HTTP/1.1 alone, which
+//   it makes beside its HTTP/2 one, or another client's) costs once the first has read the store.
 // - "ticker <workers>": on a pool of that many workers, a task ticking every millisecond while an http::client (the
 //   system's trust store, as by default) makes its first https request, to a local server whose certificate it doesn't
 //   trust: how late the ticks were at worst meanwhile (and over 300 ms before it, idle), and how long the request took.
@@ -53,6 +57,14 @@
 // (Security.framework getting ready), not make(). The worst tick during the first request was 13.2 late on 1 worker
 // and 5.8 on 4 when the pool made the context on a worker as it handshook, 0.7 and 0.4 once it made it (and warmed it
 // up) with run_blocking() (0.3 idle; the request took about 16 either way).
+//
+// Since the system's store is loaded once per process and shared (medians of 5 processes each, ms, before and after):
+// "make-insecure" 4.7 then 0.0, as such a context loads no store; "second": the second context's make() 0.1 then 0.0,
+// its warm-up 0.1 either way, its handshake 1.3 then 1.2: on macOS a second keychain store was already cheap
+// (Security.framework is ready by then, process-wide). On Linux (Arch in Docker on the same laptop, Arch's Botan 3.13,
+// its bundle of 121 CAs), where the store is a Flatfile_Certificate_Store parsing the whole bundle, the second make()
+// went from 10.7 to 0.0, an insecure context's from 11.6 to 0.0, and the second context's ("second") from 12.1 to 0.0;
+// the first stays about 11.8.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -565,12 +577,12 @@ handshake_once(net::io::scheduler* sched, std::uint16_t port, net::tls::client_c
     co_return std::pair{took, std::error_code{}};
 }
 
-int context_make()
+int context_make(bool insecure)
 {
     for (int i = 1; i <= 2; ++i)
     {
         const auto start = std::chrono::steady_clock::now();
-        const auto ctx   = net::tls::client_context::make({});
+        const auto ctx   = net::tls::client_context::make({.insecure_skip_verification = insecure});
         const auto took  = ms_since(start);
         if (!ctx.has_value())
         {
@@ -627,6 +639,52 @@ int context_verify(const pki& server, bool warm)
     std::println("handshake, trusted CA file: {}", show(took[0]));
     std::println("handshake, system store, first: {}", show(took[1]));
     std::println("handshake, system store, second: {}", show(took[2]));
+    return 0;
+}
+
+int context_second(const pki& server)
+{
+    auto sctx  = net::tls::server_context::make({.certificate_chain = server.chain, .private_key = server.key});
+    auto first = net::tls::client_context::make({});
+    if (!sctx.has_value() || !first.has_value())
+    {
+        std::println(stderr, "a context couldn't be made");
+        return 1;
+    }
+    net::tls::detail::warm_up(*first);
+
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
+    if (!listener.has_value() || !sched.spawn(accept_handshakes(&*listener, *sctx))) return 1;
+
+    // (the second context's made in the task, as the scheduler stops once it's done; it blocks a worker meanwhile.)
+    const auto run = [](net::io::scheduler*      sched,
+                        std::uint16_t            port,
+                        net::tls::client_context first) -> task<std::vector<std::string>>
+    {
+        const auto show = [](const std::pair<double, std::error_code>& h)
+        { return std::format("{:.1f} ms ({})", h.first, h.second ? h.second.message() : "ok"); };
+
+        std::vector<std::string> out;
+        const auto               by_first = co_await handshake_once(sched, port, first);
+        out.push_back("handshake, first context: " + show(by_first));
+
+        auto start  = std::chrono::steady_clock::now();
+        auto second = net::tls::client_context::make({});
+        out.push_back(std::format("make, second context: {:.1f} ms", ms_since(start)));
+        if (!second.has_value()) co_return out;
+
+        start = std::chrono::steady_clock::now();
+        net::tls::detail::warm_up(*second);
+        out.push_back(std::format("warm-up, second context: {:.1f} ms", ms_since(start)));
+
+        const auto by_second = co_await handshake_once(sched, port, *second);
+        out.push_back("handshake, second context: " + show(by_second));
+        co_return out;
+    };
+
+    for (const auto& line : sched.run_to_completion(run(&sched, listener->local_port(), *first)))
+        std::println("{}", line);
     return 0;
 }
 
@@ -747,12 +805,16 @@ int main(int argc, char** argv)
     {
         const std::string_view part = args[2];
         int                    code = 2;
-        if (part == "make") code = context_make();
+        if (part == "make") code = context_make(false);
+        else if (part == "make-insecure") code = context_make(true);
         else if (part == "verify") code = context_verify(make_pki(dir, "ecdsa", false), false);
         else if (part == "verify-warm") code = context_verify(make_pki(dir, "ecdsa", false), true);
+        else if (part == "second") code = context_second(make_pki(dir, "ecdsa", false));
         else if (part == "ticker" && args.size() > 3)
             code = context_ticker(make_pki(dir, "ecdsa", false), std::stoul(std::string{args[3]}));
-        else std::println(stderr, "usage: bench_tls context make|verify|ticker <workers>");
+        else
+            std::println(stderr,
+                         "usage: bench_tls context make|make-insecure|verify|verify-warm|second|ticker <workers>");
 
         std::filesystem::remove_all(dir);
         return code;

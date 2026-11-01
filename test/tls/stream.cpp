@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -382,6 +384,171 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
     CHECK(server.err.message() == "bad_certificate (from the peer)");
 }
 
+namespace
+{
+
+// serve_accepted runs the server's handshake on a connection, then echoes what it reads.
+task<> serve_accepted(net::tcp_socket conn, tls::server_context ctx)
+{
+    auto s = co_await tls::stream::accept(std::move(conn), ctx, net::io::clock::now() + 5s);
+    if (s.has_value()) co_await echo(*s);
+}
+
+// serve_each accepts connections until accepting fails (the scheduler stops), serving each on a task of its own, so
+// that handshakes go on at once.
+task<> serve_each(net::io::scheduler* sched, net::listener* listener, tls::server_context ctx)
+{
+    while (true)
+    {
+        auto accepted = co_await listener->accept();
+        if (!accepted.has_value() || !sched->spawn(serve_accepted(std::move(*accepted), ctx))) co_return;
+    }
+}
+
+// verdict is how a handshake with pki()'s localhost certificate, which the system doesn't trust, went with ctx:
+// "untrusted" if it failed as an untrusted certificate does (bad_certificate, sent, with Botan's reason), "ok" if it
+// succeeded, or why it failed otherwise.
+task<std::string> verdict(net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx)
+{
+    auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+    if (s.has_value())
+    {
+        co_await s->close();
+        co_return "ok";
+    }
+
+    const auto& err = s.error();
+    if (err == tls::alert::bad_certificate && !tls::from_peer(err)
+        && err.message().contains("Certificate issuer not found"))
+        co_return "untrusted";
+    co_return "failed: " + err.message();
+}
+
+}
+
+TEST_CASE("client contexts verify with their own trust store: the system's, a CA file's, or none if they don't verify",
+          "[tls][verification][trust-store]")
+{
+    const auto& p = pki();
+
+    net::io::scheduler sched{make_pool()};
+    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+    REQUIRE(sched.spawn(serve_each(&sched, &listener, server_with(p.localhost_chain, p.localhost_key))));
+
+    // two with the system's store, which doesn't trust pki()'s CA, around one that trusts it (a CA file), so that
+    // neither kind of store is the other's; and one that doesn't verify, without a CA file (so without a store).
+    std::vector<tls::client_context> contexts;
+    for (const auto& options : {tls::client_options{},
+                                tls::client_options{.trusted_ca_file = p.ca},
+                                tls::client_options{},
+                                tls::client_options{.insecure_skip_verification = true}})
+    {
+        auto ctx = tls::client_context::make(options);
+        REQUIRE(ctx.has_value());
+        contexts.push_back(std::move(*ctx));
+    }
+
+    const auto client = [](net::io::scheduler*              sched,
+                           std::uint16_t                    port,
+                           std::vector<tls::client_context> contexts) -> task<std::vector<std::string>>
+    {
+        std::vector<std::string> out;
+        out.reserve(contexts.size());
+        for (const auto& ctx : contexts) out.push_back(co_await verdict(sched, port, ctx));
+        co_return out;
+    };
+
+    CHECK(sched.run_to_completion(client(&sched, listener.local_port(), contexts))
+          == std::vector<std::string>{"untrusted", "ok", "untrusted", "ok"});
+}
+
+TEST_CASE("client contexts made at once on several threads all verify with the system's trust store, at once",
+          "[tls][verification][trust-store]")
+{
+    constexpr std::size_t count = 8;
+
+    // verdicts is what the handshakes found, for the test's task to wait for. (Declared before the scheduler, whose
+    // tasks use it.)
+    struct verdicts
+    {
+        net::io::scheduler*        sched = nullptr;
+        std::mutex                 mu;
+        std::vector<std::string>   seen;
+        std::atomic<std::uint64_t> count{0};
+
+        void add(std::string v)
+        {
+            {
+                std::scoped_lock lock{mu};
+                seen.push_back(std::move(v));
+            }
+            count.fetch_add(1);
+            sched->notify_all(count);
+        }
+    };
+    verdicts found;
+
+    // each made on a thread of its own, all at once, then its store's first lookup (as http::client's pool has it).
+    std::vector<std::expected<tls::client_context, std::error_code>> made(count, std::unexpected(std::error_code{}));
+    {
+        std::latch                start{count};
+        std::vector<std::jthread> threads;
+        threads.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            threads.emplace_back(
+                [&start, &made, i]
+                {
+                    start.arrive_and_wait();
+                    made[i] = tls::client_context::make({});
+                    if (made[i].has_value()) tls::detail::warm_up(*made[i]);
+                });
+        }
+    }
+    std::vector<tls::client_context> contexts;
+    for (auto& ctx : made)
+    {
+        REQUIRE(ctx.has_value());
+        contexts.push_back(std::move(*ctx));
+    }
+
+    const auto& p = pki();
+
+    net::io::scheduler sched{make_pool()};
+    found.sched = &sched;
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(static_cast<int>(count));
+    REQUIRE(sched.spawn(serve_each(&sched, &listener, server_with(p.localhost_chain, p.localhost_key))));
+
+    // the handshakes go at once, each a task of its own (on the pool's workers), so their verifications look in the
+    // store together; the test's task waits (up to 10 s) until they're all done.
+    const auto client = [](net::io::scheduler*              sched,
+                           std::uint16_t                    port,
+                           std::vector<tls::client_context> contexts,
+                           verdicts*                        found) -> task<bool>
+    {
+        const auto one =
+            [](net::io::scheduler* sched, std::uint16_t port, tls::client_context ctx, verdicts* found) -> task<>
+        { found->add(co_await verdict(sched, port, std::move(ctx))); };
+        for (const auto& ctx : contexts)
+        {
+            if (!sched->spawn(one(sched, port, ctx, found))) co_return false;
+        }
+
+        const auto deadline = net::io::clock::now() + 10s;
+        while (true)
+        {
+            const auto seen = found->count.load();
+            if (seen >= contexts.size()) co_return true;
+            if (co_await sched->wait_on(found->count, seen, deadline)) co_return found->count.load() >= contexts.size();
+        }
+    };
+
+    REQUIRE(sched.run_to_completion(client(&sched, listener.local_port(), contexts, &found)));
+    CHECK(found.seen == std::vector<std::string>(count, "untrusted"));
+}
+
 TEST_CASE("a TLS stream ends with close_notify, and is cut short without it", "[tls]")
 {
     net::io::scheduler sched{make_pool()};
@@ -580,6 +747,11 @@ TEST_CASE("contexts fail to load what isn't there", "[tls]")
     auto client = tls::client_context::make({.trusted_ca_file = missing});
     REQUIRE_FALSE(client.has_value());
     CHECK(client.error() == std::errc::no_such_file_or_directory);
+
+    // even for a client that doesn't verify (which wouldn't look in it).
+    auto unverifying = tls::client_context::make({.trusted_ca_file = missing, .insecure_skip_verification = true});
+    REQUIRE_FALSE(unverifying.has_value());
+    CHECK(unverifying.error() == std::errc::no_such_file_or_directory);
 
     auto server = tls::server_context::make({.certificate_chain = missing, .private_key = pki().localhost_key});
     REQUIRE_FALSE(server.has_value());
