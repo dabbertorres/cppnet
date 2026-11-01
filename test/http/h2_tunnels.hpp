@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -174,11 +175,14 @@ public:
         co_return id;
     }
 
-    // request opens a stream with an ordinary request (see h2_client::request()), without a body.
+    // request opens a stream with an ordinary request (see h2_client::request()), without a body. It throws (with why)
+    // if the session refused the request's head, which with_tunnels() passes on to the test, rather than leave the
+    // test's waits for the response to time out.
     http2::stream_id request(std::string_view method, std::string_view path)
     {
         std::scoped_lock lock{mu};
         const auto       id = c.request(method, path);
+        if (!c.failure.empty()) throw std::runtime_error{c.failure};
         wake_writer();
         return id;
     }

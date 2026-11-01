@@ -129,22 +129,43 @@ TEST_CASE("a server without TLS sends no ORIGIN, whatever its http2_origins", "[
     auto               server = make_server(&sched, {"https://localhost", "https://127.0.0.1:8443"});
     REQUIRE(sched.spawn(server.serve()));
 
-    const auto frames = sched.run_to_completion(
-        [](net::io::scheduler* sched, std::string port) -> task<std::vector<http2::frame_type>>
+    // what the client saw: what went wrong, if anything, the response's status, the ORIGINs, and the frames' types.
+    struct seen
+    {
+        std::string                           failed;
+        std::string                           status;
+        std::vector<std::vector<std::string>> origins;
+        std::vector<http2::frame_type>        frame_types;
+    };
+
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::string port) -> task<seen>
         {
             auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-            REQUIRE(conn.has_value());
+            seen out;
+            if (!conn.has_value())
+            {
+                out.failed = "not connected: " + conn.error().message();
+                co_return out;
+            }
             h2_client c{&*conn, &*conn, &*conn};
 
             // by the time a request is answered, an ORIGIN would have come, after the server's SETTINGS.
             const auto id   = c.request("GET", "/");
             const bool done = co_await c.wait_for(id);
-            REQUIRE(done);
-            CHECK(c.responses[id].status == "204");
-            CHECK(c.origins.empty());
-            co_return c.frame_types;
+            out.status      = c.responses[id].status;
+            out.origins     = c.origins;
+            out.frame_types = c.frame_types;
+            if (!done) out.failed = c.failure.empty() ? "not answered" : c.failure;
+            co_return out;
         }(&sched, std::to_string(server.local_port())));
 
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+    CHECK(out.status == "204");
+    CHECK(out.origins.empty());
+
+    const auto& frames = out.frame_types;
     REQUIRE_FALSE(frames.empty());
     CHECK(frames.front() == http2::frame_type::settings);
     CHECK(std::ranges::find(frames, http2::frame_type::origin) == frames.end());

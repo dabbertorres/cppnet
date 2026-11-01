@@ -20,8 +20,6 @@
 #include <utility>
 #include <vector>
 
-#include <catch2/catch_test_macros.hpp>
-
 #include "coro/task.hpp"
 #include "http/hpack.hpp"
 #include "http/http2.hpp"
@@ -95,8 +93,12 @@ struct h2_client final : http2::session_events
     http2::stream_id                     goaway_last = 0; // the last GOAWAY's last stream
     bool                                 closed      = false;
     bool                                 timed_out   = false; // the last pump() reached its deadline
-    int                                  finished    = 0;
-    int                                  pings       = 0; // acknowledged
+    int                                  finished    = 0;     // streams done
+    int                                  pings       = 0;     // acknowledged
+
+    // failure is why the session refused what request(), respond() or send_trailers() submitted, if it did: pump() then
+    // returns false at once, so the test, which checks what it returns, fails rather than waiting for what never went.
+    std::string failure;
 
     // hold_windows keeps the DATA received from being consumed, so the server's windows grow only by window_update()
     // (e.g. to hold its responses until they've all queued, then let them go). DATA's received all the same.
@@ -197,10 +199,19 @@ struct h2_client final : http2::session_events
         origins.emplace_back(entries.begin(), entries.end());
     }
 
+    // done marks a stream done, once: a stream that ended and is then reset (e.g. RST_STREAM(NO_ERROR) after a response
+    // the request didn't wait for) is counted in finished once, in the order it first was.
     void done(response& r)
     {
+        if (r.done) return;
         r.done  = true;
         r.order = ++finished;
+    }
+
+    // fail records why a submission was refused (the first, if several were).
+    void fail(std::string_view what, std::error_code err)
+    {
+        if (failure.empty()) failure = std::format("{}: {}", what, err.message());
     }
 
     // request opens a stream, and sends a request's head (with fields, if any) and body (if any).
@@ -219,7 +230,11 @@ struct h2_client final : http2::session_events
             {     .name = ":path",        .value = path}
         };
         head.insert(head.end(), fields.begin(), fields.end());
-        REQUIRE_FALSE(s.submit_headers(id, head, body.empty() && end));
+        if (const auto err = s.submit_headers(id, head, body.empty() && end))
+        {
+            fail(std::format("stream {}'s request", id), err);
+            return id;
+        }
         if (!body.empty()) send(id, body, end);
         return id;
     }
@@ -257,8 +272,12 @@ struct h2_client final : http2::session_events
     // send_trailers ends a stream with trailers, once its body (if any) has all been sent.
     void send_trailers(http2::stream_id id, std::span<const hpack::field> fields)
     {
-        REQUIRE_FALSE(pending_body.contains(id));
-        REQUIRE_FALSE(s.submit_headers(id, fields, true));
+        if (pending_body.contains(id))
+        {
+            fail(std::format("stream {}'s trailers", id), std::make_error_code(std::errc::device_or_resource_busy));
+            return;
+        }
+        if (const auto err = s.submit_headers(id, fields, true)) fail(std::format("stream {}'s trailers", id), err);
     }
 
     // respond sends a response's head (as a server), and its body, if any (ending the stream, if end).
@@ -267,7 +286,11 @@ struct h2_client final : http2::session_events
         const std::vector<hpack::field> head{
             {.name = ":status", .value = status}
         };
-        REQUIRE_FALSE(s.submit_headers(id, head, body.empty() && end));
+        if (const auto err = s.submit_headers(id, head, body.empty() && end))
+        {
+            fail(std::format("stream {}'s response", id), err);
+            return;
+        }
         if (!body.empty()) send(id, body, end);
     }
 
@@ -291,7 +314,7 @@ struct h2_client final : http2::session_events
     }
 
     // pump writes what's to be written, and reads and receives, until done() says so, the connection ends, or (if
-    // the socket's known) timeout passes, returning done().
+    // the socket's known) timeout passes, returning done(); or false at once, if a submission failed (see failure).
     template<typename Done>
     net::coro::task<bool> pump(Done done, net::io::clock::duration timeout = default_timeout)
     {
@@ -299,6 +322,7 @@ struct h2_client final : http2::session_events
         std::vector<std::byte> output;
 
         timed_out = false;
+        if (!failure.empty()) co_return false;
         if (sock != nullptr) sock->set_read_deadline(net::io::clock::now() + timeout);
 
         while (true)
@@ -516,14 +540,21 @@ struct writer_gate
         co_return net::io::result{};
     }
 
-    // hold holds the waits from now on; grant lets one more pass; open lets them all.
+    // hold holds the waits from now on; grant lets one more pass (and, once open() has let them all, changes nothing:
+    // allowed stays at its most, rather than wrapping to 0, which would hold every wait after it); open lets them all.
     void hold() { allowed.store(arrived.load()); }
-    void grant() { change(allowed.fetch_add(1) + 1); }
-    void open() { change(std::numeric_limits<std::uint64_t>::max()); }
 
-    void change(std::uint64_t to)
+    void grant()
     {
-        allowed.store(to);
+        auto seen = allowed.load();
+        while (seen != std::numeric_limits<std::uint64_t>::max() && !allowed.compare_exchange_weak(seen, seen + 1))
+        {}
+        sched->notify_all(allowed);
+    }
+
+    void open()
+    {
+        allowed.store(std::numeric_limits<std::uint64_t>::max());
         sched->notify_all(allowed);
     }
 

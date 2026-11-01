@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -101,15 +102,28 @@ struct test_server
 
 std::shared_ptr<net::coro::thread_pool> make_pool() { return std::make_shared<net::coro::thread_pool>(4); }
 
-// with_client connects to port, and runs test with an h2_client (its session's config) over the connection.
+// seen is what an h2_client received: its responses, by stream, and its non-empty DATA frames, in order.
+struct seen
+{
+    std::map<http2::stream_id, h2_client::response>       responses;
+    std::vector<std::pair<http2::stream_id, std::size_t>> data_log;
+};
+
+// with_client connects to port, and runs test with an h2_client (its session's config) over the connection, keeping
+// what it received in got. It returns what went wrong, if anything: test returns what went wrong with its own steps.
 template<typename Test>
-task<> with_client(net::io::scheduler* sched, std::string port, Test test, http2::session_config config = {})
+task<std::string>
+with_client(net::io::scheduler* sched, std::string port, seen* got, Test test, http2::session_config config = {})
 {
     auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-    REQUIRE(conn.has_value());
+    if (!conn.has_value()) co_return "not connected: " + conn.error().message();
 
     h2_client client{&*conn, &*conn, &*conn, http2::role::client, config};
-    co_await test(client);
+    auto      failed = co_await test(client);
+    if (failed.empty()) failed = client.failure;
+    got->responses = client.responses;
+    got->data_log  = client.data_log;
+    co_return failed;
 }
 
 // bytes is a request for /bytes.
@@ -140,9 +154,9 @@ http2::stream_id request_bytes(h2_client& c, const bytes& b)
 }
 
 // data_frames is how many non-empty DATA frames the client received on a stream.
-std::size_t data_frames(const h2_client& c, http2::stream_id id)
+std::size_t data_frames(const seen& got, http2::stream_id id)
 {
-    return static_cast<std::size_t>(std::ranges::count_if(c.data_log, [id](const auto& f) { return f.first == id; }));
+    return static_cast<std::size_t>(std::ranges::count_if(got.data_log, [id](const auto& f) { return f.first == id; }));
 }
 
 constexpr std::size_t frame = 16'384; // the client's MAX_FRAME_SIZE: the server's DATA frames' largest
@@ -186,25 +200,30 @@ TEST_CASE("an HTTP/2 response with a Content-Length ends with its last DATA fram
     test_server        server{&sched};
 
     // (a connection of its own, with windows for all of it: its writes go at once, not through the writer's turns.)
-    sched.run_to_completion(with_client(&sched,
-                                        server.port(),
-                                        [&tc](h2_client& c) -> task<>
-                                        {
-                                            const auto id   = request_bytes(c, tc.request);
-                                            const bool done = co_await c.wait_for(id);
-                                            REQUIRE(done);
+    seen             got;
+    http2::stream_id id     = 0;
+    const auto       failed = sched.run_to_completion(with_client(&sched,
+                                                                  server.port(),
+                                                                  &got,
+                                                                  [&](h2_client& c) -> task<std::string>
+                                                                  {
+                                                                id              = request_bytes(c, tc.request);
+                                                                const bool done = co_await c.wait_for(id);
+                                                                co_return done ? "" : "not done";
+                                                                  }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
 
-                                            const auto& r = c.responses[id];
-                                            CAPTURE(r.reset.message());
-                                            CHECK_FALSE(r.reset);
-                                            CHECK(r.status == "200");
-                                            CHECK(header(r, "content-length") == std::to_string(tc.request.size));
-                                            CHECK(r.body.size() == tc.request.size);
-                                            CHECK_FALSE(r.head_ended);
-                                            CHECK(r.data_frames == tc.frames);
-                                            CHECK(data_frames(c, id) == static_cast<std::size_t>(tc.frames));
-                                            CHECK(r.ended_by_data == tc.last);
-                                        }));
+    const auto& r = got.responses[id];
+    CAPTURE(r.reset.message());
+    CHECK_FALSE(r.reset);
+    CHECK(r.status == "200");
+    CHECK(header(r, "content-length") == std::to_string(tc.request.size));
+    CHECK(r.body.size() == tc.request.size);
+    CHECK_FALSE(r.head_ended);
+    CHECK(r.data_frames == tc.frames);
+    CHECK(data_frames(got, id) == static_cast<std::size_t>(tc.frames));
+    CHECK(r.ended_by_data == tc.last);
 }
 
 TEST_CASE("an HTTP/2 response with a Content-Length that waits for its window ends with its last DATA frame",
@@ -219,28 +238,34 @@ TEST_CASE("an HTTP/2 response with a Content-Length that waits for its window en
     config.local.initial_window_size = 20'000;
 
     constexpr std::size_t size = 50'000;
-    sched.run_to_completion(with_client(
+    seen                  got;
+    http2::stream_id      id     = 0;
+    const auto            failed = sched.run_to_completion(with_client(
         &sched,
         server.port(),
-        [](h2_client& c) -> task<>
+        &got,
+        [&](h2_client& c) -> task<std::string>
         {
-            const auto id   = request_bytes(c, {.size = size});
+            id              = request_bytes(c, {.size = size});
             const bool done = co_await c.wait_for(id);
-            REQUIRE(done);
-
-            const auto& r = c.responses[id];
-            CAPTURE(r.reset.message());
-            CHECK_FALSE(r.reset);
-            CHECK(r.body.size() == size);
-
-            // whatever the frames' sizes, none empty, the last ending the stream.
-            CHECK(r.data_frames >= 4);
-            CHECK(data_frames(c, id) == static_cast<std::size_t>(r.data_frames));
-            REQUIRE(r.ended_by_data.has_value());
-            CHECK(*r.ended_by_data > 0);
-            CHECK(*r.ended_by_data == c.data_log.back().second);
+            co_return done ? "" : "not done";
         },
         config));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
+
+    const auto& r = got.responses[id];
+    CAPTURE(r.reset.message());
+    CHECK_FALSE(r.reset);
+    CHECK(r.body.size() == size);
+
+    // whatever the frames' sizes, none empty, the last ending the stream.
+    CHECK(r.data_frames >= 4);
+    CHECK(data_frames(got, id) == static_cast<std::size_t>(r.data_frames));
+    REQUIRE(r.ended_by_data.has_value());
+    CHECK(*r.ended_by_data > 0);
+    REQUIRE_FALSE(got.data_log.empty());
+    CHECK(*r.ended_by_data == got.data_log.back().second);
 }
 
 TEST_CASE("HTTP/2 responses without a body, to HEAD, and without a Content-Length end as before",
@@ -249,51 +274,60 @@ TEST_CASE("HTTP/2 responses without a body, to HEAD, and without a Content-Lengt
     net::io::scheduler sched{make_pool()};
     test_server        server{&sched};
 
-    sched.run_to_completion(with_client(&sched,
-                                        server.port(),
-                                        [](h2_client& c) -> task<>
-                                        {
-                                            const auto empty    = request_bytes(c, {.size = 0});
-                                            const auto head     = request_bytes(c, {.size = 5, .method = "HEAD"});
-                                            const auto unknown  = request_bytes(c, {.size = 5, .unknown_length = true});
-                                            const auto nothing  = request_bytes(c, {.size = 0, .unknown_length = true});
-                                            const bool finished = co_await c.pump([&] { return c.finished == 4; });
-                                            REQUIRE(finished);
-
-                                            // its head ends a response without a body...
-                                            const auto& r1 = c.responses[empty];
-                                            CHECK(header(r1, "content-length") == "0");
-                                            CHECK(r1.head_ended);
-                                            CHECK(r1.data_frames == 0);
-
-                                            // ...and one to HEAD, whatever its Content-Length.
-                                            const auto& r2 = c.responses[head];
-                                            CHECK(header(r2, "content-length") == "5");
-                                            CHECK(r2.head_ended);
-                                            CHECK(r2.data_frames == 0);
-                                            CHECK(r2.body.empty());
-
-                                            // without a Content-Length, an empty DATA frame once the handler's
-                                            // returned: the server can't know which write is the last.
-                                            const auto& r3 = c.responses[unknown];
-                                            CHECK(header(r3, "content-length") == "(none)");
-                                            CHECK(r3.body == "xxxxx");
-                                            CHECK_FALSE(r3.head_ended);
-                                            CHECK(r3.data_frames == 2);
-                                            CHECK(r3.ended_by_data == 0U);
-
-                                            const auto& r4 = c.responses[nothing];
-                                            CHECK_FALSE(r4.head_ended);
-                                            CHECK(r4.data_frames == 1);
-                                            CHECK(r4.ended_by_data == 0U);
-
-                                            for (const auto id : {empty, head, unknown, nothing})
+    seen             got;
+    http2::stream_id empty   = 0;
+    http2::stream_id head    = 0;
+    http2::stream_id unknown = 0;
+    http2::stream_id nothing = 0;
+    const auto       failed =
+        sched.run_to_completion(with_client(&sched,
+                                            server.port(),
+                                            &got,
+                                            [&](h2_client& c) -> task<std::string>
                                             {
-                                                CAPTURE(id);
-                                                CHECK_FALSE(c.responses[id].reset);
-                                                CHECK(c.responses[id].status == "200");
-                                            }
-                                        }));
+                                                empty   = request_bytes(c, {.size = 0});
+                                                head    = request_bytes(c, {.size = 5, .method = "HEAD"});
+                                                unknown = request_bytes(c, {.size = 5, .unknown_length = true});
+                                                nothing = request_bytes(c, {.size = 0, .unknown_length = true});
+                                                const bool finished = co_await c.pump([&] { return c.finished == 4; });
+                                                co_return finished ? "" : "not all of them ended";
+                                            }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
+
+    // its head ends a response without a body...
+    const auto& r1 = got.responses[empty];
+    CHECK(header(r1, "content-length") == "0");
+    CHECK(r1.head_ended);
+    CHECK(r1.data_frames == 0);
+
+    // ...and one to HEAD, whatever its Content-Length.
+    const auto& r2 = got.responses[head];
+    CHECK(header(r2, "content-length") == "5");
+    CHECK(r2.head_ended);
+    CHECK(r2.data_frames == 0);
+    CHECK(r2.body.empty());
+
+    // without a Content-Length, an empty DATA frame once the handler's returned: the server can't know which write is
+    // the last.
+    const auto& r3 = got.responses[unknown];
+    CHECK(header(r3, "content-length") == "(none)");
+    CHECK(r3.body == "xxxxx");
+    CHECK_FALSE(r3.head_ended);
+    CHECK(r3.data_frames == 2);
+    CHECK(r3.ended_by_data == 0U);
+
+    const auto& r4 = got.responses[nothing];
+    CHECK_FALSE(r4.head_ended);
+    CHECK(r4.data_frames == 1);
+    CHECK(r4.ended_by_data == 0U);
+
+    for (const auto id : {empty, head, unknown, nothing})
+    {
+        CAPTURE(id);
+        CHECK_FALSE(got.responses[id].reset);
+        CHECK(got.responses[id].status == "200");
+    }
 }
 
 TEST_CASE("an HTTP/2 handler that writes less than its Content-Length has its stream reset",
@@ -302,18 +336,23 @@ TEST_CASE("an HTTP/2 handler that writes less than its Content-Length has its st
     net::io::scheduler sched{make_pool()};
     test_server        server{&sched};
 
-    sched.run_to_completion(with_client(&sched,
-                                        server.port(),
-                                        [](h2_client& c) -> task<>
-                                        {
-                                            const auto id   = request_bytes(c, {.size = 4, .length = 10});
-                                            const bool done = co_await c.wait_for(id);
-                                            REQUIRE(done);
+    seen             got;
+    http2::stream_id id     = 0;
+    const auto       failed = sched.run_to_completion(with_client(&sched,
+                                                                  server.port(),
+                                                                  &got,
+                                                                  [&](h2_client& c) -> task<std::string>
+                                                                  {
+                                                                id = request_bytes(c, {.size = 4, .length = 10});
+                                                                const bool done = co_await c.wait_for(id);
+                                                                co_return done ? "" : "not done";
+                                                                  }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
 
-                                            // what was written went, but never ended the stream.
-                                            const auto& r = c.responses[id];
-                                            CHECK(r.body == "xxxx");
-                                            CHECK(r.reset == http2::error_code::internal_error);
-                                            CHECK_FALSE(r.ended_by_data.has_value());
-                                        }));
+    // what was written went, but never ended the stream.
+    const auto& r = got.responses[id];
+    CHECK(r.body == "xxxx");
+    CHECK(r.reset == http2::error_code::internal_error);
+    CHECK_FALSE(r.ended_by_data.has_value());
 }

@@ -149,18 +149,21 @@ http2::session_config open_windows()
     return config;
 }
 
-// request_bytes requests size bytes from path (/bytes, or /frames), with a Priority field of priority, and sends it.
-task<http2::stream_id>
-request_bytes(h2_client& c, std::size_t size, std::string_view priority, std::string_view path = "/bytes")
+// request_bytes requests size bytes from path (/bytes, or /frames), with a Priority field of priority, adding its
+// stream to ids, and sends it, returning whether it went (see h2_client::failure for why it didn't, if it was refused).
+task<bool> request_bytes(h2_client&                     c,
+                         std::vector<http2::stream_id>& ids,
+                         std::size_t                    size,
+                         std::string_view               priority,
+                         std::string_view               path = "/bytes")
 {
     const auto                      length = std::to_string(size);
     const std::vector<hpack::field> fields{
         {  .name = "x-size",   .value = length},
         {.name = "priority", .value = priority}
     };
-    const auto id = c.request("GET", path, {}, true, fields);
-    (void)co_await c.pump([] { return true; }); // (what's to be written is, first)
-    co_return id;
+    ids.push_back(c.request("GET", path, {}, true, fields));
+    co_return co_await c.pump([] { return true; }); // (what's to be written is, first)
 }
 
 // probe asks /queued to count once n streams wait in the server's scheduler, and waits (up to 5 seconds) until the n-th
@@ -172,7 +175,8 @@ task<bool> probe(h2_client& c, handlers* h, std::size_t n, std::uint64_t nth)
         {.name = "x-count", .value = count}
     };
     (void)c.request("GET", "/queued", {}, true, fields);
-    (void)co_await c.pump([] { return true; });
+    const bool sent = co_await c.pump([] { return true; });
+    if (!sent) co_return false;
     co_return co_await stop_probe::reach(h->sched, h->queued, nth);
 }
 
@@ -186,6 +190,37 @@ std::string frames(const h2_client& c, std::span<const http2::stream_id> ids, st
         out += it == ids.end() ? '?' : names.at(static_cast<std::size_t>(it - ids.begin()));
     }
     return out;
+}
+
+// seen is what a test's client saw: what went wrong, if anything, the DATA frames' order (frames()), the streams that
+// were reset, and the first stream's body's size and the second's.
+struct seen
+{
+    std::string failed;
+    std::string frames;
+    int         reset       = 0;
+    std::size_t first_size  = 0;
+    std::size_t second_size = 0;
+};
+
+// look_at fills out from what c received on the streams ids (named names, for frames()), and adds why the session
+// refused a submission, if it did (whatever else went wrong: the steps that failed for it don't know why).
+void look_at(seen& out, const h2_client& c, std::span<const http2::stream_id> ids, std::string_view names)
+{
+    if (!c.failure.empty()) out.failed = out.failed.empty() ? c.failure : out.failed + " (" + c.failure + ")";
+    out.frames = frames(c, ids, names);
+    for (const auto id : ids)
+    {
+        const auto it = c.responses.find(id);
+        if (it != c.responses.end() && it->second.reset) ++out.reset;
+    }
+    const auto size = [&c](http2::stream_id id)
+    {
+        const auto it = c.responses.find(id);
+        return it == c.responses.end() ? std::size_t{0} : it->second.body.size();
+    };
+    if (!ids.empty()) out.first_size = size(ids[0]);
+    if (ids.size() > 1) out.second_size = size(ids[1]);
 }
 
 // fetch_mark GETs /mark, returning its body (the server's mark on the connection), or the error.
@@ -241,49 +276,70 @@ TEST_CASE("while the socket can't take more, HTTP/2 responses queue, then go mos
     handlers    h{.sched = &sched};
     test_server server{&sched, &h, {.http2_writable = gate.hook()}};
 
-    sched.run_to_completion(
-        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<>
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<seen>
         {
+            seen out;
             auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-            REQUIRE(conn.has_value());
-            h2_client c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
-
-            // the settings exchanged, and the writer's last round done.
-            bool ok = co_await c.sync();
-            REQUIRE(ok);
-            c.data_log.clear();
-
-            // from now on, the socket "can't take more" once the writer's written. A bulk download first, which
-            // goes at once as far as max_ahead (64 KiB) and queues the rest, as nothing else is queued; the writer
-            // writes its head (and that, if it's framed by then), then waits.
-            gate->hold();
+            if (!conn.has_value())
+            {
+                out.failed = "not connected: " + conn.error().message();
+                co_return out;
+            }
+            h2_client                     c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
             std::vector<http2::stream_id> ids;
-            ids.push_back(co_await request_bytes(c, 16 * frame, "u=7"));
-            ok = co_await probe(c, h, 1, 1);
-            REQUIRE(ok);
-            ok = co_await stop_probe::reach(sched, gate->held, 1);
-            REQUIRE(ok);
 
-            // then a more urgent one, and a usual one, which queue behind it: nothing's framed while the writer waits.
-            ids.push_back(co_await request_bytes(c, 2 * frame, "u=0"));
-            ids.push_back(co_await request_bytes(c, 2 * frame, "u=3"));
-            ok = co_await probe(c, h, 3, 2);
-            REQUIRE(ok);
+            // what went wrong, if anything, then what the client saw (the gate let go, whatever happened).
+            const auto steps = [&] -> task<std::string>
+            {
+                // the settings exchanged, and the writer's last round done.
+                if (!co_await c.sync()) co_return "no PING answered";
+                c.data_log.clear();
 
-            // let go: the bulk download's first 64 KiB were framed, the rest's the scheduler's.
+                // from now on, the socket "can't take more" once the writer's written. A bulk download first, which
+                // goes at once as far as max_ahead (64 KiB) and queues the rest, as nothing else is queued; the
+                // writer writes its head (and that, if it's framed by then), then waits.
+                gate->hold();
+                if (!co_await request_bytes(c, ids, 16 * frame, "u=7"))
+                    co_return "the bulk download's request wasn't sent";
+                if (!co_await probe(c, h, 1, 1)) co_return "the bulk download didn't queue";
+                if (!co_await stop_probe::reach(sched, gate->held, 1)) co_return "the writer didn't wait";
+
+                // then a more urgent one, and a usual one, which queue behind it: nothing's framed while the writer
+                // waits.
+                if (!co_await request_bytes(c, ids, 2 * frame, "u=0")) co_return "the urgent request wasn't sent";
+                if (!co_await request_bytes(c, ids, 2 * frame, "u=3")) co_return "the usual request wasn't sent";
+                if (!co_await probe(c, h, 3, 2)) co_return "the others didn't queue";
+
+                // let go: the bulk download's first 64 KiB were framed, the rest's the scheduler's.
+                gate->open();
+                const bool done = co_await c.pump(
+                    [&] { return std::ranges::all_of(ids, [&](auto id) { return c.responses[id].done; }); });
+                co_return done ? "" : "not all of them ended";
+            };
+            out.failed = co_await steps();
             gate->open();
-            ok = co_await c.pump([&]
-                                 { return std::ranges::all_of(ids, [&](auto id) { return c.responses[id].done; }); });
-            REQUIRE(ok);
-            CHECK(frames(c, ids, "BUN") == "BBBBUUNNBBBBBBBBBBBB");
-            for (const auto id : ids) CHECK_FALSE(c.responses[id].reset);
-            CHECK(c.responses[ids[0]].body.size() == 16 * frame);
+            look_at(out, c, ids, "BUN");
+            co_return out;
         }(&sched, server.port(), &gate, &h));
+
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+    CHECK(out.frames == "BBBBUUNNBBBBBBBBBBBB");
+    CHECK(out.reset == 0);
+    CHECK(out.first_size == 16 * frame);
 }
 
 TEST_CASE("an HTTP/2 response waiting its turn doesn't time out while the writer waits for the socket",
           "[http][http2][server][notsent-lowat][scheduler][timeouts]")
 {
+    // (the pacer's, before the scheduler, which waits for it.)
+    struct pacing
+    {
+        std::atomic_bool           stop{false};
+        std::atomic<std::uint64_t> done{0};
+    } pacer;
+
     writer_gate        gate;
     net::io::scheduler sched{make_pool()};
     gate.sched = &sched;
@@ -294,65 +350,68 @@ TEST_CASE("an HTTP/2 response waiting its turn doesn't time out while the writer
         {.write_timeout = 1s, .http2_writable = gate.hook()}
     };
 
-    sched.run_to_completion(
-        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<>
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h, pacing* pacer) -> task<seen>
         {
+            seen out;
             auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-            REQUIRE(conn.has_value());
-            h2_client c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
-
-            bool ok = co_await c.sync();
-            REQUIRE(ok);
-            c.data_log.clear();
-
-            // an urgent response (which goes at once as far as max_ahead, and queues the rest), then a bulk one
-            // waiting its turn behind it.
-            gate->hold();
-            constexpr std::size_t         big = std::size_t{4} << 20;
-            std::vector<http2::stream_id> ids;
-            ids.push_back(co_await request_bytes(c, big, "u=0"));
-            ok = co_await probe(c, h, 1, 1);
-            REQUIRE(ok);
-            ids.push_back(co_await request_bytes(c, frame, "u=7"));
-            ok = co_await probe(c, h, 2, 2);
-            REQUIRE(ok);
-
-            // the socket takes a round (64 KiB) every 20 ms, so the urgent response takes the connection for about
-            // 1.3 seconds; and once, for 600 ms (under the write timeout), it takes nothing. So the bulk one waits for
-            // its turn about 2 seconds, past its write timeout of 1, while the writer waits for the socket, and
-            // writes when it can.
-            std::atomic<std::uint64_t> pacing_done{0};
-            std::atomic_bool           stop_pacing{false};
-            const auto                 pace = [](net::io::scheduler*         sched,
-                                                 writer_gate*                gate,
-                                                 const std::atomic_bool*     stop,
-                                                 std::atomic<std::uint64_t>* done) -> task<>
+            if (!conn.has_value())
             {
-                for (int round = 0; !stop->load(); ++round)
+                out.failed = "not connected: " + conn.error().message();
+                co_return out;
+            }
+            h2_client                     c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
+            std::vector<http2::stream_id> ids;
+
+            const auto steps = [&] -> task<std::string>
+            {
+                if (!co_await c.sync()) co_return "no PING answered";
+                c.data_log.clear();
+
+                // an urgent response (which goes at once as far as max_ahead, and queues the rest), then a bulk one
+                // waiting its turn behind it.
+                gate->hold();
+                constexpr std::size_t big = std::size_t{4} << 20;
+                if (!co_await request_bytes(c, ids, big, "u=0")) co_return "the urgent request wasn't sent";
+                if (!co_await probe(c, h, 1, 1)) co_return "the urgent one didn't queue";
+                if (!co_await request_bytes(c, ids, frame, "u=7")) co_return "the bulk request wasn't sent";
+                if (!co_await probe(c, h, 2, 2)) co_return "the bulk one didn't queue";
+
+                // the socket takes a round (64 KiB) every 20 ms, so the urgent response takes the connection for
+                // about 1.3 seconds; and once, for 600 ms (under the write timeout), it takes nothing. So the bulk one
+                // waits for its turn about 2 seconds, past its write timeout of 1, while the writer waits for the
+                // socket, and writes when it can.
+                const auto pace = [](net::io::scheduler* sched, writer_gate* gate, pacing* pacer) -> task<>
                 {
-                    const auto pause = round == 30 ? 600ms : 20ms;
-                    (void)co_await sched->sleep_until(net::io::clock::now() + pause);
-                    gate->grant();
-                }
-                stop_probe::bump(sched, *done);
+                    for (int round = 0; !pacer->stop.load(); ++round)
+                    {
+                        const auto pause = round == 30 ? 600ms : 20ms;
+                        (void)co_await sched->sleep_until(net::io::clock::now() + pause);
+                        gate->grant();
+                    }
+                    stop_probe::bump(sched, pacer->done);
+                };
+                if (!sched->spawn(pace(sched, gate, pacer))) co_return "the pacer didn't start";
+
+                const bool done = co_await c.pump([&] { return c.responses[ids[1]].done; });
+                pacer->stop     = true;
+                gate->open();
+                if (!co_await stop_probe::reach(sched, pacer->done, 1)) co_return "the pacer didn't stop";
+                co_return done ? "" : "the bulk one didn't end";
             };
-            const bool spawned = sched->spawn(pace(sched, gate, &stop_pacing, &pacing_done));
-            REQUIRE(spawned);
-
-            ok          = co_await c.pump([&] { return c.responses[ids[1]].done; });
-            stop_pacing = true;
+            out.failed  = co_await steps();
+            pacer->stop = true;
             gate->open();
-            const bool paced = co_await stop_probe::reach(sched, pacing_done, 1);
-            REQUIRE(ok);
-            REQUIRE(paced);
+            look_at(out, c, ids, "UB");
+            co_return out;
+        }(&sched, server.port(), &gate, &h, &pacer));
 
-            const auto& bulk = c.responses[ids[1]];
-            CAPTURE(bulk.reset.message());
-            CHECK_FALSE(bulk.reset);
-            CHECK(bulk.body.size() == frame);
-            CHECK(c.responses[ids[0]].body.size() == big);
-            CHECK(frames(c, ids, "UB").find('B') == big / frame);
-        }(&sched, server.port(), &gate, &h));
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+    CHECK(out.reset == 0); // the bulk one's not timed out
+    CHECK(out.second_size == frame);
+    CHECK(out.first_size == std::size_t{4} << 20);
+    CHECK(out.frames.find('B') == (std::size_t{4} << 20) / frame);
 }
 
 TEST_CASE("a turn held while the writer waits for the socket is let go when it's over",
@@ -377,50 +436,62 @@ TEST_CASE("a turn held while the writer waits for the socket is let go when it's
                               if (!stop.stop_requested()) sched.request_stop();
                           }};
 
-    sched.run_to_completion(
-        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<>
+    const auto out = sched.run_to_completion(
+        [](net::io::scheduler* sched, std::string port, writer_gate* gate, handlers* h) -> task<seen>
         {
+            seen out;
             auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", port);
-            REQUIRE(conn.has_value());
-            h2_client c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
-
-            bool ok = co_await c.sync();
-            REQUIRE(ok);
-            c.data_log.clear();
-
-            // a bulk download, which goes at once as far as max_ahead (64 KiB) and queues the rest; the writer writes
-            // that, then waits for the socket.
-            gate->hold();
+            if (!conn.has_value())
+            {
+                out.failed = "not connected: " + conn.error().message();
+                co_return out;
+            }
+            h2_client                     c{&*conn, &*conn, &*conn, http2::role::client, open_windows()};
             std::vector<http2::stream_id> ids;
-            ids.push_back(co_await request_bytes(c, 16 * frame, "u=7"));
-            ok = co_await probe(c, h, 1, 1);
-            REQUIRE(ok);
-            ok = co_await stop_probe::reach(sched, gate->held, 1);
-            REQUIRE(ok);
 
-            // an urgent one, written a frame at a time, queues behind it.
-            ids.push_back(co_await request_bytes(c, 2 * frame, "u=0", "/frames"));
-            ok = co_await probe(c, h, 2, 2);
-            REQUIRE(ok);
+            const auto steps = [&] -> task<std::string>
+            {
+                if (!co_await c.sync()) co_return "no PING answered";
+                c.data_log.clear();
 
-            // a round: the urgent one's first frame, after which its turn's held (for a millisecond) for its next
-            // write, so the round ends there; then the writer waits for the socket again.
-            gate->grant();
-            ok = co_await stop_probe::reach(sched, gate->held, 2);
-            REQUIRE(ok);
+                // a bulk download, which goes at once as far as max_ahead (64 KiB) and queues the rest; the writer
+                // writes that, then waits for the socket.
+                gate->hold();
+                if (!co_await request_bytes(c, ids, 16 * frame, "u=7"))
+                    co_return "the bulk download's request wasn't sent";
+                if (!co_await probe(c, h, 1, 1)) co_return "the bulk download didn't queue";
+                if (!co_await stop_probe::reach(sched, gate->held, 1)) co_return "the writer didn't wait";
 
-            // the turn's over long before this (the writer still waiting): a canceled sleep is the watchdog's stop.
-            const auto slept = co_await sched->sleep_until(net::io::clock::now() + 50ms);
-            REQUIRE_FALSE(slept);
+                // an urgent one, written a frame at a time, queues behind it.
+                if (!co_await request_bytes(c, ids, 2 * frame, "u=0", "/frames"))
+                    co_return "the urgent request wasn't sent";
+                if (!co_await probe(c, h, 2, 2)) co_return "the urgent one didn't queue";
 
+                // a round: the urgent one's first frame, after which its turn's held (for a millisecond) for its next
+                // write, so the round ends there; then the writer waits for the socket again.
+                gate->grant();
+                if (!co_await stop_probe::reach(sched, gate->held, 2)) co_return "the writer didn't wait again";
+
+                // the turn's over long before this (the writer still waiting): a canceled sleep is the watchdog's
+                // stop.
+                if (co_await sched->sleep_until(net::io::clock::now() + 50ms)) co_return "the watchdog stopped it";
+
+                gate->open();
+                const bool done = co_await c.pump(
+                    [&] { return std::ranges::all_of(ids, [&](auto id) { return c.responses[id].done; }); });
+                co_return done ? "" : "not all of them ended";
+            };
+            out.failed = co_await steps();
             gate->open();
-            ok = co_await c.pump([&]
-                                 { return std::ranges::all_of(ids, [&](auto id) { return c.responses[id].done; }); });
-            REQUIRE(ok);
-
-            // the urgent one's frames together: the round with its first ended there, rather than going on with the
-            // bulk one's.
-            CHECK(frames(c, ids, "BU") == "BBBBUUBBBBBBBBBBBB");
-            for (const auto id : ids) CHECK_FALSE(c.responses[id].reset);
+            look_at(out, c, ids, "BU");
+            co_return out;
         }(&sched, server.port(), &gate, &h));
+
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+
+    // the urgent one's frames together: the round with its first ended there, rather than going on with the bulk
+    // one's.
+    CHECK(out.frames == "BBBBUUBBBBBBBBBBBB");
+    CHECK(out.reset == 0);
 }

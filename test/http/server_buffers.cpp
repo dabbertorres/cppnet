@@ -242,6 +242,7 @@ TEST_CASE("the server's HTTP/2 stream window is its SETTINGS', and its connectio
             // a stream may send as much as its window, which the connection's holds.
             const auto id     = c.request("POST", "/echo", {}, false);
             out.stream_window = c.s.send_window(id);
+            out.failed        = c.failure; // (the request's head refused, if it was)
             co_return out;
         }(&sched, server.local_port()));
 

@@ -1,6 +1,8 @@
 // Reprioritizing a request in flight: client_response::set_priority() sends the server a PRIORITY_UPDATE for the
 // response's stream, over HTTP/2, which cppnet's server takes as the stream's priority (read by its handler with
 // detail::stream_priority()); over HTTP/1.1, and once the response has ended, it can't.
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <memory>
@@ -159,26 +161,50 @@ TEST_CASE("set_priority() reprioritizes an HTTP/2 response in flight, as the ser
     served             server{&sched};
     http::client       client{&sched, options_for(true)};
 
-    const auto test = [](served* server, http::client* client, const test_case* tc) -> task<std::string>
+    // what the client saw: what went wrong, if anything, how many updates set_priority() took, /ping's body, and the
+    // held response's body.
+    struct seen
+    {
+        std::string failed;
+        std::size_t taken = 0;
+        std::string pong;
+        std::string body;
+    };
+
+    const auto test = [](served* server, http::client* client, const test_case* tc) -> task<seen>
     {
         // NOTE: the gate's opened whatever happens, so the handler finishes.
         net::util::defer opening{[server] noexcept { server->held.open(); }};
 
+        seen out;
         auto resp = co_await client->send(get(server->url("/hold"), tc->field));
-        REQUIRE(resp.has_value());
-        for (const auto& p : tc->updates) CHECK(resp->set_priority(p));
+        if (!resp.has_value())
+        {
+            out.failed = "/hold: " + resp.error().message();
+            co_return out;
+        }
+        for (const auto& p : tc->updates) out.taken += resp->set_priority(p) ? 1 : 0;
 
         // once /ping's answered (on the same connection, after the updates), the server has them.
         auto ping = co_await client->send(get(server->url("/ping")));
-        REQUIRE(ping.has_value());
-        const auto pong = co_await body_of(*ping);
-        CHECK(pong == "pong");
+        if (!ping.has_value())
+        {
+            out.failed = "/ping: " + ping.error().message();
+            co_return out;
+        }
+        out.pong = co_await body_of(*ping);
 
         server->held.open();
-        co_return co_await body_of(*resp);
+        out.body = co_await body_of(*resp);
+        co_return out;
     };
 
-    CHECK(sched.run_to_completion(test(&server, &client, &tc)) == tc.want);
+    const auto out = sched.run_to_completion(test(&server, &client, &tc));
+    CAPTURE(out.failed);
+    REQUIRE(out.failed.empty());
+    CHECK(out.taken == tc.updates.size());
+    CHECK(out.pong == "pong");
+    CHECK(out.body == tc.want);
 }
 
 TEST_CASE("set_priority() can't reprioritize a response that's ended, failed or isn't the client's, nor over HTTP/1.1",
@@ -189,54 +215,111 @@ TEST_CASE("set_priority() can't reprioritize a response that's ended, failed or 
 
     SECTION("over HTTP/1.1")
     {
-        http::client client{&sched, options_for(false)};
-        const auto   test = [](served* server, http::client* client) -> task<>
+        // what the client saw: what went wrong, if anything, the response's version, whether set_priority() took it,
+        // and the body.
+        struct seen
         {
-            auto resp = co_await client->send(get(server->url("/small")));
-            REQUIRE(resp.has_value());
-            CHECK(resp->version.major == 1);
-            CHECK_FALSE(resp->set_priority({.urgency = 1}));
-            const auto body = co_await body_of(*resp);
-            CHECK(body == "x");
+            std::string   failed;
+            std::uint32_t version = 0;
+            bool          taken   = false;
+            std::string   body;
         };
-        sched.run_to_completion(test(&server, &client));
+
+        http::client client{&sched, options_for(false)};
+        const auto   test = [](served* server, http::client* client) -> task<seen>
+        {
+            seen out;
+            auto resp = co_await client->send(get(server->url("/small")));
+            if (!resp.has_value())
+            {
+                out.failed = resp.error().message();
+                co_return out;
+            }
+            out.version = resp->version.major;
+            out.taken   = resp->set_priority({.urgency = 1});
+            out.body    = co_await body_of(*resp);
+            co_return out;
+        };
+
+        const auto out = sched.run_to_completion(test(&server, &client));
+        CAPTURE(out.failed);
+        REQUIRE(out.failed.empty());
+        CHECK(out.version == 1U);
+        CHECK_FALSE(out.taken);
+        CHECK(out.body == "x");
     }
 
     SECTION("over HTTP/2")
     {
+        // what the client saw: what went wrong, if anything, and whether set_priority() took each update.
+        struct seen
+        {
+            std::string   failed;
+            std::uint32_t version = 0;
+            std::string   body;                    // the ended response's
+            bool          ended           = true;  // taken for the response that's ended
+            bool          before_canceled = false; // taken for the one canceled, before
+            bool          after_canceled  = true;  // and after
+            bool          replaced        = true;  // taken for the one whose body was replaced
+            bool          none            = true;  // taken for no response at all
+        };
+
         http::client client{&sched, options_for(true)};
-        const auto   test = [](served* server, http::client* client) -> task<>
+        const auto   test = [](served* server, http::client* client) -> task<seen>
         {
             net::util::defer opening{[server] noexcept { server->held.open(); }};
+            seen             out;
 
             // its body read to its end: the server's sent all of it.
             auto ended = co_await client->send(get(server->url("/small")));
-            REQUIRE(ended.has_value());
-            CHECK(ended->version.major == 2);
-            const auto body = co_await body_of(*ended);
-            CHECK(body == "x");
-            CHECK_FALSE(ended->set_priority({.urgency = 1}));
+            if (!ended.has_value())
+            {
+                out.failed = "/small: " + ended.error().message();
+                co_return out;
+            }
+            out.version = ended->version.major;
+            out.body    = co_await body_of(*ended);
+            out.ended   = ended->set_priority({.urgency = 1});
 
             // canceled: its stream's failed.
             std::stop_source stop;
             auto             req = get(server->url("/hold"));
             req.stop             = stop.get_token();
             auto canceled        = co_await client->send(std::move(req));
-            REQUIRE(canceled.has_value());
-            CHECK(canceled->set_priority({.urgency = 1}));
+            if (!canceled.has_value())
+            {
+                out.failed = "/hold: " + canceled.error().message();
+                co_return out;
+            }
+            out.before_canceled = canceled->set_priority({.urgency = 1});
             stop.request_stop();
-            CHECK_FALSE(canceled->set_priority({.urgency = 2}));
+            out.after_canceled = canceled->set_priority({.urgency = 2});
 
             // a body the caller put in place of the client's.
             auto replaced = co_await client->send(get(server->url("/small")));
-            REQUIRE(replaced.has_value());
+            if (!replaced.has_value())
+            {
+                out.failed = "/small again: " + replaced.error().message();
+                co_return out;
+            }
             replaced->body = std::make_unique<net::io::owned_string_reader>("y");
-            CHECK_FALSE(replaced->set_priority({.urgency = 1}));
+            out.replaced   = replaced->set_priority({.urgency = 1});
 
             // none at all.
             http::client_response none;
-            CHECK_FALSE(none.set_priority({.urgency = 1}));
+            out.none = none.set_priority({.urgency = 1});
+            co_return out;
         };
-        sched.run_to_completion(test(&server, &client));
+
+        const auto out = sched.run_to_completion(test(&server, &client));
+        CAPTURE(out.failed);
+        REQUIRE(out.failed.empty());
+        CHECK(out.version == 2U);
+        CHECK(out.body == "x");
+        CHECK_FALSE(out.ended);
+        CHECK(out.before_canceled);
+        CHECK_FALSE(out.after_canceled);
+        CHECK_FALSE(out.replaced);
+        CHECK_FALSE(out.none);
     }
 }
