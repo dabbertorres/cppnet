@@ -1,0 +1,177 @@
+name: Autobahn
+
+# The Autobahn TestSuite's WebSocket cases, sections 1-7, 9 and 10 (8 has none; 12 and 13 are permessage-deflate, which
+# cppnet doesn't implement), against the examples: fuzzingclient (Autobahn as the client) against example/websocket-echo,
+# and fuzzingserver (Autobahn as the server) against example/websocket-autobahn. Run by hand, weekly, and for pull
+# requests that change what WebSockets run on (WebSockets, HTTP, the I/O layer, the examples) or this workflow and its
+# files (.github/autobahn/): about 2 minutes, beside CMake's matrix. Optional: not part of CMake's workflow, nor of the
+# `build` check master's branch protection requires.
+on:
+  workflow_dispatch:
+  schedule:
+  - cron: '17 4 * * 3'
+  pull_request:
+    branches: [ master ]
+    paths:
+    - .github/workflows/autobahn.yml
+    - .github/autobahn/**
+    - include/websocket/**
+    - src/websocket/**
+    - include/http/**
+    - src/http/**
+    - include/io/**
+    - src/io/**
+    - example/websocket-echo/**
+    - example/websocket-autobahn/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autobahn-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The suite's image, by tag and digest (amd64; the suite's version 25.10.1, Autobahn's 0.10.9).
+  AUTOBAHN_IMAGE: crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+  # How many cases the configurations select, with that image: a report with fewer (a run cut short) fails.
+  AUTOBAHN_CASES: 301
+
+jobs:
+  autobahn:
+    # NOTE: not in a job container, which has no Docker to run the suite's image: the examples are built, and run, in an
+    #       Arch container of the job's own (the latest Clang, as CMake's workflow gets it), on the host's network, as
+    #       the suite's containers are.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    # Caches as CMake's workflow keeps them (vcpkg's built packages, ccache's of the project's compilation), in the
+    # workspace, which the container mounts at the same path. Without TLS (ws:// only), so Botan isn't built: vcpkg's
+    # packages are then the same as the CMake workflow's no-tls job's, whose cache this shares.
+    - name: Start the build container
+      id: container
+      run: |
+        mkdir -p .cache/vcpkg .cache/ccache logs autobahn-reports
+        docker run -d --init --name arch --network host \
+          -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" \
+          -e CC=clang -e CXX=clang++ \
+          -e VCPKG_BINARY_SOURCES="clear;files,$GITHUB_WORKSPACE/.cache/vcpkg,readwrite" \
+          -e CCACHE_DIR="$GITHUB_WORKSPACE/.cache/ccache" -e CCACHE_BASEDIR="$GITHUB_WORKSPACE" -e CCACHE_MAXSIZE=200M \
+          archlinux:base-devel sleep infinity
+        docker exec arch pacman -Syu --noconfirm --needed git cmake ninja clang curl zip unzip tar zstd pkgconf ccache
+        docker exec arch git config --global --add safe.directory '*'
+        docker exec arch clang++ --version
+
+    - name: Cache settings
+      id: cache
+      run: |
+        echo "compiler=$(docker exec arch clang++ --version | head -1 | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
+        echo "vcpkg=$(git -C vcpkg rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore vcpkg's packages
+      id: vcpkg-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/vcpkg
+        key: vcpkg-ubuntu-26.04-${{ steps.cache.outputs.compiler }}-no-tls-${{ steps.cache.outputs.vcpkg }}-${{ hashFiles('vcpkg.json', 'ports/**') }}
+        restore-keys: vcpkg-ubuntu-26.04-${{ steps.cache.outputs.compiler }}-no-tls-
+
+    - name: Restore ccache's cache
+      id: ccache-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: .cache/ccache
+        key: ccache-autobahn-${{ steps.cache.outputs.compiler }}-${{ github.sha }}
+        restore-keys: ccache-autobahn-${{ steps.cache.outputs.compiler }}-
+
+    # Release, as the suite's section 9 measures time; the two examples only (and the library).
+    - name: Build
+      id: build
+      run: |
+        docker exec arch cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DNET_TLS=OFF -DBUILD_TESTING=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_FUZZING=OFF -DBUILD_EXAMPLE=ON
+        docker exec arch cmake --build build --parallel \
+          --target net-example-websocket-echo net-example-websocket-autobahn
+
+    # NOTE: the container runs as root, so what it wrote in the workspace (the caches among it) is root's: handed to the
+    #       runner's user, which the cache steps run as, before they're saved.
+    - name: Hand the workspace to the runner's user
+      if: always() && steps.container.outcome == 'success'
+      run: docker exec arch chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+    - name: Save vcpkg's packages
+      if: always() && steps.vcpkg-cache.outputs.cache-primary-key != '' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/vcpkg
+        key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+    - name: Show ccache's statistics
+      if: always() && steps.ccache-cache.outputs.cache-primary-key != ''
+      run: docker exec arch ccache --show-stats
+
+    - name: Save ccache's cache
+      if: always() && steps.ccache-cache.outputs.cache-primary-key != ''
+      uses: actions/cache/save@v6
+      with:
+        path: .cache/ccache
+        key: ${{ steps.ccache-cache.outputs.cache-primary-key }}
+
+    # The server: example/websocket-echo on port 9001 (its default), stopped with SIGTERM once the suite's done.
+    - name: Run fuzzingclient against websocket-echo
+      timeout-minutes: 15
+      run: |
+        docker exec -d arch sh -c \
+          'build/example/websocket-echo/net-example-websocket-echo > logs/echo.log 2>&1 & echo $! > logs/echo.pid; wait'
+        timeout 60 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; do sleep 1; done'
+        docker run --rm --network host \
+          -v "$GITHUB_WORKSPACE/.github/autobahn:/config:ro" -v "$GITHUB_WORKSPACE/autobahn-reports:/reports" \
+          "$AUTOBAHN_IMAGE" wstest -m fuzzingclient -s /config/fuzzingclient.json
+        docker exec arch sh -c \
+          'pid=$(cat logs/echo.pid); kill -TERM "$pid"; while kill -0 "$pid" 2>/dev/null; do sleep 1; done'
+
+    # The client: the suite's server on port 9002, which example/websocket-autobahn asks for the cases, runs each, and
+    # then has it write its reports.
+    - name: Run fuzzingserver against websocket-autobahn
+      if: always() && steps.build.outcome == 'success'
+      timeout-minutes: 15
+      run: |
+        docker run -d --name fuzzingserver --network host \
+          -v "$GITHUB_WORKSPACE/.github/autobahn:/config:ro" -v "$GITHUB_WORKSPACE/autobahn-reports:/reports" \
+          "$AUTOBAHN_IMAGE" wstest -m fuzzingserver -s /config/fuzzingserver.json
+        timeout 120 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/9002) 2>/dev/null; do sleep 1; done'
+        docker exec arch build/example/websocket-autobahn/net-example-websocket-autobahn --url ws://127.0.0.1:9002
+        docker stop fuzzingserver
+
+    # Every case must be OK, NON-STRICT or INFORMATIONAL (ungraded: it records what the peer did), in both reports.
+    - name: Check the results
+      if: always() && steps.build.outcome == 'success'
+      run: |
+        status=0
+        python3 .github/autobahn/check.py autobahn-reports/servers/index.json --cases "$AUTOBAHN_CASES" || status=1
+        python3 .github/autobahn/check.py autobahn-reports/clients/index.json --cases "$AUTOBAHN_CASES" || status=1
+        exit "$status"
+
+    - name: Show the logs
+      if: always() && steps.build.outcome == 'success'
+      run: |
+        echo "::group::websocket-echo"; cat logs/echo.log || true; echo "::endgroup::"
+        echo "::group::fuzzingserver"; docker logs fuzzingserver || true; echo "::endgroup::"
+
+    - name: Upload the reports
+      if: always() && steps.build.outcome == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: autobahn-reports
+        path: |
+          autobahn-reports/
+          logs/
+        if-no-files-found: warn

@@ -1,0 +1,9 @@
+{
+    "outdir": "/reports/servers",
+    "servers": [
+        {"agent": "cppnet", "url": "ws://127.0.0.1:9001"}
+    ],
+    "cases": ["1.*", "2.*", "3.*", "4.*", "5.*", "6.*", "7.*", "9.*", "10.*"],
+    "exclude-cases": ["12.*", "13.*"],
+    "exclude-agent-cases": {}
+}

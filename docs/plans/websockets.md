@@ -7,7 +7,8 @@ Learned in stage 4). Stage 5, timeouts and the server's close, done (2026-10-29;
 the client over HTTP/1.1, done (2026-10-29; see Learned in stage 6). The server's close reaching a WebSocket whose peer
 never lets its reads wait, fixed (2026-10-29; see Fixed after stage 6). Stage 7, extended CONNECT in the session, done
 (2026-10-29; see Learned in stage 7). Stage 8, WebSockets over HTTP/2 on the server, done (2026-10-29; see Learned in
-stage 8). Stage 9, WebSockets over HTTP/2 in the client, done (2026-10-30; see Learned in stage 9).
+stage 8). Stage 9, WebSockets over HTTP/2 in the client, done (2026-10-30; see Learned in stage 9). Stage 10, an
+optional Autobahn workflow, done (2026-11-01; see Learned in stage 10).
 
 ## Goal
 
@@ -1607,6 +1608,45 @@ the first request's bytes up from 112 to 118 (the client's SETTINGS says its win
 were 1 to 3% slower (pipelined 1104 to 1158 ns against 1098 to 1134 before), on a path whose code didn't change (nor was it the bench's buffers following the server's option: a build with the constant again ran as this one), so likely where the code fell, and the rest moved within
 their noise, as did `bench_websocket`'s rows but HTTP/2's in flight (above).
 
+## Learned in stage 10
+
+- The workflow is `.github/workflows/autobahn.yml`, with its configurations and checker in `.github/autobahn/`: by
+  hand (`workflow_dispatch`), weekly (Wednesdays 04:17 UTC, apart from CMake's workflow's run), and for pull requests
+  that change those files, or what WebSockets run on (`include/` and `src/`'s `websocket/`, `http/` and `io/`, and the
+  two examples): the first run took about 2 minutes, beside CMake's matrix (8 to 14), so the user chose (2026-11-01)
+  to run it on those pull requests too, which Decided question 16 had left out for its cost before it was measured.
+  Not in CMake's workflow, so not in the `build` check master's branch protection requires.
+- Sections 1-7, 9 and 10. Autobahn has no section 8 (its category is defined, with no cases), and 10 is one case
+  (10.1.1, a 64 KiB text message auto-fragmented into 1300-byte frames), which the plan's list of sections had missed,
+  and the by-hand runs too; 12 and 13 are permessage-deflate (Decided question 15); 9.9.1 is commented out upstream.
+- Where it runs: a job container has no Docker to run the suite's image in, so the job runs on the bare runner, and
+  builds and runs the examples in an `archlinux:base-devel` container of its own (Arch's Clang, as CMake's workflow
+  gets it; Ubuntu's lag behind Clang 23), on the host's network, as the suite's containers are, so each side reaches
+  the other at 127.0.0.1 (the echo server on 9001, the suite's server on 9002, apart so neither run waits for the
+  other's port). Building in one job and running on the runner itself was the other way, but what Arch builds needs
+  Arch's (newer) libstdc++ and glibc, and even a fresh container of the same image is older than the build's, which
+  `pacman -Syu` upgraded: so the examples run in the container that built them. The container runs as root, so the
+  workspace is handed back to the runner's user before the caches are saved.
+- The build: Release (section 9 measures time), the two examples' targets only, `NET_TLS=OFF` (ws:// only, so no
+  Botan): vcpkg's packages are then the same as CMake's `no-tls` job's, whose cache key this shares; ccache's cache is
+  its own.
+- The rule: a case passes if its `behavior` and its `behaviorClose` are each OK, NON-STRICT or INFORMATIONAL.
+  INFORMATIONAL is Autobahn's ungraded outcome (the case records what the peer did: 7.1.6, 7.13.1 and 7.13.2 in both
+  suites, by hand), so failing on it would fail every run. Anything else fails (FAILED, WRONG CODE, UNCLEAN,
+  UNIMPLEMENTED for a case the configuration includes), and so does a report without exactly the cases the
+  configurations select (301 with the pinned image), e.g. a run cut short. `check.py` (plain Python, the standard
+  library only) prints each suite's counts and every failing case with its report file; both suites are checked even
+  if one fails. Against the by-hand runs' reports, both pass (297 OK, 3 INFORMATIONAL); edited, a FAILED behavior and a
+  WRONG CODE close each fail, a case removed fails, a NON-STRICT passes.
+- The image is pinned by tag and digest: `crossbario/autobahn-testsuite:25.10.1` (the suite's 25.10.1, Autobahn's
+  0.10.9; Docker Hub's only tag besides `latest`, the same image), the one the by-hand runs used. A newer one may
+  change the cases' count, which `AUTOBAHN_CASES` then follows.
+- The reports (HTML and JSON per case, and each suite's index) and the echo server's log are the run's artifact; they
+  stay out of the repository.
+- The first run (the pull request's, 2026-11-01; ccache and vcpkg warm from CMake's workflow): both suites 300 cases, 297
+  OK and 3 INFORMATIONAL each, as by hand; the job about 2 minutes (the build 50 s, fuzzingclient 24 s,
+  fuzzingserver 11 s).
+
 ## Stages
 
 Each a pull request, mergeable and tested alone, in this order:
@@ -1641,9 +1681,10 @@ Each a pull request, mergeable and tested alone, in this order:
 9. **WebSockets over HTTP/2, the client.** Done (2026-10-30; see Learned in stage 9).
    `http2_client_connection::open_tunnel()`, `connect_options::http2`, the pool's check of the peer's setting; tests
    against cppnet's server.
-10. **An optional Autobahn workflow** (Decided question 16): a `workflow_dispatch` (and weekly) job on
-    `ubuntu-26.04`, outside the matrix and the required `build`, running both suites in Docker against the examples
-    and failing on a case that isn't OK or NON-STRICT.
+10. **An optional Autobahn workflow** (Decided question 16). Done (2026-11-01; see Learned in stage 10). A
+    `workflow_dispatch` (and weekly) job on `ubuntu-26.04`, outside the matrix and the required `build`, running both
+    suites (sections 1-7, 9 and 10) in Docker against the examples and failing on a case that isn't OK, NON-STRICT or
+    INFORMATIONAL; also for pull requests that change WebSockets, HTTP, the I/O layer or the examples.
 
 ## Decided questions
 
