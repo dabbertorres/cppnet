@@ -912,7 +912,8 @@ coro::task<> server::serve_connection(tcp_socket conn, coro::async_scope::lease 
             // TLS chooses HTTP/2 with ALPN; over cleartext, serve_requests() looks for its preface, and returns what it
             // read once its HTTP/1.x state is gone.
             // NOTE: serve_requests()'s frame (which holds that state) must be its own, freed as it returns, rather than
-            //       elided into this one: Clang 23 doesn't elide it while its result's used (-Rpass-missed=coro-elide).
+            //       elided into this one, which every connection would then hold for its life, HTTP/2 over TLS's
+            //       too: so serve_requests() is never inlined, as eliding its frame needs.
             if (http2_enabled && detail::alpn(*opened) == "h2"sv) co_await serve_http2(*opened, {});
             else if (auto prefaced = co_await serve_requests(*opened))
                 co_await serve_http2(*opened, std::move(*prefaced));
@@ -987,8 +988,9 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
 #endif
 
 // NOTE: each request is served here, rather than by coroutines of its own (see below), so it's long.
+// NOTE: never inlined, so its frame is never elided into serve_connection()'s (see there).
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-coro::task<std::optional<std::vector<std::byte>>> server::serve_requests(detail::connection& conn)
+[[gnu::noinline]] coro::task<std::optional<std::vector<std::byte>>> server::serve_requests(detail::connection& conn)
 {
     // close() ends the connection gracefully: at once if it's waiting for a request, or after the request it's serving
     // (see connection_state::phase). abort() (and the destructor) ends it either way.

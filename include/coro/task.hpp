@@ -31,8 +31,9 @@ public:
     [[nodiscard]] bool try_claim() noexcept { return !claimed.exchange(true, std::memory_order::acq_rel); }
 
     // release releases the operation, for the next task to claim.
-    // NOTE: not virtual, so that the compiler can see what a task's destructor does (or it doesn't elide the frames of
-    //       coroutines that are awaited directly, as it can't tell that the handle doesn't escape).
+    // NOTE: a task's destructor calls it. The call needn't be cheap, nor visible to the compiler, for the frames of
+    //       awaited coroutines to be elided: what matters is that the destructor is inlined, which it always is (see
+    //       ~task()).
     void release() noexcept { claimed.store(false, std::memory_order::release); }
 
     // cancel stops the operation, which has started, without resuming the coroutine awaiting it (which is being
@@ -227,7 +228,13 @@ public:
         return *this;
     }
 
-    ~task()
+    // NOTE: always inlined, for HALO (see awaitable_base): a coroutine's body destroys the tasks it awaits on its
+    //       exception-cleanup path too, a cold call site where Clang (23, -O3) inlines only what costs at most 45, and
+    //       a destructor left out of line there takes the task (its handle) where the elision can't see it, so the
+    //       awaited coroutine's frame isn't elided. Its cost depends on T (a ready task's result's destructor) and what
+    //       it calls: task<int>'s is 40 to 50, task<std::expected<std::string, std::error_code>>'s 135. Inlined, 84
+    //       calls in src/, bench_request and bench_task are elided, rather than 78 (-Rpass=coro-elide).
+    [[gnu::always_inline]] ~task()
     {
         if (handle) handle.destroy();
         if (op != nullptr) op->release(); // never awaited
