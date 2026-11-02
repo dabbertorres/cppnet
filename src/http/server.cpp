@@ -448,6 +448,16 @@ coro::task<> server::accept_connections(coro::async_scope::lease held)
 
 coro::task<bool> server::room_for_connection()
 {
+    // below the limit (usually), a ready task: no coroutine.
+    if (max_connections == 0 || closed.load(std::memory_order::acquire)
+        || open_connections.load(std::memory_order::acquire) < max_connections)
+        return coro::ready_task<bool>(true);
+
+    return wait_for_room();
+}
+
+coro::task<bool> server::wait_for_room()
+{
     while (max_connections != 0 && !closed.load(std::memory_order::acquire))
     {
         const auto open = open_connections.load(std::memory_order::acquire);

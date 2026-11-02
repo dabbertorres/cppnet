@@ -45,13 +45,121 @@ int hex_digit_value(char c) noexcept
 namespace net::http::http11
 {
 
+namespace
+{
+
+    using namespace std::string_view_literals;
+
+    // busy is a read's result while another waits.
+    io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
+
+    // chunk_size is the size a chunk's size line gives (without its CRLF): none, if it's malformed.
+    std::optional<std::size_t> chunk_size(std::string_view line) noexcept
+    {
+        // chunk-size = 1*HEXDIG
+        std::size_t size   = 0;
+        std::size_t digits = 0;
+        for (; digits < line.size(); ++digits)
+        {
+            auto value = hex_digit_value(line[digits]);
+            if (value < 0) break;
+
+            if (size > (std::numeric_limits<std::size_t>::max() >> 4U)) return std::nullopt;
+            size = (size << 4U) | static_cast<std::size_t>(value);
+        }
+
+        if (digits == 0) return std::nullopt;
+
+        // chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), which are skipped.
+        auto rest = line;
+        rest.remove_prefix(digits);
+
+        // (whitespace is only allowed before a ';'.)
+        if (!rest.empty())
+        {
+            auto ext_start = rest.find_first_not_of(" \t");
+            if (ext_start == std::string_view::npos || rest[ext_start] != ';' || !is_valid_field_value(rest))
+                return std::nullopt;
+        }
+
+        return size;
+    }
+
+}
+
 coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
 {
-    if (data.empty()) co_return {.count = 0};
+    // usually, a read from a chunk under way.
+    if (chunk_remaining != 0 && !data.empty() && !at_start) [[likely]]
+        return read_chunk(data);
+
+    return read_at_boundary(data);
+}
+
+coro::task<io::result> chunked_reader::read_at_boundary(std::span<std::byte> data)
+{
+    if (data.empty()) return coro::ready_task<io::result>(io::result{.count = 0});
 
     // don't read past the end of the body, into whatever follows it.
-    if (done) co_return {.count = 0, .err = make_error_code(io::errc::end_of_stream)};
+    if (done)
+        return coro::ready_task<io::result>(io::result{.count = 0, .err = make_error_code(io::errc::end_of_stream)});
 
+    // (without a start callback, a read that gets here is between chunks.)
+    if (at_start || !take_buffered_size()) return read_slowly(data);
+    return read_chunk(data);
+}
+
+bool chunked_reader::take_buffered_size() noexcept
+{
+    const auto       buffered = parent->buffered();
+    std::string_view chars{reinterpret_cast<const char*>(buffered.data()), buffered.size()};
+
+    // the CRLF after the last chunk, then the size line, whose CRLF must be within max_size_line (as
+    // read_chunk_size() reads it): as read_slowly() would take them, without waiting.
+    std::size_t taken = 0;
+    if (after_chunk)
+    {
+        if (!chars.starts_with("\r\n"sv)) return false;
+        chars.remove_prefix(2);
+        taken = 2;
+    }
+
+    auto window = chars;
+    window.remove_suffix(window.size() - std::min(window.size(), max_size_line));
+    const auto end = window.find("\r\n"sv);
+    if (end == std::string_view::npos) return false;
+
+    // (a malformed line, or the last chunk, followed by the trailers, is read_slowly()'s.)
+    auto line = chars;
+    line.remove_suffix(line.size() - end);
+    const auto size = chunk_size(line);
+    if (!size.has_value() || *size == 0) return false;
+
+    parent->consume(taken + end + 2);
+    after_chunk     = false;
+    chunk_remaining = *size;
+    return true;
+}
+
+coro::task<io::result> chunked_reader::read_chunk(std::span<std::byte> data)
+{
+    // the parent often finishes without a coroutine (with enough buffered): then so does this, and one that waits is
+    // reading's, rather than a coroutine's.
+    return reading.adapt([this, data] { return parent->read(data.first(std::min(data.size(), chunk_remaining))); },
+                         &busy);
+}
+
+io::result chunked_reader::counted(io::result res) noexcept
+{
+    chunk_remaining -= res.count;
+    if (chunk_remaining == 0) after_chunk = true;
+
+    if (res.err) return {.count = res.count, .err = truncated(res.err)};
+    return {.count = res.count};
+}
+
+coro::task<io::result> chunked_reader::read_slowly(std::span<std::byte> data)
+{
     if (at_start) [[unlikely]]
     {
         const auto callback = std::exchange(at_start, {});
@@ -79,47 +187,18 @@ coro::task<io::result> chunked_reader::read(std::span<std::byte> data)
         }
     }
 
-    auto res = co_await parent->read(data.first(std::min(data.size(), chunk_remaining)));
-    chunk_remaining -= res.count;
-    if (chunk_remaining == 0) after_chunk = true;
-
-    if (res.err) co_return {.count = res.count, .err = truncated(res.err)};
-    co_return {.count = res.count};
+    co_return co_await read_chunk(data);
 }
 
 coro::task<std::error_code> chunked_reader::read_chunk_size()
 {
     auto read = co_await io::read_terminated_line(parent, max_size_line);
     if (!read.has_value()) co_return truncated(read.error());
-    const auto& line = read.value();
 
-    // chunk-size = 1*HEXDIG
-    std::size_t size   = 0;
-    std::size_t digits = 0;
-    for (; digits < line.size(); ++digits)
-    {
-        auto value = hex_digit_value(line[digits]);
-        if (value < 0) break;
+    const auto size = chunk_size(read.value());
+    if (!size.has_value()) co_return malformed();
 
-        if (size > (std::numeric_limits<std::size_t>::max() >> 4U)) co_return malformed();
-        size = (size << 4U) | static_cast<std::size_t>(value);
-    }
-
-    if (digits == 0) co_return malformed();
-
-    // chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] ), which are skipped.
-    std::string_view rest{line};
-    rest.remove_prefix(digits);
-
-    // (whitespace is only allowed before a ';'.)
-    if (!rest.empty())
-    {
-        auto ext_start = rest.find_first_not_of(" \t");
-        if (ext_start == std::string_view::npos || rest[ext_start] != ';' || !is_valid_field_value(rest))
-            co_return malformed();
-    }
-
-    chunk_remaining = size;
+    chunk_remaining = *size;
     co_return std::error_code{};
 }
 

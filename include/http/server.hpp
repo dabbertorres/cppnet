@@ -227,6 +227,9 @@ private:
     // room_for_connection waits until fewer than max_connections are open, returning false if the scheduler stops.
     coro::task<bool> room_for_connection();
 
+    // wait_for_room is room_for_connection() at the limit.
+    coro::task<bool> wait_for_room();
+
     // serve_connection serves conn's requests, holding a lease on running (so the server isn't destroyed meanwhile).
     coro::task<> serve_connection(tcp_socket conn, coro::async_scope::lease held) noexcept;
 

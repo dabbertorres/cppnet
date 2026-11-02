@@ -1084,6 +1084,37 @@ TEST_CASE("a stalled body times out", "[http][client][timeout]")
     CHECK(client.stats() == net::http::connection_stats{});
 }
 
+TEST_CASE("a body's read dropped unawaited goes with the body", "[http][client][body]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    stalling_server    server{&sched, stalling_server::stall::in_the_body};
+    net::http::client  client{&sched};
+
+    auto test = [](net::http::client* client, std::string port) -> task<std::string>
+    {
+        auto resp = co_await client->send(get_request("127.0.0.1", port));
+        if (!resp.has_value()) co_return "error: " + resp.error().message();
+
+        // what the server sends of the body (a read returns once it has all it asked for).
+        std::array<std::byte, 5> buf{};
+        const auto               res = co_await resp->body->read(buf);
+        std::string              got{reinterpret_cast<const char*>(buf.data()), res.count};
+        if (res.err) co_return got + " [" + res.err.message() + "]";
+
+        // then a read of the rest, which never comes, dropped without being awaited: what it left (the connection's
+        // read) goes with the body, which closes its connection (as it wasn't read to its end).
+        {
+            auto dropped = resp->body->read(buf);
+        }
+        resp->body.reset();
+        co_return got;
+    };
+
+    REQUIRE(sched.spawn(server.serve()));
+    CHECK(sched.run_to_completion(test(&client, server.port)) == "hello");
+    CHECK(client.stats() == net::http::connection_stats{});
+}
+
 TEST_CASE("a stalled request body times out", "[http][client][timeout]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};

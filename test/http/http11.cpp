@@ -1192,6 +1192,117 @@ TEST_CASE("a request's head alone fails as the whole request would", "[http][1.1
     CHECK(out.build().empty());
 }
 
+TEST_CASE("a request's head is formatted into a buffered writer with room for it, as it's written to any other",
+          "[http][1.1][request_encode]")
+{
+    using net::http::request_method;
+
+    // make makes the request again, as its body is read once.
+    struct test_case
+    {
+        std::string_view                           name;
+        std::function<net::http::client_request()> make;
+    };
+
+    const auto test = GENERATE(test_case{.name = "a Host with a port",
+                                         .make =
+                                             []
+                                         {
+                                             auto req     = make_request(request_method::GET);
+                                             req.uri.port = "8080";
+                                             return req;
+                                         }},
+                               test_case{.name = "an IPv6 host, and the scheme's port",
+                                         .make =
+                                             []
+                                         {
+                                             auto req       = make_request(request_method::GET);
+                                             req.uri.scheme = "http";
+                                             req.uri.host   = "::1";
+                                             req.uri.port   = "80";
+                                             return req;
+                                         }},
+                               test_case{.name = "an IPv6 host with a port",
+                                         .make =
+                                             []
+                                         {
+                                             auto req     = make_request(request_method::GET);
+                                             req.uri.host = "::1";
+                                             req.uri.port = "8080";
+                                             return req;
+                                         }},
+                               test_case{.name = "its own Host, a query, and TE",
+                                         .make =
+                                             []
+                                         {
+                                             auto req      = make_request(request_method::GET, 0);
+                                             req.uri.query = "a=b";
+                                             req.headers.set("Host"sv, "other.example"sv);
+                                             req.headers.set("TE"sv, "trailers"sv);
+                                             return req;
+                                         }},
+                               test_case{.name = "a body with a Content-Length",
+                                         .make =
+                                             []
+                                         {
+                                             auto req = make_request(request_method::POST);
+                                             req.set_body("hello");
+                                             return req;
+                                         }},
+                               test_case{.name = "a chunked body",
+                                         .make =
+                                             []
+                                         {
+                                             auto req = make_request(request_method::PUT);
+                                             req.body = body_of("hello");
+                                             return req;
+                                         }},
+                               test_case{.name = "no body, for a method with content",
+                                         .make = [] { return make_request(request_method::POST); }});
+    CAPTURE(test.name);
+
+    const auto whole = encode_request(test.make());
+
+    SECTION("with room: a request without a body is written without a coroutine")
+    {
+        const auto                   req = test.make();
+        net::io::string_writer<char> out;
+        net::io::buffered_writer     writer{&out, 4'096};
+
+        auto       encoding = net::http::http11::request_encode(&writer, req);
+        const bool ready    = encoding.finished_without_coroutine();
+        const auto encoded  = test::sync_wait(std::move(encoding));
+        CHECK(ready == (req.body == nullptr));
+        REQUIRE(encoded.has_value());
+        REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
+        CHECK(out.build() == whole);
+
+        // and its head alone, always without one.
+        const auto                   again = test.make();
+        net::io::string_writer<char> head_out;
+        net::io::buffered_writer     head_writer{&head_out, 4'096};
+
+        auto head = net::http::http11::request_encode_head(&head_writer, again);
+        REQUIRE(head.finished_without_coroutine());
+        const auto head_encoded = std::move(head).result();
+        REQUIRE(head_encoded.has_value());
+        REQUIRE_FALSE(test::sync_wait(head_writer.flush()).err);
+        CHECK(whole.starts_with(head_out.build()));
+        CHECK(head_out.build().ends_with("\r\n\r\n"));
+    }
+
+    SECTION("without room")
+    {
+        const auto                   req = test.make();
+        net::io::string_writer<char> out;
+        net::io::buffered_writer     writer{&out, 16};
+
+        REQUIRE(test::sync_wait(net::http::http11::request_encode(&writer, req)).has_value());
+        REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
+        CHECK(out.build() == whole);
+    }
+}
+
 TEST_CASE("stop_at_interim returns each interim response, once it's passed on", "[http][1.1][response_decode][expect]")
 {
     using net::http::status;

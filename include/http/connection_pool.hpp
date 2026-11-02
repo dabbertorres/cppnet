@@ -242,7 +242,11 @@ namespace detail
         // as any HTTP/1.x connection, and says nothing of whether the host speaks HTTP/2: nor do requests to the host
         // wait for it as for an HTTP/2 connection being made. At max_connections_per_host, it closes an idle HTTP/2
         // connection (without streams) of the host's to make room.
-        coro::task<std::expected<lease, std::error_code>> acquire(std::string                    scheme,
+        //
+        // A connection (or stream) that's free is taken when it's called, rather than when its task is awaited (then
+        // the task is a ready one, without a coroutine): so its task is to be awaited, as a lease it holds, dropped, is
+        // lost to the pool (as a lease returned and dropped would be). Connecting and waiting start when it's awaited.
+        coro::task<std::expected<lease, std::error_code>> acquire(const std::string&             scheme,
                                                                   std::string                    host,
                                                                   std::string                    port,
                                                                   bool                           allow_idle,
@@ -382,6 +386,20 @@ namespace detail
             bool                 looked  = false; // at other hosts' connections, which wouldn't take it
         };
 
+        // acquire_waiting is acquire() once a first look (claim_any() without connecting) gave it no lease: it claims
+        // again, and connects, or waits and claims again. look is whether it looks at other hosts' connections first
+        // (not if the first look did, and none would take it).
+        coro::task<std::expected<lease, std::error_code>> acquire_waiting(std::string                    host,
+                                                                          std::string                    port,
+                                                                          std::string                    key,
+                                                                          bool                           tls,
+                                                                          bool                           allow_idle,
+                                                                          const http2_client_connection* skip,
+                                                                          std::stop_token                stop,
+                                                                          bool                           may_coalesce,
+                                                                          bool                           look,
+                                                                          bool                           http1_only);
+
         // claim_any is try_claim() (holding mu, reading released into seen first, for waiting), then, if that gave
         // candidates (with coalesce), take_coalesced() for them, without mu: looked, if none of them took it.
         claim claim_any(const std::string&             key,
@@ -393,25 +411,32 @@ namespace detail
                         bool                           coalesce,
                         bool                           http1_only,
                         connections&                   closing,
-                        std::uint64_t&                 seen);
+                        std::uint64_t&                 seen,
+                        bool                           may_connect = true);
 
         // These must be called while holding mu. Connections to close are moved to closing, to close after unlocking.
         // try_claim, given candidates, fills it with the connections a request may be coalesced onto, and returns
         // neither a lease nor room to connect, if the host has no HTTP/2 connection with a stream free, nor an idle one
         // (if allow_idle), and there are any: for take_coalesced() to look through, without mu. With http1_only, it
-        // looks only for an idle HTTP/1.x connection, or room (see acquire()).
+        // looks only for an idle HTTP/1.x connection, or room (see acquire()). Without may_connect, it looks only for a
+        // connection to use (neither counting room to connect one, nor making it).
         claim try_claim(const std::string&                  key,
                         bool                                tls,
                         bool                                allow_idle,
                         const http2_client_connection*      skip,
                         bool                                http1_only,
                         connections&                        closing,
-                        std::vector<coalescing_connection>* candidates);
+                        std::vector<coalescing_connection>* candidates,
+                        bool                                may_connect);
         bool  has_room(const host_connections& host) const noexcept;
         bool  evict_idle(const std::string& except_key, connections& closing);
         bool  evict_own_http2(const std::string& key, connections& closing); // an idle HTTP/2 connection of the host's
         void  forget(const std::string& key, std::unique_ptr<connection>&& conn, connections& closing);
         void  connected(const std::string& key) noexcept; // a connection being made is, or failed
+
+        // take_idle takes the host's most recently used idle connection that's still open, if there's one (closing
+        // those that aren't), holding mu.
+        std::unique_ptr<connection> take_idle(const std::string& key, connections& closing);
 
         // not_connected counts out a connection that was being made for a request, but isn't (taking mu).
         void                                 not_connected(const std::string& key, bool http1_only) noexcept;

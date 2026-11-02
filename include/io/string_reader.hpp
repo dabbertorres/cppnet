@@ -26,30 +26,33 @@ public:
         : view{std::as_bytes(std::span{view})}
     {}
 
+    // (reads never wait, so they're ready tasks: no coroutine.)
     coro::task<result> read(std::span<CharT> data)
     {
-        auto [count, err] = co_await read(std::as_writable_bytes(data));
-        co_return {
+        auto [count, err] = take(std::as_writable_bytes(data));
+        return coro::ready_task<result>(result{
             .count = count / sizeof(CharT),
             .err   = err,
-        };
+        });
     }
 
-    coro::task<result> read(std::span<std::byte> data) override
-    {
-        if (data.empty()) co_return {.count = 0};
-        if (idx == view.size()) co_return {.count = 0, .err = make_error_code(errc::end_of_stream)};
-
-        auto amount = std::min(view.size() - idx, data.size());
-        auto start  = view.begin() + idx;
-        std::copy_n(start, amount, data.begin());
-        idx += amount;
-        co_return {.count = amount};
-    }
+    coro::task<result> read(std::span<std::byte> data) override { return coro::ready_task<result>(take(data)); }
 
     [[nodiscard]] handle native_handle() const noexcept override { return 0; }
 
 private:
+    // take copies as much as fits in data of what's left.
+    result take(std::span<std::byte> data) noexcept
+    {
+        if (data.empty()) return {.count = 0};
+        if (idx == view.size()) return {.count = 0, .err = make_error_code(errc::end_of_stream)};
+
+        auto amount = std::min(view.size() - idx, data.size());
+        std::copy_n(view.begin() + idx, amount, data.begin());
+        idx += amount;
+        return {.count = amount};
+    }
+
     std::span<const std::byte> view;
     std::size_t                idx = 0;
 };

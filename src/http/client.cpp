@@ -16,6 +16,7 @@
 #include <system_error>
 #include <utility>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "http/connection.hpp"
 #include "http/headers.hpp"
@@ -93,18 +94,44 @@ public:
 
     net::coro::task<net::io::result> read(std::span<std::byte> data) override
     {
-        if (body == nullptr) co_return {.err = failed ? failed : make_error_code(net::io::errc::end_of_stream)};
+        using net::io::result;
+
+        if (body == nullptr)
+            return net::coro::ready_task<result>(
+                result{.err = failed ? failed : make_error_code(net::io::errc::end_of_stream)});
 
         // NOTE: checked first, as what's buffered would be read without waiting (so without the socket's token).
         if (stop.stop_requested())
         {
             failed = std::make_error_code(std::errc::operation_canceled);
             finish(false);
-            co_return {.err = failed};
+            return net::coro::ready_task<result>(result{.err = failed});
         }
 
-        auto res = co_await body->read(data);
+        // the body's read usually finishes without a coroutine (what's buffered): then so does this, and one that waits
+        // is reading's, rather than a coroutine's.
+        return reading.adapt([this, data] { return body->read(data); }, &busy);
+    }
 
+    using net::io::reader::read;
+
+    [[nodiscard]] net::io::handle native_handle() const noexcept override
+    {
+        return leased.conn != nullptr ? net::http::detail::native_handle(*leased.conn) : -1;
+    }
+
+    [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept override { return kept; }
+
+    // (HTTP/1.1 has no way to change a response's priority once it's been asked for.)
+    bool set_priority(const net::http::priority& /*p*/) override { return false; }
+
+private:
+    // busy is a read's result while another waits.
+    static net::io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
+
+    // after_read keeps account of what a read of the body read (finishing once it's all been read, or a read fails).
+    net::io::result after_read(net::io::result res) noexcept
+    {
         if (res.err)
         {
             const bool complete = res.err == net::io::errc::end_of_stream;
@@ -121,26 +148,16 @@ public:
             if (*remaining == 0) finish(true);
         }
 
-        co_return res;
+        return res;
     }
 
-    using net::io::reader::read;
-
-    [[nodiscard]] net::io::handle native_handle() const noexcept override
-    {
-        return leased.conn != nullptr ? net::http::detail::native_handle(*leased.conn) : -1;
-    }
-
-    [[nodiscard]] const net::http::trailer_fields& trailers() const noexcept override { return kept; }
-
-    // (HTTP/1.1 has no way to change a response's priority once it's been asked for.)
-    bool set_priority(const net::http::priority& /*p*/) override { return false; }
-
-private:
     // finish returns the connection to the pool, which may reuse it if the whole body was read.
     void finish(bool complete) noexcept
     {
         if (leased.conn == nullptr) return;
+
+        // (what a read dropped unawaited left with reading holds the body's reader, which goes now.)
+        reading.reset();
 
         // nothing is pipelined, so anything after the body is the server misbehaving.
         const bool reuse = complete && reusable && reader->buffered().empty();
@@ -162,6 +179,9 @@ private:
     std::stop_token                                     stop;
     std::error_code                                     failed; // a read failed (see read())
     net::http::trailer_fields                           kept;   // the body's trailers, once it's read to its end
+
+    // reading finishes a read of the body that has to wait (with after_read()), without a coroutine.
+    net::coro::adapter<pooled_body, net::io::result, net::io::result, &pooled_body::after_read> reading{this};
 };
 
 // limit is a timeout from client_options, where 0 is no limit.

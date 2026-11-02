@@ -434,10 +434,6 @@ task<std::error_code> write_full(net::io::writer& out, std::span<const std::byte
 // connection_te is the field line that lists TE in Connection (see request_encode()).
 constexpr std::string_view connection_te = "Connection: TE\r\n";
 
-// max_start_line_overhead is enough for a request or status line, apart from the request's target: e.g. the method,
-// version, status code and reason phrase, and the line's end and the head's.
-constexpr std::size_t max_start_line_overhead = 128;
-
 // copy_length copies exactly length bytes from body, which mustn't end before then, reading body_buffer at a time.
 task<std::error_code>
 copy_length(net::io::reader& body, net::io::writer& out, std::size_t length, std::size_t body_buffer)
@@ -539,46 +535,71 @@ void append_fields(auto& out, fields_view fields)
     }
 }
 
-// encode_head formats a request's head, framing's field among its fields.
-std::string encode_head(const client_request& req, const request_framing& framing)
+// head_extras is what a request's head has besides its framing's field and its own fields, decided once: for its size
+// and for formatting it.
+struct head_extras
 {
-    // NOTE: the head is written all at once, rather than a write (and so, a coroutine) for each part of it.
-    // the target is written in origin-form ("/path?query"), encoded so that nothing in the url can end the line.
-    const auto target = req.uri.origin_form();
+    std::string target; // in origin-form ("/path?query"), encoded so that nothing in the url can end the line
+    bool        host      = false; // a Host field from the url: HTTP/1.1 requires one
+    bool        bracketed = false; // the host's an IPv6 address, bracketed so its colons aren't mistaken for the port's
+    bool        port      = false; // the url's port follows the host (not the scheme's default)
+    bool        te        = false; // Connection lists TE (see connection_te)
+};
 
-    std::string head;
-    head.reserve(max_start_line_overhead + target.size() + req.uri.host.size() + req.uri.port.size()
-                 + framing.field.size() + fields_size(req.headers) + connection_te.size());
-
-    // NOTE: unlike the status line, nothing follows the version.
-    const auto version = effective_version(req);
-    head.append(method_string(req.method))
-        .append(" "sv)
-        .append(target)
-        .append(" HTTP/"sv)
-        .append({static_cast<char>(version.major + '0'), '.', static_cast<char>(version.minor + '0')})
-        .append("\r\n"sv);
-
-    // HTTP/1.1 requires a Host header.
-    if (!req.headers.get("Host"sv).has_value() && !req.uri.host.empty())
-    {
-        // an IPv6 address is bracketed, so its colons aren't mistaken for the port's.
-        const bool bracketed = req.uri.host.contains(':');
-        head.append(bracketed ? "Host: ["sv : "Host: "sv).append(req.uri.host).append(bracketed ? "]"sv : ""sv);
-        if (!req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port))
-            head.append(":"sv).append(req.uri.port);
-        head.append("\r\n"sv);
-    }
-
-    head.append(framing.field);
-    append_fields(head, req.headers);
+head_extras extras_of(const client_request& req)
+{
+    head_extras extras{.target = req.uri.origin_form()};
+    extras.host      = !req.headers.get("Host"sv).has_value() && !req.uri.host.empty();
+    extras.bracketed = extras.host && req.uri.host.contains(':');
+    extras.port      = extras.host && !req.uri.port.empty() && !is_default_port(req.uri.scheme, req.uri.port);
 
     // RFC 9110, section 10.1.4: TE is for the next hop only, so a sender of it lists it in Connection.
-    if (req.headers.get_all("TE"sv).has_value() && !req.headers.has_token("Connection"sv, "TE"sv))
-        head.append(connection_te);
+    extras.te = req.headers.get_all("TE"sv).has_value() && !req.headers.has_token("Connection"sv, "TE"sv);
+    return extras;
+}
 
-    head.append("\r\n"sv);
-    return head;
+// head_size is how long append_head makes a request's head.
+std::size_t head_size(const client_request& req, const request_framing& framing, const head_extras& extras) noexcept
+{
+    // the request line: the method, target and version (" HTTP/1.1"), and its CRLF.
+    std::size_t size = method_string(req.method).size() + 1 + extras.target.size() + 9 + 2;
+    if (extras.host)
+    {
+        size += "Host: "sv.size() + (extras.bracketed ? 2 : 0) + req.uri.host.size()
+              + (extras.port ? 1 + req.uri.port.size() : 0) + 2;
+    }
+
+    return size + framing.field.size() + fields_size(req.headers) + (extras.te ? connection_te.size() : 0) + 2;
+}
+
+// append_head appends a request's head, framing's field among its fields.
+void append_head(auto& out, const client_request& req, const request_framing& framing, const head_extras& extras)
+{
+    // NOTE: unlike the status line, nothing follows the version.
+    const auto                version = effective_version(req);
+    const std::array<char, 3> digits{static_cast<char>(version.major + '0'),
+                                     '.',
+                                     static_cast<char>(version.minor + '0')};
+    out.append(method_string(req.method))
+        .append(" "sv)
+        .append(extras.target)
+        .append(" HTTP/"sv)
+        .append(std::string_view{digits.data(), digits.size()})
+        .append("\r\n"sv);
+
+    if (extras.host)
+    {
+        out.append(extras.bracketed ? "Host: ["sv : "Host: "sv)
+            .append(req.uri.host)
+            .append(extras.bracketed ? "]"sv : ""sv);
+        if (extras.port) out.append(":"sv).append(req.uri.port);
+        out.append("\r\n"sv);
+    }
+
+    out.append(framing.field);
+    append_fields(out, req.headers);
+    if (extras.te) out.append(connection_te);
+    out.append("\r\n"sv);
 }
 
 // write_body writes a request's body as framing says, which isn't none, read body_buffer at a time: then, if it's
@@ -917,30 +938,79 @@ std::error_code check_request(const client_request& req) noexcept
     }
 }
 
+namespace
+{
+
+    // write_head_apart writes a request's head with a write of its own (formatted into a string), as one that doesn't
+    // fit in the writer's buffer, or a writer without one, takes: then, unless body_buffer is none, its body, as
+    // request_encode() does.
+    task<request_encoder_result> write_head_apart(io::writer*                writer,
+                                                  const client_request&      req,
+                                                  request_framing            framing,
+                                                  head_extras                extras,
+                                                  std::optional<std::size_t> body_buffer)
+    {
+        std::string head;
+        head.reserve(head_size(req, framing, extras));
+        append_head(head, req, framing, extras);
+
+        if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err)
+            co_return std::unexpected(err);
+
+        // NOTE: a request without a body (most) has no frame for it.
+        if (!body_buffer.has_value() || framing.how == request_framing::kind::none) co_return writer;
+        co_return co_await write_body(writer, req, framing, *body_buffer);
+    }
+
+    // encode_request writes a request's head, and unless body_buffer is none, its body (see request_encode()).
+    // NOTE: not a coroutine: usually, the writer is a connection's buffered writer with room for the head, which is
+    //       formatted straight into its buffer (then a request without a body is a ready task).
+    task<request_encoder_result>
+    encode_request(io::writer* writer, const client_request& req, std::optional<std::size_t> body_buffer) noexcept
+    {
+        using result = request_encoder_result;
+
+        if (writer == nullptr) return coro::ready_task<result>(std::unexpected(invalid()));
+        if (auto err = check_request(req); err) return coro::ready_task<result>(std::unexpected(err));
+
+        try
+        {
+            // NOTE: can't fail, having been checked.
+            const auto framing = *frame_request(req);
+            auto       extras  = extras_of(req);
+
+            if (auto* buffered = dynamic_cast<io::buffered_writer*>(writer); buffered != nullptr)
+            {
+                if (auto out = buffered->prepare(head_size(req, framing, extras)); !out.empty())
+                {
+                    span_appender appender{.out = out};
+                    append_head(appender, req, framing, extras);
+
+                    if (!body_buffer.has_value() || framing.how == request_framing::kind::none)
+                        return coro::ready_task<result>(writer);
+                    return write_body(writer, req, framing, *body_buffer);
+                }
+            }
+
+            return write_head_apart(writer, req, framing, std::move(extras), body_buffer);
+        }
+        catch (const std::bad_alloc&)
+        {
+            return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::not_enough_memory)));
+        }
+    }
+
+}
+
 task<request_encoder_result>
 request_encode(io::writer* writer, const client_request& req, std::size_t body_buffer) noexcept
 {
-    if (auto err = check_request(req); err) co_return std::unexpected(err);
-
-    // NOTE: can't fail, having been checked.
-    const auto framing = *frame_request(req);
-
-    const auto head = encode_head(req, framing);
-    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
-
-    // NOTE: a request without a body (most) has no frame for it.
-    if (framing.how == request_framing::kind::none) co_return writer;
-    co_return co_await write_body(writer, req, framing, body_buffer);
+    return encode_request(writer, req, body_buffer);
 }
 
 task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept
 {
-    if (auto err = check_request(req); err) co_return std::unexpected(err);
-
-    // NOTE: can't fail, having been checked.
-    const auto head = encode_head(req, *frame_request(req));
-    if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
-    co_return writer;
+    return encode_request(writer, req, std::nullopt);
 }
 
 task<request_encoder_result>

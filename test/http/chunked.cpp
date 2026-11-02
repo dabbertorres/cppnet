@@ -26,6 +26,7 @@
 #include "io/reader.hpp"
 #include "io/string_reader.hpp"
 #include "io/string_writer.hpp"
+#include "io/waiting_io.hpp"
 #include "io/writer.hpp"
 
 namespace
@@ -157,9 +158,11 @@ TEST_CASE("chunked bodies are decoded", "[http][1.1][chunked][chunked_reader]")
                   .expect = "hello"},
         test_case{.name = "empty", .input = "0\r\n\r\nNEXT", .expect = ""});
 
-    CAPTURE(tc.name);
+    // a byte at a time (each size line read a piece at a time), and all at once (each taken from what's buffered).
+    const auto trickle = GENERATE(true, false);
+    CAPTURE(tc.name, trickle);
 
-    auto [result, rest] = read_chunked(tc.input);
+    auto [result, rest] = read_chunked(tc.input, trickle);
     CHECK_FALSE(result.err);
     CHECK(result.body == tc.expect);
 
@@ -169,21 +172,116 @@ TEST_CASE("chunked bodies are decoded", "[http][1.1][chunked][chunked_reader]")
 
 TEST_CASE("malformed chunked bodies are rejected", "[http][1.1][chunked][chunked_reader]")
 {
-    auto input = GENERATE("5\r\nhelloXX0\r\n\r\n"sv,
-                          "5\r\nhello\rX0\r\n\r\n"sv,
-                          "5\r\nhelloX\n0\r\n\r\n"sv,
-                          "\r\nhello\r\n0\r\n\r\n"sv,
-                          "g\r\nhello\r\n0\r\n\r\n"sv,
-                          "5 \r\nhello\r\n0\r\n\r\n"sv,
-                          "5\nhello\r\n0\r\n\r\n"sv,
-                          "-5\r\nhello\r\n0\r\n\r\n"sv,
-                          "10000000000000000\r\nhello\r\n0\r\n\r\n"sv,
-                          "5\r\nhello\r\n0\r\nX-Bad trailer\r\n\r\n"sv,
-                          "5\r\nhel"sv);
-    CAPTURE(input);
+    auto       input   = GENERATE("5\r\nhelloXX0\r\n\r\n"sv,
+                                  "5\r\nhello\rX0\r\n\r\n"sv,
+                                  "5\r\nhelloX\n0\r\n\r\n"sv,
+                                  "\r\nhello\r\n0\r\n\r\n"sv,
+                                  "g\r\nhello\r\n0\r\n\r\n"sv,
+                                  "5 \r\nhello\r\n0\r\n\r\n"sv,
+                                  "5\nhello\r\n0\r\n\r\n"sv,
+                                  "-5\r\nhello\r\n0\r\n\r\n"sv,
+                                  "10000000000000000\r\nhello\r\n0\r\n\r\n"sv,
+                                  "5\r\nhello\r\n0\r\nX-Bad trailer\r\n\r\n"sv,
+                                  "5\r\nhel"sv);
+    const auto trickle = GENERATE(true, false);
+    CAPTURE(input, trickle);
 
-    auto [result, rest] = read_chunked(input);
+    auto [result, rest] = read_chunked(input, trickle);
     CHECK(result.err);
+}
+
+TEST_CASE("chunked bodies' buffered chunks are read without a coroutine", "[http][1.1][chunked][chunked_reader]")
+{
+    net::io::string_reader<char>      whole{"a\r\n0123456789\r\n1A\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\nNEXT"sv};
+    net::io::buffered_reader          buffered{&whole};
+    net::http::http11::chunked_reader chunked{&buffered};
+
+    // the first size line isn't buffered yet: it's read.
+    std::string body;
+    std::string buf(7, '\0');
+    auto        first = test::sync_wait(chunked.read(buf));
+    REQUIRE_FALSE(first.err);
+    body.append(buf.data(), first.count);
+
+    // then the reads within a chunk, and across the next size line, take what's buffered, up to the last chunk.
+    while (body.size() < 36)
+    {
+        auto read = chunked.read(buf);
+        REQUIRE(read.finished_without_coroutine());
+        const auto res = std::move(read).result();
+        REQUIRE_FALSE(res.err);
+        body.append(buf.data(), res.count);
+    }
+    CHECK(body == "0123456789abcdefghijklmnopqrstuvwxyz");
+
+    const auto last = test::sync_wait(chunked.read(buf));
+    CHECK(last.err == net::io::errc::end_of_stream);
+    CHECK(last.count == 0);
+}
+
+TEST_CASE("a chunked body's read that waits counts what it read once it's done",
+          "[http][1.1][chunked][chunked_reader][wait]")
+{
+    test::fed_reader                  fed;
+    net::io::buffered_reader          buffered{&fed};
+    net::http::http11::chunked_reader chunked{&buffered};
+
+    std::string buf(8, '\0');
+
+    // (a read takes what it asks for, of the chunk, before it returns: so, as much as is buffered.)
+    fed.feed("5\r\nhel"sv);
+    const auto first = test::sync_wait(chunked.read(std::span{buf}.first(3)));
+    REQUIRE_FALSE(first.err);
+    CHECK(std::string_view{buf.data(), first.count} == "hel");
+
+    // the rest of the chunk isn't here yet.
+    auto reading = test::started(chunked.read(buf));
+    REQUIRE_FALSE(reading.is_ready());
+
+    // another while it waits is busy, reading nothing.
+    auto busy = chunked.read(buf);
+    REQUIRE(busy.finished_without_coroutine());
+    const auto busy_res = std::move(busy).result();
+    CHECK(busy_res.err == std::errc::device_or_resource_busy);
+
+    // what's fed past the chunk is left for the next read.
+    fed.feed("lo\r\n3\r\nabc\r\n0\r\n\r\n"sv);
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    REQUIRE_FALSE(res.err);
+    CHECK(std::string_view{buf.data(), res.count} == "lo");
+
+    auto next = chunked.read(buf);
+    REQUIRE(next.finished_without_coroutine());
+    const auto next_res = std::move(next).result();
+    REQUIRE_FALSE(next_res.err);
+    CHECK(std::string_view{buf.data(), next_res.count} == "abc");
+
+    const auto last = test::sync_wait(chunked.read(buf));
+    CHECK(last.err == net::io::errc::end_of_stream);
+}
+
+TEST_CASE("a chunked body's read that waits and finds the stream's end fails",
+          "[http][1.1][chunked][chunked_reader][wait]")
+{
+    test::fed_reader                  fed;
+    net::io::buffered_reader          buffered{&fed};
+    net::http::http11::chunked_reader chunked{&buffered};
+
+    std::string buf(8, '\0');
+
+    fed.feed("5\r\nhel"sv);
+    const auto first = test::sync_wait(chunked.read(std::span{buf}.first(3)));
+    REQUIRE_FALSE(first.err);
+
+    auto reading = test::started(chunked.read(buf));
+    REQUIRE_FALSE(reading.is_ready());
+
+    fed.end();
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    CHECK(res.err == std::errc::connection_aborted);
+    CHECK(res.count == 0);
 }
 
 TEST_CASE("chunk size lines are limited in size", "[http][1.1][chunked][chunked_reader]")

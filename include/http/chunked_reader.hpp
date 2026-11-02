@@ -5,6 +5,7 @@
 #include <system_error>
 #include <utility>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "io/buffered_reader.hpp"
@@ -63,6 +64,24 @@ public:
     void call_at_start(io::start_callback callback) noexcept { at_start = callback; }
 
 private:
+    // read_at_boundary is read() between chunks (or of an empty span, or at the start, or past the end).
+    // NOTE: not inlined into read(), whose usual case (a chunk under way) stays small.
+    [[gnu::noinline]] coro::task<io::result> read_at_boundary(std::span<std::byte> data);
+
+    // take_buffered_size takes the next chunk's size line (and the CRLF after the last chunk), returning true, if
+    // they're buffered, and say there's a chunk; otherwise it leaves them to read_slowly(), taking nothing.
+    bool take_buffered_size() noexcept;
+
+    // read_slowly is read() of what takes a coroutine: at the start, a size line that isn't all buffered, the last
+    // chunk and the trailers, or a malformed size line.
+    coro::task<io::result> read_slowly(std::span<std::byte> data);
+
+    // read_chunk reads from the chunk under way.
+    coro::task<io::result> read_chunk(std::span<std::byte> data);
+
+    // counted counts what a read of the chunk read.
+    io::result counted(io::result res) noexcept;
+
     coro::task<std::error_code> read_chunk_size();
     coro::task<std::error_code> read_trailers();
     coro::task<std::error_code> read_crlf();
@@ -75,6 +94,9 @@ private:
     trailer_fields*                      kept            = nullptr; // where trailers go, if anywhere
     io::end_callback                     at_end;
     io::start_callback                   at_start;
+
+    // reading finishes a read of the chunk that has to wait (with counted()), without a coroutine.
+    coro::adapter<chunked_reader, io::result, io::result, &chunked_reader::counted> reading{this};
 };
 
 }

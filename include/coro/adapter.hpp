@@ -66,6 +66,14 @@ public:
         return *this;
     }
 
+    // reset lets go of an inner task left by a task of the adapter dropped unawaited, now rather than at the next
+    // adapt() (or the adapter's end): for an owner that's about to let go of what the inner task holds (e.g. the reader
+    // it reads from). It does nothing while a task of the adapter is under way.
+    void reset() noexcept
+    {
+        if (!this->is_claimed()) drop();
+    }
+
     // adapt makes a task of what make() returns (a task<In>, made only if the adapter is free), which finishes with
     // Finish: at once, without the adapter, if that one's finished already (a ready task, e.g. a read of what's
     // buffered); otherwise a task of the adapter. A ready task of busy (or what it makes, if it's a function) if a task

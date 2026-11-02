@@ -122,7 +122,7 @@ std::string connection_pool::make_key(const std::string& scheme, const std::stri
 }
 
 coro::task<std::expected<connection_pool::lease, std::error_code>>
-connection_pool::acquire(std::string                    scheme,
+connection_pool::acquire(const std::string&             scheme,
                          std::string                    host,
                          std::string                    port,
                          bool                           allow_idle,
@@ -131,27 +131,68 @@ connection_pool::acquire(std::string                    scheme,
                          bool                           coalesce,
                          bool                           http1_only)
 {
+    using result = std::expected<lease, std::error_code>;
+
 #ifdef NET_HAS_TLS
     const bool tls = scheme == "https";
-    if (!tls && scheme != "http") co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+    if (!tls && scheme != "http")
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::protocol_not_supported)));
 #else
     constexpr bool tls = false;
-    if (scheme != "http") co_return std::unexpected(std::make_error_code(std::errc::protocol_not_supported));
+    if (scheme != "http")
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::protocol_not_supported)));
 #endif
 
     // NOTE: or it might take a connection (or reserve a stream) it then has to give back.
-    if (stop.stop_requested()) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+    if (stop.stop_requested())
+        return coro::ready_task<result>(std::unexpected(std::make_error_code(std::errc::operation_canceled)));
 
-    const auto key      = make_key(scheme, host, port);
-    const auto deadline = io::clock::now() + config.connect_timeout;
-
-    // NOTE: declared before the lock, so the connections are closed after unlocking.
-    connections closing;
+    auto key = make_key(scheme, host, port);
 
     // another host's HTTP/2 connection may take an https request (see client_options::http2_coalescing): looked for
     // once, then again after each wait. (Without the option, there are none to find: see start_http2().)
     const bool may_coalesce = coalesce && tls && !http1_only;
-    bool       look         = may_coalesce;
+
+    // usually, a connection (or a stream of one) is free: then a ready task, without a coroutine. NOTE: without
+    // counting room to connect one, which would be the coroutine's to count out, if it's destroyed before it starts.
+    bool looked = false;
+    {
+        // NOTE: declared before the lock (taken by claim_any), so the connections are closed after unlocking.
+        connections   closing;
+        std::uint64_t seen = 0;
+        auto found = claim_any(key, host, port, tls, allow_idle, skip, may_coalesce, http1_only, closing, seen, false);
+        if (found.leased.has_value()) return coro::ready_task<result>(std::move(*found.leased));
+        looked = found.looked;
+    }
+
+    return acquire_waiting(std::move(host),
+                           std::move(port),
+                           std::move(key),
+                           tls,
+                           allow_idle,
+                           skip,
+                           std::move(stop),
+                           may_coalesce,
+                           may_coalesce && !looked,
+                           http1_only);
+}
+
+coro::task<std::expected<connection_pool::lease, std::error_code>>
+connection_pool::acquire_waiting(std::string                    host,
+                                 std::string                    port,
+                                 std::string                    key,
+                                 bool                           tls,
+                                 bool                           allow_idle,
+                                 const http2_client_connection* skip,
+                                 std::stop_token                stop,
+                                 bool                           may_coalesce,
+                                 bool                           look,
+                                 bool                           http1_only)
+{
+    const auto deadline = io::clock::now() + config.connect_timeout;
+
+    // NOTE: declared before the lock, so the connections are closed after unlocking.
+    connections closing;
 
     while (true)
     {
@@ -229,7 +270,8 @@ connection_pool::claim connection_pool::claim_any(const std::string&            
                                                   bool                           coalesce,
                                                   bool                           http1_only,
                                                   connections&                   closing,
-                                                  std::uint64_t&                 seen)
+                                                  std::uint64_t&                 seen,
+                                                  bool                           may_connect)
 {
     std::vector<coalescing_connection> candidates;
     claim                              found;
@@ -237,8 +279,9 @@ connection_pool::claim connection_pool::claim_any(const std::string&            
         std::scoped_lock lock{mu};
 
         // NOTE: before looking, so that a connection (or stream) freed after this is waited for no longer.
-        seen  = released.load(std::memory_order::acquire);
-        found = try_claim(key, tls, allow_idle, skip, http1_only, closing, coalesce ? &candidates : nullptr);
+        seen = released.load(std::memory_order::acquire);
+        found =
+            try_claim(key, tls, allow_idle, skip, http1_only, closing, coalesce ? &candidates : nullptr, may_connect);
     }
 
     if (candidates.empty()) return found;
@@ -251,7 +294,8 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
                                                   const http2_client_connection*      skip,
                                                   bool                                http1_only,
                                                   connections&                        closing,
-                                                  std::vector<coalescing_connection>* candidates)
+                                                  std::vector<coalescing_connection>* candidates,
+                                                  bool                                may_connect)
 {
     // an HTTP/2 connection to the host with a stream free.
     if (auto shared = http1_only ? nullptr : available_http2(key, skip))
@@ -278,20 +322,12 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
         if (conns.connecting > 0 && speaks_http2(key, tls)) return {};
     }
 
-    // the most recently used first, as the least likely to have been closed by the server.
-    // NOTE: forget() erases the host's entry when it closes its last connection, so it's looked up each time.
-    for (auto it = hosts.find(key); allow_idle && it != hosts.end() && !it->second.idle.empty(); it = hosts.find(key))
-    {
-        auto conn = std::move(it->second.idle.back().conn);
-        it->second.idle.pop_back();
+    if (auto conn = allow_idle ? take_idle(key, closing) : nullptr; conn != nullptr)
+        return {
+            .leased = lease{.conn = std::move(conn), .http2 = nullptr, .key = key, .reused = true}
+        };
 
-        if (still_open(*conn))
-            return {
-                .leased = lease{.conn = std::move(conn), .http2 = nullptr, .key = key, .reused = true}
-            };
-
-        forget(key, std::move(conn), closing);
-    }
+    if (!may_connect) return {};
 
     auto* host_conns = &hosts[key];
 
@@ -322,6 +358,22 @@ connection_pool::claim connection_pool::try_claim(const std::string&            
     // nothing's open to this host, so don't keep an entry for it while waiting.
     if (host_conns->open == 0) hosts.erase(key);
     return {};
+}
+
+std::unique_ptr<connection> connection_pool::take_idle(const std::string& key, connections& closing)
+{
+    // the most recently used first, as the least likely to have been closed by the server.
+    // NOTE: forget() erases the host's entry when it closes its last connection, so it's looked up each time.
+    for (auto it = hosts.find(key); it != hosts.end() && !it->second.idle.empty(); it = hosts.find(key))
+    {
+        auto conn = std::move(it->second.idle.back().conn);
+        it->second.idle.pop_back();
+
+        if (still_open(*conn)) return conn;
+        forget(key, std::move(conn), closing);
+    }
+
+    return nullptr;
 }
 
 bool connection_pool::wants_http2(const connection& conn) const noexcept

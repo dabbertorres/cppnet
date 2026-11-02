@@ -287,6 +287,44 @@ TEST_CASE("an adapter's task dropped unawaited frees the adapter, and leaves its
     CHECK(op.try_claim());
 }
 
+TEST_CASE("an adapter's reset() lets go of what a task dropped unawaited left, but not of a task under way",
+          "[coro][adapter][busy]")
+{
+    doubler        d;
+    test_operation op;
+    op.finish_at_start = false;
+    op.value           = 3;
+    REQUIRE(op.try_claim());
+
+    SECTION("left by a task dropped unawaited")
+    {
+        {
+            auto never_awaited = d.adapting.adapt([&] { return net::coro::operation_task(op); }, busy);
+        }
+        CHECK_FALSE(op.try_claim());
+
+        d.adapting.reset();
+        CHECK_FALSE(op.started);
+        CHECK(op.try_claim());
+    }
+
+    SECTION("under way")
+    {
+        auto awaiting = await_it(d.adapting.adapt([&] { return net::coro::operation_task(op); }, busy));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+
+        d.adapting.reset();
+        CHECK(d.adapting.is_claimed());
+
+        op.finish();
+        REQUIRE(awaiting.is_ready());
+        const int value = std::move(awaiting).result();
+        CHECK(value == 6);
+        CHECK(op.try_claim());
+    }
+}
+
 TEST_CASE("destroying the coroutine awaiting an adapter cancels its inner task", "[coro][adapter][cancel]")
 {
     doubler        d;
