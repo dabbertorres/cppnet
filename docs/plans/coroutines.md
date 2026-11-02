@@ -263,7 +263,15 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    `send_masked`). Cases, after stage 1: `bench_websocket` 64 KiB one at a time 7 -> 2 (HTTP/1.1) and 10 -> 3 (HTTP/2;
    the stream's `write_waiting` is stage 5), and the in-flight medium and large cases; `bench_request` 8 streams 56 ->
    ~52.6, 8 request bodies 91.5 -> ~75.5. Baselines: 64 KiB one at a time 87.94 / 105.27 us, 8 streams 920 us per
-   round, 8 bodies 1288.6 us per round.
+   round, 8 bodies 1288.6 us per round. Rechecked on master bbed316 (after stage 2): the same counts (64 KiB one at a
+   time 7 and 10, in flight 7.04 and 10.48; HTTP/2 medium one at a time 7, as its 8 KiB messages take the large-frame
+   paths through 4 KiB tunnel buffers; 8 streams 56.0, 8 bodies 91.5). `read_more` also goes from `bench_client`'s
+   chunked downloads, each 256-byte read that refills the buffer (74,263 / 68,119 / 66,584 per 8 MiB with 1 / 4 /
+   16 KiB readers). Target cases (named before measuring, 2026-11-01; gains are claimed only on these):
+   `bench_websocket`, one WebSocket: HTTP/1.1 large (64 KiB) one at a time, medium (8 KiB) and large in flight; HTTP/2
+   medium and large, one at a time and in flight (time and CPU time); `bench_request` over HTTP/2, 8 streams at once and
+   8 request bodies at once (time and CPU time); `bench_client` chunked downloads with each reader size (1, 4 and
+   16 KiB: time and CPU time).
 4. **Ready tasks** (`chunked_reader::read`, `pooled_body::read`, `string_reader::read`, `acquire`,
    `room_for_connection`, `write_all`, the client's head encoding). Cases: `bench_client`'s chunked downloads 66,600-
    74,300 -> under ~1,000 allocations per 8 MiB (with stage 3's `read_more`), and their time (18197 / 11436 / 9677 us
