@@ -300,6 +300,10 @@ All decided 2026-11-01.
    user's choice, after stage 1, 2026-11-01): a Mann-Whitney U test on each row's interleaved rounds, before against
    after; p < 0.05 is a gain or a regression, by the medians' direction; with p from 0.05 to 0.2, rounds are added (up
    to about 10 a side) and the test is run again; otherwise it's noise. Each row reports its medians, ranges and p.
+   As a stage tests many rows (stage 1: about 115 row-metrics, so about 6 at p < 0.05 by chance alone), the user chose
+   (after stage 1, 2026-11-01): gains count only on the stage's target rows, named in its Stages entry before it's
+   measured (others' gains are reported, not claimed); any row reaching p < 0.05 the wrong way gets a confirmation run
+   of 10 fresh interleaved rounds a side, and is a regression only if that run reproduces it.
 3. **The adapter's shape.** (a) One generic operation template in `coro/`; (b) hand-written operations per class;
    (c) ready tasks only where nothing waits. **Decided: (a).**
 4. **Spawning without wrapper coroutines.** (a) The task's promise is the detached task (Seastar's way), in stage 5;
