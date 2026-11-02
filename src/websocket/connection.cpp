@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "coro/adapter.hpp"
 #include "coro/notifier.hpp"
 #include "coro/task.hpp"
 #include "http/client.hpp"
@@ -914,11 +915,10 @@ struct connection_state
     // send writes a frame (holding the wire), flushes it and lets the wire go.
     coro::task<std::error_code> send(const frame_header& header, std::span<const std::byte> payload)
     {
-        std::array<std::byte, max_header_size> head{};
-        const auto                             size = encode_header(header, head);
-
         // usually, the frame fits in the writer's buffer: then it needs no coroutine, unless the flush waits. A
         // client's payload is masked as it's copied there, so the caller's isn't changed.
+        std::array<std::byte, max_header_size> head{};
+        const auto                             size = encode_header(header, head);
         if (auto room = tunnel.writer().prepare(size + payload.size()); !room.empty())
         {
             std::ranges::copy(std::span{head}.first(size), room.begin());
@@ -927,65 +927,68 @@ struct connection_state
             return flush_and_release();
         }
 
-        if (header.masked) return send_masked(head, size, header.mask_key, payload);
-        return send_through(head, size, payload);
+        // otherwise, it's written a part at a time, without a coroutine unless a write waits, which sending finishes
+        // (see wrote_part()).
+        return sending.adapt(
+            [&] -> coro::step<io::result, std::error_code>
+            {
+                frame_head = head;
+                head_left  = size;
+                frame_out  = payload;
+                if (header.masked)
+                {
+                    sending_now = sending_part::masked;
+                    mask_key    = header.mask_key;
+                    masked_out  = 0;
+                    return send_masked();
+                }
+
+                sending_now = sending_part::head;
+                return tunnel.writer().write(std::span<const std::byte>{frame_head}.first(head_left));
+            },
+            &busy_sending);
     }
 
-    // send_masked writes a client's frame that doesn't fit in the writer's buffer: its payload masked into the buffer,
-    // a buffer's worth at a time, each flushed in turn.
-    coro::task<std::error_code> send_masked(std::array<std::byte, max_header_size> head,
-                                            std::size_t                            size,
-                                            std::array<std::byte, 4>               key,
-                                            std::span<const std::byte>             payload)
+    // send_masked writes what's left of a client's frame that doesn't fit in the writer's buffer (its header, until
+    // head_left is 0; then its payload, masked into the buffer, a buffer's worth at a time): a flush of the buffer once
+    // it's full, or, all of it in the buffer, flush_and_release()'s first step.
+    // NOTE: the buffer's empty, unless a write failed (and then a flush fails), as the wire's this frame's.
+    coro::step<io::result, std::error_code> send_masked()
     {
-        auto&      writer = tunnel.writer();
-        const auto header = std::span<const std::byte>{head}.first(size);
-
-        // NOTE: the buffer's empty (the wire's this frame's), and it holds a header.
-        auto room = writer.prepare(size);
-        if (room.empty())
+        auto& writer = tunnel.writer();
+        if (head_left != 0)
         {
-            if (auto res = co_await writer.flush(); res.err) co_return fail_write(res.err);
-            room = writer.prepare(size);
+            auto room = writer.prepare(head_left);
+            if (room.empty()) return writer.flush();
+            std::ranges::copy(std::span{frame_head}.first(head_left), room.begin());
+            head_left = 0;
         }
-        std::ranges::copy(header, room.begin());
 
-        std::size_t offset = 0;
-        while (offset < payload.size())
+        while (masked_out < frame_out.size())
         {
             const auto free = writer.capacity() - writer.size();
-            if (free == 0)
-            {
-                if (auto res = co_await writer.flush(); res.err) co_return fail_write(res.err);
-                continue;
-            }
+            if (free == 0) return writer.flush();
 
-            const auto part = std::min(free, payload.size() - offset);
-            room            = writer.prepare(part);
-            std::ranges::copy(payload.subspan(offset, part), room.begin());
-            apply_mask(room, key, offset);
-            offset += part;
+            const auto part = std::min(free, frame_out.size() - masked_out);
+            auto       room = writer.prepare(part);
+            std::ranges::copy(frame_out.subspan(masked_out, part), room.begin());
+            apply_mask(room, mask_key, masked_out);
+            masked_out += part;
         }
 
-        co_return co_await flush_and_release();
-    }
-
-    coro::task<std::error_code>
-    send_through(std::array<std::byte, max_header_size> head, std::size_t size, std::span<const std::byte> payload)
-    {
-        auto wrote = co_await io::write_all(tunnel.writer(), std::span<const std::byte>{head}.first(size), payload);
-        if (wrote.err) co_return fail_write(wrote.err);
-        co_return co_await flush_and_release();
+        sending_now = sending_part::releasing;
+        return writer.flush();
     }
 
     // flush_and_release flushes what's written, then the replies pending by then, until there are none, then lets the
-    // wire go.
+    // wire go: usually without a coroutine, or sending (each flush that doesn't wait is finished here), and once a
+    // flush waits, sending finishes it (see wrote_part()).
     coro::task<std::error_code> flush_and_release()
     {
         while (true)
         {
             auto flushing = tunnel.writer().flush();
-            if (!flushing.finished_without_coroutine()) return flush_waiting(std::move(flushing));
+            if (!flushing.finished_without_coroutine()) return release_after(std::move(flushing));
 
             if (auto res = std::move(flushing).result(); res.err)
                 return ready_task<std::error_code>(fail_write(res.err));
@@ -993,11 +996,69 @@ struct connection_state
         }
     }
 
-    coro::task<std::error_code> flush_waiting(coro::task<io::result> flushing)
+    // release_after is flush_and_release(), once a flush (flushing) has to wait: sending's.
+    // NOTE: not inlined into flush_and_release(), whose usual case (flushes that don't wait) stays small.
+    [[gnu::noinline]] coro::task<std::error_code> release_after(coro::task<io::result> flushing)
     {
-        if (auto res = co_await std::move(flushing); res.err) co_return fail_write(res.err);
-        if (!write_replies_or_release()) co_return std::error_code{};
-        co_return co_await flush_and_release();
+        return sending.adapt(
+            [this, &flushing]
+            {
+                sending_now = sending_part::releasing;
+                return std::move(flushing);
+            },
+            &busy_sending);
+    }
+
+    // wrote_part takes the result of a write (or flush) that sending made, and makes the next step: the next part, or
+    // (once the wire's been let go, or is to be: see let_go()) none, with the error the frame failed with, if any.
+    coro::step<io::result, std::error_code> wrote_part(io::result res)
+    {
+        if (res.err) return fail_write(res.err);
+
+        switch (sending_now)
+        {
+        case sending_part::head: sending_now = sending_part::payload; return tunnel.writer().write(frame_out);
+
+        case sending_part::payload: sending_now = sending_part::releasing; return tunnel.writer().flush();
+
+        case sending_part::masked: return send_masked();
+
+        case sending_part::releasing:
+            if (!write_replies_or_release()) return std::error_code{};
+            return tunnel.writer().flush();
+        }
+        return std::error_code{};
+    }
+
+    // busy_sending is sending's result if it's taken: which it never is, as it's the wire's holder's, and the wire's
+    // only let go once sending is (see let_go()).
+    static std::error_code busy_sending() noexcept { return std::make_error_code(std::errc::device_or_resource_busy); }
+
+    // let_go_of_wire lets the wire go (must be called holding mu): at once, unless sending's taken, as a step that
+    // waited: then the wire's left to let_go(), so its next holder finds sending free. It returns whether it's gone.
+    bool let_go_of_wire() noexcept
+    {
+        if (sending.is_claimed())
+        {
+            wire_leaving = true;
+            return false;
+        }
+
+        wire_busy = false;
+        return true;
+    }
+
+    // let_go is sending's: it lets the wire go, if its last task left it to (see let_go_of_wire()), once sending's
+    // free.
+    void let_go() noexcept
+    {
+        {
+            std::scoped_lock lock{mu};
+            if (!wire_leaving) return;
+            wire_leaving = false;
+            wire_busy    = false;
+        }
+        turn.notify();
     }
 
     // write_replies_or_release writes the replies pending into the writer's buffer (empty, as it's just been flushed),
@@ -1006,12 +1067,13 @@ struct connection_state
     {
         control_frames frames;
         bool           close_gone = false; // this side's close has gone (with what's just been flushed, perhaps)
+        bool           gone       = false; // the wire's been let go (rather than left to let_go())
         {
             std::scoped_lock lock{mu};
             take_replies(frames);
             if (frames.size == 0)
             {
-                wire_busy  = false;
+                gone       = let_go_of_wire();
                 close_gone = sess.state() == close_state::close_sent || sess.state() == close_state::closed;
             }
         }
@@ -1030,10 +1092,10 @@ struct connection_state
 
             // only after a failed write, whose leftovers are in the buffer: the replies can't go.
             std::scoped_lock lock{mu};
-            wire_busy = false;
+            gone = let_go_of_wire();
         }
 
-        turn.notify();
+        if (gone) turn.notify();
         return false;
     }
 
@@ -1059,12 +1121,14 @@ struct connection_state
         }
     }
 
-    // send_replies sends the replies pending, if the wire's free; otherwise they're left to its holder.
+    // send_replies sends the replies pending, if the wire's free; otherwise they're left to its holder (unless it's
+    // letting it go, having taken the last: then once it has).
     coro::task<std::error_code> send_replies()
     {
         control_frames frames;
         {
             std::scoped_lock lock{mu};
+            if (wire_leaving) return send_replies_after_wire();
             if (wire_busy) return ready_task<std::error_code>();
 
             take_replies(frames);
@@ -1078,13 +1142,28 @@ struct connection_state
         return flush_and_release();
     }
 
+    // send_replies_after_wire is send_replies(), once the wire's holder has let it go.
+    coro::task<std::error_code> send_replies_after_wire()
+    {
+        while (true)
+        {
+            const auto seen = turn.value();
+            {
+                std::scoped_lock lock{mu};
+                if (!wire_leaving) break;
+            }
+            (void)co_await turn.wait(seen);
+        }
+        co_return co_await send_replies();
+    }
+
     // fail_write fails the connection with what failed a write (holding the wire, which it lets go), returning the
     // connection's failure.
     std::error_code fail_write(std::error_code err) noexcept
     {
         {
             std::scoped_lock lock{mu};
-            wire_busy = false;
+            (void)let_go_of_wire();
         }
         return fail_transport(err);
     }
@@ -1292,6 +1371,7 @@ struct connection_state
     std::error_code failed{}; // see connection: the first failure, which every operation then returns
 
     bool          wire_busy     = false; // a task is writing to the tunnel's writer
+    bool          wire_leaving  = false; // and it's letting it go, once sending's free (see let_go_of_wire())
     bool          message_open  = false; // a message is being written a frame at a time
     bool          message_first = false; // and its next frame is its first
     opcode        message_op    = opcode::text;
@@ -1307,6 +1387,29 @@ struct connection_state
 
     // notified when the wire or the message turn is let go, or the connection fails.
     coro::notifier turn;
+
+    // The wire's holder's: sending writes a frame that doesn't fit in the writer's buffer a part at a time (sending_now
+    // says which), and flushes what's written and the replies pending, until there are none (see wrote_part()).
+    enum class sending_part : std::uint8_t
+    {
+        head,      // the header (frame_head's first head_left bytes), then the payload (frame_out)
+        payload,   // the payload, straight from frame_out
+        masked,    // a client's frame, masked into the buffer a part at a time (see send_masked())
+        releasing, // what's written, then the replies pending, until there are none: then the wire's let go
+    };
+    sending_part                           sending_now = sending_part::releasing;
+    std::array<std::byte, max_header_size> frame_head{};
+    std::size_t                            head_left = 0;
+    std::span<const std::byte>             frame_out;
+    std::array<std::byte, 4>               mask_key{};
+    std::size_t                            masked_out = 0; // of frame_out, into the buffer
+
+    using frame_sender = coro::stepper<connection_state,
+                                       io::result,
+                                       std::error_code,
+                                       &connection_state::wrote_part,
+                                       &connection_state::let_go>;
+    frame_sender sending{this};
 
     // The read side's claim, and close()'s wait for it (see end_read()); and whether the server's close() has come,
     // and no read has taken it yet (see interrupt).

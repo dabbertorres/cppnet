@@ -21,6 +21,9 @@ class promise_base;
 template<typename Owner, typename In, typename Out, auto Finish>
 class adapter;
 
+template<typename Owner, typename In, typename Out, auto Step, auto Released>
+class stepper;
+
 // operation_base is what every operation<T> has: claiming it for a task, and cancelling it (see operation).
 class operation_base
 {
@@ -347,9 +350,12 @@ public:
     template<typename U>
     friend task<U> operation_task(operation<U>& op) noexcept;
 
-    // (an adapter starts its inner task in place: see adapter.)
+    // (an adapter, or a stepper, starts its inner task in place: see adapter.)
     template<typename Owner, typename In, typename Out, auto Finish>
     friend class adapter;
+
+    template<typename Owner, typename In, typename Out, auto Step, auto Released>
+    friend class stepper;
 
 private:
     // from_ready is the result a ready task holds.

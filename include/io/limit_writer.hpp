@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <span>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
@@ -36,10 +37,16 @@ private:
     // finish counts what a write of amount bytes (of wanted) wrote.
     result finish(result res, std::size_t amount, std::size_t wanted) noexcept;
 
-    coro::task<result> finish_after(coro::task<result> inner, std::size_t amount, std::size_t wanted);
+    // finish_waiting is finish() for the write that waited (finishing's).
+    result finish_waiting(result res) noexcept { return finish(res, waiting_amount, waiting_wanted); }
 
     writer*     out  = nullptr;
     std::size_t left = 0;
+
+    // finishing finishes a write that has to wait (of waiting_amount bytes, of waiting_wanted), without a coroutine.
+    std::size_t                                                                waiting_amount = 0;
+    std::size_t                                                                waiting_wanted = 0;
+    coro::adapter<limit_writer, result, result, &limit_writer::finish_waiting> finishing{this};
 };
 
 }

@@ -19,6 +19,7 @@
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
+#include "waiting_io.hpp"
 
 using namespace std::string_view_literals;
 
@@ -209,4 +210,49 @@ TEST_CASE("a limit_reader whose stream ends before its limit fails, unless the l
         CHECK(out.data == "abc");
         CHECK(out.err == net::io::errc::end_of_stream);
     }
+}
+
+TEST_CASE("a limit_reader's read that waits counts what it read once it's done", "[io][limit_reader][wait]")
+{
+    test::fed_reader      fed;
+    net::io::limit_reader limited{&fed, 5};
+
+    std::array<std::byte, 8> buf{};
+    auto                     reading = test::started(limited.read(buf));
+    REQUIRE_FALSE(reading.is_ready());
+
+    // another while it waits is busy, reading nothing.
+    auto busy = limited.read(buf);
+    REQUIRE(busy.finished_without_coroutine());
+    const auto busy_res = std::move(busy).result();
+    CHECK(busy_res.err == std::errc::device_or_resource_busy);
+
+    fed.feed("hello world"sv);
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    CHECK_FALSE(res.err);
+    CHECK(res.count == 5);
+    CHECK(fed.asked == std::vector<std::size_t>{5});
+
+    // the limit's been reached.
+    const auto after = test::sync_wait(limited.read(buf));
+    CHECK(after.err == end_of_stream);
+    CHECK(after.count == 0);
+}
+
+TEST_CASE("a limit_reader's read that waits and finds the stream's end before the limit fails",
+          "[io][limit_reader][wait]")
+{
+    test::fed_reader      fed;
+    net::io::limit_reader limited{&fed, 5};
+
+    std::array<std::byte, 8> buf{};
+    auto                     reading = test::started(limited.read(buf));
+    REQUIRE_FALSE(reading.is_ready());
+
+    fed.end();
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    CHECK(res.err == std::errc::connection_aborted);
+    CHECK(res.count == 0);
 }

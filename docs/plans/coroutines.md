@@ -191,6 +191,16 @@ canceled with the awaiting coroutine (`operation_base::cancel()`). It replaces `
 `limit_writer::finish_after`, `flush_before_read::flush_and_read`, the server's `sent_after` and the WebSocket's
 `flush_waiting`.
 
+A function that awaits several inner tasks in turn (`read_more`'s and `write_through`'s loops, `flush_after`'s writes,
+`flush_and_read`'s flush and then read, the WebSocket's frame written in parts and its flushes) can't hand the awaiting
+coroutine to its inner task, as something must take the steps between them. `coro::stepper` (stage 3) is the adapter for
+those: its step makes of each inner task's result its own result, or the next inner task; steps whose inner tasks finish
+at once are taken where they finish, and the inner tasks that wait continue the stepper's driver, a coroutine it makes
+the first time one waits and keeps, parked between its tasks (as the HTTP/1.1 server's watcher is), which takes the
+steps and then resumes the awaiting coroutine. So one frame per object, made once, rather than one per call, and one
+more resume per wait. A step can't let go of what keeps the stepper's users apart (the WebSocket's wire) while the
+stepper's still its task's: that's left to the stepper's `Released` hook, run once it's free.
+
 ### Ready tasks where nothing waits
 
 `string_reader::read` (never waits); `chunked_reader::read` and the client's `pooled_body::read` when the inner read

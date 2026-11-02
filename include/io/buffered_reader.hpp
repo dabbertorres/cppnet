@@ -83,8 +83,16 @@ public:
     [[nodiscard]] handle native_handle() const noexcept override { return impl->native_handle(); }
 
 private:
-    // read_more reads what's buffered, and then more.
-    coro::task<result> read_more(std::span<std::byte> data);
+    // read_more is read() of more than what's buffered.
+    // NOTE: not inlined into read(), whose usual case (what's buffered) stays small.
+    [[gnu::noinline]] coro::task<result> read_more(std::span<std::byte> data);
+
+    // read_rest is the next step of a read of more than what's buffered (see reading): a read of what's wrapped for the
+    // rest of wanted, or wanted's result, if it's all read.
+    coro::step<result, result> read_rest();
+
+    // read_on takes the result of a read that read_rest() made, and makes the next step.
+    coro::step<result, result> read_on(result res);
 
     // filled adds what a read for fill() read, returning its error.
     std::error_code filled(const result& res) noexcept;
@@ -99,6 +107,14 @@ private:
 
     // filling finishes a fill whose read has to wait (with filled()), without a coroutine.
     coro::adapter<buffered_reader, result, std::error_code, &buffered_reader::filled> filling{this};
+
+    // reading reads more than what's buffered, without a coroutine (read_on() taking each read's result): wanted, of
+    // which got's been read so far, straight into it while what's left is more than the buffer holds (direct), and the
+    // rest through the buffer.
+    std::span<std::byte>                                                      wanted;
+    std::size_t                                                               got    = 0;
+    bool                                                                      direct = false;
+    coro::stepper<buffered_reader, result, result, &buffered_reader::read_on> reading{this};
 };
 
 }

@@ -1,8 +1,12 @@
 #include "coro/adapter.hpp"
 
+#include <array>
 #include <coroutine>
+#include <cstddef>
+#include <functional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -75,6 +79,40 @@ task<int> throws_after(test_operation* op)
     (void)co_await net::coro::operation_task(*op);
     throw std::runtime_error{"inner failure"};
 }
+
+// summer is a stepper's owner: its steps add up the inner tasks' results, each step's inner task made by next (given
+// the step's number, from 0) until there have been steps of them; a negative result throws. released records, each
+// time a task of the stepper's has given its result, whether the stepper was free by then.
+struct summer
+{
+    net::coro::step<int, int> add(int value)
+    {
+        if (value < 0) throw std::runtime_error{"negative"};
+
+        sum += value;
+        if (++taken == steps) return sum;
+        return next(taken);
+    }
+
+    void released() noexcept { releases.push_back(!stepping.is_claimed()); }
+
+    // start makes a task of the stepper, for steps inner tasks.
+    task<int> start(int count)
+    {
+        steps = count;
+        taken = 0;
+        sum   = 0;
+        return stepping.adapt([this] { return next(0); }, busy);
+    }
+
+    std::function<task<int>(int)> next;
+    int                           steps = 0;
+    int                           taken = 0;
+    int                           sum   = 0;
+    std::vector<bool>             releases;
+
+    net::coro::stepper<summer, int, int, &summer::add, &summer::released> stepping{this};
+};
 
 }
 
@@ -274,4 +312,316 @@ TEST_CASE("destroying the coroutine awaiting an adapter cancels its inner task",
     CHECK(d.finished == 0);
     CHECK_FALSE(d.adapting.is_claimed());
     CHECK(op.try_claim());
+}
+
+TEST_CASE("a stepper takes the steps of inner tasks that finish at once without itself", "[coro][stepper]")
+{
+    summer s;
+    s.next = [](int step) { return net::coro::ready_task<int>(step + 1); };
+
+    auto t = s.start(3);
+    REQUIRE(t.finished_without_coroutine());
+    CHECK_FALSE(s.stepping.is_claimed());
+
+    const int value = std::move(t).result();
+    CHECK(value == 6);
+    CHECK(s.releases.empty());
+}
+
+TEST_CASE(
+    "a stepper's inner tasks continue its driver, which resumes the awaiting coroutine once the last step's taken",
+    "[coro][stepper][operation]")
+{
+    summer                        s;
+    std::array<test_operation, 3> ops;
+    for (std::size_t i = 0; i < ops.size(); ++i) ops.at(i).value = static_cast<int>(i) + 1;
+
+    s.next = [&](int step)
+    {
+        auto& op = ops.at(static_cast<std::size_t>(step));
+        REQUIRE(op.try_claim());
+        return net::coro::operation_task(op);
+    };
+
+    SECTION("each waits")
+    {
+        for (auto& op : ops) op.finish_at_start = false;
+
+        auto awaiting = await_it(s.start(3));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+        CHECK(s.stepping.is_claimed());
+
+        // the first was started with the driver to continue, not the awaiting coroutine.
+        REQUIRE(ops[0].started);
+        CHECK(ops[0].waiting.address() != awaiting.get_handle().address());
+
+        // its step starts the next, for the same driver; the awaiting coroutine waits on.
+        ops[0].finish();
+        REQUIRE(ops[1].started);
+        CHECK(ops[1].waiting.address() == ops[0].waiting.address());
+        CHECK_FALSE(awaiting.is_ready());
+
+        ops[1].finish();
+        REQUIRE(ops[2].started);
+        CHECK_FALSE(awaiting.is_ready());
+
+        ops[2].finish();
+        REQUIRE(awaiting.is_ready());
+        const int value = std::move(awaiting).result();
+        CHECK(value == 6);
+    }
+
+    SECTION("only the middle one waits: the others' steps are taken where they finish")
+    {
+        ops[1].finish_at_start = false;
+
+        auto awaiting = await_it(s.start(3));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+        CHECK(ops[0].started);
+        CHECK(ops[1].started);
+        CHECK_FALSE(ops[2].started);
+
+        ops[1].finish();
+        REQUIRE(awaiting.is_ready());
+        const int value = std::move(awaiting).result();
+        CHECK(value == 6);
+    }
+
+    SECTION("all finish when they're started: the awaiting coroutine doesn't suspend")
+    {
+        CHECK(test::sync_wait(s.start(3)) == 6);
+    }
+
+    // the stepper's free, and was by the time it said its task had given its result; each operation's done with.
+    CHECK_FALSE(s.stepping.is_claimed());
+    CHECK(s.releases == std::vector<bool>{true});
+    for (auto& op : ops)
+    {
+        CHECK(op.try_claim());
+        CHECK_FALSE(op.cancelled);
+    }
+}
+
+TEST_CASE("a stepper keeps its driver for its next task", "[coro][stepper][operation]")
+{
+    summer         s;
+    test_operation op;
+    op.finish_at_start = false;
+    op.value           = 2;
+    s.next             = [&](int /*step*/)
+    {
+        REQUIRE(op.try_claim());
+        return net::coro::operation_task(op);
+    };
+
+    std::vector<void*> drivers;
+    for (int round = 0; round < 2; ++round)
+    {
+        auto awaiting = await_it(s.start(2));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+        drivers.push_back(op.waiting.address());
+
+        op.finish();
+        REQUIRE_FALSE(awaiting.is_ready());
+        op.finish();
+        REQUIRE(awaiting.is_ready());
+        const int value = std::move(awaiting).result();
+        CHECK(value == 4);
+    }
+
+    CHECK(drivers[0] == drivers[1]);
+    CHECK(s.releases == std::vector<bool>{true, true});
+}
+
+TEST_CASE("a stepper's inner coroutines continue its driver too", "[coro][stepper][task]")
+{
+    summer         s;
+    test_operation op;
+    op.finish_at_start = false;
+    op.value           = 4;
+    REQUIRE(op.try_claim());
+
+    // a coroutine that suspends, then one that finishes when it's started (5 + 1).
+    s.next = [&](int step)
+    {
+        if (step == 1) return net::coro::ready_task<int>(1);
+        return plus_one(&op);
+    };
+
+    auto awaiting = await_it(s.start(2));
+    awaiting.get_handle().resume();
+    REQUIRE_FALSE(awaiting.is_ready());
+
+    op.finish();
+    REQUIRE(awaiting.is_ready());
+    const int value = std::move(awaiting).result();
+    CHECK(value == 6);
+    CHECK_FALSE(s.stepping.is_claimed());
+    CHECK(op.try_claim());
+}
+
+TEST_CASE("a stepper rethrows what an inner coroutine or a step threw", "[coro][stepper][task]")
+{
+    summer         s;
+    test_operation op;
+    op.finish_at_start = false;
+    REQUIRE(op.try_claim());
+
+    SECTION("an inner coroutine, after a wait: no more steps are taken")
+    {
+        s.next = [&](int step)
+        {
+            if (step == 0) return throws_after(&op);
+            return net::coro::ready_task<int>(1);
+        };
+
+        auto awaiting = await_it(s.start(2));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+
+        op.finish();
+        REQUIRE(awaiting.is_ready());
+        CHECK_THROWS_AS(std::move(awaiting).result(), std::runtime_error);
+        CHECK(s.taken == 0);
+    }
+
+    SECTION("a step, after a wait")
+    {
+        op.value = -1;
+        s.next   = [&](int /*step*/) { return net::coro::operation_task(op); };
+
+        auto awaiting = await_it(s.start(2));
+        awaiting.get_handle().resume();
+        REQUIRE_FALSE(awaiting.is_ready());
+
+        op.finish();
+        REQUIRE(awaiting.is_ready());
+        CHECK_THROWS_AS(std::move(awaiting).result(), std::runtime_error);
+    }
+
+    CHECK_FALSE(s.stepping.is_claimed());
+    CHECK(s.releases == std::vector<bool>{true});
+    CHECK(op.try_claim());
+}
+
+TEST_CASE("a stepper's step that throws without it throws from adapt()", "[coro][stepper]")
+{
+    summer s;
+    s.next = [](int /*step*/) { return net::coro::ready_task<int>(-1); };
+
+    CHECK_THROWS_AS(s.start(2), std::runtime_error);
+    CHECK_FALSE(s.stepping.is_claimed());
+}
+
+TEST_CASE("a stepper is for one task at a time", "[coro][stepper][busy]")
+{
+    summer         s;
+    test_operation op;
+    op.finish_at_start = false;
+    op.value           = 3;
+    REQUIRE(op.try_claim());
+    s.next = [&](int /*step*/) { return net::coro::operation_task(op); };
+
+    auto awaiting = await_it(s.start(1));
+    awaiting.get_handle().resume();
+    REQUIRE_FALSE(awaiting.is_ready());
+
+    // another while it waits is busy, without making its first inner task.
+    bool made  = false;
+    auto other = s.stepping.adapt(
+        [&]
+        {
+            made = true;
+            return net::coro::ready_task<int>(1);
+        },
+        busy);
+    REQUIRE(other.finished_without_coroutine());
+    const int other_value = std::move(other).result();
+    CHECK(other_value == busy);
+    CHECK_FALSE(made);
+
+    op.finish();
+    REQUIRE(awaiting.is_ready());
+    const int value = std::move(awaiting).result();
+    CHECK(value == 3);
+    CHECK_FALSE(s.stepping.is_claimed());
+}
+
+TEST_CASE("a stepper's task dropped unawaited frees the stepper, and leaves its inner task to the next adapt()",
+          "[coro][stepper][busy]")
+{
+    summer         s;
+    test_operation op;
+    REQUIRE(op.try_claim());
+    s.next = [&](int /*step*/) { return net::coro::operation_task(op); };
+
+    {
+        auto never_awaited = s.start(1);
+        CHECK(s.stepping.is_claimed());
+    }
+    CHECK_FALSE(s.stepping.is_claimed());
+
+    // the inner task, still the stepper's, holds the operation, unstarted, until the next adapt() drops it.
+    CHECK_FALSE(op.try_claim());
+    s.next          = [](int /*step*/) { return net::coro::ready_task<int>(1); };
+    auto      next  = s.start(1);
+    const int value = std::move(next).result();
+    CHECK(value == 1);
+    CHECK_FALSE(op.started);
+    CHECK(op.try_claim());
+    CHECK(s.releases.empty());
+}
+
+TEST_CASE("destroying the coroutine awaiting a stepper cancels the inner task waiting", "[coro][stepper][cancel]")
+{
+    summer                        s;
+    std::array<test_operation, 2> ops;
+    for (auto& op : ops) op.finish_at_start = false;
+    test_operation inner_op;
+    inner_op.finish_at_start = false;
+    REQUIRE(inner_op.try_claim());
+
+    SECTION("an inner operation, after a step")
+    {
+        s.next = [&](int step)
+        {
+            auto& op = ops.at(static_cast<std::size_t>(step));
+            REQUIRE(op.try_claim());
+            return net::coro::operation_task(op);
+        };
+
+        {
+            auto awaiting = await_it(s.start(2));
+            awaiting.get_handle().resume();
+            ops[0].finish();
+            REQUIRE(ops[1].started);
+            REQUIRE_FALSE(awaiting.is_ready());
+        }
+
+        CHECK_FALSE(ops[0].cancelled);
+        CHECK(ops[1].cancelled);
+    }
+
+    SECTION("an inner coroutine is destroyed, which cancels what it waits for")
+    {
+        s.next = [&](int /*step*/) { return plus_one(&inner_op); };
+
+        {
+            auto awaiting = await_it(s.start(1));
+            awaiting.get_handle().resume();
+            REQUIRE_FALSE(awaiting.is_ready());
+        }
+
+        CHECK(inner_op.cancelled);
+    }
+
+    CHECK_FALSE(s.stepping.is_claimed());
+    CHECK(s.releases.empty());
+
+    // and it's ready for the next.
+    s.next = [](int /*step*/) { return net::coro::ready_task<int>(5); };
+    CHECK(test::sync_wait(s.start(1)) == 5);
 }

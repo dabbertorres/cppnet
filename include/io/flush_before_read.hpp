@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <span>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "io/buffered_writer.hpp"
 #include "io/io.hpp"
@@ -44,14 +45,21 @@ public:
     [[nodiscard]] handle native_handle() const noexcept override { return conn->native_handle(); }
 
 private:
-    // flush_and_read finishes read(), once flushing (which needed a coroutine) does.
-    coro::task<result> flush_and_read(coro::task<result> flushing, std::span<std::byte> data);
+    // read_after takes the result of the flush (then reading into target) or the read, that a read whose flush waits
+    // makes in turn, and makes the next step.
+    coro::step<result, result> read_after(result res);
 
     static result closed() noexcept;
 
     reader*          conn;
     buffered_writer* writer;
     bool             held = false;
+
+    // flushing_first finishes a read whose flush has to wait, without a coroutine: the flush, then (unless it failed)
+    // the read, into target.
+    std::span<std::byte>                                                             target;
+    bool                                                                             flushed = false;
+    coro::stepper<flush_before_read, result, result, &flush_before_read::read_after> flushing_first{this};
 };
 
 }

@@ -6,6 +6,7 @@
 #include <span>
 #include <utility>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/reader.hpp"
@@ -67,8 +68,6 @@ public:
     void call_at_start(start_callback callback) noexcept { at_start = callback; }
 
 private:
-    coro::task<result> count_after(coro::task<result> inner);
-
     // start_then_read awaits at_start (once), then reads.
     coro::task<result> start_then_read(std::span<std::byte> data);
 
@@ -82,6 +81,9 @@ private:
     mode                    how      = mode::exact;
     end_callback            at_end;
     start_callback          at_start;
+
+    // counting finishes a read of the parent that has to wait (with counted()), without a coroutine.
+    coro::adapter<limit_reader, result, result, &limit_reader::counted> counting{this};
 };
 
 }

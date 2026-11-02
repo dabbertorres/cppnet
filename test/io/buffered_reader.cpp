@@ -25,6 +25,7 @@
 #include "io/string_reader.hpp"
 #include "io/writer.hpp"
 #include "tcp.hpp"
+#include "waiting_io.hpp"
 
 using namespace std::string_view_literals;
 
@@ -214,4 +215,100 @@ TEST_CASE("a fill that waits for a socket is finished when its data comes, and a
     const std::string_view text{reinterpret_cast<const char*>(got.data()), got.size()};
     CHECK("hello"sv.starts_with(text));
     CHECK_FALSE(text.empty());
+}
+
+TEST_CASE("a read of more than the buffer holds, whose reads wait, reads straight into it, then through the buffer",
+          "[io][buffered_reader][read]")
+{
+    test::fed_reader         fed;
+    net::io::buffered_reader reader{&fed, 8};
+
+    std::string got(20, '\0');
+    auto        reading = test::started(reader.read(got));
+    REQUIRE_FALSE(reading.is_ready());
+
+    // more than the buffer holds is left: read straight into got, at once...
+    fed.feed("abcdefghijklm"sv);
+    REQUIRE_FALSE(reading.is_ready());
+
+    // ... and the rest through the buffer, a buffer's worth, which keeps what's left over.
+    fed.feed("nopqrstuv"sv);
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    CHECK_FALSE(res.err);
+    CHECK(res.count == 20);
+    CHECK(got == "abcdefghijklmnopqrst"sv);
+    CHECK(fed.asked == std::vector<std::size_t>{20, 8});
+    CHECK(std::string_view{reinterpret_cast<const char*>(reader.buffered().data()), reader.size()} == "u"sv);
+
+    // and the reader's free for the next: what's buffered, then what one read through the buffer gives.
+    std::string next(5, '\0');
+    const auto  next_res = test::sync_wait(reader.read(next));
+    CHECK_FALSE(next_res.err);
+    CHECK(next_res.count == 2);
+    CHECK(next.starts_with("uv"sv));
+}
+
+TEST_CASE("a read of more than the buffer holds, whose reads wait, gives what it read along with its failure",
+          "[io][buffered_reader][read]")
+{
+    test::fed_reader         fed;
+    net::io::buffered_reader reader{&fed, 8};
+
+    std::string got(20, '\0');
+
+    SECTION("straight into it")
+    {
+        auto reading = test::started(reader.read(got));
+        REQUIRE_FALSE(reading.is_ready());
+
+        fed.feed("abc"sv);
+        REQUIRE_FALSE(reading.is_ready());
+        fed.end();
+        REQUIRE(reading.is_ready());
+        const auto res = std::move(reading).result();
+        CHECK(res.err == net::io::errc::end_of_stream);
+        CHECK(res.count == 3);
+    }
+
+    SECTION("through the buffer")
+    {
+        auto reading = test::started(reader.read(got));
+        REQUIRE_FALSE(reading.is_ready());
+
+        fed.feed("abcdefghijklmno"sv);
+        REQUIRE_FALSE(reading.is_ready());
+        fed.end();
+        REQUIRE(reading.is_ready());
+        const auto res = std::move(reading).result();
+        CHECK(res.err == net::io::errc::end_of_stream);
+        CHECK(res.count == 15);
+        CHECK(reader.error() == net::io::errc::end_of_stream);
+    }
+
+    CHECK(got.starts_with("abc"sv));
+}
+
+TEST_CASE("a read of more than the buffer holds is for one at a time", "[io][buffered_reader][read]")
+{
+    test::fed_reader         fed;
+    net::io::buffered_reader reader{&fed, 8};
+
+    std::string got(20, '\0');
+    auto        reading = test::started(reader.read(got));
+    REQUIRE_FALSE(reading.is_ready());
+
+    // another while it waits is busy, reading nothing.
+    std::string other(10, '\0');
+    auto        busy = reader.read(other);
+    REQUIRE(busy.finished_without_coroutine());
+    const auto busy_res = std::move(busy).result();
+    CHECK(busy_res.err == std::errc::device_or_resource_busy);
+    CHECK(busy_res.count == 0);
+
+    fed.feed("abcdefghijklmnopqrst"sv);
+    REQUIRE(reading.is_ready());
+    const auto res = std::move(reading).result();
+    CHECK(res.count == 20);
+    CHECK(fed.asked == std::vector<std::size_t>{20});
 }

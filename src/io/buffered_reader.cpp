@@ -12,6 +12,14 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
+namespace
+{
+
+// busy_error is what a read or fill that finds another waiting makes.
+std::error_code busy_error() noexcept { return std::make_error_code(std::errc::device_or_resource_busy); }
+
+}
+
 namespace net::io
 {
 
@@ -36,43 +44,54 @@ coro::task<result> buffered_reader::read(std::span<std::byte> data)
 
 coro::task<result> buffered_reader::read_more(std::span<std::byte> data)
 {
-    // copy over what we can...
-    std::size_t total = size();
-    std::ranges::copy(buffered(), data.begin());
-    consume(total);
+    // it takes what's buffered, and reads the rest: without a coroutine, unless a read has to wait, which reading
+    // finishes (see read_on()).
+    return reading.adapt(
+        [this, data]
+        {
+            got = size();
+            std::ranges::copy(buffered(), data.begin());
+            consume(got);
+            wanted = data;
+            return read_rest();
+        },
+        [] { return result{.err = busy_error()}; });
+}
 
-    // At this point, the buffer is empty. As long as length - total is larger than the buffer capacity, we can skip a
-    // copy and read straight to data: all that's left of it at once, so a large read (e.g. a WebSocket's message, or
-    // a body) takes as few reads of what's wrapped as it can (each a syscall, or a coroutine).
+coro::step<result, result> buffered_reader::read_rest()
+{
+    // the buffer's empty: as long as what's left is more than it holds, a copy's skipped by reading straight into
+    // wanted, all that's left of it at once, so a large read (e.g. a WebSocket's message, or a body) takes as few reads
+    // of what's wrapped as it can (each a syscall, or a coroutine).
+    const auto left = wanted.size() - got;
+    direct          = left > capacity();
+    if (direct) return impl->read(wanted.subspan(got));
+    if (left == 0) return result{.count = got};
 
-    while (data.size() - total > capacity())
+    // the rest, through the buffer (as fill() would read it).
+    return impl->read(std::span{buf}.subspan(end));
+}
+
+coro::step<result, result> buffered_reader::read_on(result res)
+{
+    if (direct)
     {
-        auto res = co_await impl->read(data.subspan(total));
-        total += res.count;
-
-        if (res.err) co_return result{.count = total, .err = res.err};
-        if (res.count == 0) co_return result{.count = total, .err = make_error_code(errc::no_progress)};
+        got += res.count;
+        if (res.err) return result{.count = got, .err = res.err};
+        if (res.count == 0) return result{.count = got, .err = make_error_code(errc::no_progress)};
+        return read_rest();
     }
 
-    // partial read of buffer capacity
-    auto leftover = data.size() - total;
-    if (leftover > 0)
-    {
-        co_await fill();
+    // regardless of error, give the caller what we can: an error's reported only if it can't have all it asked for.
+    const auto failed    = filled(res);
+    const auto left      = wanted.size() - got;
+    const auto available = std::min(left, size());
+    std::ranges::copy(buffered().first(available), wanted.subspan(got).begin());
+    got += available;
+    consume(available);
 
-        // regardless of error, give the user what we can
-
-        auto available = std::min(leftover, size());
-        std::ranges::copy(buffered().first(available), data.subspan(total).begin());
-
-        total += available;
-        consume(available);
-
-        // only report an error if we couldn't fulfill the caller's request
-        if (available < leftover) co_return result{.count = total, .err = err};
-    }
-
-    co_return result{.count = total};
+    if (available < left) return result{.count = got, .err = failed};
+    return result{.count = got};
 }
 
 coro::task<buffered_reader::read_until_result> buffered_reader::read_until(std::span<const std::byte> delim) noexcept
@@ -147,7 +166,7 @@ coro::task<std::error_code> buffered_reader::fill()
             }
             return impl->read(std::span{buf}.subspan(end));
         },
-        std::make_error_code(std::errc::device_or_resource_busy));
+        &busy_error);
 }
 
 std::error_code buffered_reader::filled(const result& res) noexcept

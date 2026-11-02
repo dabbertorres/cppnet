@@ -24,6 +24,7 @@
 
 #include <spdlog/common.h>
 
+#include "coro/adapter.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "exception.hpp"
@@ -257,13 +258,6 @@ bool wrote_less(const net::http::server_request& req, const net::http::response_
 net::http::protocol_version response_version(net::http::protocol_version version) noexcept
 {
     return {.major = 1, .minor = version.major == 1 && version.minor == 0 ? 0U : 1U};
-}
-
-// sent_after is true once sending (which needed a coroutine) has sent a response.
-net::coro::task<bool> sent_after(net::coro::task<net::io::writer*> sending)
-{
-    (void)co_await std::move(sending);
-    co_return true;
 }
 
 // body_to_come is whether an HTTP/1.1 request has a body to read: chunked, or with a Content-Length over 0 (which
@@ -892,6 +886,13 @@ struct server::connection_state
     tunnel_bytes        tunnel{this};
     detail::switch_hook switching{.call = &connection_state::switch_now, .context = this};
 
+    // sent_default is sending_default's finishing step: the default response has been sent.
+    bool sent_default(io::writer* /*body*/) noexcept { return true; }
+
+    // sending_default finishes sending the default response, if it has to wait, without a coroutine (see
+    // default_response()).
+    coro::adapter<connection_state, io::writer*, bool, &connection_state::sent_default> sending_default{this};
+
     // NOTE: last, so it's destroyed first (parked: the watch is always ended first), as it uses the rest.
     coro::task<> watcher;
 };
@@ -1305,12 +1306,9 @@ coro::task<bool> server::default_response(connection_state& state, response_writ
         return coro::ready_task<bool>(false);
     }
 
-    // usually, the head fits in the connection's buffer, so there's no need for a coroutine (see coro::ready_task).
-    auto sending = rw.send(status::OK, 0);
-    if (!sending.finished_without_coroutine()) return sent_after(std::move(sending));
-
-    (void)std::move(sending).result();
-    return coro::ready_task<bool>(true);
+    // usually, the head fits in the connection's buffer, so there's no need for a coroutine (see coro::ready_task); a
+    // head that has to wait is sending_default's.
+    return state.sending_default.adapt([&rw] { return rw.send(status::OK, 0); }, false);
 }
 
 coro::task<> server::end_after_decode_error(detail::connection& conn, connection_state& state, std::error_code err)

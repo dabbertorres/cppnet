@@ -9,6 +9,14 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
+namespace
+{
+
+// busy is what an operation of a reader or writer that's taken by another (waiting) makes.
+net::io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
+
+}
+
 namespace net::io
 {
 
@@ -20,14 +28,11 @@ coro::task<result> limit_reader::read(std::span<std::byte> data)
     if (at_start && !data.empty()) [[unlikely]]
         return start_then_read(data);
 
-    // the reader often finishes without a coroutine (e.g. a buffered one, with enough buffered): then so can this.
-    auto inner = parent->read(data.first(std::min(data.size(), limit - progress)));
-    if (inner.finished_without_coroutine()) return coro::ready_task<result>(counted(std::move(inner).result()));
-
-    return count_after(std::move(inner));
+    // the reader often finishes without a coroutine (e.g. a buffered one, with enough buffered): then so can this, and
+    // one that waits is counting's, rather than a coroutine's.
+    return counting.adapt([this, data] { return parent->read(data.first(std::min(data.size(), limit - progress))); },
+                          &busy);
 }
-
-coro::task<result> limit_reader::count_after(coro::task<result> inner) { co_return counted(co_await std::move(inner)); }
 
 coro::task<result> limit_reader::start_then_read(std::span<std::byte> data)
 {
