@@ -287,7 +287,29 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    74,300 -> under ~1,000 allocations per 8 MiB (with stage 3's `read_more`), and their time (18197 / 11436 / 9677 us
    with 1 / 4 / 16 KiB readers; the pool measured -25% / -33% / -36%, so removing the frames should gain at least as
    much); small 22 -> ~18; `bench_request` 8 bodies ~75.5 -> ~59.5, a connection per request -1, HTTP/2 a stream at a
-   time -1.
+   time -1. Rechecked on master 06f7d06 (after stage 3), with the allocation tracer: chunked downloads 65,942 per
+   8 MiB with each reader (stage 3 took `read_more`'s frames): `pooled_body::read` and `chunked_reader::read` for each
+   256-byte read (65,538), and for each 64 KiB chunk `read_chunk_size` and the bench handler's `write_all` (129 each);
+   small 21, not 22 (as stage 2 left it), of which `acquire`, `request_encode` and its head's string,
+   and two `pooled_body::read`s go; long head lines 56 / 37 / 30, the same 5 going; a connection per request 15, not 14
+   (`room_for_connection` goes); HTTP/2 a stream at a time 37 (`acquire` goes); 8 bodies 75.5 (16 `string_reader::read`s
+   and `acquire` go: ~58.5); 8 streams 52.7 (the bench handler's 4 `write_all`s and `acquire` go: ~47.7). Also touched:
+   `write_all` in a TLS stream's `write_queued()` (`bench_tls writes` 10.83 per 16 KiB write, -1 per write; `bench_tls
+   echo` 22 per round trip, -2), and the in-memory `bench_request` cases whose input is a `string_reader` (pipelined,
+   and its middleware cases: 2 frames per batch of 16, -0.125 per request). Target cases (named before measuring,
+   2026-11-02; gains are claimed only on these; the rule: every case whose allocation count drops, by the trace above
+   and a probe run of each bench, whose printed times were seen but not used): `bench_client`, every case (small, long
+   head lines and chunked download, with each reader size: time and CPU time); `bench_request`, a connection per
+   request, over HTTP/2 a stream at a time, 8 streams at once and 8 request bodies at once (time and CPU time), and
+   pipelined, through `http_metrics`, `http_metrics` on the route, the runtime router, the runtime router with
+   `http_metrics` on the route, and `http::timeout` on the route (time); `bench_tls echo`, 16 B and 16 KiB (time and
+   CPU time); `bench_tls writes`, each size (time). `bench/web` is measured as well (the server's accept loop changes,
+   once per connection), but isn't a target. `write_all` stays a coroutine for now: making one piece the writer's own
+   write made `bench_tls writes` 16-19% slower at every size and `bench_tls echo`'s 16 KiB round trip 13% slower, a
+   regression a confirmation run reproduced, with its mechanism not yet known (it's in `write_queued()` awaiting the
+   socket's write directly, when the write waits); it comes back on its own, once that's understood. So the `write_all`
+   frames above stay (the TLS stream's, and the bench handlers': chunked downloads ~129 more per 8 MiB, 8 streams ~51.7),
+   and `bench_tls echo` and `bench_tls writes`, targets above, lose no allocation in this stage.
 5. **Operations in long-lived objects**: accept, spawn without wrappers (or keeping them, if the promise being the
    task complicates `async_scope`'s lease and join rules: Decided question 4), the HTTP/2 stream's write that waits,
    TLS's read and flush. Cases: a connection per request ~13 -> ~10; HTTP/2 a stream at a time -1, 8 streams ~52.6 ->
