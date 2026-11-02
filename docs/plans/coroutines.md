@@ -85,7 +85,7 @@ Measured on master 3528cf2 (2026-11-01): macOS x86-64 (Intel Core i9-9980HK), Ho
 
 The pool variant against master (medians of 5 rounds; allocations exact; the pool's count only what isn't a frame):
 
-| bench, row | master | pool | change | allocations master / pool |
+| bench, case | master | pool | change | allocations master / pool |
 |---|---|---|---|---|
 | `bench_task`, a `co_await` of a task that finishes at once (flat / nested) | 51.67 / 35.3 ns | 34.8 / 26.56 ns | -32.6% / -24.8% | 1 frame each |
 | `bench_request`, pipelined | 1131.7 ns | 1026.7 ns | -9.3% | 1.4 / 0.2 |
@@ -102,14 +102,14 @@ The pool variant against master (medians of 5 rounds; allocations exact; the poo
 
 - **A frame's `malloc`/`free` costs about 17 ns** on this machine (`bench_task`).
 - **Where frames are per read of buffered data they dominate** (the client's chunked reads: -25% to -36%), and the
-  server's rows in memory gain 6% to 15%.
-- **Socket-bound rows move within noise by wall time** (a loopback round trip is ~28 us of the kernel and task
+  server's cases in memory gain 6% to 15%.
+- **Socket-bound cases move within noise by wall time** (a loopback round trip is ~28 us of the kernel and task
   hand-overs), but **by CPU time they move**: the whole `bench_websocket` process, 3 interleaved runs each, user CPU
-  16.41-16.71 s (master) against 15.27-15.41 s (pool), -7.5%, system time unchanged (28.35-28.99 s). So socket rows
+  16.41-16.71 s (master) against 15.27-15.41 s (pool), -7.5%, system time unchanged (28.35-28.99 s). So socket cases
   need CPU time (or throughput under load) to show a gain; the benches print only wall time today (stage 0).
 - **A pool isn't free**: TLS writes were 1-3% slower in every round (plausibly frames freed on the other worker, and
   cold 16 KiB classes: unverified).
-- **Removing a frame outright** should gain at least what pooling it does on the same rows: it also skips the frame's
+- **Removing a frame outright** should gain at least what pooling it does on the same cases: it also skips the frame's
   initialisation, its resume and destroy paths, and its cache footprint, without a pool's costs.
 
 ## How others do it
@@ -220,55 +220,59 @@ adopts one.
 ## Measuring
 
 Every stage measures before and after, against the bar (Decided question 2), and its pull request gives a verdict per
-row: a gain or a regression, or noise (ignored), told apart by a Mann-Whitney U test on the row's interleaved rounds
-(p < 0.05; from 0.05 to 0.2, more rounds, up to about 10 a side, then the test again; Decided question 2), with the
-medians, ranges and p in the pull request.
+metric of each benchmark case: a gain or a regression, or noise (ignored), told apart by a Mann-Whitney U test on the
+metric's interleaved rounds (p < 0.05; from 0.05 to 0.2, more rounds, up to about 10 a side, then the test again;
+Decided question 2), with the medians, ranges and p in the pull request.
 
-- **Allocations** are exact: each stage states the counts its rows should reach (from Where things stand).
-- **Time**: the stage's rows, master and the branch built from the same commands, 5 rounds each, interleaved
+- **Allocations** are exact: each stage states the counts its cases should reach (from Where things stand).
+- **Time**: the stage's cases, master and the branch built from the same commands, 5 rounds each, interleaved
   (alternating which goes first), each run started only with the 1-minute load below 4; medians, with every round
-  listed in the pull request. Wall time for rows in memory (pipelined, one per read, the
-  middleware rows, the client's chunked reads, `bench_task`); **CPU time per unit** for socket rows (stage 0 adds it),
+  listed in the pull request. Wall time for cases in memory (pipelined, one per read, the
+  middleware cases, the client's chunked reads, `bench_task`); **CPU time per unit** for socket cases (stage 0 adds it),
   and `bench/web` (cppnet's server alone) for throughput under load (Decided question 5).
 - **Frame sizes**: Clang's `-Rpass=coro-elide` remarks give each frame's size (`frame_size=`), and the elided calls'
   count before and after, so a change that costs an elision elsewhere, or grows a frame it keeps, shows.
-- **GCC**: the rows' allocation counts on GCC (no elision) at stage 0 and after stage 5, in a throwaway Linux
+- **GCC**: the cases' allocation counts on GCC (no elision) at stage 0 and after stage 5, in a throwaway Linux
   container (Decided question 7).
 
 ## Stages
 
-Each a pull request, in this order, with its rows, baselines (Where things stand) and the bar.
+Each a pull request, in this order, with its benchmark cases, baselines (Where things stand) and the bar.
 
 0. **Benches.** No library change: the cases no bench isolates, so every later stage has its proof in place.
    - `bench_tls echo`: 16 B and 16 KiB round trips over one TLS 1.3 connection (24 allocations per round trip, 8 of
      them frames; ~33 / ~139 us).
    - `bench_request`: a connection per request (accept, one request, close; a blocking client): 14 allocations per
      connection, 8 of them frames; ~100 us.
-   - CPU time per unit beside wall time on the socket rows of `bench_request`, `bench_client` and `bench_websocket`.
+   - CPU time per unit beside wall time on the socket cases of `bench_request`, `bench_client` and `bench_websocket`.
    - Master's baselines (every round), `bench/web`'s for cppnet's server, and GCC's allocation counts, in the pull
      request.
-1. **The adapter operation, and `buffered_reader::fill()`** with it. Rows: `bench_request` over a socket 3.0 -> 2.0,
+1. **The adapter operation, and `buffered_reader::fill()`** with it. Cases: `bench_request` over a socket 3.0 -> 2.0,
    one per read 4.2 -> 3.2; `bench_websocket` one at a time 4.0 -> 2.0 per message (both versions); `bench_client`
    small 29 -> 27. One frame of the four the pool served on one per read (-14.6% for all four) is about -3 to -4%,
-   within that row's spread (about 2%): CPU time on the socket rows is the likely proof, or stages 1 and 2 together.
+   within that case's spread (about 2%): CPU time on the socket cases is the likely proof, or stages 1 and 2 together.
 2. **Decode after the wait** on the server, and the client's response head. `bench_request` over a socket 2.0 -> 1.0,
-   one per read 3.2 -> 2.2; `bench_client` small 27 -> 22 (`response_decode`, `read_line`, `read_terminated_line`,
-   `peek`, `parse_fields`); `bench/web` before and after.
+   one per read 3.2 -> 2.2; `bench_client` small 27 -> 21 (the client's `response_decode`, `read_line`,
+   `read_terminated_line`, `peek` and `parse_fields`, and the server's `decode_reading`); `bench/web` before and after.
+   Target cases (named before measuring, 2026-11-01; gains are claimed only on these): `bench_request` one per read
+   (time), and over a socket, a request at a time (time and CPU time); `bench_client` small with each reader size (1,
+   4 and 16 KiB: time and CPU time); `bench/web` plaintext (256 and 1024 connections) and JSON (64 and 256
+   connections), requests per second.
 3. **The other adapters** (`read_more`, `write_through`, `flush_after`, `count_after`, `finish_after`,
    `flush_and_read`, `sent_after`, `flush_waiting`), and the WebSocket client's large-frame paths (`send_through`,
-   `send_masked`). Rows, after stage 1: `bench_websocket` 64 KiB one at a time 7 -> 2 (HTTP/1.1) and 10 -> 3 (HTTP/2;
-   the stream's `write_waiting` is stage 5), and the in-flight medium and large rows; `bench_request` 8 streams 56 ->
+   `send_masked`). Cases, after stage 1: `bench_websocket` 64 KiB one at a time 7 -> 2 (HTTP/1.1) and 10 -> 3 (HTTP/2;
+   the stream's `write_waiting` is stage 5), and the in-flight medium and large cases; `bench_request` 8 streams 56 ->
    ~52.6, 8 request bodies 91.5 -> ~75.5. Baselines: 64 KiB one at a time 87.94 / 105.27 us, 8 streams 920 us per
    round, 8 bodies 1288.6 us per round.
 4. **Ready tasks** (`chunked_reader::read`, `pooled_body::read`, `string_reader::read`, `acquire`,
-   `room_for_connection`, `write_all`, the client's head encoding). Rows: `bench_client`'s chunked downloads 66,600-
+   `room_for_connection`, `write_all`, the client's head encoding). Cases: `bench_client`'s chunked downloads 66,600-
    74,300 -> under ~1,000 allocations per 8 MiB (with stage 3's `read_more`), and their time (18197 / 11436 / 9677 us
    with 1 / 4 / 16 KiB readers; the pool measured -25% / -33% / -36%, so removing the frames should gain at least as
    much); small 22 -> ~18; `bench_request` 8 bodies ~75.5 -> ~59.5, a connection per request -1, HTTP/2 a stream at a
    time -1.
 5. **Operations in long-lived objects**: accept, spawn without wrappers (or keeping them, if the promise being the
    task complicates `async_scope`'s lease and join rules: Decided question 4), the HTTP/2 stream's write that waits,
-   TLS's read and flush. Rows: a connection per request ~13 -> ~10; HTTP/2 a stream at a time -1, 8 streams ~52.6 ->
+   TLS's read and flush. Cases: a connection per request ~13 -> ~10; HTTP/2 a stream at a time -1, 8 streams ~52.6 ->
    ~49, 8 bodies ~59.5 -> ~45; `bench_websocket` HTTP/2 64 KiB 3 -> 2; `bench_tls echo` 24 -> ~16 per round trip;
    `bench_tls writes` 10.8 -> ~7 per 16 KiB write (36.6 us: the pool made it 1-3% slower; this mustn't). May split per
    object if the pull request grows. Then GCC's allocation counts again.
@@ -287,33 +291,33 @@ All decided 2026-11-01.
 
 1. **Direction.** (a) Structural first: stages 1-5 remove frames (operations, ready tasks), then a frame allocator is
    decided with what's left (stage 6); (b) a frame allocator first; (c) both at once; (d) neither. **Decided: (a).**
-2. **The bar for "worthwhile".** In the user's words: "Any allocation drop and any gain. If a change results in no
-   gain, but also no regression, then judge the change on maintainability and readability: if that is improved, keep
-   the change; otherwise the change may be dropped. If unsure, ask me, showing evidence." So: an allocation drop or any
+2. **The bar for "worthwhile".** In the user's words: "Any allocation drop and any gain. If a change results in no gain,
+   but also no regression, then judge the change on maintainability and readability: if that is improved, keep the
+   change; otherwise the change may be dropped. If unsure, ask me, showing evidence." So: an allocation drop or any
    gain, with no regression, means keep; with no gain and no regression, keep only if maintainability or readability
    improved, otherwise it may be dropped; when unsure, ask the user, with the evidence. The user's clarification
    (2026-11-01): "provable noise should be ignored when it comes to performance gains and regressions." So a time
-   difference within a row's measured spread (the interleaved rounds' range) is neither a gain nor a regression: it is
-   noise, and ignored. Each row's noise is defined by stage 0's baselines (the round-to-round spread of master's rounds);
-   allocation counts are exact, so they're unaffected. Each stage's verdict states, per row, whether its difference is
-   beyond the spread (a real gain or regression) or within it (ignored). How noise is told from a difference (the
-   user's choice, after stage 1, 2026-11-01): a Mann-Whitney U test on each row's interleaved rounds, before against
-   after; p < 0.05 is a gain or a regression, by the medians' direction; with p from 0.05 to 0.2, rounds are added (up
-   to about 10 a side) and the test is run again; otherwise it's noise. Each row reports its medians, ranges and p.
-   As a stage tests many rows (stage 1: about 115 row-metrics, so about 6 at p < 0.05 by chance alone), the user chose
-   (after stage 1, 2026-11-01): gains count only on the stage's target rows, named in its Stages entry before it's
-   measured (others' gains are reported, not claimed); any row reaching p < 0.05 the wrong way gets a confirmation run
-   of 10 fresh interleaved rounds a side, and is a regression only if that run reproduces it.
+   difference within a metric's measured spread (the interleaved rounds' range) is neither a gain nor a regression: it
+   is noise, and ignored. Each metric's noise is defined by stage 0's baselines (the round-to-round spread of master's
+   rounds); allocation counts are exact, so they're unaffected. Each stage's verdict states, per metric, whether its
+   difference is beyond the spread (a real gain or regression) or within it (ignored). How noise is told from a
+   difference (the user's choice, after stage 1, 2026-11-01): a Mann-Whitney U test on each metric's interleaved rounds,
+   before against after; p < 0.05 is a gain or a regression, by the medians' direction; with p from 0.05 to 0.2, rounds
+   are added (up to about 10 a side) and the test is run again; otherwise it's noise. Each metric reports its medians,
+   ranges and p. As a stage tests many metrics (stage 1: about 115, so about 6 at p < 0.05 by chance alone), the user
+   chose (after stage 1, 2026-11-01): gains count only on the stage's target cases, named in its Stages entry before
+   it's measured (others' gains are reported, not claimed); any metric reaching p < 0.05 the wrong way gets a
+   confirmation run of 10 fresh interleaved rounds a side, and is a regression only if that run reproduces it.
 3. **The adapter's shape.** (a) One generic operation template in `coro/`; (b) hand-written operations per class;
    (c) ready tasks only where nothing waits. **Decided: (a).**
 4. **Spawning without wrapper coroutines.** (a) The task's promise is the detached task (Seastar's way), in stage 5;
    (b) keep `start_on` and `run`. **Decided: (a)**, falling back to (b) if it complicates `async_scope`'s lease and
    join rules.
-5. **The socket rows' proof.** (a) CPU time per unit in the benches; (b) `bench/web`'s throughput; (c) both.
+5. **The socket cases' proof.** (a) CPU time per unit in the benches; (b) `bench/web`'s throughput; (c) both.
    **Decided: (c).**
 6. **The allocation tracer.** (a) A tool kept outside the repository, run by hand when a count surprises; (b) a
    bench-only opt-in in the repository; (c) none. **Decided: (a).**
-7. **GCC.** (a) Count the rows' allocations on GCC in a throwaway Linux container at stage 0 and after stage 5; (b)
+7. **GCC.** (a) Count the cases' allocations on GCC in a throwaway Linux container at stage 0 and after stage 5; (b)
    leave GCC to CI. **Decided: (a).**
 8. **The frame allocator's form, if stage 6 adopts one.** (a) Per-thread size-class free lists in the promise's
    `operator new`/`delete`, out of line; (b) a thread-local current resource (Capy's); (c) `execution::task`'s shape
