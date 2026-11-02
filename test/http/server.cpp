@@ -446,6 +446,71 @@ TEST_CASE("pipelined requests are answered in order", "[http][server][pipelining
     CHECK(last != std::string::npos);
 }
 
+namespace
+{
+
+// exchange_in_pieces sends request to the server on port in writes of piece bytes each (all of it at once if piece is
+// 0), and reads until the server closes the connection.
+task<std::string>
+exchange_in_pieces(net::io::scheduler* sched, std::uint16_t port, std::string request, std::size_t piece)
+{
+    auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port));
+    if (!conn.has_value()) co_return "error: " + conn.error().message();
+    conn->set_read_timeout(5s);
+
+    const std::string_view rest{request};
+    for (std::size_t at = 0; at < rest.size();)
+    {
+        const auto n   = piece == 0 ? rest.size() : std::min(piece, rest.size() - at);
+        auto       res = co_await net::io::write_all(*conn, rest.substr(at, n));
+        if (res.err) co_return "error: " + res.err.message();
+        at += n;
+    }
+
+    std::string                out;
+    std::array<std::byte, 256> buf{};
+    while (true)
+    {
+        auto read = co_await conn->read(buf);
+        out.append(reinterpret_cast<const char*>(buf.data()), read.count);
+        if (read.err) break;
+    }
+
+    co_return out;
+}
+
+}
+
+TEST_CASE("a request's head is served the same whether it comes whole or in pieces", "[http][server][decode]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+
+    http::router router;
+    router.GET("/:name", echo_name);
+
+    http::server server{
+        &sched,
+        std::move(router),
+        {.host = "127.0.0.1", .port = "0"}
+    };
+    REQUIRE(sched.spawn(server.serve()));
+
+    // whole (one read, then decoded at once), or in pieces (some of which a read may find together), which are read on
+    // as the head's decoded.
+    const auto piece = GENERATE(std::size_t{0}, std::size_t{1}, std::size_t{7});
+    CAPTURE(piece);
+
+    auto out =
+        sched.run_to_completion(exchange_in_pieces(&sched,
+                                                   server.local_port(),
+                                                   "GET /pieces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                                                   piece));
+    CAPTURE(out);
+
+    CHECK(out.starts_with("HTTP/1.1 200 OK\r\n"));
+    CHECK(out.ends_with("\r\n\r\npieces"));
+}
+
 TEST_CASE("a response isn't held back waiting for the next request", "[http][server][pipelining]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};

@@ -1037,7 +1037,12 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
         // Only the headers are read under the deadline: how long the handler takes to read the body is up to it.
         detail::socket_of(conn).set_read_deadline(deadline);
 
-        auto err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
+        // a head usually comes in one read: waited for here (the reader's fill, an operation), it's then decoded
+        // without a coroutine; one that comes in pieces is read on by request_decode() (which fails as the fill did,
+        // too).
+        std::error_code err;
+        if (state.reader.size() == 0) err = co_await state.reader.fill();
+        if (!err) err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
 
         detail::socket_of(conn).set_read_deadline(std::nullopt);
 

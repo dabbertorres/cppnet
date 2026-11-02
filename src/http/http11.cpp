@@ -789,6 +789,110 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
         co_return std::make_error_code(std::errc::not_enough_memory);
     }
 }
+
+// decode_buffered_response decodes a response whose head is buffered (see head_is_buffered) and final (not an interim
+// response, which is passed on as it's decoded: see response_decode()), without a coroutine. None if it isn't both,
+// with nothing consumed.
+// NOLINTBEGIN(bugprone-exception-escape): what throws (std::bad_alloc) is caught; moving a response doesn't throw.
+std::optional<net::http::response_decoder_result>
+decode_buffered_response(buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
+{
+    if (!head_is_buffered(reader, max_header_bytes)) return std::nullopt;
+
+    try
+    {
+        // the status line, looked at before it's taken.
+        const auto       buffered = reader->buffered();
+        std::string_view chars{reinterpret_cast<const char*>(buffered.data()), buffered.size()};
+
+        client_response resp;
+        if (auto err = parse_status_line(chars.substr(0, chars.find("\r\n"sv)), resp); err) return std::unexpected(err);
+        if (net::http::status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS)
+            return std::nullopt;
+
+        head_reader head{.reader = reader, .remaining = max_header_bytes};
+        (void)head.buffered_line();
+
+        // NOTE: the lines are all buffered, so buffered_line() only fails if the head ends in a way it can't.
+        for (std::size_t count = 0;; ++count)
+        {
+            auto line = head.buffered_line();
+            if (!line.has_value()) return std::unexpected(invalid());
+
+            auto added = add_field_line(*line, count, resp.headers);
+            if (!added.has_value()) return std::unexpected(added.error());
+            if (*added) break;
+        }
+
+        auto body = make_response_body(reader, resp, method);
+        if (!body.has_value()) return std::unexpected(body.error());
+        resp.body = std::move(*body);
+        return resp;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    }
+}
+// NOLINTEND(bugprone-exception-escape)
+
+// decode_response_reading decodes a response whose head isn't all buffered yet, or that starts with an interim
+// response (see response_decode()).
+task<net::http::response_decoder_result> decode_response_reading(buffered_reader*                     reader,
+                                                                 request_method                       method,
+                                                                 std::size_t                          max_header_bytes,
+                                                                 net::http::http11::informational_ref on_informational,
+                                                                 bool stop_at_interim) noexcept
+{
+    client_response resp;
+    head_reader     head{.reader = reader, .remaining = max_header_bytes};
+
+    // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are passed to on_informational
+    // (if it's set), or skipped; other than 101, which is the last thing on the connection in HTTP/1.1. All of a
+    // response's heads count against max_header_bytes together.
+    while (true)
+    {
+        try
+        {
+            resp.headers = {};
+
+            auto line = head.buffered_line();
+            if (!line.has_value())
+            {
+                if (auto err = co_await head.read_line(); err) co_return std::unexpected(err);
+                line = head.line;
+            }
+
+            if (auto err = parse_status_line(*line, resp); err) co_return std::unexpected(err);
+            if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
+        }
+        catch (const std::bad_alloc&)
+        {
+            co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+        }
+
+        if (!status_is_information(resp.status_code) || resp.status_code == status::SWITCHING_PROTOCOLS) break;
+
+        // NOTE: outside the try, so whatever it throws (even std::bad_alloc) comes out of the task as it is.
+        if (on_informational) on_informational(resp.status_code, resp.headers);
+
+        // NOTE: without a body, as an interim response has none.
+        if (stop_at_interim) co_return resp;
+    }
+
+    try
+    {
+        auto body = make_response_body(reader, resp, method);
+        if (!body.has_value()) co_return std::unexpected(body.error());
+        resp.body = std::move(*body);
+
+        co_return resp;
+    }
+    catch (const std::bad_alloc&)
+    {
+        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
+    }
+}
 }
 
 namespace net::http::http11
@@ -957,54 +1061,11 @@ coro::task<response_decoder_result> response_decode(io::buffered_reader* reader,
                                                     informational_ref    on_informational,
                                                     bool                 stop_at_interim) noexcept
 {
-    client_response resp;
-    head_reader     head{.reader = reader, .remaining = max_header_bytes};
+    // a head that's all buffered (e.g. once a fill has waited for it) is usually final: decoded without a coroutine.
+    if (auto decoded = decode_buffered_response(reader, method, max_header_bytes); decoded.has_value())
+        return coro::ready_task<response_decoder_result>(std::move(*decoded));
 
-    // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are passed to on_informational
-    // (if it's set), or skipped; other than 101, which is the last thing on the connection in HTTP/1.1. All of a
-    // response's heads count against max_header_bytes together.
-    while (true)
-    {
-        try
-        {
-            resp.headers = {};
-
-            auto line = head.buffered_line();
-            if (!line.has_value())
-            {
-                if (auto err = co_await head.read_line(); err) co_return std::unexpected(err);
-                line = head.line;
-            }
-
-            if (auto err = parse_status_line(*line, resp); err) co_return std::unexpected(err);
-            if (auto err = co_await parse_fields(head, resp.headers); err) co_return std::unexpected(err);
-        }
-        catch (const std::bad_alloc&)
-        {
-            co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
-        }
-
-        if (!status_is_information(resp.status_code) || resp.status_code == status::SWITCHING_PROTOCOLS) break;
-
-        // NOTE: outside the try, so whatever it throws (even std::bad_alloc) comes out of the task as it is.
-        if (on_informational) on_informational(resp.status_code, resp.headers);
-
-        // NOTE: without a body, as an interim response has none.
-        if (stop_at_interim) co_return resp;
-    }
-
-    try
-    {
-        auto body = make_response_body(reader, resp, method);
-        if (!body.has_value()) co_return std::unexpected(body.error());
-        resp.body = std::move(*body);
-
-        co_return resp;
-    }
-    catch (const std::bad_alloc&)
-    {
-        co_return std::unexpected(std::make_error_code(std::errc::not_enough_memory));
-    }
+    return decode_response_reading(reader, method, max_header_bytes, on_informational, stop_at_interim);
 }
 
 coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reader> reader,

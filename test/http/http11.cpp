@@ -23,6 +23,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "coro/sync_wait.hpp"
+#include "coro/task.hpp"
 #include "http/headers.hpp"
 #include "http/http.hpp"
 #include "http/request.hpp"
@@ -761,6 +762,135 @@ TEST_CASE("response_decode passes interim responses on, in order, but 101", "[ht
         }
         CHECK(thrown == "bad_alloc");
     }
+}
+
+namespace
+{
+
+// trickle_reader reads text a byte at a time: a head that comes in pieces, so it's never all buffered before decoding.
+class trickle_reader final : public net::io::reader
+{
+public:
+    explicit trickle_reader(std::string_view text) noexcept
+        : text{text}
+    {}
+
+    net::coro::task<net::io::result> read(std::span<std::byte> data) override
+    {
+        if (data.empty()) return net::coro::ready_task<net::io::result>(net::io::result{});
+        if (text.empty())
+            return net::coro::ready_task<net::io::result>(
+                net::io::result{.err = make_error_code(net::io::errc::end_of_stream)});
+
+        data[0] = static_cast<std::byte>(text.front());
+        text.remove_prefix(1);
+        return net::coro::ready_task<net::io::result>(net::io::result{.count = 1});
+    }
+
+    using net::io::reader::read;
+
+    [[nodiscard]] net::io::handle native_handle() const noexcept override { return -1; }
+
+private:
+    std::string_view text;
+};
+
+// decoded is what decoding a response came to: its error, or its status, version, fields and body.
+struct decoded
+{
+    std::error_code             err;
+    net::http::status           status_code = net::http::status::NONE;
+    net::http::protocol_version version{};
+    net::http::headers          headers;
+    std::string                 body;
+
+    bool operator==(const decoded&) const = default;
+};
+
+// fill_whole fills reader, as a fill that has waited for a head does (string_reader's read is a coroutine, so the fill
+// is the reader's operation, which a coroutine awaits).
+net::coro::task<std::error_code> fill_whole(net::io::buffered_reader* reader) { co_return co_await reader->fill(); }
+
+decoded outcome(net::http::response_decoder_result resp)
+{
+    decoded out;
+    if (!resp.has_value())
+    {
+        out.err = resp.error();
+        return out;
+    }
+
+    out.status_code = resp->status_code;
+    out.version     = resp->version;
+    out.headers     = resp->headers;
+    if (resp->body != nullptr) out.body = read_body(*resp->body);
+    return out;
+}
+
+}
+
+TEST_CASE("a response's head decodes the same whether it's buffered whole or comes in pieces",
+          "[http][1.1][response_decode][buffered]")
+{
+    using net::http::request_method;
+
+    struct test_case
+    {
+        std::string_view name;
+        std::string_view response;
+        request_method   method            = request_method::GET;
+        bool             without_coroutine = true; // when it's buffered whole
+    };
+
+    auto tc = GENERATE(
+        test_case{.name = "Content-Length", .response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: b\r\n\r\nok"},
+        test_case{.name     = "chunked",
+                  .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"},
+        test_case{.name = "until closed", .response = "HTTP/1.1 200 OK\r\n\r\nuntil the end"},
+        test_case{.name = "no reason", .response = "HTTP/1.1 200\r\nContent-Length: 2\r\n\r\nok"},
+        test_case{.name = "no fields", .response = "HTTP/1.0 204 No Content\r\n\r\n"},
+        test_case{.name     = "HEAD",
+                  .response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+                  .method   = request_method::HEAD},
+        test_case{.name = "101", .response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nframes"},
+        test_case{.name = "a malformed status line", .response = "HTTP/1.1 2000 OK\r\n\r\n"},
+        test_case{.name = "a malformed field", .response = "HTTP/1.1 200 OK\r\nX Y: z\r\n\r\n"},
+        test_case{.name     = "conflicting lengths",
+                  .response = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab"},
+        // an interim response is passed on as it's decoded: by the coroutine, even when it's all buffered.
+        test_case{.name              = "100 Continue first",
+                  .response          = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                  .without_coroutine = false},
+        // more than the limit (100 bytes, below) isn't taken as buffered, and fails as it's read.
+        test_case{
+            .name = "too large",
+            .response =
+                "HTTP/1.1 200 OK\r\nX-Long: 01234567890123456789012345678901234567890123456789012345678901234567890123456789\r\n\r\n",
+            .without_coroutine = false});
+    CAPTURE(tc.name);
+
+    constexpr std::size_t max_header_bytes = 100;
+
+    // buffered whole, as once a fill has waited for it.
+    net::io::string_reader<char> whole_text{tc.response};
+    net::io::buffered_reader     whole{&whole_text};
+    REQUIRE_FALSE(test::sync_wait(fill_whole(&whole)));
+
+    auto decoding = net::http::http11::response_decode(&whole, tc.method, max_header_bytes);
+    CHECK(decoding.finished_without_coroutine() == tc.without_coroutine);
+    const auto from_whole = outcome(test::sync_wait(std::move(decoding)));
+
+    // a byte at a time, so it's read on as it's decoded.
+    trickle_reader           pieces_text{tc.response};
+    net::io::buffered_reader pieces{&pieces_text};
+    const auto               from_pieces =
+        outcome(test::sync_wait(net::http::http11::response_decode(&pieces, tc.method, max_header_bytes)));
+
+    CHECK(from_whole == from_pieces);
+    if (tc.name == "too large") CHECK(from_whole.err == std::errc::value_too_large);
+    if (tc.name.starts_with("a malformed") || tc.name == "conflicting lengths")
+        CHECK(from_whole.err == std::errc::invalid_argument);
+    if (!from_whole.err) CHECK(from_whole.status_code != net::http::status::NONE);
 }
 
 TEST_CASE("malformed responses are rejected", "[http][1.1][response_decode]")

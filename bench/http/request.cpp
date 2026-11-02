@@ -267,6 +267,8 @@ task<void> serve(const Router& router, net::io::reader& input, net::io::writer& 
     {
         auto at = allocations.load(std::memory_order::relaxed);
 
+        // as the server does: the head's waited for first, then decoded (without a coroutine, if it came whole).
+        if (reader.size() == 0 && co_await reader.fill()) break;
         if (auto err = co_await http::http11::request_decode(&reader, 8'192, req); err) break;
 
         // as the server does (none, here).

@@ -622,6 +622,27 @@ send_http2(net::http::detail::connection_pool::lease leased, net::http::client_r
 
 // send_http11 sends a request on an HTTP/1.x connection, which the response's body gives back to the pool once it's
 // been read. A request that's safe to repeat may be sent again if a reused connection turns out to have been closed.
+// wait_for_head fills reader if nothing's buffered (the head usually comes in one read), returning the fill's error.
+// NOTE: not a coroutine, so it adds no frame of its own.
+net::coro::task<std::error_code> wait_for_head(net::io::buffered_reader* reader)
+{
+    if (reader->size() != 0) return net::coro::ready_task<std::error_code>();
+    return reader->fill();
+}
+
+// decode_head decodes a response's head, once a fill has waited for it: failing with waited if it failed having read
+// nothing, as decoding would have. NOTE: not a coroutine, so it adds no frame of its own.
+net::coro::task<net::http::response_decoder_result> decode_head(net::io::buffered_reader*            reader,
+                                                                std::error_code                      waited,
+                                                                net::http::request_method            method,
+                                                                std::size_t                          max_header_bytes,
+                                                                net::http::http11::informational_ref on_informational)
+{
+    if (waited && reader->size() == 0)
+        return net::coro::ready_task<net::http::response_decoder_result>(std::unexpected(waited));
+    return net::http::http11::response_decode(reader, method, max_header_bytes, on_informational);
+}
+
 net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_pool> pool,
                                   net::http::detail::connection_pool::lease           leased,
                                   net::http::client_request&                          request,
@@ -701,8 +722,12 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     // NOTE: a deadline, for the final head: interim responses don't put it off.
     if (auto wait = limit(options.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
 
-    auto resp =
-        co_await http11::response_decode(body->buffered(), request.method, max_response_header_bytes, on_informational);
+    // the head usually comes in one read: waited for here (the reader's fill, an operation), it's then decoded without
+    // a coroutine. A fill that fails having read nothing fails the response as decoding it would have.
+    auto*      reader = body->buffered();
+    const auto waited = co_await wait_for_head(reader);
+
+    auto resp = co_await decode_head(reader, waited, request.method, max_response_header_bytes, on_informational);
 
     // the body's reads are only limited by io_timeout.
     sock.set_read_deadline(std::nullopt);
