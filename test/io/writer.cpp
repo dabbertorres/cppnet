@@ -17,6 +17,41 @@
 
 using namespace std::string_view_literals;
 
+TEST_CASE("write_all of one piece is the writer's write, whether or not it waits", "[io][writer][write_all]")
+{
+    test::held_writer out;
+
+    SECTION("a write the writer takes at once is a ready task")
+    {
+        out.make_room(5);
+
+        auto written = net::io::write_all(out, "hello"sv);
+        REQUIRE(written.finished_without_coroutine());
+        const auto res = std::move(written).result();
+        CHECK_FALSE(res.err);
+        CHECK(res.count == 5);
+        CHECK(out.out == "hello");
+    }
+
+    SECTION("a write that waits is the writer's operation, not a coroutine")
+    {
+        auto written = net::io::write_all(out, "hello"sv);
+        REQUIRE_FALSE(written.finished_without_coroutine());
+        CHECK_FALSE(written.get_handle());
+
+        auto writing = test::started(std::move(written));
+        REQUIRE_FALSE(writing.is_ready());
+        REQUIRE(out.waiting());
+
+        out.make_room(5);
+        REQUIRE(writing.is_ready());
+        const auto res = std::move(writing).result();
+        CHECK_FALSE(res.err);
+        CHECK(res.count == 5);
+        CHECK(out.out == "hello");
+    }
+}
+
 TEST_CASE("write_all writes its pieces in turn, until one fails", "[io][writer][write_all]")
 {
     SECTION("all of them")

@@ -304,12 +304,21 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    pipelined, through `http_metrics`, `http_metrics` on the route, the runtime router, the runtime router with
    `http_metrics` on the route, and `http::timeout` on the route (time); `bench_tls echo`, 16 B and 16 KiB (time and
    CPU time); `bench_tls writes`, each size (time). `bench/web` is measured as well (the server's accept loop changes,
-   once per connection), but isn't a target. `write_all` stays a coroutine for now: making one piece the writer's own
-   write made `bench_tls writes` 16-19% slower at every size and `bench_tls echo`'s 16 KiB round trip 13% slower, a
-   regression a confirmation run reproduced, with its mechanism not yet known (it's in `write_queued()` awaiting the
-   socket's write directly, when the write waits); it comes back on its own, once that's understood. So the `write_all`
-   frames above stay (the TLS stream's, and the bench handlers': chunked downloads ~129 more per 8 MiB, 8 streams ~51.7),
-   and `bench_tls echo` and `bench_tls writes`, targets above, lose no allocation in this stage.
+   once per connection), but isn't a target. `write_all` was left a coroutine at first: making one piece the writer's
+   own write made `bench_tls writes` 16-19% slower at every size and `bench_tls echo`'s 16 KiB round trip 13% slower,
+   which a confirmation run reproduced. The cause was where Botan's code landed, not the forwarding: Botan's TLS 1.3
+   constant-time padding scan (inlined in `Record_Layer::next_record`, about 23 us per 16 KiB record) ends in a fused
+   `add; jb`, which Intel's JCC erratum (SKX102) slows by about 25% when it crosses or ends on a 32-byte boundary, and
+   the forwarding, by shrinking the code linked before Botan, moved it onto one. Since `ports/botan/` builds Botan with
+   `-falign-loops=64` on x64, the scan's place no longer depends on what's linked before it, and the forwarding came
+   back (with the single-piece test): the TLS stream's `write_all` frame goes (`bench_tls writes` 10.83 -> 9.83 per
+   16 KiB write, `bench_tls echo` 22 -> 20 per round trip), and so do the bench handlers' (chunked downloads ~274-277
+   -> ~146-149 per 8 MiB, 8 streams 51.3 -> 47.2). Its target cases (named before measuring, 2026-11-03; the rule: every
+   case whose allocation count drops, by a probe run of each bench, whose printed times were seen but not used):
+   `bench_tls echo`, 16 B and 16 KiB (time and CPU time); `bench_tls writes`, each size (time), whether alone or in the
+   full run; `bench_request` over HTTP/2, 8 streams at once (time and CPU time); `bench_client` chunked downloads with
+   each reader size (time and CPU time). `bench_websocket` has none (its counts drift between runs, by timing, and it
+   doesn't use `write_all`), nor do `bench_tls`'s handshakes (which print no counts).
 5. **Operations in long-lived objects**: accept, spawn without wrappers (or keeping them, if the promise being the
    task complicates `async_scope`'s lease and join rules: Decided question 4), the HTTP/2 stream's write that waits,
    TLS's read and flush. Cases: a connection per request ~13 -> ~10; HTTP/2 a stream at a time -1, 8 streams ~52.6 ->

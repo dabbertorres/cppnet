@@ -42,7 +42,15 @@ protected:
     writer() = default;
 };
 
-inline coro::task<result> write_all(writer& /*out*/) { co_return {}; }
+// write_all writes each of the pieces it's given in turn, until one fails (one write each), returning how much they
+// wrote altogether.
+inline coro::task<result> write_all(writer& /*out*/) { return coro::ready_task<result>(); }
+
+// A single piece is just its write: the writer's own task, whether or not it waits, rather than a coroutine around it.
+inline coro::task<result> write_all(writer& out, std::span<const std::byte> data) { return out.write(data); }
+inline coro::task<result> write_all(writer& out, std::span<const char> data) { return out.write(data); }
+inline coro::task<result> write_all(writer& out, std::string_view data) { return out.write(data); }
+inline coro::task<result> write_all(writer& out, const std::string& data) { return out.write(data); }
 
 template<typename... Writes>
 inline coro::task<result> write_all(writer& out, std::span<const std::byte> data, Writes&&... writes)
