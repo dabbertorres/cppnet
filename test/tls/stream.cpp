@@ -2394,10 +2394,13 @@ TEST_CASE("a TLS 1.2 server without Extended Master Secret is accepted, unless t
 
 TEST_CASE("the system's trust store verifies a public server", "[tls][.network]")
 {
+    // Two roots that have long been in every store (the keychain, the system's bundle, Mozilla's): www.digicert.com's
+    // RSA chain ends at DigiCert Global Root G2 with no cross-sign, letsencrypt.org's ECDSA one at ISRG Root X1
+    // (through its cross-sign of ISRG Root X2, which some bundles lack).
     // NOTE: letsencrypt.org's certificate has no revocation information (Let's Encrypt stopped OCSP), which mustn't be
     //       required.
     // Requiring Extended Master Secret refuses neither (see the local test above for a server without it).
-    const std::string host        = GENERATE("example.com", "letsencrypt.org");
+    const std::string host        = GENERATE("www.digicert.com", "letsencrypt.org");
     const bool        require_ems = GENERATE(false, true);
     CAPTURE(host, require_ems);
 

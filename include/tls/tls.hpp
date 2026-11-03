@@ -36,7 +36,9 @@ struct client_options
     // The certificate authorities to trust: the system's (by default), or those in this PEM file instead (e.g. a
     // private CA's), read by each context made with it. The system's trust store is loaded once per process (by the
     // first context that verifies with it), then shared by every context: changes to it while the process runs aren't
-    // seen (as in Go).
+    // seen (as in Go). A GCC build on macOS reads the system's bundle (/etc/ssl/cert.pem) rather than the keychain, and
+    // that file can lack roots the keychain has (example.com's chain, at the time of writing, failed there): give a CA
+    // file with a fuller bundle if needed.
     std::optional<std::filesystem::path> trusted_ca_file{};
 
     // Skip verifying the server's certificate (and its name): for testing against self-signed servers only. Named so

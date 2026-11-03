@@ -336,7 +336,8 @@ TEST_CASE("https requests to a public server", "[tls][http][client][.network]")
 
     const auto test = [](net::http::client* client) -> task<std::string>
     {
-        auto resp = co_await client->get("https://example.com/");
+        // letsencrypt.org answers / with a 200 (not a redirect, which the client doesn't follow by default).
+        auto resp = co_await client->get("https://letsencrypt.org/");
         if (!resp.has_value()) co_return "error: " + resp.error().message();
 
         auto body = co_await net::io::read_all(*resp->body);

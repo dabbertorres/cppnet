@@ -1150,7 +1150,9 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   trust store (a `trusted_ca_file` given is still read, so `make()` fails if it can't be).
 - The system's trust store is loaded once per process, by the first context that verifies with it, and shared by every
   context after (as Go's is): changes to it while the process runs aren't seen. A `trusted_ca_file` is read by each
-  context made with it.
+  context made with it. A GCC build on macOS reads the system's bundle (`/etc/ssl/cert.pem`) rather than the keychain,
+  and that file can lack roots the keychain has (example.com's chain, at the time of writing, failed there): pass a
+  `trusted_ca_file` with a fuller bundle if needed.
 - Errors compare with `tls::alert` conditions (e.g. `err == tls::alert::bad_certificate`), whichever side sent the
   alert; `tls::from_peer(err)` says which. A certificate that failed verification says why in its message (e.g.
   "Certificate does not match provided name").
