@@ -20,6 +20,23 @@ endif()
 
 vcpkg_find_acquire_program(PYTHON3)
 
+# cppnet: every loop starts on a 64-byte boundary, on x64. Intel's JCC erratum (SKX102, in Skylake's cores through Comet
+# Lake's) slows a jump, or a fused compare-and-jump, that crosses or ends on a 32-byte boundary: the microcode that
+# fixes it keeps such a jump out of the decoded µop cache. Botan's TLS 1.3 constant-time scan for a record's padding
+# (inlined in TLS::Record_Layer::next_record) is a hot loop ending in a fused `add; jb`, and it ran about 25% slower
+# whenever an unrelated change in the size of the code linked before Botan moved that pair onto a boundary. Aligning
+# loops pins where each one starts, so a loop's speed no longer depends on what's linked before Botan; it doesn't make
+# every loop fast (one whose jump sits on a boundary from its aligned start stays slow). Not
+# -mbranches-within-32B-boundaries, the erratum's own workaround, which pads nothing in Mach-O objects (only in ELF
+# ones); and not configure.py's --extra-cxxflags, which the CXXFLAGS vcpkg sets override. x64 only: Arm's CPUs don't
+# have the erratum. To see where the scan sits:
+#   otool -tV -p __ZN5Botan3TLS12Record_Layer11next_recordEPNS0_12Cipher_StateE <binary>
+# It starts at the instruction before its `movzbl (%rax,%rsi)`, and was slow starting at 14 to 19 mod 32 (but not at 48
+# mod 64).
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
+    string(APPEND VCPKG_C_FLAGS " -falign-loops=64")
+    string(APPEND VCPKG_CXX_FLAGS " -falign-loops=64")
+endif()
 vcpkg_cmake_get_vars(cmake_vars_file)
 include("${cmake_vars_file}")
 
