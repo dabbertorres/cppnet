@@ -99,6 +99,9 @@ _deps
 # End of https://www.toptal.com/developers/gitignore/api/c++,linux,osx,cmake
 
 build/
+# A local link to the build directory in use, and preset builds kept side by side (e.g. build-clang/, build-gcc/).
+build
+build-*/
 .clangd/
 .cache/
 vcpkg_installed/

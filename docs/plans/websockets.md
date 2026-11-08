@@ -1420,7 +1420,8 @@ runs each, its lower mode was about 3% slower (medians 1240 us against 1206). `b
 10% slower (a pair 433 to 449 ns against 378 to 413): every third hand-over there goes through the queue.
 
 So one WebSocket over HTTP/2 now takes 1.2 to 1.25 times HTTP/1.1's time one at a time, small or large, from 1.8 and
-1.3.
+1.3. The target the user set (2026-10-30), as HTTP/2 wins on requests in parallel and HTTP/1.1 may beat it for one:
+per message, for one WebSocket, at most about 1.3 times HTTP/1.1's time and about 2 more allocations.
 In flight, large messages are still about twice HTTP/1.1's (the HTTP/2 path's CPU, above). The allocations are next:
 6 against 4 for small messages, 26 against 10 for large ones, 3 more than before (likely the drained `received`
 buffer being freed, and grown again, more often, as the reader now runs as soon as DATA comes).
@@ -1446,7 +1447,9 @@ worker whose reader is receiving, which goes on while the socket has more), so i
 Keeping 64 KiB of a drained tunnel's buffer (and growing it to that at once) took them out too (large, one at a time:
 13.0 allocations, 111 to 113 us; in flight 12.9, 64 to 66 us), at about 80 KiB more per WebSocket held after the
 parallel runs (213 to 223 KiB rather than 131 to 144, with 64 at once); left for a decision, as 32 KiB was chosen to
-bound what an idle WebSocket holds.
+bound what an idle WebSocket holds. The user rejected it (2026-10-31), for the memory an idle WebSocket would hold,
+and, shown how others buffer (Go: pooled chunks of 1 to 16 KiB; hyper and h2: a slice per frame; flow control the
+backpressure everywhere), chose Go's list of chunks (below).
 
 Numbers (Release, two workers; the base and this build, three runs each, interleaved, best of five within a run):
 
@@ -1530,6 +1533,17 @@ HTTP/1.1's; with many WebSockets, writes waiting their turn), and in flight the 
 
 ## Learned after stage 9: configurable sizes
 
+First, in a pull request of its own (#98, the user's choice), a cleartext connection that turns out HTTP/2 by prior
+knowledge frees its HTTP/1.1 state (two 16 KiB buffers), which had lived as long as the HTTP/2 connection: about 39 KiB
+less per connection (127 to 88 KiB). `serve_requests()` returns what it read, so its frame is no longer elided into
+`serve_connection()`'s: one allocation more per HTTP/1.1 connection, none per request.
+
+Decided with the user (2026-10-31): the options' names are flat, buffers ending in `_size` and windows in `_window`;
+a value out of range is refused (constructors throw `std::invalid_argument`, `make()`, `connect()` and `accept()`
+return `invalid_argument`), and none is read as "the default", so 0 never means it; the minimums are 1 KiB for
+buffers, 65535 for windows and 16 KiB for TLS's write batch, with no maximums but the protocol's (2^31-1 for windows).
+Defaults stay what they were unless a measurement shows otherwise (it did for two, below).
+
 The buffers and windows that a connection, stream or WebSocket holds were constants; they're options now (the guide's
 "Buffers and windows" says what each sizes), with today's values as defaults but two, which measuring changed. The
 WebSocket's are `connect_options::read_buffer_size` and `write_buffer_size` (16 KiB, the client's own HTTP/1.1
@@ -1583,7 +1597,11 @@ The uploads found something else: on Linux, cppnet's client doesn't set TCP_NODE
 stalls on Nagle's algorithm against the server's delayed ACKs, about 40 ms a window: 1.6 MiB/s over loopback with the
 server's 64 KiB window, 48 MiB/s with 1 MiB (macOS's loopback hides it: 1 GiB/s). A probe that set it on the pool's
 connections went at 946 and 1088 MiB/s over loopback, and over 20 ms at 2.8 MiB/s with 64 KiB and 23 MiB/s with
-1 MiB, as the downloads do. Left for a change of its own.
+1 MiB, as the downloads do. Left for a change of its own: #100 sets it as Go does (the user's choice: `tcp_socket::connect`
+sets it once, on the socket that wins, a failure ignored, no API change). On Linux (in Docker) uploads went from 1.5 to
+about 1500 MiB/s, and a 64 KiB WebSocket message over HTTP/1.1 from 41 ms to 52 us. The user accepted its losses:
+16-byte messages in flight 11% slower (more segments, as Nagle's algorithm no longer merges them), and 64 KiB in
+flight with many WebSockets 15 to 19% slower; coalescing a writer's small messages is parked (`parked.md`).
 
 The client's HTTP/1.1 response reader is 4 KiB now (Go's), from 1 KiB (`buffered_reader`'s default, never chosen).
 `bench_client` (Release, three runs, best of five within each; the server's allocations counted too):

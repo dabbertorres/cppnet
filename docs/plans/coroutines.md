@@ -1,6 +1,8 @@
 # Plan: one coroutine per sequence of actions
 
-Status: decided (2026-11-01): every question at the end (see Decided questions). No stage started.
+Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 4 done (pull requests
+#112 to #117; Learned in the stages has how each met the bar). Paused after stage 4 by the user (2026-11-02): stage 5
+and the `http11` references change (below) wait for the user's go-ahead.
 
 ## Goal
 
@@ -333,6 +335,35 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
 Out of scope, for a separate plan (Decided question 11): the allocations that aren't frames (HTTP/2's 28 per stream:
 HPACK field vectors, `wait_on()`'s `std::map` node and `notify()`'s vector, the stream maps and objects; the client's
 reader and writer buffers made per request; TLS's ciphertext vector per flush).
+
+## Learned in the stages
+
+- **Stage 0** (#112): the benches and baselines above, and GCC's allocation counts.
+- **Stage 1** (#113): kept. Ten interleaved rounds a side, five gains (one per read 7.1% faster, p = 0.001), no
+  regressions.
+- **Stage 2** (#114): allocations down, and `bench_client` small 3.1 to 3.5% faster (a target), but `bench_request`
+  pipelined (not a target) 1.5 to 3.1% slower, reproduced three times. A separating build (the new library under the
+  old bench loop) showed the code that case runs byte for byte the same, only moved within cache lines by a function
+  added to `http11.cpp`. The user kept the stage, taking placement as the explanation: a confirmed regression on
+  identical code whose addresses only moved is brought to the user with that evidence, and placement is an accepted
+  reason.
+- **Stage 3** (#115): kept (two target CPU-time gains, no regressions). `coro::stepper` costs one 56-byte driver
+  coroutine per object, about 400 bytes more per HTTP/1.1 connection; a hand-built fake frame instead was rejected as
+  undefined behaviour.
+- **Stage 4** (#116): kept (gains on the client's chunked downloads, small requests and long head lines, and 8 request
+  bodies; CPU time on 8 streams; no regressions), shipped first without `write_all`'s single-piece forwarding, which
+  made TLS writes 16 to 19% slower. The user accepted two behaviours it brought: `connection_pool::acquire()` claims a
+  free connection or stream when it's called, not when awaited (a task never awaited gives the lease back), and a
+  `std::bad_alloc` while encoding a request's head returns `not_enough_memory`. The slowdown was then traced to
+  Botan's padding scan and Intel's JCC erratum (stage 4's entry above); the user chose to build Botan with
+  `-falign-loops=64` on x64 only (not per CPU generation: vcpkg's binary cache doesn't key on the CPU), documented in
+  the portfile, and to bring the forwarding back. #117 did both: the flag against master reproduced no regression
+  (the handshakes' medians leaned 1 to 4% slower, as plain TCP's did; pooled over 20 rounds, two handshake metrics
+  gave p = 0.049 and 0.031, reported, not acted on), and Botan's text grew 3.4%; the forwarding against the flag cut
+  allocations on every target case (above) with no p < 0.05 either way.
+- **After stage 4** (approved by the user, 2026-11-02, as its own pull request): every `http11` encode and decode
+  parameter (`request_encode`, `request_encode_head`, `request_encode_body`, `response_encode`, both
+  `request_decode`s, `response_decode`) becomes a reference, its null check dropped; results stay pointers.
 
 ## Decided questions
 

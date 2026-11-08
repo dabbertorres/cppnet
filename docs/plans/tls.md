@@ -34,6 +34,9 @@ default, against the system's trust store.
   library). CMake defines `NET_HAS_TLS` (a public compile definition of `net`) when it's on.
 - **Client first.**
 - **Each `http::client` has its own `client_context`** (trust store, session cache), not one shared process-wide.
+  Since 2026-11-01 (#110) the system's trust store in it is read once per process and shared, as Go's `systemRoots`
+  is; a failed load isn't cached, so the next context tries again (the user's decision; Go caches the error). A CA
+  file's store and the session cache stay each context's own.
 - **The client's handshake times out after 10s by default** (`client_options::tls_handshake_timeout`, separate from
   `connect_timeout`, so an error says which phase it was): a TLS 1.3 handshake is one round trip after TCP's, and 10s
   still finishes one that loses two packets (TCP's retransmission timeout starts at 1s and doubles), while giving up on a
@@ -704,8 +707,9 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   and a client offered whichever of all it had been given (that hadn't expired) came first in its map (keyed by random
   IDs), against RFC 8446 C.4 and what this plan assumed. The tests found it (resumptions that succeeded or failed by
   chance, as a ticket under a replaced key was offered again). `client_sessions` wraps Botan's cache (which is `final`)
-  and stores TLS 1.3's handles as tickets, so each ticket is offered once (`test/tls/resumption.cpp` checks it). Worth
-  reporting upstream.
+  and stores TLS 1.3's handles as tickets, so each ticket is offered once (`test/tls/resumption.cpp` checks it). Fixed
+  upstream since, by Botan's PR #5847 (commit 33a901803c, merged 2026-08-15, after 3.13.0), so the user chose not to
+  report it: the wrapper goes once a release with the fix is in vcpkg's baseline (`parked.md`).
 - **Untested:** Botan's server refuses a ticket for another SNI (`PSK::select_offered_psk()`), but cppnet's client keeps
   tickets by host (and port), so never offers one elsewhere; the client's keying by port is tested instead.
 - **Tests:** `test/tls/resumption.cpp` (streams, TLS 1.3, no network): a second and third connection resume (both
