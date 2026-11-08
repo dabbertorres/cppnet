@@ -97,16 +97,14 @@ Working on cppnet itself: how it builds, tests, fuzzes, benchmarks and lints, an
   `cmake/vcpkg.cmake` sets the toolchain file automatically: it uses the submodule, and falls back to `$VCPKG_ROOT` only
   if the submodule isn't checked out. Don't pass `CMAKE_TOOLCHAIN_FILE` yourself. In-source builds are rejected.
 - vcpkg builds the dependencies with the same compiler (it uses `CC`/`CXX`), and its default standard library, as the
-  project uses: e.g. libc++ with Homebrew's Clang on macOS, libstdc++ on Linux. Clang 23 / libc++ 23 need fmt >= 12, so
+  project uses (libc++ with Homebrew's Clang on macOS, libstdc++ on Linux). Clang 23 / libc++ 23 need fmt >= 12, so
   spdlog must be >= 1.16.
 - The `-clang`/`-gcc` presets inherit `use-clang`/`use-gcc`, which add `-Wall -Wextra -Wpedantic`, and ASan+UBSan in
   Debug; `use-clang` also turns on libc++'s bounds checks in Debug (`_LIBCPP_HARDENING_MODE_EXTENSIVE`), so out-of-range
-  indexes abort on macOS as libstdc++'s assertions do on Linux. Changing a preset's `*_INIT` flags needs `cmake --preset
+  indexes abort with libc++ as libstdc++'s assertions do. Changing a preset's `*_INIT` flags needs `cmake --preset
   dev-clang --fresh`.
-- Development happens on macOS and Linux. On macOS, `build` is a symlink to `build-clang/` (configured with the
-  `dev-clang` preset, Homebrew clang), and there's no local GCC build (Homebrew's GCC lacks libasan for the presets'
-  sanitizers): CI's GCC jobs are the GCC check there. On Linux, both presets build locally (`dev-clang` and `dev-gcc`,
-  each with its sanitizers); point `build` at the one in use, as every preset writes to `build/`. `.clangd` reads
+- Every preset writes to `build/`: to keep a build per preset side by side, make `build` a link to a directory of its
+  own before configuring (e.g. `build-clang/` or `build-gcc/`; `.gitignore` ignores them and the link). `.clangd` reads
   `build/compile_commands.json`.
 - Sources are collected with `GLOB_RECURSE ... CONFIGURE_DEPENDS`, so a new `src/**/*.cpp` or `test/**/*.cpp` file is
   picked up without editing CMake. Each subdirectory of `example/` is added automatically when `BUILD_EXAMPLE` is on
@@ -118,7 +116,59 @@ Working on cppnet itself: how it builds, tests, fuzzes, benchmarks and lints, an
   builds Botan again, about 2 minutes per configuration. A Botan module cppnet starts using goes in the portfile's
   module list (`configure.py` can't see algorithms looked up by name at runtime); `./tests "[tls][policy]"` fails if one
   is missing. A benchmark result on TLS that changes with an unrelated change's code size is worth checking against
-  Botan's loop alignment first (the portfile's comment, and the commands in `tls.md`).
+  Botan's loop alignment first (the portfile's comment, and each platform's command under Platforms).
+
+### Platforms
+
+Development happens on macOS and Linux (Windows isn't supported). What differs between them, and what's odd about
+each, is here: a platform added gets a subsection of its own.
+
+#### macOS
+
+- **Compilers.** The `-clang` presets use the first `clang++` on `PATH`, which is Apple's unless Homebrew's LLVM (`brew
+  install llvm`) comes first; CI uses Homebrew's. Apple's clang can't link libFuzzer (so no fuzz targets) and has no
+  LeakSanitizer (`test/sanitizers.cpp` turns it on only for LLVM's clang). The `-gcc` presets use `g++`, which on macOS
+  is Apple's clang too: Homebrew's GCC is `g++-<major>`. There's no local GCC build anyway (Homebrew's GCC lacks
+  libasan for the presets' sanitizers), so CI's GCC jobs are the GCC check here.
+- **One compiler for everything.** vcpkg builds the dependencies with `CC`/`CXX`, not the preset's compiler: if they
+  name another clang, the libc++ versions differ and linking fails (e.g. an undefined `std::__1::__hash_memory`).
+  Apple's clang also searches `/usr/local/include` before `-isystem`, so Homebrew's headers (e.g. fmt's) shadow
+  vcpkg's: `brew unlink` the ones that clash.
+- **TLS's trust store.** Clang builds read the keychain. GCC builds read `/etc/ssl/cert.pem`, which lags it (macOS
+  26.6's lacks roots that public servers' chains need; `docs/plans/tls.md` has which), and Apple's `/usr/bin/openssl`
+  falls back to the keychain, so it can't show such a gap.
+- **Lint.** clang-tidy runs against libc++ here; what only libstdc++ shows (see Formatting and linting) is CI's to
+  find. IWYU, with Homebrew's LLVM, needs pointing at the same libc++ as the build, or it parses the macOS SDK's:
+
+  ```sh
+  iwyu_tool.py -p build -- -Xiwyu --mapping_file=$PWD/iwyu.imp -Xiwyu --no_fwd_decls \
+      -nostdinc++ -isystem $(brew --prefix llvm)/include/c++/v1 -resource-dir $(clang++ -print-resource-dir)
+  ```
+- **Long runs.** A Mac in maintenance sleep stalls stress runs and benchmarks: run them under `caffeinate -s -i` (e.g.
+  `seq 1 400 | caffeinate -s -i xargs -P 8 ...`). There's no `timeout` command: `perl -e 'alarm 60; exec @ARGV' cmd`
+  does the same.
+- **Loopback.** macOS's loopback hides some of what a real link shows: it delivered uploads at 1 GiB/s while Nagle's
+  algorithm stalled Linux's at 1.6 MiB/s, and its acknowledgements arrive apart from `send()`. Check changes to how
+  data is sent on Linux as well.
+- **Botan's loop alignment** (the library is `build/vcpkg_installed/<triplet>/lib/libbotan-3.a`):
+  `otool -tV -p __ZN5Botan3TLS12Record_Layer11next_recordEPNS0_12Cipher_StateE <library>`.
+
+#### Linux
+
+- **Compilers.** Both `dev-clang` and `dev-gcc` build locally, each with its sanitizers; LeakSanitizer is on by
+  default. Clang uses libstdc++ unless told otherwise, as CI's Linux jobs do.
+- **TLS's trust store** is the system's bundle.
+- **Lint.** clang-tidy against libstdc++ finds what CI's lint does. IWYU needs no pointing at a standard library:
+
+  ```sh
+  iwyu_tool.py -p build -- -Xiwyu --mapping_file=$PWD/iwyu.imp -Xiwyu --no_fwd_decls
+  ```
+- **Docker.** `host.docker.internal`, which the Autobahn command under CI uses, isn't defined by Docker Engine: add
+  `--add-host=host.docker.internal:host-gateway` to `docker run` (or use `--network host` and `localhost`).
+- **Links with a round trip** (`bench_client stream`) come from `tc netem`, which needs Linux (in a container
+  elsewhere).
+- **Botan's loop alignment** (the library as on macOS):
+  `objdump -d --disassemble=_ZN5Botan3TLS12Record_Layer11next_recordEPNS0_12Cipher_StateE <library>`.
 
 ### Tests
 
@@ -133,21 +183,21 @@ ctest --test-dir build -C Debug                 # all tests
 ctest --test-dir build -C Debug -R uuid         # via ctest regex
 ```
 
-- The hidden network tests (see Building, above) are tagged `[.network]`, which Catch2 reads as `[.][network]`; a spec
-  naming any of their tags or names runs them (`"[dns]"` includes them).
+- The hidden network tests (see the top-level Building section) are tagged `[.network]`, which Catch2 reads as
+  `[.][network]`; a spec naming any of their tags or names runs them (`"[dns]"` includes them).
 - The resolver's tests use `test/dns/blocking_lookup.hpp` (a lookup that blocks until released) and the native back
   end's `test/dns/fake_server.hpp` (a fake nameserver on loopback, its address in an injected `dns::config`, so nothing
   reads `/etc` or needs the network): their comments give the lifetime rules.
 - Stress a new or changed concurrent test once its code has settled, not after every change (commas in a test's name
-  escaped as `\,`; `caffeinate -s -i` keeps a Mac awake, so leave it out on Linux). A race that shows up in about 1 run
-  in 200 passes one run and fails CI later.
+  escaped as `\,`; on macOS, under `caffeinate`: see Platforms). A race that shows up in about 1 run in 200 passes one
+  run and fails CI later.
 
   ```sh
-  seq 1 400 | caffeinate -s -i xargs -P 8 -I{} sh -c './build/test/Debug/tests "<spec>" >/dev/null 2>&1 || echo FAIL' | grep -c FAIL
+  seq 1 400 | xargs -P 8 -I{} sh -c './build/test/Debug/tests "<spec>" >/dev/null 2>&1 || echo FAIL' | grep -c FAIL
   ```
-- In ASan builds, the tests report leaks on Linux and (with LLVM's clang) macOS: `test/sanitizers.cpp` turns
-  LeakSanitizer on where it isn't by default (Apple's clang doesn't support it), and suppresses known leaks in system
-  libraries. `ASAN_OPTIONS`/`LSAN_OPTIONS` override it.
+- In ASan builds, the tests report leaks wherever LeakSanitizer works (see Platforms): `test/sanitizers.cpp` turns it
+  on where it isn't by default, and suppresses known leaks in system libraries. `ASAN_OPTIONS`/`LSAN_OPTIONS` override
+  it.
 - `test/test_server.go` is a throwaway Go server for manual testing against the examples. It is not part of the test
   suite.
 
@@ -165,7 +215,7 @@ when the compiler can link libFuzzer: LLVM's clang (e.g. Homebrew's) can, Apple'
 what it measures, its modes and arguments, and what it found; the plans' "Learned in" sections have the numbers behind
 decisions. They're only meaningful in an optimized build, and nothing runs them automatically: `cmake --build build
 --config Release --target bench_task && ./build/bench/Release/bench_task`. `bench/CMakeLists.txt` lists the targets;
-`bench_client stream` wants a link with a round trip (e.g. netem in a Linux container), and `bench_tls writes` uses the
+`bench_client stream` wants a link with a round trip (netem: see Platforms), and `bench_tls writes` uses the
 default `write_batch_size`.
 
 `bench/web/run.sh [server ...]` compares the HTTP server with Go's net/http, hyper, Bun and Node on TechEmpower's
@@ -175,8 +225,7 @@ more.
 
 Benchmarks are load-sensitive: measure on an otherwise idle machine (nothing else building or benchmarking),
 interleaving the before and after rounds. Numbers from different machines or CPUs aren't comparable, so a baseline is
-rerun on the machine measuring the change. A Mac in maintenance sleep stalls long runs unless they're under `caffeinate
--s -i`.
+rerun on the machine measuring the change. Each platform's oddities for long runs and loopback are under Platforms.
 
 ### Formatting and linting
 
@@ -194,24 +243,14 @@ rerun on the machine measuring the change. A Mac in maintenance sleep stalls lon
 - `.clang-tidy` enables a broad set of checks: bugprone, cert, cppcoreguidelines, google, misc, modernize, performance,
   readability. `test/.clang-tidy` relaxes some checks that fire on Catch2 macros.
 - To lint, run `clang-tidy -p build <file>` (a header too: it's linted as one, with a command inferred from the compile
-  database). On macOS that's against libc++, and CI's lint is against Arch's libstdc++, which finds things libc++ hides
-  (e.g. code under feature macros only libstdc++ defines, or throw paths inside its `std::variant`): only CI, or a lint
-  on Linux (whose Clang builds use libstdc++ too), checks those.
+  database). CI's lint is against Arch's libstdc++, which finds things libc++ hides (e.g. code under feature macros
+  only libstdc++ defines, or throw paths inside its `std::variant`), so a lint against libc++ misses those.
 - Includes follow include-what-you-use (IWYU), with the mappings in `iwyu.imp` (clang-tidy's `misc-include-cleaner` is
   off, as it disagrees). IWYU sees only the platform it runs on: it once dropped `config.hpp` from `epoll_loop.cpp`,
   which compiles epoll out on Linux without an error, so `config.hpp`'s includes carry `// IWYU pragma: keep`; after an
-  IWYU pass, check the files with platform `#if`s and build on the other platform (or let CI). With Homebrew's LLVM,
-  point IWYU at the same libc++ as the build, or it uses the macOS SDK's; on Linux, against libstdc++, the plain command
-  is enough. `fix_includes.py --nocomments --nosafe_headers` applies its output; then clang-format only the include
-  blocks.
-
-  ```sh
-  # macOS, Homebrew's LLVM
-  iwyu_tool.py -p build -- -Xiwyu --mapping_file=$PWD/iwyu.imp -Xiwyu --no_fwd_decls \
-      -nostdinc++ -isystem $(brew --prefix llvm)/include/c++/v1 -resource-dir $(clang++ -print-resource-dir)
-  # Linux
-  iwyu_tool.py -p build -- -Xiwyu --mapping_file=$PWD/iwyu.imp -Xiwyu --no_fwd_decls
-  ```
+  IWYU pass, check the files with platform `#if`s and build on the other platform (or let CI). Each platform's command
+  is under Platforms. `fix_includes.py --nocomments --nosafe_headers` applies its output; then clang-format only the
+  include blocks.
 
 ### CI
 
@@ -222,7 +261,7 @@ files a change touches. A job named `build` (the check `master`'s branch protect
 did. `.github/workflows/autobahn.yml` runs the Autobahn TestSuite against the WebSocket examples; it's optional and not
 part of `build` (its header says when it runs). To run Autobahn's `fuzzingclient` by hand against
 `example/websocket-echo` (port 9001), in a scratch directory (never the repository) with a config whose server is
-`ws://host.docker.internal:9001`:
+`ws://host.docker.internal:9001` (on Linux, see Platforms):
 
 ```sh
 docker run --rm -v $PWD:/ab -w /ab crossbario/autobahn-testsuite wstest -m fuzzingclient -s /ab/fuzzingclient.json
