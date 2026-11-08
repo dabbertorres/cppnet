@@ -82,6 +82,18 @@ Measured on master 3528cf2 (2026-11-01): macOS x86-64 (Intel Core i9-9980HK), Ho
 - **A frame allocator interacts with HALO**: the pool variant with its `operator new` inlined into the ramps lost
   elisions (`server.cpp` 5 to 1, `tls.cpp` 14 to 12: the ramps grew past the inliner's threshold, so their callers
   never saw them); out of line (`[[gnu::noinline]]`), every elision stayed.
+- **Which calls Clang elides** (Clang 23, `-O3`, checked with `-Rpass=coro-elide -Rpass-missed=coro-elide`): by
+  default (`coro-elide`) only a coroutine called directly in a `co_await`, and not inside a loop; never through a
+  wrapper that isn't a coroutine (e.g. one returning a `ready_task` or a coroutine's task), nor an indirect call (e.g.
+  the handler). `[[clang::coro_await_elidable]]` on `task` switches to another pass (`coro-annotation-elide`, remarks
+  `-Rpass=coro-annotation-elide`) that elides calls by how often they run: those in loops, but not ones that run once,
+  unless `-mllvm -coro-elide-branch-ratio=0` (an internal LLVM option). So the frames a request that has to wait still
+  allocates (the handler's, and `decode_reading`'s for a head that comes in pieces) aren't elided. The attribute could
+  take `decode_reading` (with `serve_connection` awaiting it directly, defined in a header), at the cost of bigger
+  frames (eliding cold calls would put e.g. the ~4.5 KB rare-path coroutines in each connection's frame) and an
+  unstable flag (question 9: skipped); a frame allocator (question 8) is the other option.
+- **`task`'s destructor is always inlined** (`task.hpp`'s note says why): before, a virtual call in it lost 77 of 78
+  elisions, which had been put down to the call being opaque. Inlined, what it calls may be opaque.
 
 ### What the allocations cost
 

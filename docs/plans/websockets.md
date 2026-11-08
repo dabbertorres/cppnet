@@ -969,7 +969,8 @@ with `client_options::http2_coalescing` on, so there's no 421 path.
   first wait) `timed_out`, having read nothing, the stream going on; otherwise it sets `wake_at`, which the timer's
   `check_streams()` turns into a notification of `changed` (and `wake_timer_at()` wakes the timer if it's sooner than it
   knew). `set_read_deadline()` notifies `changed` itself, so the server's close (a deadline of now, from another thread)
-  ends a waiting read at once. The stop callback takes the lock (never registered nor removed holding it; the server
+  ends a waiting read at once (since #94, which made a waiting read an operation, it wakes the reader with
+  `wake_reader()` instead). The stop callback takes the lock (never registered nor removed holding it; the server
   clears the token before the stream's destroyed under the lock) and notifies; a write that would wait (or waits queued)
   once stopped fails with `operation_canceled` and leaves the scheduler, so the writer never touches its span. `abort()`
   fails the stream (`connection_aborted`) and resets it (CANCEL).
@@ -1224,7 +1225,7 @@ temporary timestamps at the hand-overs between tasks; all taken out again):
   buffer (no `pending` copy) measured no difference, nor did reads of 128 KiB rather than 32, nor a tunnel window of
   16 MiB (54 to 62 us), so they weren't kept. Reading a waiting stream's DATA straight into its reader's span (a stream
   read as an operation, as a socket's is) would save a copy and the frame, but touches every path that wakes a stream's
-  read; left for later.
+  read; left for later (since done, in #94).
 
 The fixes:
 

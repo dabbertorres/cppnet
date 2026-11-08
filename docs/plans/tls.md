@@ -36,7 +36,10 @@ default, against the system's trust store.
 - **Each `http::client` has its own `client_context`** (trust store, session cache), not one shared process-wide.
   Since 2026-11-01 (#110) the system's trust store in it is read once per process and shared, as Go's `systemRoots`
   is; a failed load isn't cached, so the next context tries again (the user's decision; Go caches the error). A CA
-  file's store and the session cache stay each context's own.
+  file's store and the session cache stay each context's own. GCC on macOS reads `/etc/ssl/cert.pem`, which lags the
+  keychain: macOS 26.6's lacks AAA Certificate Services and SSL.com's 2022 roots, so example.com's chain fails there,
+  and the public-server tests use www.digicert.com and letsencrypt.org, whose roots every store has. Apple's
+  `/usr/bin/openssl` falls back to the keychain, so it can't show such a gap.
 - **The client's handshake times out after 10s by default** (`client_options::tls_handshake_timeout`, separate from
   `connect_timeout`, so an error says which phase it was): a TLS 1.3 handshake is one round trip after TCP's, and 10s
   still finishes one that loses two packets (TCP's retransmission timeout starts at 1s and doubles), while giving up on a
@@ -602,6 +605,10 @@ handshake in the field. The network tests (public servers) exercise interoperabi
 - vcpkg's ABI hash covers the portfile, so every cache (CI's too) builds Botan again once. CI's GCC, Linux, arm64 and
   libstdc++ builds are the check of the list on other CPUs, compilers and trust stores; `configure.py` was run by hand
   for macOS and Linux on x86-64 and arm64 (with `--disable-cc-tests`), loading the same modules but the CPUs'.
+- Since #117 the port builds Botan with `-falign-loops=64` on x64 (the portfile's comment says why: Intel's JCC
+  erratum). Check where its TLS 1.3 padding scan lands in the built library with
+  `otool -tV -p __ZN5Botan3TLS12Record_Layer11next_recordEPNS0_12Cipher_StateE <lib>` on macOS, or
+  `objdump -d --disassemble=_ZN5Botan3TLS12Record_Layer11next_recordEPNS0_12Cipher_StateE <lib>` on Linux.
 
 ### Client certificates (part 2)
 
