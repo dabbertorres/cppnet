@@ -615,20 +615,18 @@ TEST_CASE("a server that doesn't answer is followed by the next", "[dns][native]
 TEST_CASE("a server whose port is closed is followed by the next at once", "[dns][native][retry]")
 {
     net::io::scheduler sched{make_pool()};
+    test::fake_server  answering{&sched, test::answer_from(host_zone())};
 
-    // a port nothing listens on: the OS refuses datagrams to it.
-    std::uint16_t closed = 0;
-    {
-        auto sock = net::udp_socket::bind(&sched, net::ipv4_addr::loopback(), 0);
-        REQUIRE(sock.has_value());
-        closed = sock->local_port();
-    }
-
-    test::fake_server answering{&sched, test::answer_from(host_zone())};
+    // a port that takes no datagram from the resolver, so the OS refuses them: held by a socket connected elsewhere (to
+    // the answering server, which sends it nothing), as a connected socket takes only its peer's. A port let go
+    // instead could be given to another socket before the query, e.g. the resolver's own, which would then read its
+    // query back and wait out its timeout.
+    auto refusing = net::udp_socket::connect(&sched, net::ipv4_addr::loopback(), answering.port());
+    REQUIRE(refusing.has_value());
 
     const auto resolver = native(config_for(
         {
-            {.addr = net::ipv4_addr::loopback(), .port = closed},
+            {.addr = net::ipv4_addr::loopback(), .port = refusing->local_port()},
             answering.nameserver()
     },
         10s));
