@@ -259,14 +259,14 @@ TEST_CASE("a connected socket's datagram to a closed port is refused", "[udp]")
 {
     net::io::scheduler sched{make_pool()};
 
-    // bind a port, and then let it go: nothing is bound to it afterwards.
-    std::uint16_t port = 0;
-    {
-        auto closed = bind_or_skip(&sched, net::ipv4_addr::loopback());
-        port        = closed.local_port();
-    }
+    // a port that takes no datagram from the client, so the OS refuses them: held by a socket connected elsewhere (to
+    // peer, which sends it nothing), as a connected socket takes only its peer's. A port let go instead could be given
+    // to another socket before the client writes, e.g. the client itself, which would then read its datagram back.
+    auto peer    = bind_or_skip(&sched, net::ipv4_addr::loopback());
+    auto holding = net::udp_socket::connect(&sched, net::ipv4_addr::loopback(), peer.local_port());
+    REQUIRE(holding.has_value());
 
-    auto client = net::udp_socket::connect(&sched, net::ipv4_addr::loopback(), port);
+    auto client = net::udp_socket::connect(&sched, net::ipv4_addr::loopback(), holding->local_port());
     REQUIRE(client.has_value());
     client->set_timeout(10s);
 
