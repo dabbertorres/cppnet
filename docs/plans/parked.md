@@ -44,6 +44,10 @@ taken off as they're started (moved into a plan of their own) or dropped.
 ## Tests
 
 - **A deterministic test mode**: one worker and fake time, as Go's `testing/synctest` or Tokio's paused clock.
+- **`test/socket.cpp`'s "wait_writable waits until the peer has read"** failed once (2026-11-13) on Linux under
+  deliberately heavy load (a full `ctest -j4` beside four stress loops of another test, in a container), while the
+  DNS closed-port flake was being reproduced; its output wasn't kept, and it hasn't failed on CI. Stress it under load
+  to tell a race from overload.
 
 ## Upstream
 
