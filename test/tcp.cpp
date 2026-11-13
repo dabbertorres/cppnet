@@ -39,6 +39,7 @@
 #include "dns/blocking_lookup.hpp"
 #include "dns/resolver.hpp"
 #include "exception.hpp"
+#include "held_port.hpp"
 #include "io/io.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
@@ -96,18 +97,6 @@ net::coro::task<bool> wait_calls(net::io::scheduler* sched, const test::blocking
     co_return true;
 }
 
-std::string closed_port()
-{
-    // bind a port, and then let it go: nothing is listening on it afterwards.
-    net::io::scheduler sched{make_pool()};
-    net::listener      listener{&sched, "127.0.0.1", "0", net::network::tcp};
-
-    sockaddr_in addr{};
-    socklen_t   size = sizeof(addr);
-    REQUIRE(::getsockname(listener.native_handle(), reinterpret_cast<sockaddr*>(&addr), &size) == 0);
-    return std::to_string(ntohs(addr.sin_port));
-}
-
 }
 
 TEST_CASE("set_notsent_lowat sets TCP_NOTSENT_LOWAT, and 0 turns it off", "[tcp][notsent-lowat]")
@@ -139,10 +128,12 @@ TEST_CASE("set_notsent_lowat sets TCP_NOTSENT_LOWAT, and 0 turns it off", "[tcp]
 
 TEST_CASE("connecting to a port nothing listens on is refused", "[tcp][connect]")
 {
-    auto port = closed_port();
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
 
     net::io::scheduler sched{make_pool()};
-    CHECK(sched.run_to_completion(connect_error(&sched, "127.0.0.1", port, 5s)) == std::errc::connection_refused);
+    CHECK(sched.run_to_completion(connect_error(&sched, "127.0.0.1", std::to_string(closed->port()), 5s))
+          == std::errc::connection_refused);
 }
 
 TEST_CASE("connecting to an unknown host fails to resolve", "[tcp][connect][.network]")
@@ -1061,7 +1052,9 @@ TEST_CASE("racing attempts starts the next at once when the latest fails", "[tcp
     auto listener = net::listener::make(&sched, "127.0.0.1", "0");
     REQUIRE(listener.has_value());
 
-    const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+    const auto held = test::held_port::make();
+    REQUIRE(held.has_value());
+    const auto closed = held->port();
 
     SECTION("while it's the only one")
     {
@@ -1298,7 +1291,9 @@ TEST_CASE("racing attempts fails with the last attempt's error", "[tcp][connect]
 {
     net::io::scheduler sched{make_pool()};
 
-    const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+    const auto held = test::held_port::make();
+    REQUIRE(held.has_value());
+    const auto closed = held->port();
 
     SECTION("one after another")
     {
@@ -1869,7 +1864,9 @@ TEST_CASE("connecting goes on if one family fails to resolve", "[tcp][connect][h
     net::io::scheduler sched{make_pool()};
     net::util::defer   release{[&lookup] noexcept { lookup.release(); }};
 
-    const auto closed = static_cast<std::uint16_t>(std::stoi(closed_port()));
+    const auto held = test::held_port::make();
+    REQUIRE(held.has_value());
+    const auto closed = held->port();
 
     // connects, letting the lookup's calls go once both have started: let go at once, one family's answer could end
     // connecting (and so the lookup) before the other's call had been given a thread, and then it's never made.

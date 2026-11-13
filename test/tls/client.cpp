@@ -23,6 +23,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "held_port.hpp"
 #include "http/connection_pool.hpp"
 #include "http/request.hpp"
 #include "io/io.hpp"
@@ -163,15 +164,6 @@ net::http::client_options trusting_options()
     net::http::client_options options;
     options.tls.trusted_ca_file = pki().ca;
     return options;
-}
-
-// closed_port is a port nothing listens on, on 127.0.0.1: bound, then let go.
-std::string closed_port()
-{
-    net::io::scheduler sched{make_pool()};
-    auto               listener = net::listener::make(&sched, "127.0.0.1", "0");
-    REQUIRE(listener.has_value());
-    return std::to_string(listener->local_port());
 }
 
 // unreadable_ca_options are a client's whose TLS context can't be made: its CA file isn't there.
@@ -545,7 +537,9 @@ TEST_CASE("an https request fails with its TLS context's error, before resolving
           "[tls][http][client][context]")
 {
     // nothing listens on the port: were the context made after connecting, connection_refused would come first.
-    const auto port = closed_port();
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
+    const auto port = std::to_string(closed->port());
 
     const bool http2 = GENERATE(true, false);
     CAPTURE(http2);
@@ -587,7 +581,9 @@ TEST_CASE("an https request stopped before its TLS context is made fails with op
           "[tls][http][client][context][cancel]")
 {
     // were the context made (or anything connected), its error (or connection_refused) would come instead.
-    const auto port = closed_port();
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
+    const auto port = std::to_string(closed->port());
 
     net::io::scheduler sched{make_pool()};
     net::http::client  client{&sched, unreadable_ca_options()};
@@ -644,9 +640,13 @@ TEST_CASE("a request destroyed while its client's TLS context waits to be made n
 
     // a context that can't be made (its CA file isn't there), to a port nothing listens on: had its load run, the
     // request would have failed, nothing connected.
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
+    const auto closed_url = "https://127.0.0.1:" + std::to_string(closed->port()) + "/";
+
     auto                         client = std::make_unique<net::http::client>(&sched, unreadable_ca_options());
     net::coro::task<std::string> caller = [](net::http::client* client, std::string url) -> net::coro::task<std::string>
-    { co_return co_await fetch(client, std::move(url)); }(client.get(), "https://127.0.0.1:" + closed_port() + "/");
+    { co_return co_await fetch(client, std::move(url)); }(client.get(), closed_url);
 
     // the request starts here, and suspends once it has handed the context's load to the blocking thread, behind the
     // blocker: counted as a connection being made meanwhile.

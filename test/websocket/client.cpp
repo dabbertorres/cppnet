@@ -30,6 +30,7 @@
 
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "held_port.hpp"
 #include "http/connection_pool.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
@@ -685,12 +686,9 @@ TEST_CASE("a WebSocket client's connecting and handshake fail as connecting does
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
-    // a port no one listens on: a listener's, closed.
-    std::uint16_t closed_port = 0;
-    {
-        auto listener = net::listener::make(&sched, "127.0.0.1", "0").value();
-        closed_port   = listener.local_port();
-    }
+    // a port no one listens on.
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
 
     // a server that never answers.
     raw_server   server{&sched};
@@ -708,7 +706,7 @@ TEST_CASE("a WebSocket client's connecting and handshake fail as connecting does
         for (const auto& url : {std::string{"ftp://127.0.0.1/ws"},
                                 std::string{"127.0.0.1/ws"},
                                 std::string{"ws://[::1/ws"},
-                                url_of(closed_port),
+                                url_of(closed->port()),
                                 server.url()})
         {
             auto conn = co_await ws::connect(client, url);
@@ -1181,12 +1179,9 @@ TEST_CASE("a WebSocket client refuses sizes out of their ranges, before it conne
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
 
-    // a port no one listens on: a listener's, closed. A connect that got as far as connecting is refused there.
-    std::uint16_t closed_port = 0;
-    {
-        auto listener = net::listener::make(&sched, "127.0.0.1", "0").value();
-        closed_port   = listener.local_port();
-    }
+    // a port no one listens on: a connect that got as far as connecting is refused there.
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
 
     struct test_case
     {
@@ -1220,6 +1215,6 @@ TEST_CASE("a WebSocket client refuses sizes out of their ranges, before it conne
         {
             auto conn = co_await ws::connect(*client, url, options);
             co_return conn.has_value() ? std::error_code{} : conn.error();
-        }(&client, url_of(closed_port), tc.options));
+        }(&client, url_of(closed->port()), tc.options));
     CHECK(got == tc.want);
 }
