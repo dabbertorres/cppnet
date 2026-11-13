@@ -47,7 +47,7 @@ TEST_CASE("just a request line", "[http][1.1][request_decode]")
     net::io::string_reader<char> content("GET /some/resource HTTP/1.1\r\nHost: a\r\n\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto task   = net::http::http11::request_decode(buf_reader);
     auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
@@ -77,7 +77,7 @@ TEST_CASE("with headers", "[http][1.1][request_decode]")
                                          "\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto task   = net::http::http11::request_decode(buf_reader);
     auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
@@ -113,7 +113,7 @@ TEST_CASE("with headers and body", "[http][1.1][request_decode]")
                                          "this is a request\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto task   = net::http::http11::request_decode(buf_reader);
     auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
@@ -165,7 +165,7 @@ TEST_CASE("with headers and multi-line body", "[http][1.1][request_decode]")
                                          "lines\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto task   = net::http::http11::request_decode(&buf_reader);
+    auto task   = net::http::http11::request_decode(buf_reader);
     auto result = test::sync_wait(std::move(task));
 
     REQUIRE(result.has_value());
@@ -221,7 +221,7 @@ TEST_CASE("chunked", "[http][1.1][request_decode]")
                                          "\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    auto result = test::sync_wait(net::http::http11::request_decode(buf_reader));
     REQUIRE(result.has_value());
 
     std::string body(64, 0);
@@ -235,7 +235,7 @@ TEST_CASE("chunked", "[http][1.1][request_decode]")
     CHECK(read_result.err == net::io::errc::end_of_stream);
     CHECK(read_result.count == 0);
 
-    auto next = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    auto next = test::sync_wait(net::http::http11::request_decode(buf_reader));
     REQUIRE(next.has_value());
     CHECK(next->method == net::http::request_method::GET);
     CHECK(next->target.path == "/next"sv);
@@ -253,7 +253,7 @@ TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
                                          "\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto first = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    auto first = test::sync_wait(net::http::http11::request_decode(buf_reader));
     REQUIRE(first.has_value());
 
     std::string body(64, 0);
@@ -265,7 +265,7 @@ TEST_CASE("next request follows the body", "[http][1.1][request_decode]")
     read_result = test::sync_wait(first->body->read(body));
     CHECK(read_result.err == net::io::errc::end_of_stream);
 
-    auto second = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    auto second = test::sync_wait(net::http::http11::request_decode(buf_reader));
     REQUIRE(second.has_value());
     CHECK(second->method == net::http::request_method::GET);
     CHECK(second->target.path == "/second"sv);
@@ -279,7 +279,7 @@ TEST_CASE("invalid percent-encoding in the target", "[http][1.1][request_decode]
                                          "\r\n");
     net::io::buffered_reader     buf_reader(&content);
 
-    auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+    auto result = test::sync_wait(net::http::http11::request_decode(buf_reader));
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == std::errc::invalid_argument);
 }
@@ -291,7 +291,7 @@ TEST_CASE("host comes from the target, if it has one", "[http][1.1][request_deco
         net::io::string_reader<char> content("GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n");
         net::io::buffered_reader     buf_reader(&content);
 
-        auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+        auto result = test::sync_wait(net::http::http11::request_decode(buf_reader));
         REQUIRE(result.has_value());
         CHECK(result->host == "example.com");
     }
@@ -301,7 +301,7 @@ TEST_CASE("host comes from the target, if it has one", "[http][1.1][request_deco
         net::io::string_reader<char> content("GET http://target.example/path HTTP/1.1\r\nHost: header.example\r\n\r\n");
         net::io::buffered_reader     buf_reader(&content);
 
-        auto result = test::sync_wait(net::http::http11::request_decode(&buf_reader));
+        auto result = test::sync_wait(net::http::http11::request_decode(buf_reader));
         REQUIRE(result.has_value());
         CHECK(result->host == "target.example");
         CHECK(result->target.path == "/path");
@@ -324,7 +324,7 @@ TEST_CASE("requests are encoded in origin-form, with a Host header", "[http][1.1
     req.uri.query = "q=x&y=z\r\n";
 
     net::io::string_writer<char> out;
-    auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
+    auto                         res = test::sync_wait(net::http::http11::request_encode(out, req));
     REQUIRE(res.has_value());
 
     CHECK(out.build() == "GET /a%20b%0D%0AX-Injected:%20yes?q=x&y=z%0D%0A HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
@@ -339,7 +339,7 @@ net::http::request_decoder_result decode(std::string_view text, std::size_t max_
     net::io::string_reader<char> content{text};
     net::io::buffered_reader     buf_reader{&content};
 
-    return test::sync_wait(net::http::http11::request_decode(&buf_reader, max_header_bytes));
+    return test::sync_wait(net::http::http11::request_decode(buf_reader, max_header_bytes));
 }
 
 }
@@ -513,7 +513,7 @@ TEST_CASE("status lines", "[http][1.1][response_encode]")
         .status_code = static_cast<net::http::status>(tc.code)
     };
 
-    auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
+    auto res = test::sync_wait(net::http::http11::response_encode(out, resp));
     REQUIRE(res.has_value());
     CHECK(out.build().starts_with(tc.want));
 }
@@ -529,7 +529,7 @@ TEST_CASE("status codes outside 100-599 aren't encoded", "[http][1.1][response_e
         .status_code = static_cast<net::http::status>(code)
     };
 
-    auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
+    auto res = test::sync_wait(net::http::http11::response_encode(out, resp));
     REQUIRE_FALSE(res.has_value());
     CHECK(res.error() == std::errc::invalid_argument);
     CHECK(out.build().empty());
@@ -586,7 +586,7 @@ TEST_CASE("unsafe header fields aren't encoded", "[http][1.1][response_encode][s
     };
     resp.headers.set(name, value);
 
-    auto res = test::sync_wait(net::http::http11::response_encode(&out, resp));
+    auto res = test::sync_wait(net::http::http11::response_encode(out, resp));
     REQUIRE_FALSE(res.has_value());
     CHECK(res.error() == std::errc::invalid_argument);
 }
@@ -876,7 +876,7 @@ TEST_CASE("a response's head decodes the same whether it's buffered whole or com
     net::io::buffered_reader     whole{&whole_text};
     REQUIRE_FALSE(test::sync_wait(fill_whole(&whole)));
 
-    auto decoding = net::http::http11::response_decode(&whole, tc.method, max_header_bytes);
+    auto decoding = net::http::http11::response_decode(whole, tc.method, max_header_bytes);
     CHECK(decoding.finished_without_coroutine() == tc.without_coroutine);
     const auto from_whole = outcome(test::sync_wait(std::move(decoding)));
 
@@ -884,7 +884,7 @@ TEST_CASE("a response's head decodes the same whether it's buffered whole or com
     trickle_reader           pieces_text{tc.response};
     net::io::buffered_reader pieces{&pieces_text};
     const auto               from_pieces =
-        outcome(test::sync_wait(net::http::http11::response_decode(&pieces, tc.method, max_header_bytes)));
+        outcome(test::sync_wait(net::http::http11::response_decode(pieces, tc.method, max_header_bytes)));
 
     CHECK(from_whole == from_pieces);
     if (tc.name == "too large") CHECK(from_whole.err == std::errc::value_too_large);
@@ -917,7 +917,7 @@ std::string encode_request(const net::http::client_request& req)
 {
     net::io::string_writer<char> out;
 
-    auto res = test::sync_wait(net::http::http11::request_encode(&out, req));
+    auto res = test::sync_wait(net::http::http11::request_encode(out, req));
     if (!res.has_value()) return "error: " + res.error().message();
     return out.build();
 }
@@ -1087,7 +1087,7 @@ TEST_CASE("a chunked request's last chunk carries make_trailers' fields", "[http
         req.make_trailers = [](net::http::trailer_fields& trailers) { trailers.set("X-Bad"sv, "a\r\nb"sv); };
 
         net::io::string_writer<char> out;
-        auto                         res = test::sync_wait(net::http::http11::request_encode(&out, req));
+        auto                         res = test::sync_wait(net::http::http11::request_encode(out, req));
         REQUIRE_FALSE(res.has_value());
         CHECK(res.error() == std::errc::invalid_argument);
         CHECK(out.build() == "PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
@@ -1171,11 +1171,11 @@ TEST_CASE("a request's head and body encode apart as together", "[http][1.1][req
     const auto                   req = test.make();
     net::io::string_writer<char> out;
 
-    const auto head = test::sync_wait(net::http::http11::request_encode_head(&out, req));
+    const auto head = test::sync_wait(net::http::http11::request_encode_head(out, req));
     REQUIRE(head.has_value());
     CHECK(out.build() == test.head);
 
-    const auto body = test::sync_wait(net::http::http11::request_encode_body(&out, req));
+    const auto body = test::sync_wait(net::http::http11::request_encode_body(out, req));
     REQUIRE(body.has_value());
     CHECK(out.build() == whole);
 }
@@ -1186,7 +1186,7 @@ TEST_CASE("a request's head alone fails as the whole request would", "[http][1.1
     req.headers.set_content_length(5);
 
     net::io::string_writer<char> out;
-    const auto                   res = test::sync_wait(net::http::http11::request_encode_head(&out, req));
+    const auto                   res = test::sync_wait(net::http::http11::request_encode_head(out, req));
     REQUIRE_FALSE(res.has_value());
     CHECK(res.error() == std::errc::invalid_argument);
     CHECK(out.build().empty());
@@ -1269,7 +1269,7 @@ TEST_CASE("a request's head is formatted into a buffered writer with room for it
         net::io::string_writer<char> out;
         net::io::buffered_writer     writer{&out, 4'096};
 
-        auto       encoding = net::http::http11::request_encode(&writer, req);
+        auto       encoding = net::http::http11::request_encode(writer, req);
         const bool ready    = encoding.finished_without_coroutine();
         const auto encoded  = test::sync_wait(std::move(encoding));
         CHECK(ready == (req.body == nullptr));
@@ -1282,7 +1282,7 @@ TEST_CASE("a request's head is formatted into a buffered writer with room for it
         net::io::string_writer<char> head_out;
         net::io::buffered_writer     head_writer{&head_out, 4'096};
 
-        auto head = net::http::http11::request_encode_head(&head_writer, again);
+        auto head = net::http::http11::request_encode_head(head_writer, again);
         REQUIRE(head.finished_without_coroutine());
         const auto head_encoded = std::move(head).result();
         REQUIRE(head_encoded.has_value());
@@ -1297,7 +1297,7 @@ TEST_CASE("a request's head is formatted into a buffered writer with room for it
         net::io::string_writer<char> out;
         net::io::buffered_writer     writer{&out, 16};
 
-        REQUIRE(test::sync_wait(net::http::http11::request_encode(&writer, req)).has_value());
+        REQUIRE(test::sync_wait(net::http::http11::request_encode(writer, req)).has_value());
         REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
         CHECK(out.build() == whole);
     }
@@ -1316,7 +1316,7 @@ TEST_CASE("stop_at_interim returns each interim response, once it's passed on", 
 
     const auto decode = [&]
     {
-        return test::sync_wait(net::http::http11::response_decode(&reader,
+        return test::sync_wait(net::http::http11::response_decode(reader,
                                                                   net::http::request_method::POST,
                                                                   std::numeric_limits<std::size_t>::max(),
                                                                   on_informational,
@@ -1349,7 +1349,7 @@ TEST_CASE("stop_at_interim doesn't stop at 101, which is final", "[http][1.1][re
 {
     owning_buffered_reader reader{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n"};
 
-    const auto resp = test::sync_wait(net::http::http11::response_decode(&reader,
+    const auto resp = test::sync_wait(net::http::http11::response_decode(reader,
                                                                          net::http::request_method::GET,
                                                                          std::numeric_limits<std::size_t>::max(),
                                                                          {},
@@ -1364,7 +1364,7 @@ TEST_CASE("a response's chunked body keeps its trailers where it's told", "[http
     owning_buffered_reader reader{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n"
                                   "Server-Timing: db;dur=53\r\nContent-Length: 5\r\n\r\n"};
 
-    auto resp = test::sync_wait(net::http::http11::response_decode(&reader, net::http::request_method::GET));
+    auto resp = test::sync_wait(net::http::http11::response_decode(reader, net::http::request_method::GET));
     REQUIRE(resp.has_value());
 
     net::http::trailer_fields trailers;
@@ -1391,7 +1391,7 @@ TEST_CASE("encoded request bodies decode", "[http][1.1][request_encode][body]")
     // NOTE: the body reads from the reader, so it's kept here (unlike in decode()).
     auto                   encoded = encode_request(req);
     owning_buffered_reader reader{encoded};
-    auto                   decoded = test::sync_wait(net::http::http11::request_decode(&reader, 8'192));
+    auto                   decoded = test::sync_wait(net::http::http11::request_decode(reader, 8'192));
     REQUIRE(decoded.has_value());
     CHECK(decoded->headers.is_chunked() == !with_length);
     CHECK(read_body(*decoded->body) == content);
@@ -1438,7 +1438,7 @@ TEST_CASE("requests decoded into one request don't keep anything of the last", "
         }
     };
 
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
     CHECK(req.method == net::http::request_method::POST);
     CHECK(req.target.path == "/a");
     CHECK(req.target.query == "x=1");
@@ -1446,7 +1446,7 @@ TEST_CASE("requests decoded into one request don't keep anything of the last", "
     CHECK(req.headers.get("X-Only-First"sv) == "yes");
     CHECK(body() == "abc");
 
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
     CHECK(req.method == net::http::request_method::PUT);
     CHECK(req.target.path == "/b");
     CHECK(req.target.query.empty());
@@ -1459,7 +1459,7 @@ TEST_CASE("requests decoded into one request don't keep anything of the last", "
     });
     CHECK(body() == "de");
 
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
     CHECK(req.method == net::http::request_method::GET);
     CHECK(req.version == net::http::protocol_version{.major = 1, .minor = 0});
     CHECK(req.target == net::http::request_target{.path = "/c"});
@@ -1485,7 +1485,7 @@ TEST_CASE("a response head that doesn't fit in the writer's buffer is still writ
     net::io::string_writer<char> out;
     net::io::buffered_writer     writer{&out, buffer_size};
 
-    auto res = test::sync_wait(net::http::http11::response_encode(&writer, resp));
+    auto res = test::sync_wait(net::http::http11::response_encode(writer, resp));
     REQUIRE(res.has_value());
     REQUIRE_FALSE(test::sync_wait(writer.flush()).err);
     CHECK(out.build() == want);
@@ -1500,7 +1500,7 @@ TEST_CASE("a field line longer than the reader's buffer is still decoded", "[htt
     net::io::buffered_reader     reader(&content, 32);
     net::http::server_request    req;
 
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
     CHECK(req.headers.get("X-Long"sv) == value);
 }
 
@@ -1511,7 +1511,7 @@ TEST_CASE("a malformed request line fails without waiting for the rest of the he
     net::io::buffered_reader     reader(&content, 8);
     net::http::server_request    req;
 
-    auto err = test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req));
+    auto err = test::sync_wait(net::http::http11::request_decode(reader, 8'192, req));
     CHECK(err == std::errc::invalid_argument);
 }
 
@@ -1710,7 +1710,7 @@ TEST_CASE("a request body's start callback is awaited before its first read", "[
     net::io::string_reader<char> content(text);
     net::io::buffered_reader     reader(&content);
     net::http::server_request    req;
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
 
     int calls = 0;
     net::http::http11::call_at_body_start(req,
@@ -1738,7 +1738,7 @@ TEST_CASE("a request body's first read fails with its start callback's error", "
     net::io::string_reader<char> content("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello");
     net::io::buffered_reader     reader(&content);
     net::http::server_request    req;
-    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(&reader, 8'192, req)));
+    REQUIRE_FALSE(test::sync_wait(net::http::http11::request_decode(reader, 8'192, req)));
 
     net::http::http11::call_at_body_start(
         req,

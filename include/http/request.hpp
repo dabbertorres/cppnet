@@ -305,7 +305,7 @@ using request_encoder_result = std::expected<io::writer*, std::error_code>;
 // request_decoders borrow the connection's reader, which must outlive the decoded request's body. The reader is kept
 // for the connection, rather than per request, so that anything buffered past the end of one request is still there
 // for the next.
-using request_decoder = coro::task<request_decoder_result> (*)(io::buffered_reader*, std::size_t) noexcept;
-using request_encoder = coro::task<request_encoder_result> (*)(io::writer*, const client_request&) noexcept;
+using request_decoder = coro::task<request_decoder_result> (*)(io::buffered_reader&, std::size_t) noexcept;
+using request_encoder = coro::task<request_encoder_result> (*)(io::writer&, const client_request&) noexcept;
 
 }

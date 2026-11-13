@@ -2,7 +2,7 @@
 
 Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 4 done (pull requests
 #112 to #117; Learned in the stages has how each met the bar). Paused after stage 4 by the user (2026-11-02): stage 5
-and the `http11` references change (below) wait for the user's go-ahead.
+waits for the user's go-ahead. The `http11` references change (below) is done.
 
 ## Goal
 
@@ -375,7 +375,14 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   allocations on every target case (above) with no p < 0.05 either way.
 - **After stage 4** (approved by the user, 2026-11-02, as its own pull request): every `http11` encode and decode
   parameter (`request_encode`, `request_encode_head`, `request_encode_body`, `response_encode`, both
-  `request_decode`s, `response_decode`) becomes a reference, its null check dropped; results stay pointers.
+  `request_decode`s, `response_decode`) becomes a reference, its null check dropped; results stay pointers. Done
+  (2026-11-13), with the private helpers they pass them to, `response_encoder` and the unused request aliases (the
+  owning `response_decode` and `response_decoder` stay as they were). Ten interleaved rounds a side against master
+  105d7b1 (`bench_request`, `bench_client`, `bench/web`): no allocation changed; six in-memory `bench_request` cases
+  1.7 to 2.9% slower (p <= 0.017), of which a confirmation run of ten more reproduced two (one per read +0.8%, p =
+  0.005; the runtime router +2.6%, p = 0.002). The code they run is the same but for `response_encode`'s dropped
+  null test (`request_decode` and `set_request_body` byte for byte), and 2,431 functions after `encode_request` sit
+  48 bytes earlier. The user kept it (2026-11-13), taking placement as the explanation, as in stage 2.
 
 ## Decided questions
 

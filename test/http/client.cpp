@@ -825,7 +825,7 @@ struct echo_server
 
         while (true)
         {
-            auto req = co_await net::http::http11::request_decode(&reader, 8'192);
+            auto req = co_await net::http::http11::request_decode(reader, 8'192);
             if (!req.has_value()) break;
 
             ++requests;

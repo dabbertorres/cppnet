@@ -1053,7 +1053,7 @@ coro::task<std::optional<detail::connection>> server::accept_tls(tcp_socket conn
         // too).
         std::error_code err;
         if (state.reader.size() == 0) err = co_await state.reader.fill();
-        if (!err) err = co_await http11::request_decode(&state.reader, max_header_bytes, req);
+        if (!err) err = co_await http11::request_decode(state.reader, max_header_bytes, req);
 
         detail::socket_of(conn).set_read_deadline(std::nullopt);
 

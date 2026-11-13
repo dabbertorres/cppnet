@@ -1669,13 +1669,13 @@ namespace
         sock.set_stop_token(options.stop);
 
         const auto handshake = detail::make_request(where.target, options);
-        if (auto head = co_await http::http11::request_encode_head(&own->writer(), handshake.request); !head)
+        if (auto head = co_await http::http11::request_encode_head(own->writer(), handshake.request); !head)
             co_return fail(head.error());
         if (auto flushed = co_await own->writer().flush(); flushed.err) co_return fail(flushed.err);
 
         if (auto wait = limit(config.response_header_timeout)) sock.set_read_deadline(io::clock::now() + *wait);
         auto response =
-            co_await http::http11::response_decode(&own->reader(), http::request_method::GET, max_response_head);
+            co_await http::http11::response_decode(own->reader(), http::request_method::GET, max_response_head);
         sock.set_read_deadline(std::nullopt);
         if (!response.has_value()) co_return fail(response.error());
 

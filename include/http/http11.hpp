@@ -32,19 +32,19 @@ inline constexpr std::size_t default_body_buffer = std::size_t{16} * 1'024;
 // request_encode writes a request, including its body: with its Content-Length (which it must match), or chunked; read
 // body_buffer at a time. POST, PUT and PATCH requests without bodies are sent with "Content-Length: 0".
 task<request_encoder_result>
-request_encode(io::writer* writer, const client_request& req, std::size_t body_buffer = default_body_buffer) noexcept;
+request_encode(io::writer& writer, const client_request& req, std::size_t body_buffer = default_body_buffer) noexcept;
 
 // request_encode_head writes a request's head: what request_encode() writes before the body, failing as it does. For a
 // client that waits for 100 (Continue) before it sends the body (Expect: 100-continue), with request_encode_body().
-task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept;
+task<request_encoder_result> request_encode_head(io::writer& writer, const client_request& req) noexcept;
 
 // request_encode_body writes the body of a request whose head request_encode_head() wrote (and, if it's chunked, the
 // last chunk, with make_trailers' fields): the rest of what request_encode() writes.
-task<request_encoder_result> request_encode_body(io::writer*           writer,
+task<request_encoder_result> request_encode_body(io::writer&           writer,
                                                  const client_request& req,
                                                  std::size_t           body_buffer = default_body_buffer) noexcept;
 
-task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept;
+task<response_encoder_result> response_encode(io::writer& writer, const server_response& resp) noexcept;
 
 // max_fields is the most field lines a message's head may have (as hyper's default): headers are looked up by going
 // through them, so a head of many tiny fields would otherwise take time quadratic in their number to decode.
@@ -57,14 +57,14 @@ constexpr std::size_t max_fields = 100;
 // - std::errc::value_too_large if the head is longer than max_header_bytes, or has more than max_fields field lines.
 // - status_condition::closed if the connection ends first.
 task<request_decoder_result>
-request_decode(io::buffered_reader* reader,
+request_decode(io::buffered_reader& reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
 
 // request_decode decodes a request's head into req, as the other does, reusing req's memory (e.g. for each request on
 // a connection): its strings, fields, and body (if it's the reader the body needs). If it fails, req is left part-way
 // decoded.
 task<std::error_code>
-request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept;
+request_decode(io::buffered_reader& reader, std::size_t max_header_bytes, server_request& req) noexcept;
 
 // call_at_body_end sets what's called once the body of a request that request_decode() decoded has been read to its
 // end: by the body's read that reaches it, or now, if it's there already (e.g. it has none). For a server to watch the
@@ -104,7 +104,7 @@ task<response_decoder_result> response_decode(std::unique_ptr<io::buffered_reade
 // on_informational, rather than going on to the next head: for a client waiting for 100 (Continue) before it sends a
 // request's body, which waits for each head with a deadline of its own. Each call's heads count against
 // max_header_bytes by themselves.
-task<response_decoder_result> response_decode(io::buffered_reader* reader,
+task<response_decoder_result> response_decode(io::buffered_reader& reader,
                                               request_method       method,
                                               std::size_t max_header_bytes = std::numeric_limits<std::size_t>::max(),
                                               informational_ref on_informational = {},

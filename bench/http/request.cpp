@@ -269,7 +269,7 @@ task<void> serve(const Router& router, net::io::reader& input, net::io::writer& 
 
         // as the server does: the head's waited for first, then decoded (without a coroutine, if it came whole).
         if (reader.size() == 0 && co_await reader.fill()) break;
-        if (auto err = co_await http::http11::request_decode(&reader, 8'192, req); err) break;
+        if (auto err = co_await http::http11::request_decode(reader, 8'192, req); err) break;
 
         // as the server does (none, here).
         if (http::detail::expectation_of(req) != http::detail::expectation::none) break;

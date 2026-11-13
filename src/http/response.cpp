@@ -182,7 +182,7 @@ coro::task<io::writer*> response_writer::start(status status_code, framing how, 
         resp->headers.set("Connection"sv, "close"sv);
 
     // usually, the head fits in the connection's buffer: then there's no need for a coroutine (see coro::ready_task).
-    auto encoding = h1.encode(h1.writer, *resp);
+    auto encoding = h1.encode(*h1.writer, *resp);
 
     // sent at once, rather than with the final response, which is its point (e.g. Early Hints).
     if (interim) return send_interim(std::move(encoding));
@@ -283,7 +283,7 @@ coro::task<std::error_code> response_writer::send_continue()
     }
 
     const auto& h1      = std::get<http11_backend>(backend);
-    auto        encoded = co_await h1.encode(h1.writer, head);
+    auto        encoded = co_await h1.encode(*h1.writer, head);
     if (!encoded.has_value()) co_return encoded.error();
 
     co_return co_await flush(h1.writer);
@@ -351,7 +351,7 @@ coro::task<std::expected<detail::tunnel*, std::error_code>> response_writer::swi
     resp->status_code = status::SWITCHING_PROTOCOLS;
     detail::put_fields(resp->headers, fields);
 
-    auto encoded = co_await h1.encode(h1.writer, *resp);
+    auto encoded = co_await h1.encode(*h1.writer, *resp);
     if (!encoded.has_value()) co_return std::unexpected(encoded.error());
 
     // NOTE: the connection's reads don't flush what's written any more (see detail::switch_hook).

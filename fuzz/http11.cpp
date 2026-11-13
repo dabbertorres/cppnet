@@ -114,7 +114,7 @@ std::string transcript(net::io::reader* conn)
 
     for (int i = 0; i < 8; ++i)
     {
-        if (auto err = test::sync_wait(net::http::http11::request_decode(&reader, 512, req)); err)
+        if (auto err = test::sync_wait(net::http::http11::request_decode(reader, 512, req)); err)
         {
             out += "error: " + err.message() + "\n";
             return out;

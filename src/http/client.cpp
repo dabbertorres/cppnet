@@ -436,7 +436,7 @@ std::optional<net::io::clock::time_point> head_deadline(const net::http::client_
 // nothing); a final response first is returned. Another interim response is passed on (with the 100), and the wait goes
 // on, to the same deadline. Each head, once its first byte's in, has response_header_timeout to come whole.
 net::coro::task<std::expected<std::optional<net::http::client_response>, std::error_code>>
-await_continue(net::io::buffered_reader*            reader,
+await_continue(net::io::buffered_reader&            reader,
                net::socket&                         sock,
                const net::http::client_request&     request,
                const net::http::client_options&     options,
@@ -452,15 +452,15 @@ await_continue(net::io::buffered_reader*            reader,
         // NOTE: checked with heads buffered too, so a server sending interim responses without end doesn't put it off.
         if (io::clock::now() >= deadline) co_return std::nullopt;
 
-        if (reader->buffered().empty())
+        if (reader.buffered().empty())
         {
             sock.set_read_deadline(deadline);
-            if (auto err = co_await reader->fill(); err)
+            if (auto err = co_await reader.fill(); err)
             {
                 if (err != io::status_condition::timed_out) co_return std::unexpected(err);
 
                 // nothing came (a timed-out read reads nothing): the reads after it start afresh.
-                reader->reset(nullptr);
+                reader.reset(nullptr);
                 co_return std::nullopt;
             }
         }
@@ -480,7 +480,7 @@ await_continue(net::io::buffered_reader*            reader,
 net::coro::task<std::error_code>
 send_body(net::io::buffered_writer& out, const net::http::client_request& request, std::size_t body_buffer)
 {
-    auto res = co_await net::http::http11::request_encode_body(&out, request, body_buffer);
+    auto res = co_await net::http::http11::request_encode_body(out, request, body_buffer);
     if (!res.has_value()) co_return res.error();
     co_return (co_await out.flush()).err;
 }
@@ -512,7 +512,7 @@ net::coro::task<std::optional<sent>> send_expecting(net::io::buffered_writer&   
 {
     const auto& options = body->options();
 
-    auto waited = co_await await_continue(body->buffered(), sock, request, options, on_informational);
+    auto waited = co_await await_continue(*body->buffered(), sock, request, options, on_informational);
     if (!waited.has_value()) co_return sent{.response = std::unexpected(waited.error())};
 
     // a 100, or none in time: the body goes. A server may respond before reading all of it (e.g. 413 Content Too
@@ -644,21 +644,21 @@ send_http2(net::http::detail::connection_pool::lease leased, net::http::client_r
 // been read. A request that's safe to repeat may be sent again if a reused connection turns out to have been closed.
 // wait_for_head fills reader if nothing's buffered (the head usually comes in one read), returning the fill's error.
 // NOTE: not a coroutine, so it adds no frame of its own.
-net::coro::task<std::error_code> wait_for_head(net::io::buffered_reader* reader)
+net::coro::task<std::error_code> wait_for_head(net::io::buffered_reader& reader)
 {
-    if (reader->size() != 0) return net::coro::ready_task<std::error_code>();
-    return reader->fill();
+    if (reader.size() != 0) return net::coro::ready_task<std::error_code>();
+    return reader.fill();
 }
 
 // decode_head decodes a response's head, once a fill has waited for it: failing with waited if it failed having read
 // nothing, as decoding would have. NOTE: not a coroutine, so it adds no frame of its own.
-net::coro::task<net::http::response_decoder_result> decode_head(net::io::buffered_reader*            reader,
+net::coro::task<net::http::response_decoder_result> decode_head(net::io::buffered_reader&            reader,
                                                                 std::error_code                      waited,
                                                                 net::http::request_method            method,
                                                                 std::size_t                          max_header_bytes,
                                                                 net::http::http11::informational_ref on_informational)
 {
-    if (waited && reader->size() == 0)
+    if (waited && reader.size() == 0)
         return net::coro::ready_task<net::http::response_decoder_result>(std::unexpected(waited));
     return net::http::http11::response_decode(reader, method, max_header_bytes, on_informational);
 }
@@ -704,8 +704,8 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
     // the head in one write, rather than one per field.
     io::buffered_writer out{&detail::as_writer(*body->connection()), 4'096};
 
-    auto res = expecting ? co_await http11::request_encode_head(&out, request)
-                         : co_await http11::request_encode(&out, request, options.write_buffer_size);
+    auto res = expecting ? co_await http11::request_encode_head(out, request)
+                         : co_await http11::request_encode(out, request, options.write_buffer_size);
     if (res.has_value())
     {
         if (auto flushed = co_await out.flush(); flushed.err) res = std::unexpected(flushed.err);
@@ -744,7 +744,7 @@ net::coro::task<sent> send_http11(std::shared_ptr<net::http::detail::connection_
 
     // the head usually comes in one read: waited for here (the reader's fill, an operation), it's then decoded without
     // a coroutine. A fill that fails having read nothing fails the response as decoding it would have.
-    auto*      reader = body->buffered();
+    auto&      reader = *body->buffered();
     const auto waited = co_await wait_for_head(reader);
 
     auto resp = co_await decode_head(reader, waited, request.method, max_response_header_bytes, on_informational);

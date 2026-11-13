@@ -234,7 +234,7 @@ void reuse_or_make(std::unique_ptr<net::io::reader>& body, Args&&... args)
 // set_request_body decides how long the request's body is (RFC 9112, section 6.3), and sets its body to read only that
 // much of reader. The rules are strict where requests are ambiguous, as an ambiguity between this server and anything
 // in front of it is what request smuggling exploits.
-std::error_code set_request_body(buffered_reader* reader, server_request& req)
+std::error_code set_request_body(buffered_reader& reader, server_request& req)
 {
     if (req.headers.get_all("Transfer-Encoding"sv).has_value())
     {
@@ -251,7 +251,7 @@ std::error_code set_request_body(buffered_reader* reader, server_request& req)
         // and nothing else is implemented.
         if (codings.size() > 1) return std::make_error_code(std::errc::not_supported);
 
-        reuse_or_make<net::http::http11::chunked_reader>(req.body, reader);
+        reuse_or_make<net::http::http11::chunked_reader>(req.body, &reader);
         return {};
     }
 
@@ -264,7 +264,7 @@ std::error_code set_request_body(buffered_reader* reader, server_request& req)
     }
 
     // NOTE: a body that ends before its length fails (std::errc::connection_aborted), so it isn't taken for all of it.
-    reuse_or_make<net::io::limit_reader>(req.body, static_cast<net::io::reader*>(reader), length);
+    reuse_or_make<net::io::limit_reader>(req.body, static_cast<net::io::reader*>(&reader), length);
     return {};
 }
 
@@ -300,17 +300,17 @@ std::expected<response_framing, std::error_code> framing_of(const client_respons
 
 // make_response_body wraps reader (which it borrows) to read only the response's body.
 std::expected<std::unique_ptr<net::io::reader>, std::error_code>
-make_response_body(buffered_reader* reader, const client_response& resp, request_method method)
+make_response_body(buffered_reader& reader, const client_response& resp, request_method method)
 {
     auto framing = framing_of(resp, method);
     if (!framing.has_value()) return std::unexpected(framing.error());
 
-    auto* parent = static_cast<net::io::reader*>(reader);
+    auto* parent = static_cast<net::io::reader*>(&reader);
 
     switch (*framing)
     {
     case response_framing::none: return std::make_unique<net::io::limit_reader>(parent, 0);
-    case response_framing::chunked: return std::make_unique<net::http::http11::chunked_reader>(reader);
+    case response_framing::chunked: return std::make_unique<net::http::http11::chunked_reader>(&reader);
     case response_framing::length:
         // NOTE: a body that ends before its length fails (std::errc::connection_aborted), so it isn't taken for all of
         // it (nor its connection reused).
@@ -604,12 +604,12 @@ void append_head(auto& out, const client_request& req, const request_framing& fr
 
 // write_body writes a request's body as framing says, which isn't none, read body_buffer at a time: then, if it's
 // chunked, the last chunk, with make_trailers' fields.
-task<net::http::request_encoder_result> write_body(net::io::writer*      writer,
+task<net::http::request_encoder_result> write_body(net::io::writer&      writer,
                                                    const client_request& req,
                                                    request_framing       framing,
                                                    std::size_t           body_buffer) noexcept
 {
-    net::http::http11::chunked_writer chunked{writer};
+    net::http::http11::chunked_writer chunked{&writer};
     try
     {
         std::error_code err;
@@ -618,7 +618,7 @@ task<net::http::request_encoder_result> write_body(net::io::writer*      writer,
         {
         case request_framing::kind::none: break;
         case request_framing::kind::length:
-            if (framing.length > 0) err = co_await copy_length(*req.body, *writer, framing.length, body_buffer);
+            if (framing.length > 0) err = co_await copy_length(*req.body, writer, framing.length, body_buffer);
             break;
         case request_framing::kind::chunked:
             // a chunked request without a body (only if it asked for chunked) is just the last chunk.
@@ -643,7 +643,7 @@ task<net::http::request_encoder_result> write_body(net::io::writer*      writer,
         if (err) co_return std::unexpected(err);
     }
 
-    co_return writer;
+    co_return &writer;
 }
 
 // status_line_size is how long append_status_head makes the status line (with its CRLF).
@@ -677,7 +677,7 @@ void append_status_head(auto& out, const net::http::server_response& resp)
 }
 
 // write_status_head writes a response's head that didn't fit in the writer's buffer (see response_encode).
-task<net::http::response_encoder_result> write_status_head(net::io::writer*                  writer,
+task<net::http::response_encoder_result> write_status_head(net::io::writer&                  writer,
                                                            const net::http::server_response& resp) noexcept
 {
     try
@@ -687,9 +687,8 @@ task<net::http::response_encoder_result> write_status_head(net::io::writer*     
         head.reserve(status_line_size(resp) + fields_size(resp.headers) + 2);
         append_status_head(head, resp);
 
-        if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err)
-            co_return std::unexpected(err);
-        co_return writer;
+        if (auto err = co_await write_full(writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
+        co_return &writer;
     }
     catch (const std::bad_alloc&)
     {
@@ -724,9 +723,9 @@ std::expected<bool, std::error_code> take_head_line(std::string_view line, head_
 
 // head_is_buffered is whether the reader's buffer holds a whole head (up to the empty line that ends it), within
 // max_header_bytes: then decoding it doesn't need to read.
-bool head_is_buffered(const buffered_reader* reader, std::size_t max_header_bytes) noexcept
+bool head_is_buffered(const buffered_reader& reader, std::size_t max_header_bytes) noexcept
 {
-    const auto       buffered = reader->buffered();
+    const auto       buffered = reader.buffered();
     std::string_view chars{reinterpret_cast<const char*>(buffered.data()), std::min(buffered.size(), max_header_bytes)};
 
     // NOTE: every line ends with CRLF (see head_reader), so this is the end of a line and then an empty line: the
@@ -735,11 +734,11 @@ bool head_is_buffered(const buffered_reader* reader, std::size_t max_header_byte
 }
 
 // decode_buffered decodes a request whose head is buffered (see head_is_buffered), without a coroutine.
-std::error_code decode_buffered(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+std::error_code decode_buffered(buffered_reader& reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     try
     {
-        head_reader head{.reader = reader, .remaining = max_header_bytes};
+        head_reader head{.reader = &reader, .remaining = max_header_bytes};
         head_state  state;
 
         while (true)
@@ -766,11 +765,11 @@ std::error_code decode_buffered(buffered_reader* reader, std::size_t max_header_
 // comes (so a malformed one fails without waiting for the rest), from the reader's buffer: it's refilled until the line
 // is all there, rather than the line read into a string, unless the buffer can't hold it.
 task<std::error_code>
-decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+decode_reading(buffered_reader& reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     try
     {
-        head_reader head{.reader = reader, .remaining = max_header_bytes};
+        head_reader head{.reader = &reader, .remaining = max_header_bytes};
         head_state  state;
 
         while (true)
@@ -780,12 +779,12 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
             {
                 line = *buffered;
             }
-            else if (reader->size() >= head.remaining)
+            else if (reader.size() >= head.remaining)
             {
                 // the head's longer than it may be.
                 co_return std::make_error_code(std::errc::value_too_large);
             }
-            else if (reader->size() == reader->capacity())
+            else if (reader.size() == reader.capacity())
             {
                 // the line's longer than the buffer.
                 if (auto err = co_await head.read_line(); err) co_return err;
@@ -793,7 +792,7 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
             }
             else
             {
-                if (auto err = co_await reader->fill(); err) co_return err;
+                if (auto err = co_await reader.fill(); err) co_return err;
                 continue;
             }
 
@@ -816,14 +815,14 @@ decode_reading(buffered_reader* reader, std::size_t max_header_bytes, server_req
 // with nothing consumed.
 // NOLINTBEGIN(bugprone-exception-escape): what throws (std::bad_alloc) is caught; moving a response doesn't throw.
 std::optional<net::http::response_decoder_result>
-decode_buffered_response(buffered_reader* reader, request_method method, std::size_t max_header_bytes) noexcept
+decode_buffered_response(buffered_reader& reader, request_method method, std::size_t max_header_bytes) noexcept
 {
     if (!head_is_buffered(reader, max_header_bytes)) return std::nullopt;
 
     try
     {
         // the status line, looked at before it's taken.
-        const auto       buffered = reader->buffered();
+        const auto       buffered = reader.buffered();
         std::string_view chars{reinterpret_cast<const char*>(buffered.data()), buffered.size()};
 
         client_response resp;
@@ -831,7 +830,7 @@ decode_buffered_response(buffered_reader* reader, request_method method, std::si
         if (net::http::status_is_information(resp.status_code) && resp.status_code != status::SWITCHING_PROTOCOLS)
             return std::nullopt;
 
-        head_reader head{.reader = reader, .remaining = max_header_bytes};
+        head_reader head{.reader = &reader, .remaining = max_header_bytes};
         (void)head.buffered_line();
 
         // NOTE: the lines are all buffered, so buffered_line() only fails if the head ends in a way it can't.
@@ -859,14 +858,14 @@ decode_buffered_response(buffered_reader* reader, request_method method, std::si
 
 // decode_response_reading decodes a response whose head isn't all buffered yet, or that starts with an interim
 // response (see response_decode()).
-task<net::http::response_decoder_result> decode_response_reading(buffered_reader*                     reader,
+task<net::http::response_decoder_result> decode_response_reading(buffered_reader&                     reader,
                                                                  request_method                       method,
                                                                  std::size_t                          max_header_bytes,
                                                                  net::http::http11::informational_ref on_informational,
                                                                  bool stop_at_interim) noexcept
 {
     client_response resp;
-    head_reader     head{.reader = reader, .remaining = max_header_bytes};
+    head_reader     head{.reader = &reader, .remaining = max_header_bytes};
 
     // interim (1xx) responses, e.g. 100 Continue, come before the final response, and are passed to on_informational
     // (if it's set), or skipped; other than 101, which is the last thing on the connection in HTTP/1.1. All of a
@@ -944,7 +943,7 @@ namespace
     // write_head_apart writes a request's head with a write of its own (formatted into a string), as one that doesn't
     // fit in the writer's buffer, or a writer without one, takes: then, unless body_buffer is none, its body, as
     // request_encode() does.
-    task<request_encoder_result> write_head_apart(io::writer*                writer,
+    task<request_encoder_result> write_head_apart(io::writer&                writer,
                                                   const client_request&      req,
                                                   request_framing            framing,
                                                   head_extras                extras,
@@ -954,11 +953,10 @@ namespace
         head.reserve(head_size(req, framing, extras));
         append_head(head, req, framing, extras);
 
-        if (auto err = co_await write_full(*writer, std::as_bytes(std::span{head})); err)
-            co_return std::unexpected(err);
+        if (auto err = co_await write_full(writer, std::as_bytes(std::span{head})); err) co_return std::unexpected(err);
 
         // NOTE: a request without a body (most) has no frame for it.
-        if (!body_buffer.has_value() || framing.how == request_framing::kind::none) co_return writer;
+        if (!body_buffer.has_value() || framing.how == request_framing::kind::none) co_return &writer;
         co_return co_await write_body(writer, req, framing, *body_buffer);
     }
 
@@ -966,11 +964,10 @@ namespace
     // NOTE: not a coroutine: usually, the writer is a connection's buffered writer with room for the head, which is
     //       formatted straight into its buffer (then a request without a body is a ready task).
     task<request_encoder_result>
-    encode_request(io::writer* writer, const client_request& req, std::optional<std::size_t> body_buffer) noexcept
+    encode_request(io::writer& writer, const client_request& req, std::optional<std::size_t> body_buffer) noexcept
     {
         using result = request_encoder_result;
 
-        if (writer == nullptr) return coro::ready_task<result>(std::unexpected(invalid()));
         if (auto err = check_request(req); err) return coro::ready_task<result>(std::unexpected(err));
 
         try
@@ -979,7 +976,7 @@ namespace
             const auto framing = *frame_request(req);
             auto       extras  = extras_of(req);
 
-            if (auto* buffered = dynamic_cast<io::buffered_writer*>(writer); buffered != nullptr)
+            if (auto* buffered = dynamic_cast<io::buffered_writer*>(&writer); buffered != nullptr)
             {
                 if (auto out = buffered->prepare(head_size(req, framing, extras)); !out.empty())
                 {
@@ -987,7 +984,7 @@ namespace
                     append_head(appender, req, framing, extras);
 
                     if (!body_buffer.has_value() || framing.how == request_framing::kind::none)
-                        return coro::ready_task<result>(writer);
+                        return coro::ready_task<result>(&writer);
                     return write_body(writer, req, framing, *body_buffer);
                 }
             }
@@ -1003,24 +1000,24 @@ namespace
 }
 
 task<request_encoder_result>
-request_encode(io::writer* writer, const client_request& req, std::size_t body_buffer) noexcept
+request_encode(io::writer& writer, const client_request& req, std::size_t body_buffer) noexcept
 {
     return encode_request(writer, req, body_buffer);
 }
 
-task<request_encoder_result> request_encode_head(io::writer* writer, const client_request& req) noexcept
+task<request_encoder_result> request_encode_head(io::writer& writer, const client_request& req) noexcept
 {
     return encode_request(writer, req, std::nullopt);
 }
 
 task<request_encoder_result>
-request_encode_body(io::writer* writer, const client_request& req, std::size_t body_buffer) noexcept
+request_encode_body(io::writer& writer, const client_request& req, std::size_t body_buffer) noexcept
 {
     try
     {
         auto framing = frame_request(req);
         if (!framing.has_value()) return coro::ready_task<request_encoder_result>(std::unexpected(framing.error()));
-        if (framing->how == request_framing::kind::none) return coro::ready_task<request_encoder_result>(writer);
+        if (framing->how == request_framing::kind::none) return coro::ready_task<request_encoder_result>(&writer);
 
         return write_body(writer, req, *framing, body_buffer);
     }
@@ -1031,11 +1028,11 @@ request_encode_body(io::writer* writer, const client_request& req, std::size_t b
     }
 }
 
-task<response_encoder_result> response_encode(io::writer* writer, const server_response& resp) noexcept
+task<response_encoder_result> response_encode(io::writer& writer, const server_response& resp) noexcept
 {
     using result = response_encoder_result;
 
-    if (writer == nullptr || !valid_fields(resp.headers)) return coro::ready_task<result>(std::unexpected(invalid()));
+    if (!valid_fields(resp.headers)) return coro::ready_task<result>(std::unexpected(invalid()));
 
     // a status code is three digits, from 100 to 599 (RFC 9110, section 15).
     const auto code = static_cast<std::uint16_t>(resp.status_code);
@@ -1043,7 +1040,7 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
 
     // usually, it's a connection's buffered writer, with room for the head: then it's formatted straight into the
     // buffer, without a coroutine (see coro::ready_task).
-    if (auto* buffered = dynamic_cast<io::buffered_writer*>(writer); buffered != nullptr)
+    if (auto* buffered = dynamic_cast<io::buffered_writer*>(&writer); buffered != nullptr)
     {
         try
         {
@@ -1052,7 +1049,7 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
             {
                 span_appender appender{.out = out};
                 append_status_head(appender, resp);
-                return coro::ready_task<result>(writer);
+                return coro::ready_task<result>(&writer);
             }
         }
         catch (const std::bad_alloc&)
@@ -1064,7 +1061,7 @@ task<response_encoder_result> response_encode(io::writer* writer, const server_r
     return write_status_head(writer, resp);
 }
 
-task<request_decoder_result> request_decode(io::buffered_reader* reader, std::size_t max_header_bytes) noexcept
+task<request_decoder_result> request_decode(io::buffered_reader& reader, std::size_t max_header_bytes) noexcept
 {
     try
     {
@@ -1079,7 +1076,7 @@ task<request_decoder_result> request_decode(io::buffered_reader* reader, std::si
 }
 
 task<std::error_code>
-request_decode(io::buffered_reader* reader, std::size_t max_header_bytes, server_request& req) noexcept
+request_decode(io::buffered_reader& reader, std::size_t max_header_bytes, server_request& req) noexcept
 {
     req.clear();
 
@@ -1125,7 +1122,7 @@ void call_at_body_start(const server_request& req, io::start_callback callback) 
     // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
-coro::task<response_decoder_result> response_decode(io::buffered_reader* reader,
+coro::task<response_decoder_result> response_decode(io::buffered_reader& reader,
                                                     request_method       method,
                                                     std::size_t          max_header_bytes,
                                                     informational_ref    on_informational,
@@ -1143,7 +1140,7 @@ coro::task<response_decoder_result> response_decode(std::unique_ptr<io::buffered
                                                     std::size_t                          max_header_bytes,
                                                     informational_ref                    on_informational) noexcept
 {
-    auto resp = co_await response_decode(reader.get(), method, max_header_bytes, on_informational);
+    auto resp = co_await response_decode(*reader, method, max_header_bytes, on_informational);
     if (!resp.has_value()) co_return resp;
 
     try
