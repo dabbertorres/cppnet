@@ -442,19 +442,28 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   returns false (the task destroyed unrun) once the pool is shutting down, rather than true and a logged exception. GCC
   14 keeps the handle a final awaiter returns in the actor's locals, not the frame, so destroying the frame there is
   safe (checked on a reduced case, as no local GCC builds cppnet). Allocations: a connection per request 13 -> 11,
-  HTTP/2 a stream at a time 36 -> 35, 8 streams 47.6 -> 44.6, 8 bodies 58.5 -> 55.5; no other count changed. Elisions
-  (`-Rpass=coro-elide` over `src/` and `bench/`): 80 elided before and after, 418 -> 417 not: `start_on` (120 B) and
-  `run` (96 B) gone, `awaited` added, every other frame's size the same. The fuzz targets' compiles are left out: they
-  build some library sources into logs of the same names, so earlier counts depended on which finished last. Ten
-  interleaved rounds a side against `stage5-accept` 0621325 (`bench_task`, `bench_request`, `bench_client`, `bench_tls`,
-  `bench_websocket`, `bench/web`): the targets' times are noise (time / CPU time: a connection per request +3.5% /
-  +2.4%, p = 0.68 / 0.79; a stream at a time -1.8% / -1.8%, p = 0.082 / 0.054; 8 streams -4.2% / -2.4%, p = 0.16 / 0.12;
-  8 bodies +0.7% / +0.9%, p = 0.26 / 0.39), and `bench_task`'s co_awaits unchanged (p >= 0.19). Gains off the targets
-  (reported, not claimed): `bench_client`'s long head lines 2.6 to 3.3% faster by time and CPU time with each reader (p
-  < 0.001; 2.2 to 4.5% again in the confirmation run), which undoes what accept's pull request measured on them, and one
-  per read -1.5% (p = 0.038). One wrong-way result, the 1 KiB reader's chunked download (CPU time +1.6%, p = 0.019;
-  allocations +0.19%, p = 0.041, which drift with timing), wasn't reproduced by ten more rounds (+0.03%, p = 0.68;
-  +0.08%, p = 0.57). Verdict on the bar: an allocation drop on every target case, and no regression.
+  HTTP/2 a stream at a time 36 -> 35, 8 streams 47.6 -> 44.6, 8 bodies 58.5 -> 55.5; no other count changed but
+  `bench_websocket`'s 8 and 64 WebSockets at once, slightly (e.g. 64 over HTTP/1.1, large in flight, 2.25 -> 2.13 per
+  message; found after merging, below). Elisions (`-Rpass=coro-elide` over `src/` and `bench/`): 80 elided before and
+  after, 418 -> 417 not: `start_on` (120 B) and `run` (96 B) gone, `awaited` added, every other frame's size the same.
+  The fuzz targets' compiles are left out: they build some library sources into logs of the same names, so earlier
+  counts depended on which finished last. Ten interleaved rounds a side against `stage5-accept` 0621325 (`bench_task`,
+  `bench_request`, `bench_client`, `bench_tls`, `bench_websocket`, `bench/web`): the targets' times are noise (time /
+  CPU time: a connection per request +3.5% / +2.4%, p = 0.68 / 0.79; a stream at a time -1.8% / -1.8%, p = 0.082 /
+  0.054; 8 streams -4.2% / -2.4%, p = 0.16 / 0.12; 8 bodies +0.7% / +0.9%, p = 0.26 / 0.39), and `bench_task`'s
+  co_awaits unchanged (p >= 0.19). Gains off the targets (reported, not claimed): `bench_client`'s long head lines 2.6
+  to 3.3% faster by time and CPU time with each reader (p < 0.001; 2.2 to 4.5% again in the confirmation run), which
+  undoes what accept's pull request measured on them, and one per read -1.5% (p = 0.038). One wrong-way result, the 1
+  KiB reader's chunked download (CPU time +1.6%, p = 0.019; allocations +0.19%, p = 0.041, which drift with timing),
+  wasn't reproduced by ten more rounds (+0.03%, p = 0.68; +0.08%, p = 0.57). Verdict on the bar: an allocation drop on
+  every target case, and no regression. After merging (2026-11-14), the comparison script was found to have misread
+  `bench_websocket`'s 8- and 64-WebSocket groups (each case as its group's last). Read again, with ten more rounds of
+  `bench_websocket`: 8 WebSockets over HTTP/1.1, medium one at a time, is slower by time and CPU time (+1.4% / +1.6%, p
+  = 0.004 / 0.007 over the twenty rounds; +1.3% / +1.7%, p = 0.14 / 0.082 in the first ten, +1.9% / +1.5%, p = 0.013 /
+  0.034 in the next), perhaps from the test every `task<void>`'s final suspend now makes rather than placement alone,
+  and the user kept the change (2026-11-14). The wrong-way result the first read missed, the same with small messages
+  (+0.9%, p = 0.049), wasn't reproduced (-0.4%, p = 0.94); 8 over HTTP/2, medium one at a time, is faster (-1.7% /
+  -1.5%, p = 0.028 / 0.036 over the twenty rounds).
 - **Stage 5, the HTTP/2 write** (2026-11-14): a stream's write that has to wait is an operation its writer holds
   (`stream_write`), as its read is, rather than `write_waiting()`'s coroutine (224 B). The stream knows it while it
   waits (`writing`), and what finishes it does so holding the connection's lock (`wake_writer()`): the writer framing
