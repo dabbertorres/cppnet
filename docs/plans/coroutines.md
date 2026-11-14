@@ -340,7 +340,15 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    `bench_tls writes` 10.8 -> ~7 per 16 KiB write (36.6 us: the pool made it 1-3% slower; this mustn't). A pull request
    per object, each measured and kept or dropped on its own (the user, 2026-11-13), in this order: accept, spawning,
    the HTTP/2 stream's write, TLS's read and flush. Measured on the same Mac as stages 0 to 4 (the user, 2026-11-13).
-   Then GCC's allocation counts again.
+   Then GCC's allocation counts again. Accept's target cases (named before measuring, 2026-11-13; gains are claimed
+   only on these; the rule: every case whose allocation count drops, by a probe run of each bench, whose printed times
+   were seen but not used, and, for `bench_tls`'s handshakes, which print no counts, a copy of it counting per
+   connection): `bench_request`, a connection per request (14 -> 13 per connection; time and CPU time); `bench_tls`'s
+   handshakes, with each server key, full without tickets, full and resumed, and TCP alone (one fewer per connection,
+   e.g. TCP alone 10 -> 9, ECDSA P-256 full 1912 -> 1911; time and CPU time). `bench_client`, `bench_websocket`,
+   `bench_tls echo` and `writes` keep their counts (their accepts are outside what they count; the in-flight and
+   chunked cases' drift by timing, as before), and `bench/web` is measured as well (an accept per connection, which
+   live through each run), but isn't a target.
 6. **The frame allocator**, with what's left (handlers, the client's `send()` chain, `drive()`, the spawned frames):
    per-thread size-class free lists in the promise's `operator new`/`delete`, out of line (Decided question 8, asked
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
