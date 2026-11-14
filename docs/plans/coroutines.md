@@ -356,7 +356,19 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    CPU time. `bench_client`, `bench_websocket` and `bench_tls` (handshakes, echo and writes) keep their counts (their
    spawns are outside what they count), as do `bench_notifier` and `bench_blocking` (which spawn only to set up).
    Measured as well, not targets: `bench_task`, as every `task<void>`'s final suspend now tests whether it was spawned,
-   and `bench/web` (a spawn per connection, which live through each run).
+   and `bench/web` (a spawn per connection, which live through each run). The HTTP/2 write's target cases (named before
+   measuring, 2026-11-14; the same rule, by a probe run of each bench, two of `bench_request` and `bench_websocket`,
+   against `stage5-spawn` 3f8a501): every HTTP/2 case whose writes wait for their turn or the window, time and CPU time.
+   `bench_request` over HTTP/2, 8 streams at once (43.4-43.7 -> 40.1-41.0 per response) and 8 request bodies at once
+   (55.6 -> 40.6-40.7 per request: the client's body writes wait, a 16 KiB read at a time). `bench_websocket` over
+   HTTP/2: one WebSocket, medium in flight (2.23 -> 2.00 per message), large one at a time (3.00 -> 2.00, as planned)
+   and in flight (3.46 -> 2.00); 8 WebSockets at once, medium in flight (3.09-3.14 -> 2.15-2.17), large one at a time
+   (3.94-3.99 -> 2.11-2.12) and in flight (8.55-8.56 -> 2.61-2.69); 64 WebSockets at once, medium one at a time (2.18 ->
+   2.02) and in flight (4.04-4.09 -> 2.03-2.05), large one at a time (8.61-8.67 -> 2.19) and in flight (12.51-12.59 ->
+   2.13-2.16). Every other count stayed: HTTP/2 a stream at a time (35.0: its writes go at once), the HTTP/1.1 cases,
+   `bench_tls`, `bench_task`, `bench_notifier`, `bench_blocking` and `bench_router` (`bench_client`'s chunked downloads
+   drift by timing, as before). Measured as well, not targets: `bench_client` and `bench_tls` (the code they run is
+   unchanged, but the library's moves).
 6. **The frame allocator**, with what's left (handlers, the client's `send()` chain, `drive()`, the spawned frames):
    per-thread size-class free lists in the promise's `operator new`/`delete`, out of line (Decided question 8, asked
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
