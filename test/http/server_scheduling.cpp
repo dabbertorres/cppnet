@@ -27,7 +27,9 @@
 
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include "coro/async_scope.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "http/h2_client.hpp"
@@ -77,6 +79,13 @@ struct outcomes
         stop_probe::bump(sched, returned);
     }
 
+    // record notes how a write named name went, without counting a handler as returned.
+    void record(const std::string& name, net::io::result res)
+    {
+        std::scoped_lock lock{mu};
+        writes[name] = res;
+    }
+
     // write_of is how the write of the handler for name went, if it's returned.
     std::optional<net::io::result> write_of(const std::string& name)
     {
@@ -103,15 +112,26 @@ struct outcomes
 
     net::io::scheduler*        sched = nullptr;
     std::atomic<std::uint64_t> returned{0};
+    std::atomic<std::uint64_t> go{0}; // the test's go-ahead, for a handler that waits for it (/abandon)
 
     std::mutex                             mu;
     std::map<std::string, net::io::result> writes;
     std::map<std::string, std::stop_token> tokens;
 };
 
+// write_noting writes data to body, into res, then sets done: a write a handler starts in a task of its own, which it
+// joins (or destroys) before it goes on, so the task never outlives what it points to.
+task<>
+write_noting(net::io::writer* body, std::span<const std::byte> data, net::io::result* res, std::atomic<bool>* done)
+{
+    *res = co_await body->write(data);
+    done->store(true);
+}
+
 // make_router answers /bytes with x-size bytes, written at once (with a Content-Length, or without and with a trailer
 // if the request has x-trailer), and a Priority field of x-response-priority's value if it has one; and /queued (the
-// probe) once x-count streams wait in the connection's scheduler, saying so in x-queued.
+// probe) once x-count streams wait in the connection's scheduler, saying so in x-queued. /twice and /abandon write
+// responses without a Content-Length (so straight to their streams' writers): see their comments.
 http::router make_router(outcomes* o)
 {
     http::router r;
@@ -129,6 +149,63 @@ http::router make_router(outcomes* o)
               if (trailing) resp.trailers().set("x-sent", std::to_string(res.count));
 
               o->wrote(std::string{req.headers.get("x-name"sv).value_or(""sv)}, res, req.stop);
+          });
+    // /twice writes twice at once: x-size bytes ('a's) in a task of its own, which waits for the window, then "bbbb"
+    // while that one waits. It records both writes ("first", "second"), and whether the first waited ("waited": a
+    // count of 1 if it did).
+    r.GET("/twice",
+          [o](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const auto size = std::stoul(std::string{req.headers.get("x-size"sv).value_or("0"sv)});
+              auto*      body = co_await resp.send(http::status::OK);
+
+              const std::string      data(size, 'a');
+              net::io::result        first;
+              std::atomic<bool>      first_done{false};
+              net::coro::async_scope scope;
+              (void)scope.spawn(write_noting(body, std::as_bytes(std::span{data}), &first, &first_done));
+
+              // (spawn() returns once the task's waiting, if it has to.)
+              o->record("waited", {.count = first_done.load() ? 0U : 1U});
+              const auto second = co_await body->write("bbbb"sv);
+              co_await scope.join();
+
+              o->record("first", first);
+              o->wrote("second", second, req.stop);
+          });
+
+    // /abandon starts a write of x-size bytes that waits for the window, and abandons it, freeing its bytes: with x-how
+    // "dropped", its task is dropped unawaited; with "destroyed", the coroutine awaiting it is destroyed while it waits
+    // (recording "waited": a count of 1 if it did). Then it counts itself returned, waits for the test's go (o->go),
+    // writes "after", and records how that went ("after"), counting itself returned again.
+    r.GET("/abandon",
+          [o](const http::server_request& req, http::response_writer& resp) -> task<void>
+          {
+              const auto size      = std::stoul(std::string{req.headers.get("x-size"sv).value_or("0"sv)});
+              const bool destroyed = req.headers.get("x-how"sv) == "destroyed"sv;
+              auto*      body      = co_await resp.send(http::status::OK);
+
+              // (so the server's writer framing from them after they're freed is a use after free.)
+              auto data = std::make_unique<std::string>(size, 'a');
+              if (destroyed)
+              {
+                  net::io::result   res;
+                  std::atomic<bool> done{false};
+                  auto              writing = write_noting(body, std::as_bytes(std::span{*data}), &res, &done);
+                  o->record("waited", {.count = writing.resume() ? 1U : 0U});
+                  writing = {};
+              }
+              else
+              {
+                  // (the task's a temporary, gone at the end of the statement.)
+                  (void)body->write(std::as_bytes(std::span{*data}));
+              }
+              data.reset();
+              stop_probe::bump(o->sched, o->returned);
+
+              (void)co_await stop_probe::reach(o->sched, o->go, 1);
+              const auto after = co_await body->write("after"sv);
+              o->wrote("after", after, req.stop);
           });
     r.GET("/queued",
           [](const http::server_request& req, http::response_writer& resp) -> task<void>
@@ -221,28 +298,43 @@ struct held
     // whether they have.
     task<bool> start(std::span<const response> responses)
     {
+        const bool plugged = co_await stop_up();
+        if (!plugged) co_return false;
+
+        for (const auto& r : responses) ids.push_back(request_bytes(*client, r));
+
+        const bool queued = co_await wait_queued(responses.size());
+        if (!queued) co_return false;
+
+        client->data_log.clear();
+        co_return true;
+    }
+
+    // stop_up plugs the connection, returning whether it did.
+    task<bool> stop_up()
+    {
         auto& c = *client;
         plug    = request_bytes(c, {.name = "plug", .size = initial_window});
 
         // NOTE: the waits are awaited into locals, not in the conditions: GCC 16 made `!co_await c.wait_for(probe) ||
         //       header(...) != "yes"` true when the wait had returned true and the header was "yes" (a co_await in one
         //       operand of ||, a temporary with a destructor in the other).
-        const bool plugged = co_await c.wait_for(plug);
-        if (!plugged || c.responses[plug].body.size() != initial_window) co_return false;
+        const bool          plugged = co_await c.wait_for(plug);
+        co_return plugged&& c.responses[plug].body.size() == initial_window;
+    }
 
-        for (const auto& r : responses) ids.push_back(request_bytes(c, r));
-
-        // the probe, answered once they've all queued.
-        const auto                      count = std::to_string(responses.size());
+    // wait_queued waits until n streams wait in the server's scheduler (with a probe request, answered once they do),
+    // returning whether they do.
+    task<bool> wait_queued(std::size_t n) const
+    {
+        auto&                           c     = *client;
+        const auto                      count = std::to_string(n);
         const std::vector<hpack::field> fields{
             {.name = "x-count", .value = count}
         };
-        const auto probe    = c.request("GET", "/queued", {}, true, fields);
-        const bool answered = co_await c.wait_for(probe);
-        if (!answered || header(c.responses[probe], "x-queued") != "yes") co_return false;
-
-        c.data_log.clear();
-        co_return true;
+        const auto           probe    = c.request("GET", "/queued", {}, true, fields);
+        const bool           answered = co_await c.wait_for(probe);
+        co_return answered&& header(c.responses[probe], "x-queued") == "yes";
     }
 
     // give lets the server send n more bytes on the connection: as the plug's consumed (the client's session sends
@@ -996,4 +1088,135 @@ TEST_CASE("an HTTP/2 response waiting its turn doesn't time out while the server
     CHECK(bulk.body.size() == frame);
     CHECK(urgent == big);
     CHECK(order.find('B') == big / frame);
+}
+
+TEST_CASE("an HTTP/2 response's write while another waits fails, writing nothing, and the one waiting goes on",
+          "[http][http2][server][scheduler][write]")
+{
+    outcomes           o; // (before the scheduler, whose tasks use it)
+    std::string        body;
+    net::io::scheduler sched{make_pool()};
+    o.sched = &sched;
+    test_server server{&sched, &o};
+
+    const auto failed = sched.run_to_completion(with_client(&sched,
+                                                            server.port(),
+                                                            [&](h2_client& c) -> task<std::string>
+                                                            {
+                                                                held       h{c};
+                                                                const bool plugged = co_await h.stop_up();
+                                                                if (!plugged) co_return "not plugged";
+
+                                                                const auto size = std::to_string(2 * frame);
+                                                                const std::vector<hpack::field> fields{
+                                                                    {.name = "x-size", .value = size}
+                                                                };
+                                                                const auto id =
+                                                                    c.request("GET", "/twice", {}, true, fields);
+
+                                                                // the first write waits in the scheduler (the second's
+                                                                // made while it does).
+                                                                const bool queued = co_await h.wait_queued(1);
+                                                                if (!queued) co_return "the first write didn't queue";
+
+                                                                const bool given = co_await h.give(2 * frame);
+                                                                if (!given) co_return "the window wasn't given";
+                                                                const bool done = co_await c.wait_for(id);
+                                                                if (!done) co_return "unfinished";
+                                                                body = c.responses[id].body;
+                                                                co_return std::string{};
+                                                            }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
+
+    const auto waited = o.write_of("waited");
+    const auto first  = o.write_of("first");
+    const auto second = o.write_of("second");
+    REQUIRE(waited.has_value());
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(waited->count == 1);
+    CHECK(second->count == 0);
+    CHECK(second->err == std::errc::device_or_resource_busy);
+    CHECK(first->count == 2 * frame);
+    CHECK_FALSE(first->err);
+    CHECK(body == std::string(2 * frame, 'a'));
+}
+
+TEST_CASE("an HTTP/2 response's write abandoned while it waits leaves nothing queued, and the connection goes on",
+          "[http][http2][server][scheduler][write]")
+{
+    const auto how = GENERATE("dropped"sv, "destroyed"sv);
+    CAPTURE(how);
+
+    outcomes           o; // (before the scheduler, whose tasks use it)
+    std::string        body;
+    std::size_t        other_size = 0;
+    std::size_t        abandoned  = 0; // DATA frames of the abandoned write's stream before the other's end
+    net::io::scheduler sched{make_pool()};
+    o.sched = &sched;
+    test_server server{&sched, &o};
+
+    const auto failed = sched.run_to_completion(with_client(
+        &sched,
+        server.port(),
+        [&](h2_client& c) -> task<std::string>
+        {
+            held       h{c};
+            const bool plugged = co_await h.stop_up();
+            if (!plugged) co_return "not plugged";
+
+            const auto                      size = std::to_string(2 * frame);
+            const std::vector<hpack::field> fields{
+                {.name = "x-size", .value = size},
+                { .name = "x-how",  .value = how}
+            };
+            const auto id = c.request("GET", "/abandon", {}, true, fields);
+
+            // the handler's abandoned its write (and freed its bytes; the plug's handler has returned too); then
+            // another response waits for the window.
+            const bool head = co_await c.pump([&] { return !c.responses[id].status.empty(); });
+            if (!head) co_return "no head";
+            const bool abandoning = co_await stop_probe::reach(o.sched, o.returned, 2);
+            if (!abandoning) co_return "the write wasn't abandoned";
+            const auto other  = request_bytes(c, {.name = "other", .size = frame});
+            const bool queued = co_await h.wait_queued(1);
+            if (!queued) co_return "the other response didn't queue";
+
+            // a window for both: what the server frames of the abandoned write (were it queued) would come in the
+            // same rounds as the other's frame, and so before the PING's acknowledgement.
+            c.data_log.clear();
+            bool ok = co_await h.give(3 * frame);
+            if (!ok) co_return "the window wasn't given";
+            ok = co_await c.pump([&] { return c.responses[other].done; });
+            if (!ok) co_return "the other response unfinished";
+            ok = co_await c.sync();
+            if (!ok) co_return "no PING acknowledgement";
+            abandoned =
+                static_cast<std::size_t>(std::ranges::count(c.data_log, id, &decltype(c.data_log)::value_type::first));
+            other_size = c.responses[other].body.size();
+
+            // the abandoned write's stream goes on.
+            stop_probe::bump(o.sched, o.go);
+            ok = co_await c.wait_for(id);
+            if (!ok) co_return "the abandoned write's response unfinished";
+            body = c.responses[id].body;
+            co_return std::string{};
+        }));
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
+
+    CHECK(abandoned == 0);
+    CHECK(other_size == frame);
+    CHECK(body == "after");
+    const auto after = o.write_of("after");
+    REQUIRE(after.has_value());
+    CHECK(after->count == 5);
+    CHECK_FALSE(after->err);
+    if (how == "destroyed"sv)
+    {
+        const auto waited = o.write_of("waited");
+        REQUIRE(waited.has_value());
+        CHECK(waited->count == 1);
+    }
 }

@@ -274,14 +274,58 @@ private:
     stream_read        waiting;
 };
 
+// stream_write is a stream_writer's write that has to wait for its turn, or the windows: an operation (see
+// coro::operation), so a write that waits needs no coroutine. What the write couldn't submit at once joins the
+// connection's scheduler only once it's awaited (start()), so a task of it that's dropped unawaited leaves nothing
+// there for the connection's writer to frame from a span that's gone. Its stream then knows it (writing), and what
+// finishes it does so holding the lock (wake()): the connection's writer having framed the rest, the stream failing
+// (reset, timed out, or its connection ending), or (a tunnel's) stop. Its writer's resumed on the pool, never by
+// whoever finished it.
+//
+// As a socket's write, it must outlive a write waiting on it: a coroutine destroyed while it waits cancels it
+// (cancel(), which takes the stream out of the scheduler), which is only safe while it hasn't finished (its writer not
+// yet resumed).
+class stream_write final : public coro::operation<io::result>
+{
+public:
+    explicit stream_write(http2_stream_base* stream) noexcept
+        : stream{stream}
+    {}
+
+    // claim readies it for the rest of a write of into, past submitted (what the write submitted at once), returning
+    // false if it's in use.
+    [[nodiscard]] bool claim(std::span<const std::byte> into, std::size_t submitted) noexcept;
+
+    bool       start(std::coroutine_handle<> caller) noexcept override;
+    io::result result() noexcept override;
+    void       cancel() noexcept override;
+
+    // wake finishes the write if it's done (holding the lock), resuming its writer on the pool.
+    void wake() noexcept;
+
+private:
+    // done is whether the write's done (holding the lock), having set res if it is: its stream's failed, the
+    // connection's writer has framed all of it (the stream's out of the scheduler), or its tunnel's stopped (which
+    // takes it out).
+    bool done() noexcept;
+
+    http2_stream_base*         stream;
+    std::span<const std::byte> data;
+    std::size_t                written = 0;
+    io::result                 res;
+    std::coroutine_handle<>    awaiting;
+};
+
 // stream_writer writes what a stream sends (a response's body, or a request's) as DATA, waiting for the
-// flow-control windows to have room, and its turn (see http2_connection_base::step_write()). A write that can go at
-// once returns without a coroutine.
+// flow-control windows to have room, and its turn (see http2_connection_base::begin_write()). A write that can go at
+// once returns without a coroutine, and one that has to wait is an operation (see stream_write). One write at a time:
+// another while one's under way fails with std::errc::device_or_resource_busy, writing nothing.
 class stream_writer final : public io::writer
 {
 public:
     explicit stream_writer(http2_stream_base* stream) noexcept
         : stream{stream}
+        , waiting{stream}
     {}
 
     coro::task<io::result> write(std::span<const std::byte> data) override;
@@ -291,6 +335,7 @@ public:
 
 private:
     http2_stream_base* stream;
+    stream_write       waiting;
 };
 
 // stream_tunnel is a stream once it's a tunnel (see http/tunnel.hpp): once a 2xx has answered its extended CONNECT
@@ -330,7 +375,7 @@ public:
     // set_stop_token registers a callback on stop (removing the last's first, which waits for it if it's being made,
     // so it's called without the connection's lock) that marks the tunnel stopped and wakes the stream's read and
     // waits, which then fail (std::errc::operation_canceled): a read that has to wait, and a write that waits for its
-    // turn or the windows (with what it sent before; see http2_connection_base::step_write()).
+    // turn or the windows (with what it sent before; see http2_connection_base::begin_write()).
     void set_stop_token(std::stop_token stop) noexcept override;
 
     [[nodiscard]] std::stop_token closing() const noexcept override { return closing_token; }
@@ -417,6 +462,12 @@ public:
     stream_read* reading = nullptr;
     void         wake_reader() noexcept;
 
+    // The write waiting in the connection's scheduler, if one is (see stream_write), and wake_writer, which finishes it
+    // if it's done (holding the lock): called whenever the stream fails, the connection's writer has framed all of its
+    // write, or a tunnel's stopped.
+    stream_write* writing = nullptr;
+    void          wake_writer() noexcept;
+
     bool            ended = false; // this side has sent END_STREAM
     std::error_code failure;       // reset, timed out, or the connection ended (see fail_stream())
 
@@ -451,7 +502,7 @@ public:
     std::unique_ptr<stream_tunnel> tunnel;
 
     // notified whenever any of the above changes (but what's received: its reader's woken by wake_reader()), or the
-    // stream's (or connection's) window grows.
+    // stream's (or connection's) window grows. (Its writer's write that waits is finished by wake_writer() instead.)
     coro::notifier changed;
 
     stream_writer writer{this};
@@ -513,40 +564,29 @@ public:
     http2::session   session;
     chunk_pool       chunks; // for what the streams receive (see received_data)
 
-    // The streams waiting to send DATA, in their turns by priority (see step_write()), guarded by mu. Each side sets
+    // The streams waiting to send DATA, in their turns by priority (see begin_write()), guarded by mu. Each side sets
     // its streams' priorities through it (update()), so a waiting stream moves when its priority changes: a server's
     // from the client's signals, a client's from its request's Priority field, then client_response::set_priority().
     http2_scheduler send_order;
 
-    // write_state is how far a stream's write has gone, from one step to the next.
-    struct write_state
-    {
-        std::size_t written = 0;     // what the write submitted itself
-        bool        queued  = false; // it's handed the rest to the scheduler
-    };
-
-    // write_step is what a step of a write came to: its result, once it's done; otherwise what it's to wait for before
-    // the next step (a notifier, and the value it read).
-    struct write_step
-    {
-        bool            done = false;
-        io::result      result;
-        coro::notifier* wait = nullptr;
-        std::uint64_t   seen = 0;
-    };
-
-    // step_write takes a step of a stream's write of data (taking the lock), as far as it can go without waiting.
+    // begin_write takes the first step of a stream's write of data (taking the lock), as far as it can go without
+    // waiting: its result, if that's all of it (or it failed, or another write of the stream's is under way: then
+    // std::errc::device_or_resource_busy, writing nothing); none if the rest has to wait, waiting then claimed for it.
     //
     // A write (a server's response, or a client's request body) is submitted to the session at once, a frame at a time,
     // while less than max_ahead of DATA waits for the writer (or is being written), no stream waits in the scheduler,
     // and the output's under max_output: so a connection whose streams don't contend for it pays nothing for the
     // scheduler. Otherwise (or for what doesn't fit, or has no window), the stream waits in the scheduler with the
-    // rest, for the writer to frame it in its turn (see fill()), and the write returns once it's all framed: so the
-    // stream's end (an empty DATA, or trailers) still follows its data, and only max_ahead of DATA (and what's in the
-    // socket's buffers) is past reordering.
+    // rest once waiting's awaited (see queue_rest()), for the writer to frame it in its turn (see fill()), and the
+    // write returns once it's all framed: so the stream's end (an empty DATA, or trailers) still follows its data, and
+    // only max_ahead of DATA (and what's in the socket's buffers) is past reordering.
     //
     // Either way, a body of known length ends with its last DATA frame (see http2_stream_base::data_left).
-    write_step step_write(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
+    std::optional<io::result> begin_write(http2_stream_base& s, std::span<const std::byte> data, stream_write& waiting);
+
+    // queue_rest queues rest, what a stream's write couldn't submit at once, in the scheduler, for the writer to frame
+    // in its turn, and tells the writer (holding the lock).
+    void queue_rest(http2_stream_base& s, std::span<const std::byte> rest);
 
     // wake_writer tells the writer there's output, if there is: called without the lock.
     void wake_writer();
@@ -570,7 +610,7 @@ public:
 
     // fail_stream fails s with err, unless it has failed already (holding the lock), queuing its stop source (if it
     // has one, and it isn't a tunnel, whose user finds its failure in its reads and writes) for stop_pending() to stop.
-    // It finishes a read that's waiting; waking its other waits is the caller's.
+    // It finishes a read and a write that are waiting; waking its other waits is the caller's.
     //
     // Stop sources are never stopped holding the lock: std::stop_source::request_stop() runs the callbacks registered
     // on it inline, and they're anyone's (the handler's, a scheduler wait's, ...), taking locks of their own. So each
@@ -586,10 +626,6 @@ public:
     void notify_writer() noexcept { writer_wakeup.notify(); }
 
     [[nodiscard]] io::handle native_handle() const noexcept { return detail::native_handle(conn); }
-
-    // unqueue takes a stream out of the scheduler (taking the lock): for a write destroyed while it waits there, whose
-    // span the writer mustn't touch once it's gone.
-    void unqueue(http2_stream_base& s);
 
     // wait_queued waits until at least n streams wait in the scheduler (true), or the connection's ending (false): for
     // tests, to know that streams have queued (e.g. with no window to send) before letting them send.
@@ -689,10 +725,9 @@ private:
     // (turn_held), when the others' would otherwise take it.
     void fill();
 
-    // step_write()'s parts (holding the lock): submit_at_once submits a write as far as it may go at once (failing the
-    // stream if it can't submit), and queue_rest queues the rest in the scheduler.
-    std::error_code submit_at_once(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
-    void            queue_rest(http2_stream_base& s, std::span<const std::byte> data, write_state& state);
+    // submit_at_once submits a write of data as far as it may go at once (holding the lock), adding what it submitted
+    // to written, and failing the stream if it can't submit (see begin_write()).
+    std::error_code submit_at_once(http2_stream_base& s, std::span<const std::byte> data, std::size_t& written);
 
     // submit_body submits data of a stream's body to the session (as far as the windows allow; see
     // http2::session::submit_data()), with END_STREAM if it's the last of a body of known length (see

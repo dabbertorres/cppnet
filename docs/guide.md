@@ -657,7 +657,9 @@ scheduler.spawn(server.serve());
   head, and returns the writer for a body of that length; `resp.send(status)` is for a body whose length isn't known
   (sent chunked). A handler that sends nothing gets an empty 200; one that throws, a 500. `send()` throws
   `std::system_error` (`std::errc::invalid_argument`) if a header can't be sent (e.g. a value with a line break),
-  over HTTP/1.1 and HTTP/2 alike.
+  over HTTP/1.1 and HTTP/2 alike. A body's writes go one at a time: over HTTP/2, one made while another's under way
+  (waiting for the flow-control windows, or its turn) fails with `std::errc::device_or_resource_busy`, writing
+  nothing, as a second flush of HTTP/1.1's buffered writer does.
 - **Interim responses:** `resp.send(status)` with a 1xx status (e.g. `status::EARLY_HINTS`), before the final
   response, sends an interim one at once, with the headers set so far, which the final response then sends too:
 
