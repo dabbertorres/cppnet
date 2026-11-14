@@ -455,6 +455,35 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   per read -1.5% (p = 0.038). One wrong-way result, the 1 KiB reader's chunked download (CPU time +1.6%, p = 0.019;
   allocations +0.19%, p = 0.041, which drift with timing), wasn't reproduced by ten more rounds (+0.03%, p = 0.68;
   +0.08%, p = 0.57). Verdict on the bar: an allocation drop on every target case, and no regression.
+- **Stage 5, the HTTP/2 write** (2026-11-14): a stream's write that has to wait is an operation its writer holds
+  (`stream_write`), as its read is, rather than `write_waiting()`'s coroutine (224 B). The stream knows it while it
+  waits (`writing`), and what finishes it does so holding the connection's lock (`wake_writer()`): the writer framing
+  the rest (`fill()`), the stream failing (`fail_stream()`: a reset, a timeout, the connection's end), or a tunnel's
+  stop. It no longer waits on the stream's notifier, so the notifies that aren't about it (settings, window updates, the
+  client's head) no longer wake it. Two behaviours are the user's choices (2026-11-14): another write while one's under
+  way fails with `device_or_resource_busy`, writing nothing (as a socket's second write, the stream's reader and
+  `buffered_writer` do); and what a write can't submit at once joins the connection's scheduler only once its task is
+  awaited (what can go at once still goes at the call), so a task dropped unawaited leaves nothing queued. Three bugs
+  went with it, each now tested (the tests fail on 3f8a501, two of them as use after free under ASan): a second write
+  while one waited replaced the first's span in the scheduler, so the first returned claiming all of it written; a
+  write's task dropped unawaited left its span queued, for the writer to frame from freed memory; and a write destroyed
+  while it waited left its coroutine's handle in the stream's notifier, which the next notify resumed. Allocations: 8
+  streams 44.6 -> 41.2 per response, 8 bodies 55.5 -> 40.6 per request, `bench_websocket`'s HTTP/2 64 KiB one at a time
+  3 -> 2 (as planned), and the other target cases as their Stages entry has them (e.g. 64 WebSockets, large in flight,
+  12.7 -> 2.1); no other count changed. Elisions (`-Rpass=coro-elide` over `src/` and `bench/`, the fuzz targets left
+  out): 80 elided before and after, 417 -> 416 not (`write_waiting` gone), every other frame's size the same. Ten
+  interleaved rounds a side against master 3f8a501 (`bench_request`, `bench_websocket`, `bench_client`, `bench_tls`):
+  target gains on the WebSockets that share an HTTP/2 connection, by time and CPU time: 64 at once, medium in flight
+  (-5.5% / -4.6%, p = 0.001), large one at a time (-4.9% / -4.4%, p = 0.005) and large in flight (-3.4% / -2.9%, p <
+  0.001); 8 at once, medium in flight (-3.1% / -2.7%, p = 0.028 / 0.034), large one at a time (-3.1% / -2.9%, p = 0.002
+  / 0.003) and large in flight (-3.9% / -3.7%, p = 0.023 / 0.026). The other targets are noise (one WebSocket's, p >=
+  0.49; 64 at once, medium one at a time, p >= 0.76; 8 streams +4.1% / +2.8%, p = 0.57 / 0.68; 8 bodies -2.7% / -1.8%, p
+  = 0.43 / 0.47). Gains off the targets (reported, not claimed): `bench_client`'s 1 KiB reader's chunked download
+  (-2.0%, p = 0.021), `bench_request` one per read (-1.3%, p = 0.038) and pipelined (-1.0%, p = 0.045), one WebSocket's
+  HTTP/2 small one at a time (-2.7% / -2.0%, p = 0.011 / 0.014), and 8 WebSockets' HTTP/1.1 medium one at a time (-14% /
+  -14%, p = 0.011 / 0.007). One wrong-way result, `bench_tls echo` (16 B +5.9% / +4.3%, p = 0.014 / 0.021; 16 KiB +3.9%
+  / +4.7%, p = 0.045 / 0.041), wasn't reproduced by ten more rounds (-0.3% to -0.7%, p >= 0.76). Verdict on the bar: an
+  allocation drop on every target case, six target gains, and no regression.
 
 ## Decided questions
 
