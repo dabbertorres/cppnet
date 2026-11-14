@@ -37,6 +37,20 @@ taken off as they're started (moved into a plan of their own) or dropped.
 - **An allocator experiment**: jemalloc, mimalloc, snmalloc and gperftools' tcmalloc (all in vcpkg; Google's tcmalloc
   builds only with Bazel). cppnet itself stays allocator-agnostic; whether it's a benchmarks-only CMake option or
   preloading is open. Best run once allocations and sizes settle.
+- **Code layout: build flags and attributes** (the user, 2026-11-13, after #120's two slowdowns from 2,431 functions
+  moving 48 bytes): first decide the goal, results that don't swing with placement or faster placement, then test on
+  each machine's CPU, as the effects differ. Candidates:
+  - `-falign-functions=64`: a function's size no longer moves the others; it costs padding, about 370 KB for ~11,600
+    functions.
+  - `-falign-loops=64` for cppnet's own loops, as for Botan's (this Mac's i9-9980HK has the JCC erratum).
+  - `-mbranches-within-32B-boundaries`: ELF only, so Linux on an affected Intel CPU.
+  - `[[gnu::hot]]`/`[[gnu::cold]]`, or `[[gnu::aligned(64)]]` on chosen functions.
+  - PGO with function ordering, or BOLT (Linux).
+
+  `-ffunction-sections`/`-fdata-sections` with `--gc-sections` shrink the binary rather than fix placement. Mach-O already
+  splits code per function and has `-dead_strip`; on ELF they are what a linker ordering file needs. MSVC's `/Gy` and
+  `/OPT:REF` don't apply while there's no Windows build. Measure with the coroutines plan's bar, plus code size, and
+  `perf`'s front-end counters on Linux to tell the decoded-µop cache from the erratum.
 - **The web benchmark against newer suites**: TechEmpower's benchmark may not have been updated since 2024 (the user's
   report, not yet checked). HTTPArena and similar projects serve the same purpose: check what they measure differently
   (tests, load generators, rules), then propose changes to `bench/web`.

@@ -1,8 +1,8 @@
 # Plan: one coroutine per sequence of actions
 
 Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 4 done (pull requests
-#112 to #117; Learned in the stages has how each met the bar). Paused after stage 4 by the user (2026-11-02): stage 5
-waits for the user's go-ahead. The `http11` references change (below) is done.
+#112 to #117; Learned in the stages has how each met the bar). Paused after stage 4 by the user (2026-11-02); the
+`http11` references change (below) is done (#120). Stage 5 resumed with the user's go-ahead (2026-11-13).
 
 ## Goal
 
@@ -337,8 +337,10 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    task complicates `async_scope`'s lease and join rules: Decided question 4), the HTTP/2 stream's write that waits,
    TLS's read and flush. Cases: a connection per request ~13 -> ~10; HTTP/2 a stream at a time -1, 8 streams ~52.6 ->
    ~49, 8 bodies ~59.5 -> ~45; `bench_websocket` HTTP/2 64 KiB 3 -> 2; `bench_tls echo` 24 -> ~16 per round trip;
-   `bench_tls writes` 10.8 -> ~7 per 16 KiB write (36.6 us: the pool made it 1-3% slower; this mustn't). May split per
-   object if the pull request grows. Then GCC's allocation counts again.
+   `bench_tls writes` 10.8 -> ~7 per 16 KiB write (36.6 us: the pool made it 1-3% slower; this mustn't). A pull request
+   per object, each measured and kept or dropped on its own (the user, 2026-11-13), in this order: accept, spawning,
+   the HTTP/2 stream's write, TLS's read and flush. Measured on the same Mac as stages 0 to 4 (the user, 2026-11-13).
+   Then GCC's allocation counts again.
 6. **The frame allocator**, with what's left (handlers, the client's `send()` chain, `drive()`, the spawned frames):
    per-thread size-class free lists in the promise's `operator new`/`delete`, out of line (Decided question 8, asked
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
