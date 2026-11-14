@@ -328,10 +328,15 @@ struct accept_options
 // stream is a TLS connection over a TCP socket, which it owns: it reads and writes the application's data.
 //
 // A read and a write may run at once (e.g. on different threads), as with a socket; and as with a socket, only one
-// read. Writes may, too: each is sent whole, in the order they were called. The socket's deadlines and timeouts (see
-// socket()) limit them. A write returns once what it wrote has gone to the socket, after anything queued before it
-// (e.g. another write, or a read's reply to the peer, which another task may be writing): so the socket's write
-// deadline and timeout limit it, whichever task does the writing.
+// read: another while one waits fails with std::errc::device_or_resource_busy. Writes may, too: each is sent whole, in
+// the order they were called. The socket's deadlines and timeouts (see socket()) limit them. A write returns once what
+// it wrote has gone to the socket, after anything queued before it (e.g. another write, or a read's reply to the
+// peer, which another task may be writing): so the socket's write deadline and timeout limit it, whichever task does
+// the writing. A write is encrypted when it's called, and flushed when its task is awaited (so one whose task is
+// destroyed unawaited goes with the next write). Reads and writes need no coroutine of their own: a read takes what's
+// decrypted already, or reads the socket, as far as it can without waiting, and waits (if it must) through the
+// stream's reader, as a socket's read does; a write's flush goes through the stream's flusher, unless another task's
+// flush has it.
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends

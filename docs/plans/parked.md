@@ -20,11 +20,14 @@ taken off as they're started (moved into a plan of their own) or dropped.
 
 ## Performance
 
-- **The TLS flush's fast path**: `tls::stream`'s flush costs about three allocations a batch (the `flush()` and
-  `write_queued()` coroutines, and the ciphertext's vector) even when the socket takes it all; a ready task when no
-  flush is in progress and the socket takes everything would make smaller batches cheap.
+- **The TLS flush's fast path**: `tls::stream`'s flush costs an allocation a batch (the ciphertext's vector; its
+  coroutines went with stage 5 of the coroutines plan, which made it the stream's flusher) even when the socket takes it
+  all, and its task is the flusher's even then; a ready task when no flush is in progress and the socket takes
+  everything would make smaller batches cheaper still, but would take the flush on when the write's called, not when
+  it's awaited (a behaviour to decide).
 - **TLS encryption throughput**, with `tls::detail::connection`'s sensitivity to layout: `write_batch` among the flush's
-  members made `bench_tls writes` 15% slower, so it's kept last.
+  members made `bench_tls writes` 15% slower, so the members before it are kept where they were (what's added goes
+  after it).
 - **Writes that wait, as an operation**: a stream's waiting write as a `coro::operation` would halve the three or so
   allocations left over HTTP/1.1.
 - **An adaptive HTTP/2 window**, sized from a measured bandwidth-delay product, as .NET's and hyper's optional one.

@@ -268,7 +268,12 @@ namespace detail
 // the stepper's been let go: for an owner whose steps let go of something that the stepper's next task depends on (e.g.
 // a connection's turn to write, the next holder of which uses the stepper), which a step can't do while the stepper's
 // still the last one's. (Steps that run without the stepper, in adapt(), can.)
-template<typename Owner, typename In, typename Out, auto Step, auto Released = nullptr>
+//
+// Canceled, if given (a member function of Owner, noexcept), is called when the coroutine awaiting a task of the
+// stepper's is destroyed while it waits, once the inner task waiting has been canceled, and before the stepper's let go
+// (so what the steps keep in the owner is still that task's): for an owner whose steps hold something that a canceled
+// task must give back, as no step will (e.g. a stream's flush, which others wait to take on).
+template<typename Owner, typename In, typename Out, auto Step, auto Released = nullptr, auto Canceled = nullptr>
 class stepper final : public operation<Out>
 {
 public:
@@ -333,6 +338,11 @@ public:
     {
         if (op != nullptr) op->cancel();
         let_go_of_inner();
+        if constexpr (!std::is_same_v<decltype(Canceled), std::nullptr_t>)
+        {
+            static_assert(std::is_nothrow_invocable_v<decltype(Canceled), Owner&>);
+            std::invoke(Canceled, *owner);
+        }
         this->release();
     }
     // NOLINTEND(portability-template-virtual-member-function)
