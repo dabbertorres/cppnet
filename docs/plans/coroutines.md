@@ -348,7 +348,15 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    e.g. TCP alone 10 -> 9, ECDSA P-256 full 1912 -> 1911; time and CPU time). `bench_client`, `bench_websocket`,
    `bench_tls echo` and `writes` keep their counts (their accepts are outside what they count; the in-flight and
    chunked cases' drift by timing, as before), and `bench/web` is measured as well (an accept per connection, which
-   live through each run), but isn't a target.
+   live through each run), but isn't a target. Spawning's target cases (named before measuring, 2026-11-13; the same
+   rule, by a probe run of each bench and the counting copy of `bench_tls`): `bench_request`, a connection per request
+   (13 -> 11 per connection: `start_on` and `run` around `serve_connection`), over HTTP/2 a stream at a time (36 ->
+   35: the server's `run` around `run_stream`), 8 streams at once (47.6 -> 44.7 per response) and 8 request bodies at
+   once (58.5 -> 55.6: the server's `run`, and the bench's `start_on` and `run` around each stream's sender), time and
+   CPU time. `bench_client`, `bench_websocket` and `bench_tls` (handshakes, echo and writes) keep their counts (their
+   spawns are outside what they count), as do `bench_notifier` and `bench_blocking` (which spawn only to set up).
+   Measured as well, not targets: `bench_task`, as every `task<void>`'s final suspend now tests whether it was spawned,
+   and `bench/web` (a spawn per connection, which live through each run).
 6. **The frame allocator**, with what's left (handlers, the client's `send()` chain, `drive()`, the spawned frames):
    per-thread size-class free lists in the promise's `operator new`/`delete`, out of line (Decided question 8, asked
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
