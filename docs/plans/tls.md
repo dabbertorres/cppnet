@@ -821,7 +821,12 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   them is destroyed; and a write destroyed while it waits for its turn. Each fails on f78fc07 with a use after free
   under ASan, and the first, with the count left high, by the close_notify answer never coming.
 - **Measured** (target cases, named before measuring: none, as no bench has flushes that wait for each other or are
-  destroyed; a correctness fix that mustn't regress): see the stage's pull request.
+  destroyed; a correctness fix that mustn't regress): ten interleaved rounds a side against f78fc07 (`bench_tls`,
+  `bench_request`, `bench_client`, `bench_websocket`) changed no allocation count, and every `bench_tls` metric is noise
+  (p >= 0.089; e.g. `writes` 16 KiB 37.30 -> 37.10 us, p = 0.26; `echo` 16 B 32.45 -> 32.06 us, p = 0.23). Two wrong-way
+  results, `bench_client`'s 4 KiB reader's long head lines (+1.1%, p = 0.049) and `bench_request` pipelined through
+  `http::timeout` on the route (+1.7%, p = 0.031), weren't reproduced by ten more rounds (-0.4%, p = 0.31; +0.7%, p =
+  0.57). No regression.
 
 ## Stages
 
