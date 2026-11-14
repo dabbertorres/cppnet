@@ -393,6 +393,24 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   0.005; the runtime router +2.6%, p = 0.002). The code they run is the same but for `response_encode`'s dropped
   null test (`request_decode` and `set_request_body` byte for byte), and 2,431 functions after `encode_request` sit
   48 bytes earlier. The user kept it (2026-11-13), taking placement as the explanation, as in stage 2.
+- **Stage 5, accept** (2026-11-13): `listener::accept()` takes a connection that's waiting as a ready task, and
+  otherwise waits through an operation the listener holds, one accept at a time (another that has to wait fails with
+  `device_or_resource_busy`, as it did before through the scheduler's wait), so it's no longer `const`. Allocations: a
+  connection per request 14 -> 13, and `bench_tls`'s handshakes one fewer per connection; no other count changed, nor
+  did any elision or kept frame's size (`-Rpass=coro-elide` over `src/` and `bench/`: 78 elided, 422 not, before and
+  after; accept's own 936-byte frame is gone). Ten interleaved rounds a side against master 55c8542 (`bench_request`,
+  `bench_client`, `bench_tls`, `bench/web`): one target gain, `bench_tls`'s ECDSA P-256 full handshake without
+  tickets (time -1.0%, p = 0.031; CPU time -1.3%, p = 0.026), which ten more rounds didn't show again (p = 0.41 and
+  0.27); a connection per request -4.8% and -3.4% (p = 0.68 and 0.57: noise); TCP alone leaned +6.6% (p = 0.058 and
+  0.082, at ten rounds: noise; -1.3% in the next ten). Gains off the targets (reported, not claimed): the 4 KiB
+  reader's chunked download (-2.0%, p = 0.005) and http::timeout over a socket (-3.5%, p = 0.034). One regression:
+  `bench_client`'s long head lines, with each reader, 2.3 to 4.5% slower by time and CPU time (p <= 0.001),
+  reproduced by a confirmation run of ten more (2.5 to 4.0%, p <= 0.007). The code it runs is unchanged and only
+  moved: the two binaries' functions are the same instruction for instruction but for the listener's, the server's
+  that use its layout (it holds the listener, now 272 bytes larger) or its accept loop, and padding after functions;
+  `http11.cpp`'s functions sit 32 bytes earlier, the buffered reader's and the scheduler's mostly 144 bytes later.
+  Verdict on the bar: an allocation drop and a target gain, and one regression on code that only moved. The user kept
+  it (2026-11-13), taking placement as the explanation, as in stage 2 and after stage 4.
 
 ## Decided questions
 
