@@ -1155,7 +1155,7 @@ TEST_CASE("racing attempts takes the first to connect, and closes the rest", "[t
     // connects, writes a byte to the connection it got, then reads from each connection the listener accepted: the
     // winner's gets the byte, the loser's ends.
     const auto run =
-        [](net::io::scheduler* sched, fake_network* network, const net::listener* listener) -> net::coro::task<outcome>
+        [](net::io::scheduler* sched, fake_network* network, net::listener* listener) -> net::coro::task<outcome>
     {
         outcome result;
 

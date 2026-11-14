@@ -91,7 +91,7 @@ task<> get(net::io::scheduler* sched, http::client* c, std::string url, fetched*
 
 // accept accepts a connection on listener, and runs a server's handshake over it (with ctx), offering h2 and http/1.1
 // by ALPN.
-task<std::optional<tls::stream>> accept(const net::listener& listener, tls::server_context ctx)
+task<std::optional<tls::stream>> accept(net::listener& listener, tls::server_context ctx)
 {
     auto accepted = co_await listener.accept();
     if (!accepted.has_value()) co_return std::nullopt;

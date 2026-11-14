@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cerrno>
+#include <coroutine>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -199,16 +201,34 @@ std::uint16_t listener::local_port() const
     }
 }
 
-coro::task<std::expected<tcp_socket, std::error_code>> listener::accept() const
+// NOTE: accept tries first, without a coroutine (see coro::ready_task), and only waits (also without one: see
+//       accept_operation) if it has to.
+coro::task<std::expected<tcp_socket, std::error_code>> listener::accept()
 {
-    const auto canceled = std::make_error_code(std::errc::operation_canceled);
+    using result_type = std::expected<tcp_socket, std::error_code>;
 
+    if (!is_listening.load(std::memory_order::acquire))
+        return coro::ready_task<result_type>(std::unexpected(std::make_error_code(std::errc::operation_canceled)));
+
+    if (auto accepted = try_accept(); accepted.has_value())
+    {
+        if (!accepted->has_value()) return coro::ready_task<result_type>(std::unexpected(accepted->error()));
+        return coro::ready_task<result_type>(tcp_socket{scheduler, **accepted});
+    }
+
+    // the scheduler accepts, once a connection's waiting (see accept_operation).
+    if (!accepting.claim())
+        return coro::ready_task<result_type>(std::unexpected(std::make_error_code(std::errc::device_or_resource_busy)));
+
+    return coro::operation_task(accepting);
+}
+
+std::optional<std::expected<io::handle, std::error_code>> listener::try_accept() const noexcept
+{
     while (true)
     {
-        if (!is_listening.load(std::memory_order::acquire)) co_return std::unexpected(canceled);
-
         io::handle inc_fd = ::accept(main_fd, nullptr, nullptr);
-        if (inc_fd != -1) co_return tcp_socket{scheduler, inc_fd};
+        if (inc_fd != -1) return inc_fd;
 
         auto err = errno;
         switch (err)
@@ -220,21 +240,65 @@ coro::task<std::expected<tcp_socket, std::error_code>> listener::accept() const
 #if EAGAIN != EWOULDBLOCK
         case EWOULDBLOCK:
 #endif
-        {
-            auto wait_err = co_await scheduler->wait(main_fd, io::poll_op::read);
-            if (wait_err)
-            {
-                // shutdown() deregisters the handle, which may be seen as either error.
-                if (!is_listening.load(std::memory_order::acquire)) co_return std::unexpected(canceled);
-                co_return std::unexpected(wait_err);
-            }
+            return std::nullopt;
 
-            continue;
-        }
-
-        default: co_return std::unexpected(std::error_code{err, std::system_category()});
+        default: return std::unexpected(std::error_code{err, std::system_category()});
         }
     }
+}
+
+bool listener::accept_operation::claim() noexcept
+{
+    if (!try_claim()) return false;
+
+    accepted = invalid_fd;
+    failed   = {};
+    return true;
+}
+
+bool listener::accept_operation::start(std::coroutine_handle<> awaiting) noexcept
+{
+    return begin(*owner->scheduler, owner->main_fd, io::poll_op::read, std::nullopt, awaiting);
+}
+
+bool listener::accept_operation::perform() noexcept
+{
+    auto res = owner->try_accept();
+    if (!res.has_value()) return false;
+
+    if (res->has_value()) accepted = **res;
+    else failed = res->error();
+    return true;
+}
+
+std::expected<tcp_socket, std::error_code> listener::accept_operation::result()
+{
+    end_wait();
+
+    const auto waited = error();
+    const auto fd     = std::exchange(accepted, invalid_fd);
+    const auto err    = failed;
+    auto*      sched  = owner->scheduler;
+    release();
+
+    if (waited)
+    {
+        // shutdown() deregisters the handle, which may be seen as either error.
+        if (!owner->is_listening.load(std::memory_order::acquire))
+            return std::unexpected(std::make_error_code(std::errc::operation_canceled));
+        return std::unexpected(waited);
+    }
+
+    if (fd == invalid_fd) return std::unexpected(err);
+    return tcp_socket{sched, fd};
+}
+
+void listener::accept_operation::cancel() noexcept
+{
+    // NOTE: nothing's been accepted to close: the wait's still going (the coroutine's destroyed while it waits), and
+    //       perform() ends it once it accepts.
+    cancel_wait();
+    release();
 }
 
 void listener::shutdown() noexcept

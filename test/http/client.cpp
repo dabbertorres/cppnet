@@ -978,7 +978,7 @@ struct stalling_server
         port = local_port(listener);
     }
 
-    task<> serve() const
+    task<> serve()
     {
         while (true)
         {

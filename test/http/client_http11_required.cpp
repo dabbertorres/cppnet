@@ -163,7 +163,7 @@ struct h1_peer
     task<bool> send(std::string_view bytes) { co_return !(co_await net::io::write_all(socket, bytes)).err; }
 };
 
-task<std::optional<h1_peer>> accept_h1(const net::listener& listener)
+task<std::optional<h1_peer>> accept_h1(net::listener& listener)
 {
     auto accepted = co_await listener.accept();
     if (!accepted.has_value()) co_return std::nullopt;

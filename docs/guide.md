@@ -189,6 +189,11 @@ const std::array<net::ip_addr, 2> addresses{net::ipv6_addr::loopback(), net::ipv
 auto local = co_await net::tcp_socket::connect(&scheduler, addresses, 7777);
 ```
 
+`accept` takes a connection that's already waiting without a coroutine, and otherwise waits for one, one accept at a
+time: another that has to wait meanwhile fails with `std::errc::device_or_resource_busy`, as a socket's second read
+does. Once the listener's shut down (`shutdown()`), or the scheduler stopped, accepts fail with
+`std::errc::operation_canceled`, those waiting too.
+
 `connect` races a host's addresses, as RFC 8305 (Happy Eyeballs) has it: in their order (the resolver's, sorted by RFC
 6724), but interleaved by family, the first address's first (e.g. IPv6, IPv4, IPv6, ...), it starts an attempt every
 `connect_options::attempt_delay` (250 ms), or at once when the latest attempt fails, and the attempts go on together,

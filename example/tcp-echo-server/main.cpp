@@ -40,7 +40,7 @@ net::coro::task<> serve_connection(net::tcp_socket socket)
     }
 }
 
-net::coro::task<> run_echo_server(net::io::scheduler& scheduler, const net::listener& listener)
+net::coro::task<> run_echo_server(net::io::scheduler& scheduler, net::listener& listener)
 {
     while (true)
     {
