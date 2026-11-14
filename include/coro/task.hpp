@@ -18,6 +18,8 @@ class promise;
 
 class promise_base;
 
+class async_scope;
+
 template<typename Owner, typename In, typename Out, auto Finish>
 class adapter;
 
@@ -357,6 +359,9 @@ public:
     template<typename Owner, typename In, typename Out, auto Step, auto Released>
     friend class stepper;
 
+    // (an async_scope takes the coroutine of a task it spawns: see promise<void>::detach().)
+    friend class async_scope;
+
 private:
     // from_ready is the result a ready task holds.
     static T from_ready(ready_type value)
@@ -420,7 +425,6 @@ public:
     operation_base* suspended_in = nullptr;
 
     auto initial_suspend() noexcept { return std::suspend_always{}; }
-    auto final_suspend() noexcept { return final_awaitable{}; }
 
     void set_continuation(std::coroutine_handle<> handle) noexcept { continuation = handle; }
 
@@ -433,9 +437,7 @@ public:
     // yet (it's the only other thing that sets the flag).
     [[nodiscard]] bool finished() const noexcept { return second.load(std::memory_order::acquire); }
 
-private:
-    friend struct final_awaitable;
-
+protected:
     struct final_awaitable
     {
         [[nodiscard]] bool await_ready() const noexcept { return false; }
@@ -456,8 +458,16 @@ private:
         void await_resume() noexcept { /* noop */ }
     };
 
-    std::coroutine_handle<> continuation{nullptr};
-    std::atomic<bool>       second{false};
+    // A spawned coroutine (detached: see promise<void>::detach()) has no awaiting coroutine to continue, but a scope
+    // that owns it: so they share a place, which detached tells apart (and the promise stays as small as it was).
+    union
+    {
+        std::coroutine_handle<> continuation{nullptr};
+        async_scope*            owner;
+    };
+
+    std::atomic<bool> second{false};
+    bool              detached = false;
 };
 
 template<typename T>
@@ -489,6 +499,8 @@ public:
     ~promise()                         = default;
 
     task<T> get_return_object() noexcept { return task<T>{std::coroutine_handle<promise<T>>::from_promise(*this)}; }
+
+    auto final_suspend() noexcept { return final_awaitable{}; }
 
     template<typename Y>
         requires((is_reference && std::is_constructible_v<T, Y&&>)
@@ -597,6 +609,29 @@ public:
         return task<void>{std::coroutine_handle<promise<void>>::from_promise(*this)};
     }
 
+    // final_suspend continues the awaiting coroutine, as every task's does, unless the coroutine was spawned (see
+    // detach()): then nothing awaits it, and it ends itself.
+    auto final_suspend() noexcept
+    {
+        struct awaitable
+        {
+            [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<promise> self) noexcept
+            {
+                if (!self.promise().detached) return promise_base::final_awaitable{}.await_suspend(self);
+
+                // NOTE: the frame is gone once end_detached() returns, so nothing of it may be touched afterwards.
+                end_detached(self);
+                return std::noop_coroutine();
+            }
+
+            void await_resume() const noexcept { /* noop */ }
+        };
+
+        return awaitable{};
+    }
+
     void return_void() noexcept {}
 
     void unhandled_exception() noexcept { exception = std::current_exception(); }
@@ -607,6 +642,20 @@ public:
     }
 
 private:
+    friend class async_scope;
+
+    // detach makes the coroutine scope's, for async_scope::spawn(): the coroutine is then the detached task itself,
+    // with no frame around it, as nothing awaits it. Once it ends, it passes on its exception (if one escaped),
+    // destroys its frame, and then tells the scope (see end_detached()). Called before it starts.
+    void detach(async_scope& scope) noexcept
+    {
+        owner    = &scope;
+        detached = true;
+    }
+
+    // end_detached ends a detached coroutine (see detach()). Defined with async_scope, whose internals it uses.
+    static void end_detached(std::coroutine_handle<promise> self) noexcept;
+
     std::exception_ptr exception;
 };
 

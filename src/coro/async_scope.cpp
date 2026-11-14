@@ -7,9 +7,36 @@
 #include <vector>
 
 #include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
+
+namespace
+{
+
+// awaited is a coroutine for a task without one of its own left to run (see async_scope::spawn()): it awaits task, so
+// the task ends (or throws) as it would awaited anywhere.
+net::coro::task<> awaited(net::coro::task<> task) { co_await std::move(task); }
+
+}
 
 namespace net::coro
 {
+
+// NOLINTNEXTLINE(bugprone-exception-escape): an exception thrown by the scope's exception handler ends the program.
+void promise<void>::end_detached(std::coroutine_handle<promise> self) noexcept
+{
+    auto& scope = *self.promise().owner;
+
+    if (auto error = std::exchange(self.promise().exception, nullptr); error != nullptr)
+    {
+        if (scope.on_exception) scope.on_exception(error);
+        else std::terminate();
+    }
+
+    // the frame is destroyed before the scope is told the task has finished, so nothing of the task (e.g. what its
+    // parameters own) outlives the scope.
+    self.destroy();
+    scope.finish();
+}
 
 bool async_scope::join_operation::await_suspend(std::coroutine_handle<> awaiting) noexcept
 {
@@ -33,29 +60,42 @@ async_scope::~async_scope()
 
 bool async_scope::spawn(task<> task)
 {
+    auto handle = adopt(task);
+    if (!handle) return false;
+
+    // NOTE: the frame may be destroyed (on another thread) before resume() returns.
+    handle.resume();
+
+    return true;
+}
+
+bool async_scope::spawn_on(thread_pool& pool, task<> task)
+{
+    auto handle = adopt(task);
+    if (!handle) return false;
+
+    // NOTE: once it's queued, a worker may run it to its end (destroying its frame) before queue() returns.
+    if (pool.queue(handle)) return true;
+
+    // the pool is shutting down: the task never starts.
+    handle.destroy();
+    finish();
+    return false;
+}
+
+std::coroutine_handle<promise<void>> async_scope::adopt(task<>& task)
+{
+    if (auto handle = task.get_handle(); !handle || handle.done()) task = awaited(std::move(task));
+
     {
         std::scoped_lock lock{mu};
-        if (is_closed) return false;
+        if (is_closed) return nullptr;
         ++count;
     }
 
-    detached owner{};
-
-    try
-    {
-        owner = run(this, std::move(task));
-    }
-    catch (...)
-    {
-        // the coroutine frame couldn't be allocated, so the task never started.
-        finish();
-        throw;
-    }
-
-    // NOTE: the frame may be destroyed (on another thread) before resume() returns.
-    owner.handle.resume();
-
-    return true;
+    auto handle = std::exchange(task.handle, nullptr);
+    handle.promise().detach(*this);
+    return handle;
 }
 
 async_scope::lease async_scope::acquire() noexcept
@@ -65,24 +105,6 @@ async_scope::lease async_scope::acquire() noexcept
 
     ++count;
     return lease{this};
-}
-
-async_scope::detached async_scope::run(async_scope* scope, task<> task)
-{
-    {
-        // moved into a nested scope, so the task's frame is destroyed before the scope is told it is finished.
-        auto owned = std::move(task);
-
-        try
-        {
-            co_await owned;
-        }
-        catch (...)
-        {
-            if (scope->on_exception) scope->on_exception(std::current_exception());
-            else std::terminate();
-        }
-    }
 }
 
 // NOLINTNEXTLINE(bugprone-exception-escape): on_drained is checked before it's called.

@@ -13,8 +13,11 @@
 namespace net::coro
 {
 
-// async_scope owns detached tasks: it keeps count of the tasks spawned into it, destroys each one's coroutine frame
-// when it finishes, and can be joined (waited on until it has no tasks left).
+class thread_pool;
+
+// async_scope owns detached tasks: it keeps count of the tasks spawned into it, and can be joined (waited on until it
+// has no tasks left). A spawned task's coroutine is the detached task itself, with no frame around it: it counts in the
+// scope from when it's spawned, and destroys its own frame when it finishes, before the scope stops counting it.
 //
 // Once closed, a scope refuses new tasks. A scope must outlive its tasks, so its destructor closes it and blocks until
 // they have all finished.
@@ -104,7 +107,15 @@ public:
 
     // spawn starts task on the calling thread, where it runs until it first suspends. If the scope is closed, the task
     // is destroyed without being run, and false is returned.
+    //
+    // A task without a coroutine of its own left to run (a ready task, an operation's, an empty one, or one that has
+    // finished) is given one, which awaits it: so it ends as it would awaited, its exception passed on as any task's.
     bool spawn(task<> task);
+
+    // spawn_on queues task on pool, behind what's queued there, to start on one of its workers (a task without a
+    // coroutine of its own is given one, as by spawn()). If the scope is closed, or the pool is shutting down, the task
+    // is destroyed without being run, and false is returned.
+    bool spawn_on(thread_pool& pool, task<> task);
 
     // acquire takes a lease on the scope (see lease): an empty one if the scope is closed.
     [[nodiscard]] lease acquire() noexcept;
@@ -125,54 +136,12 @@ public:
     void join_blocking() noexcept;
 
 private:
-    // detached is the coroutine that owns a spawned task, and destroys itself when done.
-    //
-    // NOTE: it starts suspended, and is resumed once run() has returned. If it started eagerly, it could finish (and be
-    //       destroyed) on another thread while run() is still returning, which GCC's generated code doesn't allow for.
-    struct detached
-    {
-        struct promise_type
-        {
-            promise_type(async_scope* scope, const task<>& /*unused*/) noexcept
-                : scope{scope}
-            {}
+    // (a spawned coroutine's promise ends it: see promise<void>::end_detached().)
+    friend class promise<void>;
 
-            detached get_return_object() noexcept { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
-
-            std::suspend_always initial_suspend() noexcept { return {}; }
-
-            auto final_suspend() noexcept
-            {
-                struct awaitable
-                {
-                    [[nodiscard]] bool await_ready() const noexcept { return false; }
-
-                    void await_suspend(std::coroutine_handle<promise_type> self) noexcept
-                    {
-                        // destroy the frame before telling the scope, so nothing of the task outlives the scope.
-                        auto* owner = self.promise().scope;
-                        self.destroy();
-                        owner->finish();
-                    }
-
-                    void await_resume() const noexcept {}
-                };
-
-                return awaitable{};
-            }
-
-            void return_void() noexcept {}
-
-            // the body catches everything.
-            void unhandled_exception() noexcept { std::terminate(); }
-
-            async_scope* scope;
-        };
-
-        std::coroutine_handle<promise_type> handle;
-    };
-
-    static detached run(async_scope* scope, task<> task);
+    // adopt takes task's coroutine for the scope (giving it one, if it has none to run: see spawn()), counting it, and
+    // returns its handle: or null if the scope is closed, leaving task to destroy it.
+    std::coroutine_handle<promise<void>> adopt(task<>& task);
 
     void finish() noexcept;
 

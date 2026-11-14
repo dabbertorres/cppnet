@@ -584,6 +584,57 @@ TEST_CASE("resumes from other threads, and yields, are queued", "[coro][thread_p
     }
 }
 
+TEST_CASE("a coroutine queued from a worker runs behind what's queued, not next", "[coro][thread_pool][queue]")
+{
+    thread_pool pool{1};
+
+    std::vector<int>      order;
+    std::binary_semaphore queue_it{0};
+    std::binary_semaphore queued{0};
+    std::binary_semaphore done{0};
+
+    auto first = noted(&order, 1);
+    auto next  = noted(&order, 2, nullptr, nullptr, &done);
+
+    // on the worker: first is queued (by another thread, while this waits), then next is.
+    auto drive = [](thread_pool*            pool,
+                    std::binary_semaphore*  queue_it,
+                    std::binary_semaphore*  queued,
+                    std::coroutine_handle<> next) -> net::coro::task<>
+    {
+        co_await pool->schedule();
+        queue_it->release();
+        queued->acquire();
+        pool->queue(next);
+    }(&pool, &queue_it, &queued, handle_of(next));
+    drive.get_handle().resume();
+
+    // NOTE: released whatever happens, so the worker isn't left waiting.
+    const bool started = queue_it.try_acquire_for(std::chrono::seconds{10});
+    if (started) CHECK(pool.queue(handle_of(first)));
+    queued.release();
+
+    const bool finished = started && done.try_acquire_for(std::chrono::seconds{10});
+    pool.shutdown();
+
+    REQUIRE(finished);
+    CHECK(order == std::vector{1, 2});
+}
+
+TEST_CASE("a pool shutting down queues nothing more", "[coro][thread_pool][queue]")
+{
+    thread_pool pool{1};
+
+    std::vector<int> order;
+    auto             never = noted(&order, 1);
+
+    CHECK_FALSE(pool.queue(nullptr));
+
+    pool.shutdown();
+    CHECK_FALSE(pool.queue(handle_of(never)));
+    CHECK(order.empty());
+}
+
 TEST_CASE("a pool shutting down runs what's in its workers' slots", "[coro][thread_pool][slot]")
 {
     std::vector<int>      order;

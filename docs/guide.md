@@ -31,9 +31,10 @@ There are two ways to run tasks:
 
 - **`scheduler.run_to_completion(task)`** runs one task to its end, blocking the calling thread, and returns its
   result. Then it stops the scheduler. It suits a program that does one thing (e.g. `example/http-get`), and tests.
-- **`scheduler.spawn(task)`** starts a `task<>` in the background, owned by the scheduler until it finishes. A server
-  is spawned this way (`scheduler.spawn(server.serve())`). Spawning returns false (and drops the task) once the
-  scheduler is stopping.
+- **`scheduler.spawn(task)`** starts a `task<>` in the background, owned by the scheduler until it finishes: its
+  coroutine is itself what's queued on the pool, with no coroutine frame around it but its own. A server is spawned
+  this way (`scheduler.spawn(server.serve())`). Spawning returns false (and destroys the task without running it) once
+  the scheduler is stopping, or its pool is shutting down.
 
 The pool's idle workers wait for I/O themselves, so nothing else needs to run: a server's main thread can just wait
 for a signal (see `example/http-server`). `scheduler.run()` exists for running the scheduler on a thread of your
@@ -91,8 +92,8 @@ another task) runs next on that worker, once the task that woke it suspends or r
 worker for it: so a hand-over between tasks costs no thread wakeup. A worker runs at most two such in a row before what
 else is waiting. If the waking task goes on for long without suspending (e.g. a loop whose awaits all find their
 results ready), the woken one waits for it: after 10 to 20 ms, an idle worker takes it over (on a pool of one worker,
-it waits until the task suspends). Tasks resumed from other threads, and `co_await pool.yield()`, wait their turn
-behind what's queued.
+it waits until the task suspends). Spawned tasks, tasks resumed from other threads, and `co_await pool.yield()`, wait
+their turn behind what's queued.
 
 Tasks shouldn't block (e.g. on a mutex held for long, or a blocking syscall), as that holds up a worker:
 `scheduler.run_blocking(func)` runs a blocking function on threads set aside for that (4, unless the scheduler is made

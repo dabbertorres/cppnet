@@ -166,6 +166,10 @@ public:
 
     bool resume(std::coroutine_handle<> handle) noexcept;
 
+    // queue queues handle to be resumed on a worker, behind what's queued (never in the calling worker's slot, unlike
+    // resume()), returning false if the pool is shutting down (or handle is null).
+    bool queue(std::coroutine_handle<> handle) noexcept;
+
     [[nodiscard]] operation yield() { return schedule(); }
     void                    shutdown() noexcept;
 
@@ -211,6 +215,10 @@ private:
 
     void worker(std::size_t index);
     void schedule(std::coroutine_handle<> /*handle*/);
+
+    // queue_locked queues handle, returning how many workers to notify for it (see wake_locked()). Must be called
+    // holding wait_mutex.
+    std::size_t queue_locked(std::coroutine_handle<> handle) noexcept;
 
     // own_slot is the calling thread's slot, if it's one of the pool's workers (otherwise null).
     [[nodiscard]] slot* own_slot() const noexcept;

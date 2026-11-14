@@ -432,12 +432,35 @@ void thread_pool::schedule(std::coroutine_handle<> handle)
 
     {
         std::scoped_lock lock{wait_mutex};
-        num_jobs.fetch_add(1, std::memory_order::release);
-        jobs.emplace_back(handle);
-        woken = wake_locked(1);
+        woken = queue_locked(handle);
     }
 
     notify(woken);
 }
 
+bool thread_pool::queue(std::coroutine_handle<> handle) noexcept
+{
+    if (handle == nullptr) return false;
+
+    std::size_t woken = 0;
+
+    {
+        // NOTE: running is checked under the lock, as shutdown() changes it: so a job queued here is one the workers
+        //       run before they stop.
+        std::scoped_lock lock{wait_mutex};
+        if (!running.load(std::memory_order::acquire)) return false;
+
+        woken = queue_locked(handle);
+    }
+
+    notify(woken);
+    return true;
+}
+
+std::size_t thread_pool::queue_locked(std::coroutine_handle<> handle) noexcept
+{
+    num_jobs.fetch_add(1, std::memory_order::release);
+    jobs.emplace_back(handle);
+    return wake_locked(1);
+}
 }

@@ -550,8 +550,9 @@ public:
     // pool is the thread pool the scheduler runs tasks on.
     [[nodiscard]] coro::thread_pool* pool() const noexcept { return workers.get(); }
 
-    // spawn starts task on the thread pool. If the scheduler is stopping, the task is destroyed without being run, and
-    // false is returned.
+    // spawn queues task on the thread pool, behind what's queued there, to start on one of its workers. If the
+    // scheduler is stopping (or the pool is shutting down), the task is destroyed without being run, and false is
+    // returned.
     //
     // Exceptions that escape the task are logged.
     bool spawn(coro::task<> task);

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -57,6 +58,25 @@ task<> join(async_scope* scope, bool* joined)
     *joined = true;
 }
 
+// on_worker records whether it runs on one of pool's workers, holding held until it ends.
+task<> on_worker(std::shared_ptr<int> /*held*/, net::coro::thread_pool* pool, std::atomic<bool>* ran_on_worker)
+{
+    ran_on_worker->store(pool->on_worker());
+    co_return;
+}
+
+// message_of is the message of the std::exception that ex holds.
+std::string message_of(const std::exception_ptr& ex)
+{
+    try
+    {
+        std::rethrow_exception(ex);
+    }
+    catch (const std::exception& err)
+    {
+        return err.what();
+    }
+}
 }
 
 TEST_CASE("spawned tasks run, and are destroyed when they finish", "[coro][async_scope]")
@@ -121,6 +141,97 @@ TEST_CASE("exceptions escaping a task are passed to the handler", "[coro][async_
 
     REQUIRE(scope.spawn(throw_runtime_error()));
     CHECK(message == "boom");
+    CHECK(scope.empty());
+}
+
+TEST_CASE("a task without a coroutine of its own to run ends as it would awaited", "[coro][async_scope]")
+{
+    std::vector<std::string> messages;
+
+    async_scope scope{[&](const std::exception_ptr& ex) { messages.push_back(message_of(ex)); }};
+
+    SECTION("a ready task")
+    {
+        REQUIRE(scope.spawn(net::coro::ready_task()));
+        CHECK(messages.empty());
+    }
+
+    SECTION("an empty task, which can't be awaited")
+    {
+        REQUIRE(scope.spawn(task<>{}));
+        CHECK(messages == std::vector<std::string>{"awaited an empty task"});
+    }
+
+    SECTION("a task that has finished, its exception passed on")
+    {
+        auto finished = throw_runtime_error();
+        CHECK_FALSE(finished.resume());
+
+        const bool spawned = scope.spawn(std::move(finished));
+        REQUIRE(spawned);
+        CHECK(messages == std::vector<std::string>{"boom"});
+    }
+
+    CHECK(scope.empty());
+}
+
+TEST_CASE("spawn_on starts tasks on the pool's workers", "[coro][async_scope][spawn_on]")
+{
+    net::coro::thread_pool pool{2};
+    async_scope            scope;
+
+    auto              held          = std::make_shared<int>();
+    std::atomic<bool> ran_on_worker = false;
+
+    REQUIRE(scope.spawn_on(pool, on_worker(held, &pool, &ran_on_worker)));
+    scope.join_blocking();
+
+    CHECK(ran_on_worker.load());
+    CHECK(held.use_count() == 1); // the task's frame is gone once the scope is empty
+}
+
+TEST_CASE("spawn_on passes exceptions escaping a task to the handler", "[coro][async_scope][spawn_on]")
+{
+    net::coro::thread_pool pool{2};
+
+    std::mutex  mu;
+    std::string message;
+
+    async_scope scope{[&](const std::exception_ptr& ex)
+                      {
+                          std::scoped_lock lock{mu};
+                          message = message_of(ex);
+                      }};
+
+    REQUIRE(scope.spawn_on(pool, throw_runtime_error()));
+    scope.join_blocking();
+
+    std::scoped_lock lock{mu};
+    CHECK(message == "boom");
+}
+
+TEST_CASE("spawn_on destroys tasks without running them when it can't start them", "[coro][async_scope][spawn_on]")
+{
+    net::coro::thread_pool pool{2};
+    async_scope            scope;
+
+    auto              held          = std::make_shared<int>();
+    std::atomic<bool> ran_on_worker = false;
+
+    SECTION("the scope is closed")
+    {
+        scope.close();
+        CHECK_FALSE(scope.spawn_on(pool, on_worker(held, &pool, &ran_on_worker)));
+    }
+
+    SECTION("the pool is shutting down")
+    {
+        pool.shutdown();
+        CHECK_FALSE(scope.spawn_on(pool, on_worker(held, &pool, &ran_on_worker)));
+    }
+
+    CHECK_FALSE(ran_on_worker.load());
+    CHECK(held.use_count() == 1);
     CHECK(scope.empty());
 }
 

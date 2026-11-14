@@ -405,6 +405,26 @@ TEST_CASE("shutdown cancels pending waits, and lets tasks finish", "[io][schedul
     CHECK_FALSE(sched.spawn([]() -> task<> { co_return; }()));
 }
 
+TEST_CASE("spawn destroys the task without running it once the pool is shutting down", "[io][scheduler]")
+{
+    auto      pool = make_pool();
+    scheduler sched{pool};
+
+    std::atomic<bool> ran  = false;
+    std::atomic<bool> gone = false;
+
+    pool->shutdown();
+
+    CHECK_FALSE(sched.spawn(
+        [](std::shared_ptr<void> /*held*/, std::atomic<bool>* ran) -> task<>
+        {
+            ran->store(true);
+            co_return;
+        }(gone_when_destroyed(&gone), &ran)));
+    CHECK_FALSE(ran.load());
+    CHECK(gone.load());
+}
+
 TEST_CASE("a scheduler that never ran can be destroyed", "[io][scheduler]")
 {
     std::error_code   err;

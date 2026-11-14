@@ -30,12 +30,6 @@
 namespace
 {
 
-net::coro::task<> start_on(net::coro::thread_pool* workers, net::coro::task<> task)
-{
-    co_await workers->schedule();
-    co_await task;
-}
-
 // making is the call this thread is making, if any: so that a call that cancels itself doesn't wait for itself.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): a thread's own.
 thread_local const net::io::scheduler::call_base* making = nullptr;
@@ -117,7 +111,7 @@ void scheduler::deregister_handle(handle fd) noexcept
     resume(done);
 }
 
-bool scheduler::spawn(coro::task<> task) { return scope.spawn(start_on(workers.get(), std::move(task))); }
+bool scheduler::spawn(coro::task<> task) { return scope.spawn_on(*workers, std::move(task)); }
 
 bool scheduler::suspend(waiter& state, std::coroutine_handle<> awaiting) noexcept
 {
