@@ -799,6 +799,30 @@ handshake in the field. The network tests (public servers) exercise interoperabi
   waits (stopped). Botan's own client fails (unexpected_message) on application data while it's renegotiating, so the
   HTTP/2 test reads the server's opening frames, up to its SETTINGS acknowledgement, first.
 
+### Waits for the flush (after stage 5 of the coroutines plan)
+
+- **Before:** a write's flush that found another in progress, `wait_writable()` and a write waiting for its turn all
+  waited on a `coro::notifier`, which keeps a waiting coroutine's handle until it's notified, and can't let go of it: so
+  a coroutine destroyed while it waited there (e.g. a write's task, once the flush became the stream's flusher, or a
+  handler's) was resumed by the next notify once its frame was freed (a use after free, which ASan shows). And a flush
+  waiting to take the flush on counts in `flush_waiters` until it's woken, which a destroyed one never was: the flush in
+  progress then stopped at its target for a waiter that didn't exist, leaving what was queued after it (e.g. a read's
+  reply, such as its close_notify) unsent until some later flush, and the count stayed high for good.
+- **Now** (2026-11-14, the user's choice of three: the others were making the notifier's waits removable, or leaving the
+  waits undestroyable as the notifier's are): each wait is the stream's own, an intrusive list of waiters guarded by
+  `mu`, each in its waiter's state (an awaiter in its coroutine's frame, or the flusher's operation, which needs no
+  coroutine, so the flusher's `wait_flushed()` coroutine went). What changes the flush wakes them holding `mu`, resuming
+  them on the pool; a waiter destroyed while it waits takes itself out of the list and undoes its count together,
+  holding `mu`, which is safe while it hasn't been woken (as a socket's operation is). So a write's (or
+  `wait_writable()`'s, or `shutdown()`'s) task may be destroyed while it waits for another task's flush or its turn.
+- **Tests:** `test/tls/stream.cpp` (`[tls][cancel]`): a waiting flush destroyed (the flusher's, a coroutine's,
+  `wait_writable()`'s) while another's is held up by a peer that reads nothing, after which the peer still gets the
+  client's answer to its close_notify, queued behind that flush; the flushes still waiting taking it on after one with
+  them is destroyed; and a write destroyed while it waits for its turn. Each fails on f78fc07 with a use after free
+  under ASan, and the first, with the count left high, by the close_notify answer never coming.
+- **Measured** (target cases, named before measuring: none, as no bench has flushes that wait for each other or are
+  destroyed; a correctness fix that mustn't regress): see the stage's pull request.
+
 ## Stages
 
 1. **Dependency, and `tls::stream`.** The vcpkg feature and CMake option; `client_context`, `server_context` and `stream`

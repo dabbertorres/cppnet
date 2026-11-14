@@ -1221,17 +1221,18 @@ auto tls = co_await net::tls::stream::connect(std::move(*sock), *ctx, "example.c
   with `std::errc::device_or_resource_busy`, as a socket's does. Reads and writes don't make a coroutine each: a read
   takes what's decrypted already, and otherwise waits through the stream's reader; a write is encrypted when it's
   called, and flushed when its task is awaited (so a write whose task is destroyed unawaited goes with the next one). A
-  write returns once what it wrote has gone to the socket (after what was queued before it, e.g. another write, or a
-  read's reply to the peer), so the socket's write deadline and timeout limit it; a write that fails fails every write
-  after it (part of a record may have gone). A write larger than `write_batch_size` (in `client_options` and
-  `server_options`: 64 KiB; at least 16 KiB, a record's plaintext, or `make()` fails with `std::errc::invalid_argument`)
-  is encrypted and sent a batch at a time, so it holds no more than a batch of ciphertext, whatever its size: a larger
-  batch costs memory per writing stream and saves allocations, but no time (over loopback, a 16 MiB write took as long
-  in batches of 16, 64 and 256 KiB, whose heap peaked at about 140, 350 and 900 KiB); writes go whole, in the order they
-  were called (one called while a large one is going waits for it, as `shutdown()`'s close_notify does), and a read's
-  replies to the peer may go between its parts. As a write's place is taken when `write()` is called, a large write's
-  task must be awaited (or destroyed) before the task that made it awaits a later write or `shutdown()` on the same
-  stream, which would otherwise wait for it for ever.
+  write's task may also be destroyed while it waits for another task's flush (or its turn): it leaves the queue; one
+  destroyed while it writes fails the writes after it. A write returns once what it wrote has gone to the socket (after
+  what was queued before it, e.g. another write, or a read's reply to the peer), so the socket's write deadline and
+  timeout limit it; a write that fails fails every write after it (part of a record may have gone). A write larger than
+  `write_batch_size` (in `client_options` and `server_options`: 64 KiB; at least 16 KiB, a record's plaintext, or
+  `make()` fails with `std::errc::invalid_argument`) is encrypted and sent a batch at a time, so it holds no more than a
+  batch of ciphertext, whatever its size: a larger batch costs memory per writing stream and saves allocations, but no
+  time (over loopback, a 16 MiB write took as long in batches of 16, 64 and 256 KiB, whose heap peaked at about 140, 350
+  and 900 KiB); writes go whole, in the order they were called (one called while a large one is going waits for it, as
+  `shutdown()`'s close_notify does), and a read's replies to the peer may go between its parts. As a write's place is
+  taken when `write()` is called, a large write's task must be awaited (or destroyed) before the task that made it
+  awaits a later write or `shutdown()` on the same stream, which would otherwise wait for it for ever.
 - `co_await tls->shutdown()` sends close_notify without closing the socket, so what the peer sent before its own
   close_notify can still be read. The peer's close_notify ends the stream (`io::errc::end_of_stream`), and is answered
   with close_notify, so nothing more can be written either.

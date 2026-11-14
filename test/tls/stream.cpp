@@ -3312,3 +3312,380 @@ TEST_CASE("a read's replies go with a write whose task has the stream's flusher,
     CHECK(server_read == "before the end");
     CHECK(server_done.err == net::io::errc::end_of_stream);
 }
+
+namespace
+{
+
+// waiter is which of a write's waits for the flush in progress (another's) a test destroys: a write's whose task has
+// the stream's flusher, one whose flush is a coroutine of its own (as the flusher's taken), or wait_writable()'s.
+enum class waiter : std::uint8_t
+{
+    flusher,
+    coroutine,
+    wait_writable,
+};
+
+std::string_view name(waiter w)
+{
+    switch (w)
+    {
+    case waiter::flusher: return "the flusher's";
+    case waiter::coroutine: return "a coroutine's";
+    case waiter::wait_writable: return "wait_writable()'s";
+    }
+    return "?";
+}
+
+}
+
+TEST_CASE(
+    "a flush destroyed while it waits for another's leaves that one to finish, and to send what's queued after it",
+    "[tls][write][flush][cancel]")
+{
+    const auto kind = GENERATE(waiter::flusher, waiter::coroutine, waiter::wait_writable);
+    CAPTURE(name(kind));
+
+    // (outliving the scheduler's tasks, which use them.)
+    std::string        server_read;
+    std::stop_source   abandon;
+    net::io::scheduler sched{make_pool()};
+    server_outcome     server_done{.sched = &sched, .err = {}};
+    server_outcome     client_read{.sched = &sched, .err = {}};
+
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // sends close_notify at once (which the client answers as it reads it), then reads nothing until the client has
+    // read it: then until the client's close_notify (or a read timeout, should it not come).
+    const auto server = [](std::string* server_read, server_outcome* server_done, server_outcome* client_read)
+    {
+        return [server_read, server_done, client_read](tls::stream& s) -> task<>
+        {
+            if (auto err = co_await s.shutdown(); err)
+            {
+                server_done->finish(err);
+                co_return;
+            }
+
+            co_await client_read->wait();
+            s.socket().set_read_timeout(5s);
+            auto [read, err] = co_await read_to_end(s);
+            *server_read     = std::move(read);
+            server_done->finish(err);
+            co_await s.close();
+        };
+    };
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   server(&server_read, &server_done, &client_read))));
+
+    // a batch large enough for each write to be encrypted whole, as it's called.
+    auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .write_batch_size = std::size_t{16} << 20});
+    REQUIRE(ctx.has_value());
+
+    // more than both sides' socket buffers hold, so that writing it waits for the peer to read.
+    const auto lots = pattern(std::size_t{16} << 20, 'a');
+
+    struct outcome
+    {
+        net::io::result written;
+        std::error_code read_ended;
+        std::string     failed; // what went wrong with the test's own tasks, if anything
+    };
+
+    const auto client = [kind](net::io::scheduler* sched,
+                               std::uint16_t       port,
+                               tls::client_context ctx,
+                               const std::string*  lots,
+                               std::stop_source*   abandon,
+                               server_outcome*     server_done,
+                               server_outcome*     client_read) -> task<outcome>
+    {
+        outcome out;
+        auto    s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value())
+        {
+            out.failed = "connect: " + s.error().message();
+            client_read->finish({});
+            co_return out;
+        }
+        s->set_stop_token(abandon->get_token());
+
+        // the write that flushes (and its task) and the one that waits for it, made in an order that gives the
+        // stream's flusher to the one that's to have it: the first made.
+        server_outcome        written{.sched = sched, .err = {}};
+        net::io::result       ignored;
+        server_outcome        never_done{.sched = sched, .err = {}};
+        task<net::io::result> writing;
+        task<net::io::result> waiting;
+        if (kind == waiter::flusher)
+        {
+            waiting = s->write(std::as_bytes(std::span{"w"sv}));
+            writing = s->write(std::as_bytes(std::span{*lots}));
+        }
+        else
+        {
+            writing = s->write(std::as_bytes(std::span{*lots}));
+            waiting = kind == waiter::coroutine ? s->write(std::as_bytes(std::span{"w"sv})) : s->wait_writable();
+        }
+
+        // the first takes the flush on, and waits for the socket (as the peer reads nothing yet): the other waits for
+        // it, until it's destroyed.
+        auto flushes = await_write(std::move(writing), &out.written, &written);
+        flushes.get_handle().resume();
+        {
+            auto waits = await_write(std::move(waiting), &ignored, &never_done);
+            waits.get_handle().resume();
+            if (flushes.is_ready() || waits.is_ready()) out.failed = "a write didn't wait";
+        }
+
+        // the server's close_notify, whose answer (as a flush is in progress) is left to that flush.
+        auto [_, err]  = co_await read_to_end(*s);
+        out.read_ended = err;
+        client_read->finish({});
+
+        if (!co_await finish_or_abandon({&written}, abandon)) out.failed = "the write didn't finish";
+        (void)co_await server_done->wait();
+        co_await s->close();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(
+        client(&sched, listener.local_port(), *ctx, &lots, &abandon, &server_done, &client_read));
+
+    CAPTURE(out.written.err.message(), out.read_ended.message(), server_done.err.message());
+    CHECK(out.failed.empty());
+    CHECK(out.read_ended == net::io::errc::end_of_stream);
+    CHECK_FALSE(out.written.err);
+    CHECK(out.written.count == lots.size());
+
+    // the client's close_notify went once the flush that had it queued got to it, with no other flush to send it.
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+    std::string want;
+    switch (kind)
+    {
+    case waiter::flusher: want = "w" + lots; break;
+    case waiter::coroutine: want = lots + "w"; break;
+    case waiter::wait_writable: want = lots; break;
+    }
+    CHECK(server_read.size() == want.size());
+    const bool all = server_read == want;
+    CHECK(all);
+}
+
+TEST_CASE("flushes still waiting for another's take it on, and finish, once one waiting with them is destroyed",
+          "[tls][write][flush][cancel]")
+{
+    const auto kind = GENERATE(waiter::flusher, waiter::coroutine);
+    CAPTURE(name(kind));
+
+    // (outliving the scheduler's tasks, which use them.)
+    std::string        server_read;
+    std::stop_source   abandon;
+    net::io::scheduler sched{make_pool()};
+    server_outcome     server_done{.sched = &sched, .err = {}};
+    server_outcome     client_waiting{.sched = &sched, .err = {}};
+
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // reads nothing until the client's flushes wait.
+    const auto server = [](std::string* server_read, server_outcome* server_done, server_outcome* client_waiting)
+    {
+        return [server_read, server_done, client_waiting](tls::stream& s) -> task<>
+        {
+            co_await client_waiting->wait();
+            auto [read, err] = co_await read_to_end(s);
+            *server_read     = std::move(read);
+            server_done->finish(err);
+            co_await s.close();
+        };
+    };
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   server(&server_read, &server_done, &client_waiting))));
+
+    // a batch large enough for each write to be encrypted whole, as it's called.
+    auto ctx = tls::client_context::make({.trusted_ca_file = pki().ca, .write_batch_size = std::size_t{16} << 20});
+    REQUIRE(ctx.has_value());
+
+    // more than both sides' socket buffers hold, so that writing it waits for the peer to read.
+    const auto lots = pattern(std::size_t{16} << 20, 'a');
+
+    struct outcome
+    {
+        net::io::result written;
+        net::io::result last;
+        std::string     failed; // what went wrong with the test's own tasks, if anything
+    };
+
+    const auto client = [kind](net::io::scheduler* sched,
+                               std::uint16_t       port,
+                               tls::client_context ctx,
+                               const std::string*  lots,
+                               std::stop_source*   abandon,
+                               server_outcome*     server_done,
+                               server_outcome*     client_waiting) -> task<outcome>
+    {
+        outcome out;
+        auto    s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value())
+        {
+            out.failed = "connect: " + s.error().message();
+            client_waiting->finish({});
+            co_return out;
+        }
+        s->set_stop_token(abandon->get_token());
+
+        // the write that flushes, and the one destroyed while it waits for it, the first made having the flusher.
+        task<net::io::result> writing;
+        task<net::io::result> destroyed;
+        if (kind == waiter::flusher)
+        {
+            destroyed = s->write(std::as_bytes(std::span{"d"sv}));
+            writing   = s->write(std::as_bytes(std::span{*lots}));
+        }
+        else
+        {
+            writing   = s->write(std::as_bytes(std::span{*lots}));
+            destroyed = s->write(std::as_bytes(std::span{"d"sv}));
+        }
+
+        // the first takes the flush on (both writes), and waits for the socket, as the peer reads nothing yet.
+        server_outcome written{.sched = sched, .err = {}};
+        server_outcome last_done{.sched = sched, .err = {}};
+        auto           flushes = await_write(std::move(writing), &out.written, &written);
+        flushes.get_handle().resume();
+
+        // made once the flush in progress has taken what was queued: so it waits to take the flush on after it.
+        auto last = await_write(s->write(std::as_bytes(std::span{"last"sv})), &out.last, &last_done);
+        {
+            net::io::result ignored;
+            server_outcome  never_done{.sched = sched, .err = {}};
+            auto            waits = await_write(std::move(destroyed), &ignored, &never_done);
+            waits.get_handle().resume();
+            last.get_handle().resume();
+            if (flushes.is_ready() || waits.is_ready() || last.is_ready()) out.failed = "a write didn't wait";
+        }
+        client_waiting->finish({});
+
+        if (!co_await finish_or_abandon({&written, &last_done}, abandon)) out.failed = "the writes didn't finish";
+        (void)co_await s->shutdown();
+        (void)co_await server_done->wait();
+        co_await s->close();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(
+        client(&sched, listener.local_port(), *ctx, &lots, &abandon, &server_done, &client_waiting));
+
+    CAPTURE(out.written.err.message(), out.last.err.message(), server_done.err.message());
+    CHECK(out.failed.empty());
+    CHECK_FALSE(out.written.err);
+    CHECK(out.written.count == lots.size());
+    CHECK_FALSE(out.last.err);
+    CHECK(out.last.count == "last"sv.size());
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+
+    const auto want = kind == waiter::flusher ? "d" + lots + "last" : lots + "dlast";
+    CHECK(server_read.size() == want.size());
+    const bool all = server_read == want;
+    CHECK(all);
+}
+
+TEST_CASE("a write destroyed while it waits for its turn leaves the write in progress to finish, and the next to go",
+          "[tls][write][batches][cancel]")
+{
+    // (outliving the scheduler's tasks, which use them.)
+    std::string        server_read;
+    std::stop_source   abandon;
+    net::io::scheduler sched{make_pool()};
+    server_outcome     server_done{.sched = &sched, .err = {}};
+    server_outcome     client_waiting{.sched = &sched, .err = {}};
+
+    net::listener listener{&sched, "127.0.0.1", "0", net::network::tcp};
+    listener.listen(8);
+
+    // reads nothing until the client's write waits for its turn.
+    const auto server = [](std::string* server_read, server_outcome* server_done, server_outcome* client_waiting)
+    {
+        return [server_read, server_done, client_waiting](tls::stream& s) -> task<>
+        {
+            co_await client_waiting->wait();
+            auto [read, err] = co_await read_to_end(s);
+            *server_read     = std::move(read);
+            server_done->finish(err);
+            co_await s.close();
+        };
+    };
+    const auto ctx = trusting_client();
+    REQUIRE(sched.spawn(serve_once(&listener,
+                                   server_with(pki().localhost_chain, pki().localhost_key),
+                                   server(&server_read, &server_done, &client_waiting))));
+
+    // more than both sides' socket buffers hold (and than a batch), so that writing it waits for the peer to read.
+    const auto lots = pattern(std::size_t{12} << 20, 'a');
+
+    struct outcome
+    {
+        net::io::result written;
+        net::io::result next;
+        std::string     failed; // what went wrong with the test's own tasks, if anything
+    };
+
+    const auto client = [](net::io::scheduler* sched,
+                           std::uint16_t       port,
+                           tls::client_context ctx,
+                           const std::string*  lots,
+                           std::stop_source*   abandon,
+                           server_outcome*     server_done,
+                           server_outcome*     client_waiting) -> task<outcome>
+    {
+        outcome out;
+        auto    s = co_await connect_to(sched, port, std::move(ctx), "localhost");
+        if (!s.has_value())
+        {
+            out.failed = "connect: " + s.error().message();
+            client_waiting->finish({});
+            co_return out;
+        }
+        s->set_stop_token(abandon->get_token());
+
+        // the large write goes a batch at a time, in its turn, and waits for the socket (as the peer reads nothing
+        // yet); then the next waits for its turn, until it's destroyed.
+        server_outcome written{.sched = sched, .err = {}};
+        auto           large = await_write(s->write(std::as_bytes(std::span{*lots})), &out.written, &written);
+        large.get_handle().resume();
+        {
+            net::io::result ignored;
+            server_outcome  never_done{.sched = sched, .err = {}};
+            auto waits = await_write(s->write(std::as_bytes(std::span{"destroyed"sv})), &ignored, &never_done);
+            waits.get_handle().resume();
+            if (large.is_ready() || waits.is_ready()) out.failed = "a write didn't wait";
+        }
+        client_waiting->finish({});
+
+        if (!co_await finish_or_abandon({&written}, abandon)) out.failed = "the write didn't finish";
+        out.next = co_await s->write(std::as_bytes(std::span{"next"sv}));
+        (void)co_await s->shutdown();
+        (void)co_await server_done->wait();
+        co_await s->close();
+        co_return out;
+    };
+
+    const auto out = sched.run_to_completion(
+        client(&sched, listener.local_port(), ctx, &lots, &abandon, &server_done, &client_waiting));
+
+    CAPTURE(out.written.err.message(), out.next.err.message(), server_done.err.message());
+    CHECK(out.failed.empty());
+    CHECK_FALSE(out.written.err);
+    CHECK(out.written.count == lots.size());
+    CHECK_FALSE(out.next.err);
+    CHECK(out.next.count == "next"sv.size());
+    CHECK(server_done.err == net::io::errc::end_of_stream);
+
+    // the destroyed write's turn was skipped, as it was never encrypted.
+    CHECK(server_read.size() == lots.size() + 4);
+    const bool all = server_read == lots + "next";
+    CHECK(all);
+}

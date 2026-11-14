@@ -68,9 +68,9 @@
 #include <botan/tls_version.h>
 #include <botan/x509cert.h>
 #include <botan/x509path.h>
+#include <spdlog/spdlog.h>
 
 #include "coro/adapter.hpp"
-#include "coro/notifier.hpp"
 #include "coro/task.hpp"
 #include "encoding/hex.hpp"
 #include "io/io.hpp"
@@ -1124,7 +1124,6 @@ struct connection
 {
     explicit connection(tcp_socket conn) noexcept
         : socket{std::move(conn)}
-        , flushed{socket.get_scheduler()->pool()}
     {}
 
     // take_received moves what's been decrypted (and not read yet) into data, returning how much. Must be called
@@ -1202,8 +1201,126 @@ struct connection
         }
     }
 
+    // flush_waiter is a task's place among those waiting for the flush to change (see wake_waiters()): the flush in
+    // progress having written some, or stopped, or a write's turn having ended. It's in the waiting task's own state
+    // (its coroutine's frame, or the flusher's), and linked into the stream's list while it waits (holding mu). counted
+    // is whether it counts among flush_waiters (a flush waiting to take the flush on, once the one in progress has
+    // written its own).
+    struct flush_waiter
+    {
+        flush_waiter*           prev     = nullptr;
+        flush_waiter*           next     = nullptr;
+        std::coroutine_handle<> awaiting = nullptr;
+        bool                    linked   = false;
+        bool                    counted  = false;
+    };
+
+    // wait_locked links w, for awaiting to be resumed once the flush changes, unless it has since seen (flush_changes'
+    // value when its task found it had to wait), returning whether it's linked: whether awaiting must suspend. Holding
+    // mu.
+    bool wait_locked(flush_waiter& w, std::uint64_t seen, std::coroutine_handle<> awaiting) noexcept
+    {
+        if (flush_changes != seen) return false;
+
+        w.awaiting = awaiting;
+        w.prev     = waiters_tail;
+        w.next     = nullptr;
+        w.linked   = true;
+        if (waiters_tail != nullptr) waiters_tail->next = &w;
+        else waiters_head = &w;
+        waiters_tail = &w;
+        return true;
+    }
+
+    // unlink_locked takes w out of the list (holding mu).
+    void unlink_locked(flush_waiter& w) noexcept
+    {
+        if (w.prev != nullptr) w.prev->next = w.next;
+        else waiters_head = w.next;
+        if (w.next != nullptr) w.next->prev = w.prev;
+        else waiters_tail = w.prev;
+        w.prev   = nullptr;
+        w.next   = nullptr;
+        w.linked = false;
+    }
+
+    // forget_locked takes w out of the list if it's still in it (its task's being destroyed while it waits), undoing
+    // its count among flush_waiters, which its task would have, had it been woken (holding mu).
+    void forget_locked(flush_waiter& w) noexcept
+    {
+        if (!w.linked) return;
+        unlink_locked(w);
+        if (w.counted) --flush_waiters;
+    }
+
+    // wake_waiters tells those waiting that the flush has changed (holding mu): each is taken out of the list, and its
+    // task resumed on the pool, never here, as this holds mu (which they take, to see what changed).
+    void wake_waiters() noexcept
+    {
+        ++flush_changes;
+        auto* const pool = socket.get_scheduler()->pool();
+        while (waiters_head != nullptr)
+        {
+            auto& w        = *waiters_head;
+            auto  awaiting = w.awaiting;
+            unlink_locked(w);
+
+            // NOTE: a pool refuses only once it's shutting down, which it doesn't while its scheduler's tasks (the
+            //       stream's) run; resuming the waiter here instead could deadlock (it takes mu).
+            if (!pool->resume(awaiting))
+            {
+                spdlog::critical("a TLS stream's flush can't resume a task waiting for it: the thread pool's shutting "
+                                 "down");
+                std::terminate();
+            }
+        }
+    }
+
+    // changed is a coroutine's wait for the flush to change since seen (see flush_waiter), counted among flush_waiters
+    // if counted. As a socket's operation, it must outlive the wait: a coroutine destroyed while it waits takes it out
+    // of the list (its destructor, with the coroutine's frame), which is only safe while it hasn't been woken (its
+    // coroutine not yet resumed).
+    class changed
+    {
+    public:
+        changed(connection& c, std::uint64_t seen, bool counted) noexcept
+            : c{&c}
+            , seen{seen}
+        {
+            w.counted = counted;
+        }
+
+        changed(const changed&)            = delete;
+        changed(changed&&)                 = delete;
+        changed& operator=(const changed&) = delete;
+        changed& operator=(changed&&)      = delete;
+
+        // NOLINTNEXTLINE(bugprone-exception-escape): locking a std::mutex doesn't throw, but for a broken one.
+        ~changed()
+        {
+            std::scoped_lock lock{c->mu};
+            c->forget_locked(w);
+        }
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+        // NOLINTNEXTLINE(bugprone-exception-escape): as above.
+        bool await_suspend(std::coroutine_handle<> awaiting) noexcept
+        {
+            std::scoped_lock lock{c->mu};
+            return c->wait_locked(w, seen, awaiting);
+        }
+
+        void await_resume() const noexcept { /* noop */ }
+
+    private:
+        connection*   c;
+        std::uint64_t seen;
+        flush_waiter  w;
+    };
+
     // flush_step is what a flush does next: return (with err), write pending (having taken the flush on), or wait
-    // for the flush in progress (whose notifier's value was seen).
+    // for the flush in progress (flush_changes' value having been seen).
     struct flush_step
     {
         enum class action : std::uint8_t
@@ -1244,7 +1361,7 @@ struct connection
 
         ++flush_waiters;
         step.what = flush_step::action::wait;
-        step.seen = flushed.value();
+        step.seen = flush_changes;
         return step;
     }
 
@@ -1333,7 +1450,12 @@ struct connection
             flush_pending = std::move(next.pending);
             return socket.write(std::as_bytes(std::span{flush_pending}));
 
-        case flush_step::action::wait: flush_now = flush_phase::waiting; return wait_flushed(next.seen);
+        case flush_step::action::wait:
+            flush_now = flush_phase::waiting;
+
+            // NOTE: always free here: it's only the flusher's, and its last task is done with before its next.
+            (void)flusher_waiting.claim(next.seen);
+            return coro::operation_task(flusher_waiting);
         }
         return flush_done(next.err);
     }
@@ -1345,18 +1467,10 @@ struct connection
         return io::result{.count = err ? 0 : flush_count, .err = err};
     }
 
-    // wait_flushed waits for the flush in progress to write some, or stop (seen being the notifier's value when the
-    // flusher found it in progress): the flusher's inner task while another task's flush has it.
-    // NOTE: a coroutine, as the notifier's waits are awaited by one, which mustn't be destroyed while it waits.
-    coro::task<io::result> wait_flushed(std::uint64_t seen)
-    {
-        (void)co_await flushed.wait(seen);
-        co_return io::result{};
-    }
-
     // flush_canceled is the flusher's, when the coroutine awaiting its task was destroyed while it waited: if it was
     // writing, the rest of a record may never go, so nothing more can (as when a write fails), and the flush goes to
-    // those waiting to take it on.
+    // those waiting to take it on. (Waiting for the flush in progress, its wait was taken out of the list, and its
+    // count undone, as it was canceled: see flush_wait.)
     // NOLINTNEXTLINE(bugprone-exception-escape): locking a std::mutex doesn't throw, but for a broken one.
     void flush_canceled() noexcept
     {
@@ -1365,9 +1479,9 @@ struct connection
             std::scoped_lock lock{mu};
             if (!write_failure) write_failure = std::make_error_code(std::errc::operation_canceled);
             flushing = false;
+            wake_waiters();
         }
         std::vector<std::uint8_t>{}.swap(flush_pending);
-        flushed.notify();
     }
 
     // flush_coroutine is flush(), when another task has the flusher: its steps in a coroutine of its own.
@@ -1389,7 +1503,7 @@ struct connection
                 auto err = co_await write_queued(std::move(step.pending), target);
                 co_return io::result{.count = err ? 0 : count, .err = err};
             }
-            case flush_step::action::wait: (void)co_await flushed.wait(step.seen); break;
+            case flush_step::action::wait: co_await changed{*this, step.seen, true}; break;
             }
 
             std::scoped_lock lock{mu};
@@ -1429,10 +1543,10 @@ struct connection
                     pending.swap(outgoing);
                 }
             }
-        }
 
-        // those whose writes have gone return; and those waiting take the rest on, if this has stopped.
-        flushed.notify();
+            // those whose writes have gone return; and those waiting take the rest on, if this has stopped.
+            wake_waiters();
+        }
         return ended;
     }
 
@@ -1445,13 +1559,11 @@ struct connection
         util::defer abandoned{[this, &ended] noexcept
                               {
                                   if (ended) return;
-                                  {
-                                      std::scoped_lock lock{mu};
-                                      if (!write_failure)
-                                          write_failure = std::make_error_code(std::errc::operation_canceled);
-                                      flushing = false;
-                                  }
-                                  flushed.notify();
+                                  std::scoped_lock lock{mu};
+                                  if (!write_failure)
+                                      write_failure = std::make_error_code(std::errc::operation_canceled);
+                                  flushing = false;
+                                  wake_waiters();
                               }};
 
         while (true)
@@ -1484,7 +1596,7 @@ struct connection
         write_turn& operator=(write_turn&&)      = delete;
         ~write_turn() { end(); }
 
-        // wait waits for its turn (as a flush does, on flushed: ending a turn notifies it).
+        // wait waits for its turn (as a flush waits for the one in progress: ending a turn wakes the waiters).
         coro::task<> wait() const
         {
             while (true)
@@ -1493,9 +1605,9 @@ struct connection
                 {
                     std::scoped_lock lock{c->mu};
                     if (c->turn_now == ticket) co_return;
-                    seen = c->flushed.value();
+                    seen = c->flush_changes;
                 }
-                (void)co_await c->flushed.wait(seen);
+                co_await changed{*c, seen, false};
             }
         }
 
@@ -1532,8 +1644,8 @@ struct connection
             {
                 turns_skipped.insert(ticket);
             }
+            wake_waiters();
         }
-        flushed.notify();
     }
 
     // write_batched writes data, once it's its turn, a batch at a time: each encrypted, then flushed before the next,
@@ -1620,10 +1732,10 @@ struct connection
                 }
 
                 ++flush_waiters;
-                seen = flushed.value();
+                seen = flush_changes;
             }
 
-            (void)co_await flushed.wait(seen);
+            co_await changed{*this, seen, true};
 
             std::scoped_lock lock{mu};
             --flush_waiters;
@@ -1635,11 +1747,9 @@ struct connection
         util::defer release{[this, &held] noexcept
                             {
                                 if (!held) return;
-                                {
-                                    std::scoped_lock lock{mu};
-                                    flushing = false;
-                                }
-                                flushed.notify();
+                                std::scoped_lock lock{mu};
+                                flushing = false;
+                                wake_waiters();
                             }};
 
         const auto                res = co_await socket.wait_writable();
@@ -1846,8 +1956,11 @@ struct connection
     std::uint64_t           turn_now    = 0;
     std::set<std::uint64_t> turns_skipped;
 
-    // notified when a flush has written some, or stopped.
-    coro::notifier flushed;
+    // what tasks waiting for the flush to change wait on (see flush_waiter): how many times it has, and those waiting,
+    // first to last.
+    std::uint64_t flush_changes = 0;
+    flush_waiter* waiters_head  = nullptr;
+    flush_waiter* waiters_tail  = nullptr;
 
     // what a read of the socket reads into: only one waits at once.
     std::array<std::uint8_t, (std::size_t{16} * 1'024) + 1'024> ciphertext{};
@@ -1907,13 +2020,64 @@ struct connection
     enum class flush_phase : std::uint8_t
     {
         starting, // its start (flush_started)
-        waiting,  // the flush in progress to write some (wait_flushed())
+        waiting,  // the flush in progress to write some (flusher_waiting)
         writing,  // a write of flush_pending, with the flush taken on
     };
     std::uint64_t             flush_target = 0;
     std::size_t               flush_count  = 0;
     std::vector<std::uint8_t> flush_pending;
     started                   flush_started;
+
+    // flush_wait is the flusher's wait for the flush in progress to change (see flush_waiter): an operation, so it
+    // needs no coroutine. As a socket's operation, it must outlive the wait: a coroutine awaiting the flusher that's
+    // destroyed while it waits cancels it (cancel(), which takes it out of the list and undoes its count among
+    // flush_waiters), which is only safe while it hasn't been woken (the flusher's driver not yet resumed).
+    class flush_wait final : public coro::operation<io::result>
+    {
+    public:
+        explicit flush_wait(connection& c) noexcept
+            : c{&c}
+        {
+            w.counted = true;
+        }
+
+        // claim readies it to wait for the flush to change since seen, returning false if it's in use.
+        [[nodiscard]] bool claim(std::uint64_t since) noexcept
+        {
+            if (!try_claim()) return false;
+            seen = since;
+            return true;
+        }
+
+        // NOLINTNEXTLINE(bugprone-exception-escape): locking a std::mutex doesn't throw, but for a broken one.
+        bool start(std::coroutine_handle<> awaiting) noexcept override
+        {
+            std::scoped_lock lock{c->mu};
+            return c->wait_locked(w, seen, awaiting);
+        }
+
+        io::result result() override
+        {
+            release();
+            return {};
+        }
+
+        // NOLINTNEXTLINE(bugprone-exception-escape): as start().
+        void cancel() noexcept override
+        {
+            {
+                std::scoped_lock lock{c->mu};
+                c->forget_locked(w);
+            }
+            release();
+        }
+
+    private:
+        connection*   c;
+        std::uint64_t seen = 0;
+        flush_waiter  w;
+    };
+    flush_wait flusher_waiting{*this};
     coro::stepper<connection, io::result, io::result, &connection::flushed_some, nullptr, &connection::flush_canceled>
         flusher{this};
 

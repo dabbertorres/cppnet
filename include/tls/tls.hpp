@@ -336,7 +336,9 @@ struct accept_options
 // destroyed unawaited goes with the next write). Reads and writes need no coroutine of their own: a read takes what's
 // decrypted already, or reads the socket, as far as it can without waiting, and waits (if it must) through the
 // stream's reader, as a socket's read does; a write's flush goes through the stream's flusher, unless another task's
-// flush has it.
+// flush has it. A write's task (or wait_writable()'s, or shutdown()'s) may be destroyed while it waits for another
+// task's flush, or for its turn after a large write: it's taken out of the wait. One destroyed while it writes fails
+// every write after it, as a write that fails does.
 //
 // Errors are the socket's, or TLS's (in category()): e.g. an alert from the peer, a certificate that couldn't be
 // verified, or the connection ending without the peer's close_notify (stream_truncated). The peer's close_notify ends
