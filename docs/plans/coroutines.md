@@ -501,6 +501,39 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   -14%, p = 0.011 / 0.007). One wrong-way result, `bench_tls echo` (16 B +5.9% / +4.3%, p = 0.014 / 0.021; 16 KiB +3.9%
   / +4.7%, p = 0.045 / 0.041), wasn't reproduced by ten more rounds (-0.3% to -0.7%, p >= 0.76). Verdict on the bar: an
   allocation drop on every target case, six target gains, and no regression.
+- **Stage 5, TLS** (2026-11-14): a TLS stream's read that waits and its flush are steppers the stream holds, its reader
+  and its flusher, rather than coroutines per call (`read_more`'s 168 B and `receive`'s 648 B, the write's lambda and
+  `flush`'s 440 B). The reader reads the socket, feeds the channel and flushes its replies, as far as it can at the call
+  (a ready task), and the handshake reads through it too. The flusher's first step is taken when its task is awaited
+  (its first inner task is an operation that finishes as soon as it's started), so a write is still encrypted at the
+  call and flushed only once awaited, and a task dropped unawaited leaves its record to the next flush, as before; a
+  flush while another task's has the flusher is a coroutine of its own, as the whole flush was, so writes from several
+  tasks still queue in order rather than fail. `coro::stepper` gained a `Canceled` hook (run before the stepper's let
+  go), so a flush whose awaiting coroutine is destroyed mid-write still fails the writes after it. One behaviour
+  changed, as the HTTP/2 write's first choice has it: a second read while one waits fails with `device_or_resource_busy`
+  (it shared the ciphertext buffer before). Allocations: `bench_tls echo` 20 -> 14 per round trip, `writes` 9.83 -> 6.94
+  per 16 KiB write (and about 31% fewer at every size), the handshakes 2 fewer per connection; no other bench uses TLS.
+  Elisions (`-Rpass=coro-elide` over `src/` and `bench/`, the fuzz targets left out): 80 -> 76 elided (the `flush` calls
+  in the write's lambda, `receive`, `handshake_steps` and `shutdown`, gone with their callers or callees), 417 not,
+  before and after (`receive`, `read_more`, `flush` and the lambda gone; `flush_coroutine`, `wait_flushed` and the two
+  drivers added); `handshake_steps` 584 -> 224 B, `shutdown` 672 -> 312 B, `write_batched` 272 -> 344 B. Ten interleaved
+  rounds a side against `stage5-h2-write` 1eae548 (`bench_tls`, `bench_request`, `bench_client`, `bench_websocket`):
+  target gains on `bench_tls echo` (16 B -3.9% / -4.4% by time / CPU time, p < 0.001; 16 KiB -2.1% / -1.7%, p = 0.031 /
+  0.005), `writes` 16 KiB (-1.7%, p = 0.025), 256 KiB (-2.1%, p = 0.007) and 1 MiB (-2.1%, p = 0.001), and the ECDSA
+  P-256 mutual TLS handshakes, resumed (-2.0% / -1.5%, p = 0.028 / 0.014) and full without tickets (CPU time -1.5%, p =
+  0.034); the other targets are noise (`writes` 64 KiB and 16 MiB, p >= 0.57; the other handshakes, p >= 0.075). Gains
+  off the targets (reported, not claimed): `bench_request` pipelined through `http_metrics` on the route (-4.4%, p =
+  0.001; -2.6%, p = 0.006, in the confirmation run). Six wrong-way results got ten more rounds a side: five weren't
+  reproduced (`bench_request` over a socket to a handler that waits once, and `bench_websocket`'s 64 WebSockets HTTP/1.1
+  medium, 8 WebSockets HTTP/1.1 small, and one WebSocket's HTTP/2 small and medium, one at a time: p >= 0.27), and one
+  was: `bench_client`'s 1 KiB reader, small, CPU time +0.8% (p = 0.041), then +2.1% and time +2.3% (p = 0.002). The
+  confirmation run had one wrong-way result of its own, the 16 KiB reader's long head lines (+0.7%, p = 0.017 / 0.045),
+  which the first run didn't show (p = 0.71 / 0.57). `bench_client` runs no TLS, and its code is unchanged and only
+  moved: the two binaries' functions are the same instruction for instruction (but for the nearest symbol names of their
+  jump tables) except TLS's, and the stepper's symbols' names, and about 6,900 functions linked after `tls.cpp` sit
+  6,784 or 6,816 bytes later (the client's own, linked before it, don't move). Verdict on the bar: an allocation drop on
+  every target case, target gains on echo, writes and two handshakes, and one regression on code that only moved,
+  which the user kept (2026-11-14).
 
 ## Decided questions
 
