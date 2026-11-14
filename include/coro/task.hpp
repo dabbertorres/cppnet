@@ -23,7 +23,7 @@ class async_scope;
 template<typename Owner, typename In, typename Out, auto Finish>
 class adapter;
 
-template<typename Owner, typename In, typename Out, auto Step, auto Released>
+template<typename Owner, typename In, typename Out, auto Step, auto Released, auto Canceled>
 class stepper;
 
 // operation_base is what every operation<T> has: claiming it for a task, and cancelling it (see operation).
@@ -356,7 +356,7 @@ public:
     template<typename Owner, typename In, typename Out, auto Finish>
     friend class adapter;
 
-    template<typename Owner, typename In, typename Out, auto Step, auto Released>
+    template<typename Owner, typename In, typename Out, auto Step, auto Released, auto Canceled>
     friend class stepper;
 
     // (an async_scope takes the coroutine of a task it spawns: see promise<void>::detach().)

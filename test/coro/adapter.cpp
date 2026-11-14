@@ -82,7 +82,8 @@ task<int> throws_after(test_operation* op)
 
 // summer is a stepper's owner: its steps add up the inner tasks' results, each step's inner task made by next (given
 // the step's number, from 0) until there have been steps of them; a negative result throws. released records, each
-// time a task of the stepper's has given its result, whether the stepper was free by then.
+// time a task of the stepper's has given its result, whether the stepper was free by then; and canceled, each time the
+// coroutine awaiting one was destroyed while it waited, whether the stepper was still the task's then.
 struct summer
 {
     net::coro::step<int, int> add(int value)
@@ -95,6 +96,8 @@ struct summer
     }
 
     void released() noexcept { releases.push_back(!stepping.is_claimed()); }
+
+    void canceled() noexcept { cancels.push_back(stepping.is_claimed()); }
 
     // start makes a task of the stepper, for steps inner tasks.
     task<int> start(int count)
@@ -110,8 +113,9 @@ struct summer
     int                           taken = 0;
     int                           sum   = 0;
     std::vector<bool>             releases;
+    std::vector<bool>             cancels;
 
-    net::coro::stepper<summer, int, int, &summer::add, &summer::released> stepping{this};
+    net::coro::stepper<summer, int, int, &summer::add, &summer::released, &summer::canceled> stepping{this};
 };
 
 }
@@ -435,6 +439,7 @@ TEST_CASE(
     // the stepper's free, and was by the time it said its task had given its result; each operation's done with.
     CHECK_FALSE(s.stepping.is_claimed());
     CHECK(s.releases == std::vector<bool>{true});
+    CHECK(s.cancels.empty());
     for (auto& op : ops)
     {
         CHECK(op.try_claim());
@@ -656,8 +661,10 @@ TEST_CASE("destroying the coroutine awaiting a stepper cancels the inner task wa
         CHECK(inner_op.cancelled);
     }
 
+    // the owner was told, before the stepper was let go, and only then.
     CHECK_FALSE(s.stepping.is_claimed());
     CHECK(s.releases.empty());
+    CHECK(s.cancels == std::vector<bool>{true});
 
     // and it's ready for the next.
     s.next = [](int /*step*/) { return net::coro::ready_task<int>(5); };
