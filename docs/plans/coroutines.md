@@ -368,7 +368,15 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    2.13-2.16). Every other count stayed: HTTP/2 a stream at a time (35.0: its writes go at once), the HTTP/1.1 cases,
    `bench_tls`, `bench_task`, `bench_notifier`, `bench_blocking` and `bench_router` (`bench_client`'s chunked downloads
    drift by timing, as before). Measured as well, not targets: `bench_client` and `bench_tls` (the code they run is
-   unchanged, but the library's moves).
+   unchanged, but the library's moves). TLS's read and flush's target cases (named before measuring, 2026-11-14; the
+   same rule, by a probe run of `bench_tls` and its counting copy): `bench_tls echo`, 16 B and 16 KiB (20 -> 14 per
+   round trip: each side's write and read that waits; time and CPU time); `bench_tls writes`, each size (per write: 16
+   KiB 9.83 -> 6.94, 64 KiB 27.32 -> 18.78, 256 KiB 110.27 -> 76.11, 1 MiB 438.11 -> 301.45, 16 MiB 6994 -> 4808; time);
+   `bench_tls`'s handshakes, with each server key, full without tickets, full and resumed (2 fewer per connection, e.g.
+   ECDSA P-256 full 1911 -> 1909: each side's handshake reads and flushes without frames, but makes the stream's reader
+   and flusher drivers; time and CPU time). TCP alone keeps its count, as does every other bench (only `bench_tls` uses
+   TLS): `bench_request`, `bench_client` and `bench_websocket` are measured as well (the code linked after `tls.cpp`
+   moves, and `coro::stepper` gained a hook), but aren't targets.
 6. **The frame allocator**, with what's left (handlers, the client's `send()` chain, `drive()`, the spawned frames):
    per-thread size-class free lists in the promise's `operator new`/`delete`, out of line (Decided question 8, asked
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
