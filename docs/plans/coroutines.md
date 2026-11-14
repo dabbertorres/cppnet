@@ -1,8 +1,9 @@
 # Plan: one coroutine per sequence of actions
 
-Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 4 done (pull requests
-#112 to #117; Learned in the stages has how each met the bar). Paused after stage 4 by the user (2026-11-02); the
-`http11` references change (below) is done (#120). Stage 5 resumed with the user's go-ahead (2026-11-13).
+Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 5 done (pull requests #112
+to #117, and #121 to #124; Learned in the stages has how each met the bar, and GCC's counts after stage 5). Paused after
+stage 4 by the user (2026-11-02); the `http11` references change (below) is done (#120). Stage 5 resumed with the user's
+go-ahead (2026-11-13), and finished 2026-11-14. Stage 6 waits for the user's go-ahead.
 
 ## Goal
 
@@ -340,9 +341,10 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    `bench_tls writes` 10.8 -> ~7 per 16 KiB write (36.6 us: the pool made it 1-3% slower; this mustn't). A pull request
    per object, each measured and kept or dropped on its own (the user, 2026-11-13), in this order: accept, spawning,
    the HTTP/2 stream's write, TLS's read and flush. Measured on the same Mac as stages 0 to 4 (the user, 2026-11-13).
-   Then GCC's allocation counts again. Accept's target cases (named before measuring, 2026-11-13; gains are claimed
-   only on these; the rule: every case whose allocation count drops, by a probe run of each bench, whose printed times
-   were seen but not used, and, for `bench_tls`'s handshakes, which print no counts, a copy of it counting per
+   Then GCC's allocation counts again: done (2026-11-14; Learned in the stages has them). Accept's target cases
+   (named before measuring, 2026-11-13; gains are claimed only on these; the rule: every case whose allocation count
+   drops, by a probe run of each bench, whose printed times were seen but not used, and, for `bench_tls`'s handshakes,
+   which print no counts, a copy of it counting per
    connection): `bench_request`, a connection per request (14 -> 13 per connection; time and CPU time); `bench_tls`'s
    handshakes, with each server key, full without tickets, full and resumed, and TCP alone (one fewer per connection,
    e.g. TCP alone 10 -> 9, ECDSA P-256 full 1912 -> 1911; time and CPU time). `bench_client`, `bench_websocket`,
@@ -534,6 +536,53 @@ reader and writer buffers made per request; TLS's ciphertext vector per flush).
   6,784 or 6,816 bytes later (the client's own, linked before it, don't move). Verdict on the bar: an allocation drop on
   every target case, target gains on echo, writes and two handshakes, and one regression on code that only moved,
   which the user kept (2026-11-14).
+- **After stage 5, GCC's allocation counts** (2026-11-14, Decided question 7): stage 0's cases again, on master
+  f78fc07 (stage 5's last pull request, #125, changes no count), Release with TLS, one run each (the counts are
+  exact): GCC 16.2.1 with libstdc++ and Arch's Botan 3.13 in a throwaway Linux container on the `cppnet-linux` image,
+  as at stage 0, and Clang 23.1.3 with libc++ (`dev-clang`) on the Mac. Every case counts fewer on GCC than at stage 0,
+  none more. The gaps to Clang in what stage 5 changed are closed: TLS's echo and writes, the WebSockets, a
+  connection per request and a request at a time over a socket count the same on both (to 0.05, which GCC's in-flight
+  and setup counts drift by, as at stage 0). What's left was traced on both (copies of `bench_client` and
+  `bench_request` recording each counted allocation's callers and size), and each frame among it checked against
+  Clang's `-Rpass=coro-elide` remarks; none of it is a stage 5 object's:
+  - 3 per client request (every `bench_client` case, and each HTTP/2 case) aren't frames: libstdc++'s strings keep 15
+    characters inline, libc++'s 22, so `connection_pool::make_key`'s two (`http://127.0.0.1` is 16) and
+    `try_claim`'s copy of the key allocate on GCC alone. They're the kind Decided question 11 leaves to another plan.
+    They're the whole of `bench_client` small's gap.
+  - The chunked downloads, about 650 per 8 MiB: the server's `chunked_writer::write` awaits `write_full` for the size
+    line, the data and the CRLF, two of them through its `string_view` overload, which awaits the span one: 5 frames
+    per 64 KiB chunk, which Clang elides. Stage 4 made the client's chunked reader and `write_all` ready tasks, not the
+    chunked writer: the same change would close this.
+  - Long head lines: `read_terminated_line`'s `read_line` (200 B on Clang), once for each head line that waits for
+    more (4 / 1 / 0 per response with the 1 / 4 / 16 KiB readers).
+  - Frames around handlers: the HTTP/2 server's `respond_after`, which `run_stream` awaits (+1 on each HTTP/2 case);
+    the handler a middleware on the route awaits (`http_metrics` and `http::timeout` on the route, +1); the benches'
+    own handlers awaiting `plaintext` (`waits_once`, and `with_cookies` in long head lines, +1).
+  - 8 request bodies: the HTTP/2 client's `send_body` (+1). The rest of 8 streams' and 8 bodies' gaps (about 0.5 to
+    1) is mostly 16 KiB receive buffers, whose count drifts with timing.
+
+  | case | Clang (macOS), after stage 5 | GCC (Linux), stage 0 | GCC (Linux), after stage 5 |
+  |---|--:|--:|--:|
+  | `bench_request` pipelined | 1.2 | 3.4 | 1.2 |
+  | `bench_request` one per read | 2.2 | 6.2 | 2.2 |
+  | `bench_request` over a socket | 1.0 | 5.0 | 1.0 |
+  | `bench_request` handler that waits once | 1.0 | 5.0 | 2.0 |
+  | `bench_request` a connection per request | 11.0 | 17.0 | 11.0 |
+  | `bench_request` HTTP/2, a stream at a time | 35.0 | 43.1 | 39.1 |
+  | `bench_request` HTTP/2, 8 streams (per response) | 41.2 | 64.7 | 46.2 |
+  | `bench_request` HTTP/2, 8 request bodies (per request) | 40.6 | 97.3 | 46.5 |
+  | `bench_request` through `http_metrics` / on the route / runtime router | 2.2 / 1.2 / 2.2 | 4.4 / 4.4 / 4.4 | 2.2 / 2.2 / 2.2 |
+  | `bench_request` runtime router with `http_metrics` / `http::timeout` on the route | 3.2 / 2.2 | 5.4 / 5.4 | 3.2 / 3.2 |
+  | `bench_request` over a socket, `http::timeout` | 2.0 | 7.0 | 3.0 |
+  | `bench_client` small (any reader) | 16 | 37.03 | 19.03 |
+  | `bench_client` long head lines (1 / 4 / 16 KiB readers) | 51 / 32 / 25 | 75.03 / 53.03 / 47.03 | 59.03 / 37.03 / 29.03 |
+  | `bench_client` chunked download (1 / 4 / 16 KiB readers) | 148 / 146 / 146 | 75,434 / 69,291 / 67,755 | 798 / 799 / 799 |
+  | `bench_websocket` 16 B or 8 KiB one at a time, HTTP/1.1 | 2 / 2 | 4.03 / 4.03 | 2.03 / 2.03 |
+  | `bench_websocket` 64 KiB one at a time, HTTP/1.1 / HTTP/2 | 2 / 2 | 12.03 / 15.05 | 2.03 / 2.05 |
+  | `bench_websocket` 8 KiB one at a time, HTTP/2 | 2 | 12.03 | 2.03 |
+  | `bench_websocket` in flight, 64 KiB, HTTP/1.1 / HTTP/2 | 2.00 / 2.00 | 10.13 / 14.35 | 2.00 / 2.04 |
+  | `bench_tls echo` 16 B / 16 KiB (per round trip) | 14 / 14 | 28.03 / 28.03 | 14.03 / 14.03 |
+  | `bench_tls writes` 16 KiB / 64 KiB (per write) | 6.94 / 18.78 | 13.83 / 31.34 | 6.95 / 18.80 |
 
 ## Decided questions
 
