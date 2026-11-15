@@ -178,9 +178,9 @@ The tests use Catch2 v3 and build into a single `tests` executable. CTest cases 
 ```sh
 ctest --test-dir build -C Debug                 # all tests
 ./build/test/Debug/tests                        # run directly
-./build/test/Debug/tests "[uuid]"               # by tag
+./build/test/Debug/tests "[sha1]"               # by tag
 ./build/test/Debug/tests "parse single digits"  # by test name
-ctest --test-dir build -C Debug -R uuid         # via ctest regex
+ctest --test-dir build -C Debug -R sha1         # via ctest regex
 ```
 
 - The hidden network tests (see the top-level Building section) are tagged `[.network]`, which Catch2 reads as
