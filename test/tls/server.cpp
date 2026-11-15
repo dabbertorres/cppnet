@@ -1003,8 +1003,9 @@ TEST_CASE("an HTTPS server sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP
               const auto text = got ? std::to_string(value) : "(getsockopt failed)";
               (void)co_await net::io::write_all(*body, text);
           });
-    // more than the socket's buffers hold, written 64 KiB at a time: so (over HTTP/2) the writer waits for the TLS
-    // stream's socket to take more, and the client's reads (and the stream's replies to them, if any) go on meanwhile.
+    // written 64 KiB at a time, past the client's small receive buffer (see its options below): so (over HTTP/2) the
+    // writer waits for the TLS stream's socket to take more, and the client's reads (and the stream's replies to them,
+    // if any) go on meanwhile.
     r.GET("/big",
           [patterned](const http::server_request& /*req*/, http::response_writer& resp) -> task<void>
           {
@@ -1020,9 +1021,14 @@ TEST_CASE("an HTTPS server sets TCP_NOTSENT_LOWAT on its HTTP/2 connections' TCP
     net::io::scheduler sched{make_pool()};
     https_server       server{&sched, tls_config(), std::move(r)};
 
-    // HTTP/2 agreed on with ALPN, or HTTP/1.1 (the client offering only it).
-    auto options  = trusting_options();
-    options.http2 = use_http2;
+    // HTTP/2 agreed on with ALPN, or HTTP/1.1 (the client offering only it). The client's TCP receive buffer is small
+    // (8 KiB, set before it connects): on Linux, its window holds the server's writes of /big back whatever pace the
+    // client reads at, so what's not sent piles past the server's mark, and the writer waits. (With the system's, which
+    // grows, a client reading as fast as the server wrote would leave the waits to chance, as it still does on macOS,
+    // which raises the buffer to a floor: about 320 KiB over loopback.)
+    auto options               = trusting_options();
+    options.http2              = use_http2;
+    options.tcp_receive_buffer = std::size_t{8} * 1'024;
     http::client client{&sched, options};
 
     const auto test = [](http::client* client, std::string base) -> task<std::pair<std::string, std::string>>
