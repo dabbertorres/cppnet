@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -239,21 +237,6 @@ basic_headers<N>& basic_headers<N>::set_content_length(std::size_t length)
 }
 
 template<std::size_t N>
-basic_headers<N>& basic_headers<N>::set_content_type(const content_type& content_type)
-{
-    // nothing to add
-    if (content_type.type.empty()) return *this;
-
-    std::ostringstream ss;
-    ss << content_type.type;
-
-    std::ranges::for_each(content_type.parameters,
-                          [&](const auto& param) { ss << ": " << param.first << '=' << param.second; });
-
-    return set("Content-Type"sv, ss.str());
-}
-
-template<std::size_t N>
 std::optional<std::string_view> basic_headers<N>::get(std::string_view key) const
 {
     const auto* field = find(key);
@@ -323,65 +306,6 @@ std::optional<std::size_t> basic_headers<N>::get_content_length() const
     }
 
     return length;
-}
-
-template<std::size_t N>
-std::optional<content_type> basic_headers<N>::get_content_type() const
-{
-    auto maybe = get("Content-Type"sv);
-    if (!maybe.has_value()) return std::nullopt;
-
-    const std::string_view type  = maybe.value();
-    const std::size_t      split = type.find(';');
-    if (split == std::string_view::npos) return content_type{.type = std::string{type}};
-
-    content_type out{.type = std::string{type}};
-
-    for (auto param : util::split_string(maybe.value(), ';', split + 1))
-    {
-        auto kv_split = param.find('=');
-        if (kv_split == std::string_view::npos)
-        {
-            out.parameters.emplace(param, "");
-            continue;
-        }
-
-        auto key = util::trim_string(param.substr(0, kv_split));
-        auto val = util::trim_string(param.substr(kv_split + 1));
-        val      = util::unquote(val);
-
-        // charset is a known parameter defined as case-insensitive, standardized as lowercase
-        if (util::equal_ignore_case(key, "charset"sv))
-        {
-            constexpr auto to_lower = [](char& c) { c = static_cast<char>(std::tolower(c)); };
-
-            std::string key_v{key};
-            std::string val_v{val};
-
-            std::ranges::for_each(key_v, to_lower);
-            std::ranges::for_each(val_v, to_lower);
-
-            out.parameters.emplace(key_v, val_v);
-        }
-        else
-        {
-            out.parameters.emplace(key, val);
-        }
-    }
-
-    return out;
-}
-
-template<std::size_t N>
-auto basic_headers<N>::get_content_encoding() const -> std::optional<values_range>
-{
-    return get_all("Content-Encoding"sv);
-}
-
-template<std::size_t N>
-auto basic_headers<N>::get_transfer_encoding() const -> std::optional<values_range>
-{
-    return get_all("Transfer-Encoding"sv);
 }
 
 template<std::size_t N>

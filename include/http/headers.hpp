@@ -6,7 +6,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -14,18 +13,6 @@
 
 namespace net::http
 {
-
-struct content_type
-{
-    std::string                                  type{};
-    std::unordered_map<std::string, std::string> parameters{};
-    [[nodiscard]] std::optional<std::string>     charset() const noexcept
-    {
-        auto it = parameters.find("charset");
-        if (it != parameters.end()) return it->second;
-        return std::nullopt;
-    }
-};
 
 // header_values are a field's values, one per field line; a header_field is a field: its name, and its values.
 using header_values = util::small_vector<std::string, 1>;
@@ -98,7 +85,6 @@ public:
     void clear() noexcept;
 
     basic_headers& set_content_length(std::size_t length);
-    basic_headers& set_content_type(const content_type& content_type);
 
     // NOTE: the views get() and get_all() return are only valid until the headers are next changed (as a vector's
     //       elements' are), as the fields are held in order, rather than one by one.
@@ -120,11 +106,7 @@ public:
 
     // get_content_length returns the Content-Length, if it's present and valid: a decimal number, which every value of
     // it (if repeated) agrees on.
-    [[nodiscard]] std::optional<std::size_t>  get_content_length() const;
-    [[nodiscard]] std::optional<content_type> get_content_type() const;
-
-    [[nodiscard]] std::optional<values_range> get_content_encoding() const;
-    [[nodiscard]] std::optional<values_range> get_transfer_encoding() const;
+    [[nodiscard]] std::optional<std::size_t> get_content_length() const;
 
     // is_chunked returns whether chunked is the last of the transfer codings, as it must be if it's used at all.
     [[nodiscard]] bool is_chunked() const;
