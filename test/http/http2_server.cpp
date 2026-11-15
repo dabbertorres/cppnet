@@ -43,6 +43,7 @@
 #include "listen.hpp"
 #include "socket.hpp"
 #include "tcp.hpp"
+#include "util/defer.hpp"
 
 namespace http  = net::http;
 namespace http2 = net::http::http2;
@@ -1259,6 +1260,7 @@ TEST_CASE("an HTTP/2 handler's token is stopped when its stream times out", "[ht
     std::atomic<std::uint64_t> read_done{0};
     std::atomic_bool           spawn_failed{false}; // the handler couldn't spawn its reader
     std::atomic_bool           read_late{false};    // the reader ended long after the handler was stopped
+    std::atomic<std::uint64_t> handler_done{0};     // set once the handler has returned
 
     net::io::scheduler sched{make_pool()};
 
@@ -1267,6 +1269,8 @@ TEST_CASE("an HTTP/2 handler's token is stopped when its stream times out", "[ht
     r.POST("/read-aside",
            [&](http::server_request& req, http::response_writer&) -> task<void>
            {
+               const net::util::defer finished{[&] noexcept { stop_probe::bump(&sched, handler_done); }};
+
                const bool spawned = sched.spawn(
                    [](net::io::scheduler* sched, net::io::reader* body, std::atomic<std::uint64_t>* done) -> task<>
                    {
@@ -1303,7 +1307,13 @@ TEST_CASE("an HTTP/2 handler's token is stopped when its stream times out", "[ht
 
                                                                 const bool woke =
                                                                     co_await stop_probe::reach(&sched, probe.woke, 1);
-                                                                co_return woke ? "" : "the handler didn't wake";
+                                                                if (!woke) co_return "the handler didn't wake";
+
+                                                                // and has returned: once this returns, the scheduler's
+                                                                // stopped, which would end its wait for the reader.
+                                                                const bool returned =
+                                                                    co_await stop_probe::reach(&sched, handler_done, 1);
+                                                                co_return returned ? "" : "the handler didn't return";
                                                             }));
     CAPTURE(failed);
     REQUIRE(failed.empty());
