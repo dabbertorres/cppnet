@@ -53,8 +53,7 @@ WarningsAsErrors: false
 # - clang-analyzer-optin.core.EnumCastOutOfRange: it flags flag enums (e.g. span_flags), whose combinations aren't
 #   enumerators.
 # - cppcoreguidelines-avoid-do-while: do-while is fine.
-# - misc-multiple-inheritance: e.g. socket is both an io::reader and an io::writer, and util::overloaded is the usual
-#   visitor idiom.
+# - misc-multiple-inheritance: e.g. socket is both an io::reader and an io::writer.
 # - cppcoreguidelines-avoid-reference-coroutine-parameters: tasks are lazy, and awaited where they're made, so
 #   reference parameters (e.g. reader/writer, request handlers) outlive them.
 # - cppcoreguidelines-pro-bounds-*: they flag every operator[] and pointer arithmetic.

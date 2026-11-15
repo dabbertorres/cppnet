@@ -270,24 +270,11 @@ public:
         return c.s.can_open_stream();
     }
 
-    // connection_ended is whether the connection has ended (the server closed it, or reading or writing failed).
-    [[nodiscard]] bool connection_ended()
-    {
-        std::scoped_lock lock{mu};
-        return ended;
-    }
-
     // goaway_received is whether the server has sent GOAWAY.
     [[nodiscard]] bool goaway_received()
     {
         std::scoped_lock lock{mu};
         return c.goaway;
-    }
-
-    // wait_ended waits for the connection to end, returning whether it did (within wait_limit).
-    net::coro::task<bool> wait_ended()
-    {
-        return wait_until([this] { return ended; });
     }
 
     // finish ends the reader and writer tasks (what the session has to send is written first), and waits for them.

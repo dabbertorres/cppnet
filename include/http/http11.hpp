@@ -56,6 +56,8 @@ constexpr std::size_t max_fields = 100;
 //   coding).
 // - std::errc::value_too_large if the head is longer than max_header_bytes, or has more than max_fields field lines.
 // - status_condition::closed if the connection ends first.
+// The decoded request's body borrows reader, which must outlive it. A server keeps a reader for the connection, rather
+// than one per request, so that anything buffered past the end of one request is still there for the next.
 task<request_decoder_result>
 request_decode(io::buffered_reader& reader,
                std::size_t          max_header_bytes = std::numeric_limits<std::size_t>::max()) noexcept;
