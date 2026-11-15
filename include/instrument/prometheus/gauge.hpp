@@ -25,28 +25,11 @@ struct gauge : public base_metric<gauge>
 
     [[nodiscard]] double get() const noexcept;
 
-    template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
-    double increment(double v = 1.0, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
-    {
-        auto new_value = detail::add(value, v);
-        set_updated_at(updated_at);
-        return new_value;
-    }
+    double increment(double v = 1.0) noexcept { return detail::add(value, v); }
 
-    template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
-    double decrement(double v = 1.0, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
-    {
-        auto new_value = detail::add(value, -v);
-        set_updated_at(updated_at);
-        return new_value;
-    }
+    double decrement(double v = 1.0) noexcept { return detail::add(value, -v); }
 
-    template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
-    void set(double v, std::chrono::time_point<Clock, Duration> updated_at = Clock::now()) noexcept
-    {
-        value.store(v, std::memory_order_release);
-        set_updated_at(updated_at);
-    }
+    void set(double v) noexcept { value.store(v, std::memory_order_release); }
 
     double operator+=(double v) noexcept;
     double operator++() noexcept;

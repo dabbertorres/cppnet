@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -103,31 +101,14 @@ struct base_metric
     }
 
     // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility): derived metrics inherit it (with its access).
-    base_metric(const base_metric& other)
-        : name{other.name}
-        , help{other.help}
-        , labels{other.labels}
-        , last_update{other.last_update.load(std::memory_order_acquire)}
-    {}
-
-    base_metric& operator=(const base_metric& other)
-    {
-        if (this == std::addressof(other)) return *this;
-
-        name   = other.name;
-        help   = other.help;
-        labels = other.labels;
-        last_update.exchange(other.last_update, std::memory_order_acquire);
-
-        return *this;
-    }
+    base_metric(const base_metric&)            = default;
+    base_metric& operator=(const base_metric&) = default;
 
     // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility): derived metrics inherit it (with its access).
     base_metric(base_metric&& other) noexcept
         : name{std::exchange(other.name, "")}
         , help{std::exchange(other.help, "")}
         , labels{std::exchange(other.labels, {})}
-        , last_update{other.last_update.exchange(std::chrono::seconds(0), std::memory_order_acquire)}
     {}
 
     base_metric& operator=(base_metric&& other) noexcept
@@ -135,8 +116,6 @@ struct base_metric
         name   = std::exchange(other.name, "");
         help   = std::exchange(other.help, "");
         labels = std::exchange(other.labels, {});
-        last_update.store(other.last_update.exchange(std::chrono::seconds(0), std::memory_order_acquire),
-                          std::memory_order_release);
 
         return *this;
     }
@@ -148,29 +127,6 @@ struct base_metric
     std::string   name;
     std::string   help;
     metric_labels labels;
-
-    template<typename Clock = std::chrono::steady_clock>
-    [[nodiscard]] Clock::time_point last_updated() const noexcept
-    {
-        auto since_epoch       = last_update.load(std::memory_order_acquire);
-        auto clock_since_epoch = std::chrono::duration_cast<Clock::duration>(since_epoch);
-        return std::chrono::time_point<Clock>{clock_since_epoch};
-    }
-
-    template<typename Clock = std::chrono::steady_clock>
-    void set_updated_now() noexcept
-    {
-        auto ts = Clock::now();
-        set_updated_at(ts);
-    }
-
-    template<typename Clock = std::chrono::steady_clock, typename Duration = Clock::duration>
-    void set_updated_at(std::chrono::time_point<Clock, Duration> timepoint) noexcept
-    {
-        auto since_epoch = timepoint.time_since_epoch();
-        auto seconds     = std::chrono::duration_cast<decltype(last_update.load())>(since_epoch);
-        last_update.store(seconds, std::memory_order_relaxed);
-    }
 
     // encode writes the metric in Prometheus' text format.
     coro::task<io::result> encode(io::writer& out) const
@@ -217,8 +173,7 @@ struct base_metric
                 },
                 "a metric needs an encode_own_samples, or a get() of its value");
 
-            // NOTE: no timestamp, as Prometheus then uses the time of the scrape. (The text format's are milliseconds
-            //       since the Unix epoch, which last_update, from steady_clock, isn't.)
+            // NOTE: no timestamp, as Prometheus then uses the time of the scrape.
             out += name;
             encode_labels(out);
             out += ' ';
@@ -273,8 +228,6 @@ protected:
 
         out += '}';
     }
-
-    std::atomic<std::chrono::seconds> last_update;
 };
 
 // derive_child returns a new metric like parent (e.g. with a histogram's buckets), with new_labels added to its labels

@@ -20,7 +20,6 @@
 namespace net::instrument::prometheus
 {
 
-using namespace std::chrono_literals;
 using namespace std::string_view_literals;
 
 std::string_view metric_type_string(metric_type type) noexcept
