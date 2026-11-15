@@ -298,18 +298,20 @@ TEST_CASE("a request canceled during its TLS handshake fails, and counts its con
                          net::http::client*  client,
                          std::string         port) -> task<std::pair<std::error_code, net::io::clock::duration>>
     {
+        // the stop's time is set from the request's start here, not from when a worker first runs the task that
+        // requests it (which, under load, may be before the request starts).
         std::stop_source source;
+        const auto       start = net::io::clock::now();
         if (!sched->spawn(
-                [](net::io::scheduler* sched, std::stop_source source) -> task<>
+                [](net::io::scheduler* sched, std::stop_source source, net::io::clock::time_point at) -> task<>
                 {
-                    (void)co_await sched->sleep_until(net::io::clock::now() + 100ms);
+                    (void)co_await sched->sleep_until(at);
                     source.request_stop();
-                }(sched, source)))
+                }(sched, source, start + 100ms)))
             co_return std::pair{std::make_error_code(std::errc::resource_unavailable_try_again),
                                 net::io::clock::duration{}};
 
-        const auto start = net::io::clock::now();
-        auto       resp  = co_await client->get("https://localhost:" + port + "/", source.get_token());
+        auto resp = co_await client->get("https://localhost:" + port + "/", source.get_token());
         co_return std::pair{resp.has_value() ? std::error_code{} : resp.error(), net::io::clock::now() - start};
     };
 
