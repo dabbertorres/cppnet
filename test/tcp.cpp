@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <exception>
 #include <expected>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -26,6 +27,9 @@
 
 #include <netdb.h>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#    include <sys/sysctl.h>
+#endif
 
 #include <arpa/inet.h>
 #include <catch2/catch_message.hpp>
@@ -75,6 +79,28 @@ std::expected<int, std::error_code> nodelay(const net::tcp_socket& conn)
     if (::getsockopt(conn.native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, &size) != 0)
         return std::unexpected(std::error_code{errno, std::system_category()});
     return value;
+}
+
+// buffer_sizes are a socket's receive and send buffers' sizes (SO_RCVBUF, SO_SNDBUF), as the kernel reports them.
+struct buffer_sizes
+{
+    int receive = -1;
+    int send    = -1;
+};
+
+// buffers_of is the socket conn has's buffer_sizes, or why connecting (or reading them) failed.
+std::expected<buffer_sizes, std::error_code> buffers_of(const connect_result& conn)
+{
+    if (!conn.has_value()) return std::unexpected(conn.error());
+
+    buffer_sizes sizes;
+    socklen_t    size = sizeof(int);
+    if (::getsockopt(conn->native_handle(), SOL_SOCKET, SO_RCVBUF, &sizes.receive, &size) != 0)
+        return std::unexpected(std::error_code{errno, std::system_category()});
+    size = sizeof(int);
+    if (::getsockopt(conn->native_handle(), SOL_SOCKET, SO_SNDBUF, &sizes.send, &size) != 0)
+        return std::unexpected(std::error_code{errno, std::system_category()});
+    return sizes;
 }
 
 // nodelay_of is TCP_NODELAY's value on the socket conn has (see nodelay()), or why connecting failed.
@@ -308,6 +334,123 @@ TEST_CASE("connecting turns Nagle's algorithm off on the socket it returns", "[t
         CHECK(*result.off == 0);
         REQUIRE(result.on.has_value());
         CHECK(*result.on != 0);
+    }
+}
+
+TEST_CASE("connecting sets the receive and send buffers' sizes given on the socket", "[tcp][connect][buffers]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const auto connect = [](net::io::scheduler* sched, std::uint16_t port, std::size_t receive, std::size_t send)
+        -> net::coro::task<std::expected<buffer_sizes, std::error_code>>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched,
+                                                      "127.0.0.1",
+                                                      std::to_string(port),
+                                                      {.receive_buffer = receive, .send_buffer = send});
+        co_return buffers_of(conn);
+    };
+
+    // sizes neither system's default usually is (Linux's are 128 KiB and 16 KiB, macOS's 128 KiB both).
+    constexpr std::size_t receive = std::size_t{12} * 1'024;
+    constexpr std::size_t send    = std::size_t{24} * 1'024;
+
+    const auto sizes = sched.run_to_completion(connect(&sched, listener->local_port(), receive, send));
+    CAPTURE(sizes.error_or({}).message());
+    REQUIRE(sizes.has_value());
+
+    // Linux doubles a size, for its own accounting; macOS rounds it up to a multiple of the connection's segment size,
+    // with a floor (over loopback, well above these).
+    CAPTURE(sizes->receive, sizes->send);
+#ifdef __linux__
+    CHECK(std::cmp_equal(sizes->receive, 2 * receive));
+    CHECK(std::cmp_equal(sizes->send, 2 * send));
+#else
+    CHECK(std::cmp_greater_equal(sizes->receive, receive));
+    CHECK(std::cmp_greater_equal(sizes->send, send));
+#endif
+}
+
+TEST_CASE("connecting with a buffer past the system's limit caps it", "[tcp][connect][buffers]")
+{
+    net::io::scheduler sched{make_pool()};
+
+    auto listener = net::listener::make(&sched, "127.0.0.1", "0");
+    REQUIRE(listener.has_value());
+
+    const auto connect = [](net::io::scheduler* sched,
+                            std::uint16_t       port) -> net::coro::task<std::expected<buffer_sizes, std::error_code>>
+    {
+        auto conn = co_await net::tcp_socket::connect(sched,
+                                                      "127.0.0.1",
+                                                      std::to_string(port),
+                                                      {.receive_buffer = std::numeric_limits<std::size_t>::max()});
+        co_return buffers_of(conn);
+    };
+
+    const auto sizes = sched.run_to_completion(connect(&sched, listener->local_port()));
+    CAPTURE(sizes.error_or({}).message());
+    REQUIRE(sizes.has_value());
+    CAPTURE(sizes->receive);
+
+#ifdef __linux__
+    // at net.core.rmem_max, which it reports doubled.
+    int  rmem_max = 0;
+    auto file     = std::ifstream{"/proc/sys/net/core/rmem_max"};
+    REQUIRE(static_cast<bool>(file >> rmem_max));
+    CHECK(sizes->receive == 2 * rmem_max);
+#elifdef __APPLE__
+    // at kern.ipc.maxsockbuf.
+    // NOTE: read into 64 bits, zeroed, whether the kernel's is 32 or 64 (macOS is little-endian).
+    std::uint64_t maxsockbuf = 0;
+    std::size_t   size       = sizeof(maxsockbuf);
+    REQUIRE(::sysctlbyname("kern.ipc.maxsockbuf", &maxsockbuf, &size, nullptr, 0) == 0);
+    CHECK(std::cmp_equal(sizes->receive, maxsockbuf));
+#else
+    SKIP("no known limit here");
+#endif
+}
+
+TEST_CASE("connecting with a buffer size of 0 fails before connecting", "[tcp][connect][buffers]")
+{
+    // a port that refuses connections: so failing with anything but invalid_argument would show it tried.
+    const auto closed = test::held_port::make();
+    REQUIRE(closed.has_value());
+
+    net::io::scheduler sched{make_pool()};
+
+    const auto options = GENERATE(net::tcp_socket::connect_options{.receive_buffer = 0},
+                                  net::tcp_socket::connect_options{.send_buffer = 0});
+    CAPTURE(options.receive_buffer.has_value());
+
+    SECTION("to a host")
+    {
+        const auto connect = [](net::io::scheduler*              sched,
+                                std::uint16_t                    port,
+                                net::tcp_socket::connect_options options) -> net::coro::task<std::error_code>
+        {
+            auto conn = co_await net::tcp_socket::connect(sched, "127.0.0.1", std::to_string(port), options);
+            co_return conn.has_value() ? std::error_code{} : conn.error();
+        };
+
+        CHECK(sched.run_to_completion(connect(&sched, closed->port(), options)) == std::errc::invalid_argument);
+    }
+
+    SECTION("to addresses")
+    {
+        const auto connect = [](net::io::scheduler*              sched,
+                                std::uint16_t                    port,
+                                net::tcp_socket::connect_options options) -> net::coro::task<std::error_code>
+        {
+            const std::array<net::ip_addr, 1> addrs{net::ipv4_addr::loopback()};
+            auto                              conn = co_await net::tcp_socket::connect(sched, addrs, port, options);
+            co_return conn.has_value() ? std::error_code{} : conn.error();
+        };
+
+        CHECK(sched.run_to_completion(connect(&sched, closed->port(), options)) == std::errc::invalid_argument);
     }
 }
 

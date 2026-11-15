@@ -218,6 +218,14 @@ connections have, and as `http::server` sets it on those it accepts: with it on,
 sent before is acknowledged, which a peer delaying its acknowledgements holds up (by 40 ms or more on Linux, where an
 upload stalled that long at the end of each flow-control window). It's set on the attempt that won, once it's
 connected, and a failure to set it is ignored; `sock->set_nodelay(false)` turns Nagle's algorithm back on.
+`connect_options::receive_buffer` and `send_buffer` set the socket's buffers' sizes (SO_RCVBUF, SO_SNDBUF) on each
+attempt's socket before it connects, so TCP's window scale is agreed with the receive buffer; unset, the system's grow
+with the connection. 0 fails with `std::errc::invalid_argument` (Linux would take it as its least, and macOS refuses
+it). The kernel adjusts a size: Linux doubles it and caps it at `net.core.rmem_max` or `wmem_max`; macOS caps it at
+`kern.ipc.maxsockbuf`, and once connected rounds it up to a multiple of the segment size, with a floor (over loopback,
+about 320 KiB to receive and 64 KiB to send). A small receive buffer holds the peer to what's read, within that floor;
+set after connecting, below the window already offered, it makes the receiver drop what the peer sends into that
+window, and each drop costs a retransmission's timeout.
 
 A socket's reads and writes can be limited by a **deadline** (a time by which they must finish:
 `set_read_deadline()`, `set_write_deadline()`, `set_deadline()`) or a **timeout** (how long each may go without
@@ -416,6 +424,8 @@ body the server may send ahead of what's been read of it (SETTINGS_INITIAL_WINDO
 most a window a round trip (one download over a 20 ms round trip went at 2.8, about 30 and 73 MiB/s with 64 KiB, 1 MiB
 and 4 MiB), and a body that isn't read holds that much, as does a WebSocket over HTTP/2 that isn't read, whose stream
 has this window if it's more than its own.
+`tcp_receive_buffer` and `tcp_send_buffer` set its connections' TCP buffers (see `connect_options::receive_buffer`):
+unset, the system's.
 
 HTTP/2 is used over TLS with servers that agree on it with ALPN (unless `client_options::http2` is off), and over
 cleartext only when `client_options::http2_prior_knowledge` says the server speaks it. A response's `version` says

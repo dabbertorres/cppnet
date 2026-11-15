@@ -243,6 +243,60 @@ TEST_CASE("the client's connections have Nagle's algorithm off", "[http][client]
     CHECK(sched.run_to_completion(get(&sched, url, http2)) == (http2 ? "2: on" : "1: on"));
 }
 
+TEST_CASE("the client's connections have the TCP buffers' sizes it's given", "[http][client][buffers]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(2)};
+    net::http::server  server{&sched,
+                              net::listener::make(&sched, "127.0.0.1", "0").value(),
+                              [](net::http::server_request&, net::http::response_writer& resp) -> task<>
+                              {
+                                 auto* body = co_await resp.send(net::http::status::OK, 5);
+                                 (void)co_await net::io::write_all(*body, "hello"sv);
+                              }};
+    REQUIRE(sched.spawn(server.serve()));
+
+    // SO_RCVBUF and SO_SNDBUF on the client's socket (the response's body's handle, before the body's read, which gives
+    // the connection back), or -1 for what couldn't be read.
+    auto get = [](net::io::scheduler* sched, std::string url, std::size_t receive, std::size_t send)
+        -> task<std::pair<int, int>>
+    {
+        net::http::client_options options;
+        options.tcp_receive_buffer = receive;
+        options.tcp_send_buffer    = send;
+        net::http::client client{sched, options};
+
+        auto resp = co_await client.get(url);
+        if (!resp.has_value()) co_return std::pair{-1, -1};
+
+        std::pair<int, int> sizes{-1, -1};
+        socklen_t           size = sizeof(int);
+        (void)::getsockopt(resp->body->native_handle(), SOL_SOCKET, SO_RCVBUF, &sizes.first, &size);
+        size = sizeof(int);
+        (void)::getsockopt(resp->body->native_handle(), SOL_SOCKET, SO_SNDBUF, &sizes.second, &size);
+
+        (void)co_await net::io::read_all(*resp->body);
+        co_return sizes;
+    };
+
+    // sizes neither system's default usually is (Linux's are 128 KiB and 16 KiB, macOS's 128 KiB both).
+    constexpr std::size_t receive = std::size_t{12} * 1'024;
+    constexpr std::size_t send    = std::size_t{24} * 1'024;
+
+    const auto url              = std::format("http://127.0.0.1:{}/", server.local_port());
+    const auto [received, sent] = sched.run_to_completion(get(&sched, url, receive, send));
+
+    // Linux doubles a size, for its own accounting; macOS rounds it up to a multiple of the connection's segment size,
+    // with a floor (over loopback, well above these).
+    CAPTURE(received, sent);
+#ifdef __linux__
+    CHECK(std::cmp_equal(received, 2 * receive));
+    CHECK(std::cmp_equal(sent, 2 * send));
+#else
+    CHECK(std::cmp_greater_equal(received, receive));
+    CHECK(std::cmp_greater_equal(sent, send));
+#endif
+}
+
 #ifndef NET_HAS_TLS
 TEST_CASE("without TLS, https isn't supported", "[http][client]")
 {

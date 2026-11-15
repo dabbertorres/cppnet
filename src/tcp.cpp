@@ -123,6 +123,24 @@ net::coro::task<std::error_code> wait_connected(net::io::scheduler*        sched
     }
 }
 
+// set_buffer sets one of the socket's buffers' sizes (SO_RCVBUF or SO_SNDBUF), if it's given one: the kernel caps it
+// anyway, so a size past an int's is the largest.
+std::error_code set_buffer(net::io::handle fd, int option, std::optional<std::size_t> bytes) noexcept
+{
+    if (!bytes.has_value()) return {};
+
+    const int value = static_cast<int>(std::min<std::size_t>(*bytes, std::numeric_limits<int>::max()));
+    if (::setsockopt(fd, SOL_SOCKET, option, &value, sizeof(value)) == -1) return from_errno(errno);
+    return {};
+}
+
+// valid_buffers is whether options' buffer sizes, if given, are valid: not 0, which Linux takes as its least and
+// macOS refuses (see connect_options::receive_buffer).
+bool valid_buffers(const net::tcp_socket::connect_options& options) noexcept
+{
+    return options.receive_buffer != std::size_t{0} && options.send_buffer != std::size_t{0};
+}
+
 // started is an attempt to connect that has started: its socket, and whether it's connected already.
 struct started
 {
@@ -147,7 +165,15 @@ std::expected<started, std::error_code> start(net::io::scheduler*               
         ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
     }
 
-    std::error_code err;
+    // before connecting, as TCP's window scale is agreed then (see connect_options::receive_buffer).
+    std::error_code err = set_buffer(fd, SO_RCVBUF, options.receive_buffer);
+    if (!err) err = set_buffer(fd, SO_SNDBUF, options.send_buffer);
+    if (err)
+    {
+        conn.close(false);
+        return std::unexpected(err);
+    }
+
     if (options.system_connect) err = options.system_connect(fd, addr.get(), addr.size);
     else if (::connect(fd, addr.get(), addr.size) == -1) err = from_errno(errno);
 
@@ -751,7 +777,8 @@ tcp_socket::connect(io::scheduler* scheduler, std::string host, std::string port
     if (options.stop.stop_requested()) co_return std::unexpected(std::make_error_code(std::errc::operation_canceled));
 
     const auto number = port_number(port);
-    if (!number.has_value()) co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
+    if (!number.has_value() || !valid_buffers(options))
+        co_return std::unexpected(std::make_error_code(std::errc::invalid_argument));
 
     // the timeout covers resolving the host, as well as connecting.
     const auto deadline = io::clock::now() + options.timeout;
@@ -795,6 +822,10 @@ coro::task<std::expected<tcp_socket, std::error_code>> tcp_socket::connect(io::s
                                                                            std::uint16_t            port,
                                                                            const connect_options&   options)
 {
+    if (!valid_buffers(options))
+        return coro::ready_task<std::expected<tcp_socket, std::error_code>>(
+            std::unexpected(std::make_error_code(std::errc::invalid_argument)));
+
     // NOTE: not a coroutine, so the addresses are converted (and so copied) before it returns.
     std::vector<detail::socket_address> converted;
     converted.reserve(addresses.size());

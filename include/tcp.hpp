@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -67,6 +68,18 @@ public:
         std::chrono::milliseconds attempt_delay = std::chrono::milliseconds{250};
 
         bool keepalive = true;
+
+        // The socket's receive and send buffers' sizes (SO_RCVBUF, SO_SNDBUF), in bytes, set on each attempt's socket
+        // before it connects, so that TCP's window scale is agreed with the receive buffer: nothing leaves the
+        // system's, which grow with the connection (autotuning). 0 fails with std::errc::invalid_argument (before
+        // anything's resolved or connected), as Linux would take it as its least and macOS refuses it. The kernel
+        // adjusts a size: Linux doubles it (for its own accounting) and caps it at net.core.rmem_max or wmem_max;
+        // macOS caps it at kern.ipc.maxsockbuf, and once connected rounds it up to a multiple of the connection's
+        // segment size, with a floor (over loopback, about 320 KiB to receive and 64 KiB to send). A small receive
+        // buffer holds the peer to what's read, within that floor. (Set after connecting, smaller than the window
+        // already offered, the peer would send into that window, and the receiver drop what it can't hold.)
+        std::optional<std::size_t> receive_buffer{};
+        std::optional<std::size_t> send_buffer{};
 
         // Requesting stop ends connecting (or resolving the host), failing with std::errc::operation_canceled, without
         // trying the addresses left. It only covers connecting: the socket returned doesn't take it (see

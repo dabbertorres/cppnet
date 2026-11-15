@@ -47,6 +47,11 @@ struct client_options
     // Whether to turn on TCP keepalives (SO_KEEPALIVE), which detect connections to hosts that have gone away.
     bool tcp_keepalive = true;
 
+    // The TCP sockets' receive and send buffers' sizes (SO_RCVBUF, SO_SNDBUF), in bytes, set before they connect: see
+    // tcp_socket::connect_options::receive_buffer. Nothing leaves the system's, which grow with the connection.
+    std::optional<std::size_t> tcp_receive_buffer{};
+    std::optional<std::size_t> tcp_send_buffer{};
+
     // Whether to reuse connections for more than one request (HTTP keep-alive).
     bool keep_alive = true;
 

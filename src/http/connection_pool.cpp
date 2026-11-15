@@ -616,10 +616,12 @@ connection_pool::connect(bool                  tls,
                                                    port,
                                                    {
                                                        .timeout = std::max(remaining, std::chrono::milliseconds{1}),
-                                                       .attempt_delay = config.attempt_delay,
-                                                       .keepalive     = config.tcp_keepalive,
-                                                       .stop          = stop,
-                                                       .resolver      = config.resolver,
+                                                       .attempt_delay  = config.attempt_delay,
+                                                       .keepalive      = config.tcp_keepalive,
+                                                       .receive_buffer = config.tcp_receive_buffer,
+                                                       .send_buffer    = config.tcp_send_buffer,
+                                                       .stop           = stop,
+                                                       .resolver       = config.resolver,
                                                    });
     if (!conn.has_value()) co_return std::unexpected(conn.error());
 
