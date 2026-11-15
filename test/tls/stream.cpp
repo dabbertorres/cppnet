@@ -379,6 +379,7 @@ TEST_CASE("certificates that aren't the server's, or aren't trusted, are rejecte
     CHECK_FALSE(tls::from_peer(s.error()));
     CHECK(s.error().message().contains(tc.reason));
 
+    REQUIRE(server.done.load() == 1);
     CHECK(server.err == tls::alert::bad_certificate);
     CHECK(tls::from_peer(server.err));
     CHECK(server.err.message() == "bad_certificate (from the peer)");
@@ -1577,8 +1578,11 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
             }
             else
             {
-                co_await client_done->wait();
-                server_done->finish({});
+                // NOTE: with a deadline, which ends the client's last write should it wait (as it has no limit of its
+                //       own) by closing under it: finishing with timed_out then, so that a client that's only slow
+                //       fails as that, not as the writes' errors.
+                const bool client_finished = co_await client_done->wait();
+                server_done->finish(client_finished ? std::error_code{} : std::make_error_code(std::errc::timed_out));
             }
 
             co_await s.close();
@@ -1658,7 +1662,8 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
         }
 
         client_done->finish({});
-        co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -1667,6 +1672,7 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
         client(&sched, listener.local_port(), ctx, &first, &second, &server_done, &client_done));
 
     CAPTURE(out.first.err.message(), out.second.err.message(), out.later.err.message(), out.shutdown.message());
+    CAPTURE(server_done.err.message());
     CHECK(out.failed.empty());
     if (reads)
     {
@@ -1677,7 +1683,6 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
         CHECK_FALSE(out.shutdown);
 
         // all of it, in order, then close_notify.
-        CAPTURE(server_done.err.message());
         CHECK(server_done.err == net::io::errc::end_of_stream);
         CHECK(server_read.size() == first.size() + second.size());
         const bool in_order = server_read == first + second;
@@ -1689,6 +1694,9 @@ TEST_CASE("writes return once their data has gone to a slow peer, or fail with i
         CHECK(out.first.err == std::errc::timed_out);
         CHECK(out.second.err == std::errc::timed_out);
         CHECK(out.later.err == std::errc::timed_out);
+
+        // and the server didn't give up on the client first (closing under its writes).
+        CHECK_FALSE(server_done.err);
     }
 }
 
@@ -1720,7 +1728,9 @@ TEST_CASE("waiting for a stream to be writable waits for a write in progress, ra
             }
             else
             {
-                co_await client_done->wait();
+                // NOTE: without a deadline, as the client finishes client_done on every path, its waits before then
+                //       limited by its write timeout.
+                co_await client_done->settle();
                 server_done->finish({});
             }
 
@@ -1766,6 +1776,7 @@ TEST_CASE("waiting for a stream to be writable waits for a write in progress, ra
         if (!s.has_value())
         {
             out.shutdown = s.error();
+            client_done->finish({});
             co_return out;
         }
         if (!reads) s->socket().set_write_timeout(300ms);
@@ -1781,16 +1792,20 @@ TEST_CASE("waiting for a stream to be writable waits for a write in progress, ra
                              &written))
         {
             out.failed = "the write didn't start";
+            client_done->finish({});
             co_return out;
         }
-        (void)co_await started.wait();
+
+        // NOTE: without a deadline, as the write's task, once spawned, says so first.
+        co_await started.settle();
 
         out.wait = co_await s->wait_writable();
         if (!co_await finish_or_abandon({&written}, &abandon)) out.failed = "the write didn't finish";
 
         if (reads) out.shutdown = co_await s->shutdown();
         client_done->finish({});
-        co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -2507,21 +2522,23 @@ TEST_CASE("large writes go a batch at a time, and arrive whole", "[tls][write][b
                            std::uint16_t                   port,
                            tls::client_context             ctx,
                            const std::vector<std::string>* writes,
-                           server_outcome*                 server_done) -> task<std::vector<net::io::result>>
+                           server_outcome* server_done) -> task<std::pair<std::vector<net::io::result>, std::string>>
     {
         std::vector<net::io::result> results;
         auto                         s = co_await connect_to(sched, port, std::move(ctx), "localhost");
-        if (!s.has_value()) co_return results;
+        if (!s.has_value()) co_return std::pair{results, "connect: " + s.error().message()};
 
         for (const auto& w : *writes) results.push_back(co_await s->write(std::as_bytes(std::span{w})));
         (void)co_await s->shutdown();
-        co_await server_done->wait();
+        const bool served = co_await server_done->wait();
         co_await s->close();
-        co_return results;
+        co_return std::pair{results, served ? std::string{} : "the server didn't finish"};
     };
 
-    const auto results = sched.run_to_completion(client(&sched, listener.local_port(), ctx, &writes, &server_done));
+    const auto [results, failed] =
+        sched.run_to_completion(client(&sched, listener.local_port(), ctx, &writes, &server_done));
 
+    CHECK(failed.empty());
     REQUIRE(results.size() == writes.size());
     std::string all;
     for (std::size_t i = 0; i < writes.size(); ++i)
@@ -2603,7 +2620,8 @@ TEST_CASE("writes go in the order they were called, each whole, whatever order t
         out.shutdown = co_await s->shutdown();
         if (!co_await finish_or_abandon({&first_done, &second_done, &third_done}, &abandon))
             out.failed = "the writes didn't finish";
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -2679,7 +2697,8 @@ TEST_CASE("a write whose task is destroyed before it's awaited leaves its turn t
         out.last = co_await s->write(std::as_bytes(std::span{*last}));
         if (!co_await finish_or_abandon({&first_done}, &abandon)) out.failed = "the first write didn't finish";
         (void)co_await s->shutdown();
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -3039,10 +3058,10 @@ TEST_CASE("a write whose task is dropped unawaited goes with the next write", "[
     const auto client = [](net::io::scheduler* sched,
                            std::uint16_t       port,
                            tls::client_context ctx,
-                           server_outcome*     server_done) -> task<net::io::result>
+                           server_outcome*     server_done) -> task<std::pair<net::io::result, std::string>>
     {
         auto s = co_await connect_to(sched, port, std::move(ctx), "localhost");
-        if (!s.has_value()) co_return net::io::result{.err = s.error()};
+        if (!s.has_value()) co_return std::pair{net::io::result{.err = s.error()}, std::string{}};
 
         // encrypted as it's called, and flushed only when awaited: so it's left to the next.
         {
@@ -3051,13 +3070,14 @@ TEST_CASE("a write whose task is dropped unawaited goes with the next write", "[
         const auto last = co_await s->write(std::as_bytes(std::span{"then the last"sv}));
 
         (void)co_await s->shutdown();
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
         co_await s->close();
-        co_return last;
+        co_return std::pair{last, served ? std::string{} : "the server didn't finish"};
     };
 
-    const auto last = sched.run_to_completion(client(&sched, listener.local_port(), ctx, &server_done));
+    const auto [last, failed] = sched.run_to_completion(client(&sched, listener.local_port(), ctx, &server_done));
     CAPTURE(last.err.message(), server_done.err.message());
+    CHECK(failed.empty());
     CHECK_FALSE(last.err);
     CHECK(last.count == "then the last"sv.size());
     CHECK(server_read == "dropped, then the last");
@@ -3087,7 +3107,9 @@ TEST_CASE("a write's flush waits for another task's in progress, whichever of th
     {
         return [server_read, server_done, client_waiting](tls::stream& s) -> task<>
         {
-            co_await client_waiting->wait();
+            // NOTE: without a deadline, as the client finishes client_waiting on every path, with nothing to wait for
+            //       before then.
+            co_await client_waiting->settle();
             auto [read, err] = co_await read_to_end(s);
             *server_read     = std::move(read);
             server_done->finish(err);
@@ -3150,7 +3172,8 @@ TEST_CASE("a write's flush waits for another task's in progress, whichever of th
 
         if (!co_await finish_or_abandon({&first_done, &second_done}, abandon)) out.failed = "the writes didn't finish";
         (void)co_await s->shutdown();
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -3182,7 +3205,9 @@ TEST_CASE("destroying the coroutine awaiting a write while its flush waits fails
     {
         return [client_done](tls::stream& s) -> task<>
         {
-            co_await client_done->wait();
+            // NOTE: without a deadline, as the client finishes client_done on every path, its last write limited by
+            //       a deadline of its own.
+            co_await client_done->settle();
             co_await s.close();
         };
     };
@@ -3227,7 +3252,9 @@ TEST_CASE("destroying the coroutine awaiting a write while its flush waits fails
             if (awaiting.is_ready()) out.failed = "the write didn't wait";
         }
 
-        // part of a record may have gone, so nothing more can be written.
+        // part of a record may have gone, so nothing more can be written. NOTE: a deadline, so a write that waits (as
+        // the server reads nothing) fails, rather than the test waiting for ever.
+        s->socket().set_write_deadline(net::io::clock::now() + 5s);
         out.later = co_await s->write(std::as_bytes(std::span{"more"sv}));
 
         client_done->finish({});
@@ -3276,6 +3303,7 @@ TEST_CASE("a read's replies go with a write whose task has the stream's flusher,
     {
         net::io::result written;
         std::error_code read_ended;
+        std::string     failed; // what went wrong with the test's own tasks, if anything
     };
 
     const auto client = [](net::io::scheduler* sched,
@@ -3299,13 +3327,15 @@ TEST_CASE("a read's replies go with a write whose task has the stream's flusher,
         out.read_ended = err;
         out.written    = co_await std::move(write);
 
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
 
     const auto out = sched.run_to_completion(client(&sched, listener.local_port(), ctx, &server_done));
     CAPTURE(out.written.err.message(), out.read_ended.message(), server_done.err.message());
+    CHECK(out.failed.empty());
     CHECK(out.read_ended == net::io::errc::end_of_stream);
     CHECK_FALSE(out.written.err);
     CHECK(out.written.count == "before the end"sv.size());
@@ -3367,7 +3397,9 @@ TEST_CASE(
                 co_return;
             }
 
-            co_await client_read->wait();
+            // NOTE: without a deadline, as the client finishes client_read on every path (having read the
+            //       close_notify sent above, or failed): the read's timeout limits the rest.
+            co_await client_read->settle();
             s.socket().set_read_timeout(5s);
             auto [read, err] = co_await read_to_end(s);
             *server_read     = std::move(read);
@@ -3444,8 +3476,19 @@ TEST_CASE(
         out.read_ended = err;
         client_read->finish({});
 
+        // NOTE: once the client has read the server's close_notify, the server's serving, and finishes on every path,
+        //       its read limited by its timeout: so it's waited for without a deadline. Otherwise the read's check
+        //       fails the test, and the wait has one.
         if (!co_await finish_or_abandon({&written}, abandon)) out.failed = "the write didn't finish";
-        (void)co_await server_done->wait();
+        if (out.read_ended == net::io::errc::end_of_stream)
+        {
+            co_await server_done->settle();
+        }
+        else
+        {
+            const bool served = co_await server_done->wait();
+            if (!served && out.failed.empty()) out.failed = "the server didn't finish";
+        }
         co_await s->close();
         co_return out;
     };
@@ -3494,7 +3537,9 @@ TEST_CASE("flushes still waiting for another's take it on, and finish, once one 
     {
         return [server_read, server_done, client_waiting](tls::stream& s) -> task<>
         {
-            co_await client_waiting->wait();
+            // NOTE: without a deadline, as the client finishes client_waiting on every path, with nothing to wait for
+            //       before then.
+            co_await client_waiting->settle();
             auto [read, err] = co_await read_to_end(s);
             *server_read     = std::move(read);
             server_done->finish(err);
@@ -3571,7 +3616,8 @@ TEST_CASE("flushes still waiting for another's take it on, and finish, once one 
 
         if (!co_await finish_or_abandon({&written, &last_done}, abandon)) out.failed = "the writes didn't finish";
         (void)co_await s->shutdown();
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
@@ -3611,7 +3657,9 @@ TEST_CASE("a write destroyed while it waits for its turn leaves the write in pro
     {
         return [server_read, server_done, client_waiting](tls::stream& s) -> task<>
         {
-            co_await client_waiting->wait();
+            // NOTE: without a deadline, as the client finishes client_waiting on every path, with nothing to wait for
+            //       before then.
+            co_await client_waiting->settle();
             auto [read, err] = co_await read_to_end(s);
             *server_read     = std::move(read);
             server_done->finish(err);
@@ -3668,7 +3716,8 @@ TEST_CASE("a write destroyed while it waits for its turn leaves the write in pro
         if (!co_await finish_or_abandon({&written}, abandon)) out.failed = "the write didn't finish";
         out.next = co_await s->write(std::as_bytes(std::span{"next"sv}));
         (void)co_await s->shutdown();
-        (void)co_await server_done->wait();
+        const bool served = co_await server_done->wait();
+        if (!served && out.failed.empty()) out.failed = "the server didn't finish";
         co_await s->close();
         co_return out;
     };
