@@ -3,7 +3,9 @@
 Status: decided (2026-11-01): every question at the end (see Decided questions). Stages 0 to 5 done (pull requests #112
 to #117, and #121 to #124; Learned in the stages has how each met the bar, and GCC's counts after stage 5). Paused after
 stage 4 by the user (2026-11-02); the `http11` references change (below) is done (#120). Stage 5 resumed with the user's
-go-ahead (2026-11-13), and finished 2026-11-14. Stage 6 waits for the user's go-ahead.
+go-ahead (2026-11-13), and finished 2026-11-14. Before stage 6, the user chose (2026-11-14) to remove the allocations
+that aren't frames, on either compiler, first (Decided question 11's separate plan), then the frames only GCC makes
+(After stage 5, GCC's allocation counts). Stage 6 waits for both, and for the user's go-ahead.
 
 ## Goal
 
@@ -627,7 +629,7 @@ All decided 2026-11-01.
 10. **C++26.** (a) Keep the hand-rolled `task`, with operations shaped so they could be wrapped as senders, and revisit
     when libc++ ships P2300; (b) adopt stdexec now; (c) ignore it. **Decided: (a).**
 11. **The allocations that aren't frames.** (a) A separate plan later; (b) folded into these stages; (c) leave them.
-    **Decided: (a).**
+    **Decided: (a)**, and that plan comes before stage 6, followed by the frames only GCC makes (the user, 2026-11-14).
 12. **The client's request chain** (`send()` 9.9 KB, `send_http11()` 10.5 KB or `send_http2()` 11.1 KB,
     `http2_client_connection::send()` 5.3 KB, `wait_for_head()` 2 KB: 3-4 frames, ~27 KB per request, in two
     translation units and a retry loop). (a) Fold them into fewer coroutines; (b) leave them for now. **Decided: (b)**,
