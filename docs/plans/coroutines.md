@@ -386,9 +386,9 @@ Each a pull request, in this order, with its benchmark cases, baselines (Where t
    again here with the data: the pool variant measured on top of stage 5, against the bar). Then the client's request
    chain is looked at again (Decided question 12).
 
-Out of scope, for a separate plan (Decided question 11): the allocations that aren't frames (HTTP/2's 28 per stream:
-HPACK field vectors, `wait_on()`'s `std::map` node and `notify()`'s vector, the stream maps and objects; the client's
-reader and writer buffers made per request; TLS's ciphertext vector per flush).
+Out of scope, for a separate plan (`allocations.md`; Decided question 11): the allocations that aren't frames
+(HTTP/2's 28 per stream: HPACK field vectors, `wait_on()`'s `std::map` node and `notify()`'s vector, the stream maps
+and objects; the client's reader and writer buffers made per request; TLS's ciphertext vector per flush).
 
 ## Learned in the stages
 
