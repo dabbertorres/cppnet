@@ -205,6 +205,23 @@ std::int64_t send_buffer(const net::socket& sock)
     return value;
 }
 
+// set_send_buffer sets the socket's send buffer's size.
+void set_send_buffer(const net::socket& sock, int bytes)
+{
+    REQUIRE(::setsockopt(sock.native_handle(), SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) == 0);
+}
+
+// filled_mark is the TCP_NOTSENT_LOWAT mark for the tests that fill a socket that's to stay unwritable until its peer
+// reads, and mark_send_buffer the writer's send buffer that goes with it.
+// NOTE: once fill() has returned, the peer's receiver may still take more in without a read: Linux's took the last
+//       4 KiB after its window looked closed (in about 1 run in 70, with a 4 KiB mark, which that made writable). So
+//       the mark is past anything the receiver can take: its whole buffer (connect_loopback()'s 16 KiB, which Linux
+//       doubles) is 32 KiB at most, so a 128 KiB mark leaves at least 96 KiB unsent, over its half (64 KiB), where
+//       Linux's poll() says writable. The send buffer holds the mark's worth with room to spare, so that it's the
+//       mark that stops the writes, not a full buffer.
+constexpr std::size_t filled_mark      = std::size_t{128} * 1'024;
+constexpr int         mark_send_buffer = 512 * 1'024;
+
 // drain reads what's arrived at the socket, without waiting.
 void drain(const net::socket& sock)
 {
@@ -255,9 +272,13 @@ TEST_CASE("wait_writable waits until the peer has read", "[socket][wait-writable
     auto [writer, peer] = connect_loopback(&sched);
 
     // without a mark, until the send buffer has room; with one, until what's not sent is under it (Linux: under half).
-    const auto mark = GENERATE(std::size_t{0}, std::size_t{4096});
+    const auto mark = GENERATE(std::size_t{0}, filled_mark);
     CAPTURE(mark);
-    if (mark != 0) REQUIRE(writer.set_notsent_lowat(mark).has_value());
+    if (mark != 0)
+    {
+        set_send_buffer(writer, mark_send_buffer);
+        REQUIRE(writer.set_notsent_lowat(mark).has_value());
+    }
 
     fill(writer);
 
@@ -265,7 +286,8 @@ TEST_CASE("wait_writable waits until the peer has read", "[socket][wait-writable
     // would still take more, but poll() says the socket isn't writable.
     if (mark != 0) CHECK(held(writer) < send_buffer(writer) / 2);
 
-    // nothing reads, so it waits: resumed here, it waits once this returns, and nothing but a read can end that.
+    // nothing reads, so it waits: resumed here, it waits once this returns, and nothing but a read can end that (with a
+    // mark, as it's past what the peer's receiver can still take in: see filled_mark).
     auto waiting = wait_writable(&writer);
     waiting.get_handle().resume();
     REQUIRE_FALSE(waiting.get_promise().finished());
@@ -292,7 +314,8 @@ TEST_CASE("wait_writable ends at the socket's write deadline or timeout", "[sock
     scheduler sched{make_pool()};
     auto [writer, peer] = connect_loopback(&sched);
 
-    REQUIRE(writer.set_notsent_lowat(4096).has_value());
+    set_send_buffer(writer, mark_send_buffer);
+    REQUIRE(writer.set_notsent_lowat(filled_mark).has_value());
 
     constexpr auto limit = 100ms;
     const auto     start = net::io::clock::now();
@@ -323,7 +346,8 @@ TEST_CASE("wait_writable ends when the socket's stop token is stopped", "[socket
     scheduler        sched{make_pool()};
     auto [writer, peer] = connect_loopback(&sched);
     writer.set_stop_token(source.get_token());
-    REQUIRE(writer.set_notsent_lowat(4096).has_value());
+    set_send_buffer(writer, mark_send_buffer);
+    REQUIRE(writer.set_notsent_lowat(filled_mark).has_value());
 
     fill(writer);
 
