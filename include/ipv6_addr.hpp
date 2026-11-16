@@ -171,12 +171,10 @@ public:
         return data.back() == 1 && std::all_of(data.begin(), data.end() - 1, [](auto b) { return b == 0; });
     }
 
-    [[nodiscard]] constexpr bool is_unique_local() const noexcept { return (data[0] & 0xfc) == 0b1111'1100; }
-    [[nodiscard]] constexpr bool is_link_local() const noexcept
-    {
-        return data[0] == 0b1111'1110 && data[1] == 0b1000'0000
-            && std::all_of(data.begin() + 2, data.end() - 8, [](auto b) { return b == 0; });
-    }
+    [[nodiscard]] constexpr bool is_unique_local() const noexcept { return (data[0] & 0xfe) == 0xfc; }
+    // is_link_local is whether it's in fe80::/10. The addresses hosts form have the 54 bits after the prefix zero, but
+    // the type is the prefix's (RFC 4291's address type identification), and routers keep all of fe80::/10 on its link.
+    [[nodiscard]] constexpr bool is_link_local() const noexcept { return data[0] == 0xfe && (data[1] & 0xc0) == 0x80; }
 
     [[nodiscard]] constexpr bool is_multicast() const noexcept { return data[0] == 0b1111'1111; }
 

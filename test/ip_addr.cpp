@@ -239,3 +239,39 @@ TEST_CASE("IPv4 address classification", "[ipv4_addr]")
     CHECK_FALSE(ipv4_addr::parse("172.32.0.1")->is_private_network());
     CHECK_FALSE(ipv4_addr::parse("192.169.168.1")->is_private_network());
 }
+
+TEST_CASE("IPv6 address classification", "[ipv6_addr]")
+{
+    CHECK(ipv6_addr::parse("::1")->is_loopback());
+    CHECK_FALSE(ipv6_addr::parse("::")->is_loopback());
+    CHECK_FALSE(ipv6_addr::parse("::1:0")->is_loopback());
+
+    // fc00::/7
+    CHECK(ipv6_addr::parse("fc00::1")->is_unique_local());
+    CHECK(ipv6_addr::parse("fdff:ffff::1")->is_unique_local());
+    CHECK_FALSE(ipv6_addr::parse("fbff::1")->is_unique_local());
+    CHECK_FALSE(ipv6_addr::parse("fe80::1")->is_unique_local());
+    CHECK_FALSE(ipv6_addr::parse("ff02::1")->is_unique_local());
+
+    // fe80::/10, whatever the 54 bits after it (zero in the addresses hosts form)
+    CHECK(ipv6_addr::parse("fe80::1")->is_link_local());
+    CHECK(ipv6_addr::parse("fe80::ffff:ffff:ffff:ffff")->is_link_local());
+    CHECK(ipv6_addr::parse("fe80:0:0:1::1")->is_link_local());
+    CHECK(ipv6_addr::parse("febf:ffff::1")->is_link_local());
+    CHECK_FALSE(ipv6_addr::parse("fe7f::1")->is_link_local());
+    CHECK_FALSE(ipv6_addr::parse("fec0::1")->is_link_local());
+    CHECK_FALSE(ipv6_addr::parse("2001:db8::1")->is_link_local());
+
+    // ff00::/8
+    CHECK(ipv6_addr::parse("ff02::1")->is_multicast());
+    CHECK(ipv6_addr::parse("ff00::")->is_multicast());
+    CHECK_FALSE(ipv6_addr::parse("fe80::1")->is_multicast());
+}
+
+TEST_CASE("an IPv6 address splits into its subnet prefix and interface identifier", "[ipv6_addr]")
+{
+    const auto addr = ipv6_addr::parse("2001:db8:1:2:3:4:5:6");
+    REQUIRE(addr.has_value());
+    CHECK(addr->subnet_prefix() == 0x2001'0db8'0001'0002);
+    CHECK(addr->interface_identifier() == 0x0003'0004'0005'0006);
+}
