@@ -809,6 +809,50 @@ TEST_CASE("idle connections are closed after idle_timeout", "[http][client][pool
     CHECK(stats == net::http::connection_stats{});
 }
 
+TEST_CASE("close_idle closes the idle connections, not those in use", "[http][client][pool]")
+{
+    net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};
+    keepalive_server   server{&sched};
+    net::http::client  client{&sched};
+
+    struct outcome
+    {
+        std::string                 result{};
+        net::http::connection_stats before{}; // with one connection in use, and one idle
+        net::http::connection_stats after{};  // once close_idle has closed the idle one
+    };
+
+    auto test = [](net::io::scheduler* sched, net::http::client* client, keepalive_server* server) -> task<outcome>
+    {
+        outcome out;
+        {
+            // the first response's body is left unread, so its connection stays in use while the second request
+            // makes another, which is idle once its body's been read.
+            auto in_use = co_await client->send(get_request("127.0.0.1", server->port));
+            if (!in_use.has_value()) co_return outcome{.result = "error: " + in_use.error().message()};
+            out.result = co_await fetch(client, "127.0.0.1", server->port);
+            out.before = client->stats();
+
+            client->close_idle();
+            if (!co_await reached(sched, server->closed, 1)) out.result += " [not closed]";
+            out.after = client->stats();
+
+            out.result += co_await read_all(in_use->body.get());
+        }
+
+        // the connection that was in use was left open: with its response read and dropped, it's reused.
+        out.result += co_await fetch(client, "127.0.0.1", server->port);
+        co_return out;
+    };
+
+    const auto out = run(sched, server, test(&sched, &client, &server));
+    CHECK(out.result == "hellohellohello");
+    CHECK(out.before == net::http::connection_stats{.open = 2, .idle = 1});
+    CHECK(out.after == net::http::connection_stats{.open = 1, .idle = 0});
+    CHECK(server.accepted == 2);
+    CHECK(server.requests == 3);
+}
+
 TEST_CASE("requests are retried if a reused connection was closed", "[http][client][pool]")
 {
     net::io::scheduler sched{std::make_shared<net::coro::thread_pool>(4)};

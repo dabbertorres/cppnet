@@ -263,6 +263,29 @@ task<> send_with(net::io::scheduler*  sched,
     if (stop != nullptr) stop->shutdown();
 }
 
+// send_then_drop sends req with client, recording what happens in out, as send_with does, but drops the response
+// before recording that it's finished, so the client's done with its stream by then.
+task<> send_then_drop(net::io::scheduler* sched, http::client* client, http::client_request req, outcome* out)
+{
+    {
+        auto resp = co_await client->send(std::move(req));
+        if (!resp.has_value())
+        {
+            out->err = resp.error();
+        }
+        else
+        {
+            out->status = static_cast<int>(resp->status_code);
+            auto body   = co_await net::io::read_all(*resp->body);
+            if (body.has_value()) out->body = std::move(*body);
+            else out->err = body.error();
+        }
+    }
+
+    out->finished.store(1);
+    sched->notify_all(out->finished);
+}
+
 http::client_request request(http::request_method method, const std::string& url)
 {
     return {.method = method, .uri = net::url::parse(url).value()};
@@ -1644,6 +1667,50 @@ TEST_CASE("with idle_timeout 0, an HTTP/2 connection closes once its last stream
     REQUIRE(failed.empty());
     CHECK(goaway);
     CHECK(out.body == "only");
+}
+
+TEST_CASE("close_idle closes an idle HTTP/2 connection, not one with a stream open", "[http][http2][client]")
+{
+    outcome            first; // (before the scheduler, which waits for the requests)
+    outcome            second;
+    net::io::scheduler sched{make_pool()};
+    fake_host          host{&sched};
+    http::client       client{&sched, prior_knowledge()};
+
+    const auto test = [&] -> task<std::string>
+    {
+        if (!sched.spawn(send_then_drop(&sched, &client, request(http::request_method::GET, host.url("/1")), &first)))
+            co_return "not spawned";
+
+        auto conn = co_await accept(&host);
+        if (conn == nullptr) co_return "not accepted";
+        auto& server = conn->server;
+        if (!co_await server.pump([&] { return server.responses.contains(1); })) co_return "no first request";
+        server.respond(1, "200", "first");
+        if (!co_await server.pump([] { return true; })) co_return "the first response wasn't sent";
+        if (!co_await first.wait(&sched)) co_return "the first request didn't finish";
+
+        // with a stream open, the connection isn't idle, so it's kept: the stream's response still comes.
+        if (!sched.spawn(send_then_drop(&sched, &client, request(http::request_method::GET, host.url("/2")), &second)))
+            co_return "not spawned";
+        if (!co_await server.pump([&] { return server.responses.contains(3); })) co_return "no second request";
+        client.close_idle();
+        server.respond(3, "200", "second");
+        if (!co_await server.pump([] { return true; })) co_return "the second response wasn't sent";
+        if (!co_await second.wait(&sched)) co_return "the second request didn't finish";
+
+        // with none open, it's idle, so it's closed.
+        client.close_idle();
+        if (!co_await server.pump([&] { return server.closed; }, 3s)) co_return "the connection wasn't closed";
+        co_return server.failure;
+    };
+
+    const auto failed = sched.run_to_completion(test());
+    CAPTURE(failed);
+    REQUIRE(failed.empty());
+    CHECK(first.body == "first");
+    CHECK(second.err == std::error_code{});
+    CHECK(second.body == "second");
 }
 
 TEST_CASE("an HTTP/2 connection with a stream reserved isn't idle", "[http][http2][client]")
