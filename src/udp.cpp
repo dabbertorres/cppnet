@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 
 #include "coro/task.hpp"
+#include "exception.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
 #include "sockaddr.hpp"
@@ -18,13 +19,11 @@
 namespace
 {
 
-std::error_code last_error() noexcept { return {errno, std::system_category()}; }
-
 // open makes a socket of family's, owned (and registered with the scheduler) from the start.
 std::expected<net::udp_socket, std::error_code> open(net::io::scheduler* scheduler, int family) noexcept
 {
     const net::io::handle fd = ::socket(family, SOCK_DGRAM, 0);
-    if (fd == -1) return std::unexpected(last_error());
+    if (fd == -1) return std::unexpected(net::errno_code());
 
     try
     {
@@ -55,7 +54,7 @@ udp_socket::connect(io::scheduler* scheduler, const ip_addr& addr, std::uint16_t
     if (!sock.has_value()) return sock;
 
     // NOTE: a datagram socket connects at once: nothing is sent.
-    if (::connect(sock->native_handle(), to.get(), to.size) != 0) return std::unexpected(last_error());
+    if (::connect(sock->native_handle(), to.get(), to.size) != 0) return std::unexpected(net::errno_code());
     return sock;
 }
 
@@ -69,7 +68,7 @@ udp_socket::bind(io::scheduler* scheduler, const ip_addr& addr, std::uint16_t po
 
     // NOTE: no SO_REUSEADDR (unlike a TCP listener's): for UDP, it would let another socket bind the same port, and
     //       take its datagrams.
-    if (::bind(sock->native_handle(), at.get(), at.size) != 0) return std::unexpected(last_error());
+    if (::bind(sock->native_handle(), at.get(), at.size) != 0) return std::unexpected(net::errno_code());
     return sock;
 }
 

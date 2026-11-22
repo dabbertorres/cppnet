@@ -446,10 +446,7 @@ std::optional<io::result> socket::try_read(std::span<std::byte> data, detail::so
         auto err = errno;
         if (err == EINTR) continue;
         if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
-        return io::result{
-            .count = 0,
-            .err   = {err, std::system_category()}
-        };
+        return io::result{.count = 0, .err = errno_code(err)};
     }
 }
 
@@ -479,10 +476,7 @@ std::optional<io::result> socket::try_write(std::span<const std::byte>    data,
             auto err = errno;
             if (err == EINTR) continue;
             if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
-            return io::result{
-                .count = 0,
-                .err   = {err, std::system_category()}
-            };
+            return io::result{.count = 0, .err = errno_code(err)};
         }
     }
 
@@ -499,10 +493,7 @@ std::optional<io::result> socket::try_write(std::span<const std::byte>    data,
         auto err = errno;
         if (err == EINTR) continue;
         if (err == EAGAIN || err == EWOULDBLOCK) return std::nullopt;
-        return io::result{
-            .count = written,
-            .err   = {err, std::system_category()}
-        };
+        return io::result{.count = written, .err = errno_code(err)};
     }
 
     return io::result{.count = written};
@@ -520,10 +511,7 @@ std::optional<io::result> socket::poll_writable() const noexcept
 
         auto err = errno;
         if (err == EINTR) continue;
-        return io::result{
-            .count = 0,
-            .err   = {err, std::system_category()}
-        };
+        return io::result{.count = 0, .err = errno_code(err)};
     }
 
     if ((entry.revents & POLLNVAL) != 0)

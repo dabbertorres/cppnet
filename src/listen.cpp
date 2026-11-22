@@ -87,14 +87,14 @@ listener::open(io::scheduler* scheduler, const std::string& host, const std::str
 
     ::freeaddrinfo(servinfo);
 
-    if (fd == invalid_fd) return std::unexpected(std::error_code{last_err, std::system_category()});
+    if (fd == invalid_fd) return std::unexpected(errno_code(last_err));
 
     // accept() must never block (the scheduler only says a connection may be ready), and the socket shouldn't leak into
     // child processes.
     if (const int err = detail::make_nonblocking_cloexec(fd); err != 0)
     {
         ::close(fd);
-        return std::unexpected(std::error_code{err, std::system_category()});
+        return std::unexpected(errno_code(err));
     }
 
     try
@@ -123,8 +123,7 @@ std::expected<listener, std::error_code> listener::make(io::scheduler*     sched
     listener out{scheduler, *fd};
     if (net == network::tcp)
     {
-        if (::listen(out.main_fd, max_backlog) == -1)
-            return std::unexpected(std::error_code{errno, std::system_category()});
+        if (::listen(out.main_fd, max_backlog) == -1) return std::unexpected(errno_code());
         out.is_listening.store(true, std::memory_order::release);
     }
 
@@ -240,7 +239,7 @@ std::optional<std::expected<io::handle, std::error_code>> listener::try_accept()
 #endif
             return std::nullopt;
 
-        default: return std::unexpected(std::error_code{err, std::system_category()});
+        default: return std::unexpected(errno_code(err));
         }
     }
 }

@@ -95,8 +95,6 @@ bool of_protocol(const net::detail::socket_address& addr, net::protocol proto) n
     return false;
 }
 
-std::error_code from_errno(int err) noexcept { return {err, std::system_category()}; }
-
 // wait_connected waits for a connection that's in progress to be established, returning the error if it fails.
 //
 // The connection is established (or failed) once the socket is writable. The socket may be reported ready before then
@@ -114,12 +112,12 @@ net::coro::task<std::error_code> wait_connected(net::io::scheduler*        sched
         int       sock_err = 0;
         socklen_t size     = sizeof(sock_err);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &size) == -1) sock_err = errno;
-        if (sock_err != 0) co_return from_errno(sock_err);
+        if (sock_err != 0) co_return net::errno_code(sock_err);
 
         sockaddr_storage peer{};
         socklen_t        peer_size = sizeof(peer);
         if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &peer_size) == 0) co_return std::error_code{};
-        if (errno != ENOTCONN) co_return from_errno(errno);
+        if (errno != ENOTCONN) co_return net::errno_code();
     }
 }
 
@@ -130,7 +128,7 @@ std::error_code set_buffer(net::io::handle fd, int option, std::optional<std::si
     if (!bytes.has_value()) return {};
 
     const int value = static_cast<int>(std::min<std::size_t>(*bytes, std::numeric_limits<int>::max()));
-    if (::setsockopt(fd, SOL_SOCKET, option, &value, sizeof(value)) == -1) return from_errno(errno);
+    if (::setsockopt(fd, SOL_SOCKET, option, &value, sizeof(value)) == -1) return net::errno_code();
     return {};
 }
 
@@ -154,7 +152,7 @@ std::expected<started, std::error_code> start(net::io::scheduler*               
                                               const net::tcp_socket::connect_options& options)
 {
     net::io::handle fd = ::socket(addr.family(), SOCK_STREAM, 0);
-    if (fd == -1) return std::unexpected(from_errno(errno));
+    if (fd == -1) return std::unexpected(net::errno_code());
 
     // makes the socket non-blocking before connecting, and owns it from here on.
     net::tcp_socket conn{scheduler, fd};
@@ -175,7 +173,7 @@ std::expected<started, std::error_code> start(net::io::scheduler*               
     }
 
     if (options.system_connect) err = options.system_connect(fd, addr.get(), addr.size);
-    else if (::connect(fd, addr.get(), addr.size) == -1) err = from_errno(errno);
+    else if (::connect(fd, addr.get(), addr.size) == -1) err = net::errno_code();
 
     if (!err) return started{.conn = std::move(conn), .connected = true};
     if (err == std::errc::operation_in_progress) return started{.conn = std::move(conn), .connected = false};
@@ -740,7 +738,7 @@ std::expected<void, std::error_code> tcp_socket::set_nodelay(bool nodelay) const
 {
     const int value = nodelay ? 1 : 0;
     if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) == -1)
-        return std::unexpected(std::error_code{errno, std::system_category()});
+        return std::unexpected(errno_code());
     return {};
 }
 
@@ -749,7 +747,7 @@ std::expected<void, std::error_code> tcp_socket::set_notsent_lowat(std::size_t b
 #ifdef TCP_NOTSENT_LOWAT
     const int value = static_cast<int>(std::min<std::size_t>(bytes, std::numeric_limits<int>::max()));
     if (::setsockopt(native_handle(), IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, sizeof(value)) == -1)
-        return std::unexpected(std::error_code{errno, std::system_category()});
+        return std::unexpected(errno_code());
     return {};
 #else
     (void)bytes;

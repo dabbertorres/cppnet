@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <ratio>
 #include <system_error>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #include "config.hpp" // IWYU pragma: keep (for the platform macros)
+#include "exception.hpp"
 
 #ifdef NET_IS_LINUX
 #    include <charconv>
@@ -48,10 +50,7 @@ using result = std::expected<T, std::error_code>;
 std::unexpected<std::error_code> from_errno() noexcept
 {
     const int err = errno;
-    return std::unexpected{
-        err != 0 ? std::error_code{err, std::system_category()}
-            : std::make_error_code(std::errc::io_error)
-    };
+    return std::unexpected{err != 0 ? net::errno_code(err) : std::make_error_code(std::errc::io_error)};
 }
 
 std::unexpected<std::error_code> failed(std::errc err) noexcept { return std::unexpected{std::make_error_code(err)}; }
@@ -223,9 +222,10 @@ std::expected<std::size_t, std::error_code> process_open_fds() noexcept
     const int own = ::dirfd(dir);
 
     std::size_t count = 0;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): the directory stream is this function's own.
     while (const auto* entry = ::readdir(dir))
     {
-        std::string_view name{entry->d_name};
+        std::string_view name{static_cast<const char*>(entry->d_name)};
         if (name == "." || name == "..") continue;
 
         auto fd = parse_number<int>(name);
@@ -309,7 +309,7 @@ std::expected<time_point, std::error_code> process_start_time() noexcept
 {
 #ifdef NET_IS_LINUX
     // starttime is in clock ticks since the system booted, and /proc/stat's btime is when that was, in Unix time.
-    auto start_ticks = stat_field<unsigned long long>(22);
+    auto start_ticks = stat_field<std::uint64_t>(22);
     if (!start_ticks) return std::unexpected{start_ticks.error()};
 
     auto ticks = ::sysconf(_SC_CLK_TCK);
@@ -324,7 +324,7 @@ std::expected<time_point, std::error_code> process_start_time() noexcept
     if (btime == std::string_view::npos) return failed(std::errc::bad_message);
     rest = rest.substr(btime + 7);
 
-    auto boot = parse_number<long long>(rest.substr(0, rest.find('\n')));
+    auto boot = parse_number<std::int64_t>(rest.substr(0, rest.find('\n')));
     if (!boot) return std::unexpected{boot.error()};
 
     auto since_boot = std::chrono::duration<double>{static_cast<double>(*start_ticks) / static_cast<double>(ticks)};
