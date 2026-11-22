@@ -6,7 +6,6 @@
 #include <span>
 #include <system_error>
 #include <tuple>
-#include <utility>
 
 #include "coro/task.hpp"
 #include "io/io.hpp"
