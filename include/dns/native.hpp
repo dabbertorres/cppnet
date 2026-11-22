@@ -32,6 +32,9 @@ inline constexpr std::size_t max_cname_links = 8;
 // else last. Names over 253 bytes, with empty labels or labels over 63, or under .onion (RFC 7686), are left out.
 [[nodiscard]] std::vector<std::string> name_list(const config& conf, std::string_view name);
 
+// of_protocol is whether addr is of the family proto asks for (any, for protocol::not_care).
+[[nodiscard]] bool of_protocol(const ip_addr& addr, protocol proto) noexcept;
+
 // random_id is a query ID, from the OS's randomness (util::random_bytes(), taken a batch at a time per thread).
 [[nodiscard]] std::uint16_t random_id() noexcept;
 

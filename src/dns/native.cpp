@@ -550,17 +550,6 @@ net::coro::task<lookup_result> query_dns(net::io::scheduler*                    
     co_return std::unexpected(last ? last : dns::make_error_code(dns::errc::name_not_found));
 }
 
-bool of_protocol(const net::ip_addr& addr, net::protocol proto) noexcept
-{
-    switch (proto)
-    {
-    case net::protocol::not_care: return true;
-    case net::protocol::ipv4: return addr.is_ipv4();
-    case net::protocol::ipv6: return addr.is_ipv6();
-    }
-    return false;
-}
-
 // from_hosts is host's addresses in the hosts table (of proto's families: maybe none), if it's there.
 std::optional<std::vector<net::ip_addr>> from_hosts(const dns::config& conf, std::string_view host, net::protocol proto)
 {
@@ -572,7 +561,7 @@ std::optional<std::vector<net::ip_addr>> from_hosts(const dns::config& conf, std
     std::vector<net::ip_addr> addrs;
     for (const auto& addr : it->second)
     {
-        if (of_protocol(addr, proto)) addrs.push_back(addr);
+        if (dns::detail::of_protocol(addr, proto)) addrs.push_back(addr);
     }
     return addrs;
 }
@@ -581,6 +570,18 @@ std::optional<std::vector<net::ip_addr>> from_hosts(const dns::config& conf, std
 
 namespace net::dns::detail
 {
+
+bool of_protocol(const net::ip_addr& addr, net::protocol proto) noexcept
+{
+    switch (proto)
+    {
+    case net::protocol::not_care: return true;
+    case net::protocol::ipv4: return addr.is_ipv4();
+    case net::protocol::ipv6: return addr.is_ipv6();
+    }
+
+    return false;
+}
 
 std::vector<std::string> name_list(const config& conf, std::string_view name)
 {

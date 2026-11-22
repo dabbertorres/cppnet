@@ -175,6 +175,26 @@ TEST_CASE("query IDs are random", "[dns][native][id]")
     CHECK(ids.size() > 240);
 }
 
+TEST_CASE("an address is of the family asked for", "[dns][native][protocol]")
+{
+    struct test_case
+    {
+        net::protocol proto    = net::protocol::not_care;
+        bool          v4       = false;
+        bool          expected = false;
+    };
+
+    const auto tc = GENERATE(test_case{.proto = net::protocol::not_care, .v4 = true, .expected = true},
+                             test_case{.proto = net::protocol::not_care, .v4 = false, .expected = true},
+                             test_case{.proto = net::protocol::ipv4, .v4 = true, .expected = true},
+                             test_case{.proto = net::protocol::ipv4, .v4 = false, .expected = false},
+                             test_case{.proto = net::protocol::ipv6, .v4 = true, .expected = false},
+                             test_case{.proto = net::protocol::ipv6, .v4 = false, .expected = true});
+
+    const net::ip_addr addr = tc.v4 ? net::ip_addr{addr4} : net::ip_addr{net::ipv6_addr::loopback()};
+    CHECK(dns::detail::of_protocol(addr, tc.proto) == tc.expected);
+}
+
 TEST_CASE("addresses are sorted by RFC 6724", "[dns][native][rfc6724]")
 {
     const auto ip = [](std::string_view text)

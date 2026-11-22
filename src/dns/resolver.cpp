@@ -58,18 +58,6 @@ std::optional<net::ip_addr> literal(const std::string& host) noexcept
     return *addr;
 }
 
-bool of_protocol(const net::ip_addr& addr, net::protocol proto) noexcept
-{
-    switch (proto)
-    {
-    case net::protocol::not_care: return true;
-    case net::protocol::ipv4: return addr.is_ipv4();
-    case net::protocol::ipv6: return addr.is_ipv6();
-    }
-
-    return false;
-}
-
 // valid_name is whether name is a domain name that may be looked up, as Go's isDomainName has it: labels of 1 to 63
 // letters, digits, '-' and '_' ('_' being in real names, e.g. SRV records', and '-' neither first nor last), joined by
 // dots, at most 253 bytes, not counting a final dot. All-numeric names (e.g. "127.1") are allowed, unlike Go's: the
@@ -179,7 +167,7 @@ std::optional<lookup_result> at_once(const std::string& host, net::protocol prot
 {
     if (auto addr = literal(host); addr.has_value())
     {
-        if (!of_protocol(*addr, proto))
+        if (!net::dns::detail::of_protocol(*addr, proto))
             return lookup_result{std::unexpected(std::make_error_code(std::errc::address_family_not_supported))};
         return lookup_result{std::vector{*addr}};
     }
@@ -476,7 +464,7 @@ namespace
 
         // one family of both: only its addresses (not a numeric host's of the other family, or a test's).
         auto& addrs = **ran;
-        std::erase_if(addrs, [proto](const ip_addr& addr) { return !of_protocol(addr, proto); });
+        std::erase_if(addrs, [proto](const ip_addr& addr) { return !detail::of_protocol(addr, proto); });
         if (addrs.empty()) co_return std::unexpected(make_gai_error_code(EAI_NONAME));
         co_return std::move(*ran);
     }
