@@ -651,12 +651,7 @@ namespace
             if (const auto it = streams.find(id); it != streams.end() && end_stream)
             {
                 auto& s = *it->second;
-                for (const auto& f : fields)
-                {
-                    if (!trailer_allowed(f.name)) continue;
-                    if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<trailer_fields>();
-                    s.received_trailers->add(f.name, f.value);
-                }
+                s.keep_trailers(fields);
 
                 end_received(s);
             }

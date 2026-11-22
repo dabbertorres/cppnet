@@ -453,6 +453,10 @@ public:
     std::unique_ptr<trailer_fields> received_trailers;
     trailer_fields*                 trailers_to = nullptr;
 
+    // keep_trailers keeps a trailers block's fields (without those that can't be trailers) in received_trailers
+    // (holding the lock).
+    void keep_trailers(std::span<const hpack::field> fields);
+
     // hand_over_trailers moves the trailers received to trailers_to, if both are there (holding the lock).
     void hand_over_trailers() noexcept;
 

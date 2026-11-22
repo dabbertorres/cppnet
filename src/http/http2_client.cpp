@@ -140,18 +140,6 @@ namespace
         trailer_fields                                            kept;     // the trailers, once it's read to its end
     };
 
-    // keep_trailers keeps a trailers block's fields in the stream (without those that can't be trailers), for its
-    // body's reader to hand over at the end (holding the lock).
-    void keep_trailers(http2_stream_base& s, std::span<const hpack::field> fields)
-    {
-        for (const auto& f : fields)
-        {
-            if (!trailer_allowed(f.name)) continue;
-            if (s.received_trailers == nullptr) s.received_trailers = std::make_unique<trailer_fields>();
-            s.received_trailers->add(f.name, f.value);
-        }
-    }
-
     // request_ends_after is how much DATA ends a request's stream, if that's known (see
     // http2_client_connection::open()). Trailers follow the body, or the head, if there's none (which then doesn't end
     // the stream). Without them, the head ends the stream if there's no body, and the body's last DATA if its length is
@@ -948,7 +936,7 @@ void http2_client_connection::on_headers(http2::stream_id              id,
 
     // trailers end the body: kept (without those that can't be trailers) for the body's reader to hand over once it
     // reaches the end, so whoever reads them does once the body's been read, and they don't change meanwhile.
-    if (kind == http2::block_kind::trailers) keep_trailers(s, fields);
+    if (kind == http2::block_kind::trailers) s.keep_trailers(fields);
 
     if (end_stream) end_received(s);
     else s.changed.notify();

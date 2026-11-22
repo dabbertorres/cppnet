@@ -447,6 +447,16 @@ void http2_stream_base::wake_reader() noexcept
     if (reading != nullptr) reading->wake();
 }
 
+void http2_stream_base::keep_trailers(std::span<const hpack::field> fields)
+{
+    for (const auto& f : fields)
+    {
+        if (!trailer_allowed(f.name)) continue;
+        if (received_trailers == nullptr) received_trailers = std::make_unique<trailer_fields>();
+        received_trailers->add(f.name, f.value);
+    }
+}
+
 void http2_stream_base::hand_over_trailers() noexcept
 {
     if (trailers_to == nullptr || received_trailers == nullptr) return;
