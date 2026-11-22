@@ -299,9 +299,7 @@ coro::task<io::result> stream_reader::read(std::span<std::byte> data)
 
         if (s.received.empty())
         {
-            if (!waiting.claim(data))
-                return coro::ready_task<io::result>(
-                    io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)});
+            if (!waiting.claim(data)) return coro::ready_task<io::result>(io::busy_result());
             return coro::operation_task(waiting);
         }
 
@@ -397,7 +395,7 @@ io::result stream_read::result() noexcept
     if (busy)
     {
         release();
-        return io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)};
+        return io::busy_result();
     }
 
     auto&      c = *stream->conn;
@@ -580,7 +578,7 @@ http2_connection_base::begin_write(http2_stream_base& s, std::span<const std::by
         std::scoped_lock lock{mu};
 
         // NOTE: checked holding the lock, under which it's claimed, so two writes can't both get past it.
-        if (waiting.is_claimed()) return io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)};
+        if (waiting.is_claimed()) return io::busy_result();
         if (s.failure) return io::result{.err = s.failure};
 
         // at once while no one waits for a turn (nor for the writer to catch up with control frames and heads); the

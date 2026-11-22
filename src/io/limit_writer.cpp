@@ -8,14 +8,6 @@
 #include "coro/task.hpp"
 #include "io/io.hpp"
 
-namespace
-{
-
-// busy is what an operation of a reader or writer that's taken by another (waiting) makes.
-net::io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
-
-}
-
 namespace net::io
 {
 
@@ -33,7 +25,7 @@ coro::task<result> limit_writer::write(std::span<const std::byte> data)
             waiting_wanted = data.size();
             return out->write(data.first(amount));
         },
-        &busy);
+        &busy_result);
 }
 
 result limit_writer::finish(result res, std::size_t amount, std::size_t wanted) noexcept

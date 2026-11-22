@@ -38,3 +38,13 @@ TEST_CASE("only the OS's codes match by their value", "[io][errors]")
     const std::error_code other{ECONNRESET, net::io::category()};
     CHECK(other != net::io::status_condition::closed);
 }
+
+TEST_CASE("busy is the OS's device or resource busy, and moved nothing", "[io][errors][busy]")
+{
+    const auto err = net::io::busy_error();
+    CHECK(err == std::errc::device_or_resource_busy);
+
+    const auto res = net::io::busy_result();
+    CHECK(res.count == 0);
+    CHECK(res.err == err);
+}

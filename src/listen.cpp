@@ -21,6 +21,7 @@
 
 #include "coro/task.hpp"
 #include "exception.hpp"
+#include "io/io.hpp"
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
@@ -217,8 +218,7 @@ coro::task<std::expected<tcp_socket, std::error_code>> listener::accept()
     }
 
     // the scheduler accepts, once a connection's waiting (see accept_operation).
-    if (!accepting.claim())
-        return coro::ready_task<result_type>(std::unexpected(std::make_error_code(std::errc::device_or_resource_busy)));
+    if (!accepting.claim()) return coro::ready_task<result_type>(std::unexpected(io::busy_error()));
 
     return coro::operation_task(accepting);
 }

@@ -1405,13 +1405,8 @@ struct connection
                 (void)flush_started.try_claim();
                 return coro::operation_task(flush_started);
             },
-            &busy_flushing);
-    }
-
-    // busy_flushing is the flusher's result if it's taken, which it never is (see flush_locked()).
-    static io::result busy_flushing() noexcept
-    {
-        return io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)};
+            // the flusher's result if it's taken, which it never is (see flush_locked()).
+            &io::busy_result);
     }
 
     // flushed_some is the flusher's step: it takes the result of its last inner task (the start, a wait for the flush
@@ -1779,7 +1774,8 @@ struct connection
                 read_until = read_goal::receive;
                 return receive();
             },
-            &busy_reading);
+            // the reader's result if a task of it is under way: another read waiting.
+            &io::busy_result);
     }
 
     // receive is the reader's next inner task: a read of the socket.
@@ -1788,12 +1784,6 @@ struct connection
         // NOTE: only one read waits at once (the reader's), so ciphertext isn't shared.
         read_now = read_phase::receiving;
         return socket.read(std::as_writable_bytes(std::span{ciphertext}));
-    }
-
-    // busy_reading is the reader's result if a task of it is under way: another read waiting.
-    static io::result busy_reading() noexcept
-    {
-        return io::result{.err = std::make_error_code(std::errc::device_or_resource_busy)};
     }
 
     // received_some is the reader's step: it takes the result of a read of the socket (passing what it read to the
@@ -1909,7 +1899,8 @@ struct connection
                 read_until = read_goal::data;
                 return receive();
             },
-            &busy_reading);
+            // the reader's result if a task of it is under way: another read waiting.
+            &io::busy_result);
     }
 
     // NOTE: declared first, so destroyed last: the channel (below) may use the rest until it's gone.

@@ -22,6 +22,16 @@ struct result
     std::error_code err{};
 };
 
+// busy_error is what an operation of a reader, a writer or a socket makes when another is already waiting, or under
+// way, in the one place only one can be: std::errc::device_or_resource_busy.
+[[nodiscard]] inline std::error_code busy_error() noexcept
+{
+    return std::make_error_code(std::errc::device_or_resource_busy);
+}
+
+// busy_result is busy_error() as a result that moved nothing.
+[[nodiscard]] inline result busy_result() noexcept { return {.err = busy_error()}; }
+
 // errc are the I/O errors that aren't the OS's.
 enum class errc : std::uint8_t
 {

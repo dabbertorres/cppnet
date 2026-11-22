@@ -50,9 +50,6 @@ namespace
 
     using namespace std::string_view_literals;
 
-    // busy is a read's result while another waits.
-    io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
-
     // chunk_size is the size a chunk's size line gives (without its CRLF): none, if it's malformed.
     std::optional<std::size_t> chunk_size(std::string_view line) noexcept
     {
@@ -146,7 +143,7 @@ coro::task<io::result> chunked_reader::read_chunk(std::span<std::byte> data)
     // the parent often finishes without a coroutine (with enough buffered): then so does this, and one that waits is
     // reading's, rather than a coroutine's.
     return reading.adapt([this, data] { return parent->read(data.first(std::min(data.size(), chunk_remaining))); },
-                         &busy);
+                         &io::busy_result);
 }
 
 io::result chunked_reader::counted(io::result res) noexcept

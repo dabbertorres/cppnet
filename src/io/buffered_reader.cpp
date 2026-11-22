@@ -12,14 +12,6 @@
 #include "io/io.hpp"
 #include "io/reader.hpp"
 
-namespace
-{
-
-// busy_error is what a read or fill that finds another waiting makes.
-std::error_code busy_error() noexcept { return std::make_error_code(std::errc::device_or_resource_busy); }
-
-}
-
 namespace net::io
 {
 
@@ -55,7 +47,7 @@ coro::task<result> buffered_reader::read_more(std::span<std::byte> data)
             wanted = data;
             return read_rest();
         },
-        [] { return result{.err = busy_error()}; });
+        &busy_result);
 }
 
 coro::step<result, result> buffered_reader::read_rest()

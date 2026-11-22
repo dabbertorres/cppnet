@@ -373,8 +373,7 @@ struct connection_state
     // connection has failed.
     std::error_code begin_read() noexcept
     {
-        if (reading.exchange(true, std::memory_order::acq_rel))
-            return std::make_error_code(std::errc::device_or_resource_busy);
+        if (reading.exchange(true, std::memory_order::acq_rel)) return io::busy_error();
 
         if (auto err = failure())
         {
@@ -946,7 +945,9 @@ struct connection_state
                 sending_now = sending_part::head;
                 return tunnel.writer().write(std::span<const std::byte>{frame_head}.first(head_left));
             },
-            &busy_sending);
+            // sending's result if it's taken: which it never is, as it's the wire's holder's, and the wire's only let
+            // go once sending is (see let_go()).
+            &io::busy_error);
     }
 
     // send_masked writes what's left of a client's frame that doesn't fit in the writer's buffer (its header, until
@@ -1006,7 +1007,9 @@ struct connection_state
                 sending_now = sending_part::releasing;
                 return std::move(flushing);
             },
-            &busy_sending);
+            // sending's result if it's taken: which it never is, as it's the wire's holder's, and the wire's only let
+            // go once sending is (see let_go()).
+            &io::busy_error);
     }
 
     // wrote_part takes the result of a write (or flush) that sending made, and makes the next step: the next part, or
@@ -1029,10 +1032,6 @@ struct connection_state
         }
         return std::error_code{};
     }
-
-    // busy_sending is sending's result if it's taken: which it never is, as it's the wire's holder's, and the wire's
-    // only let go once sending is (see let_go()).
-    static std::error_code busy_sending() noexcept { return std::make_error_code(std::errc::device_or_resource_busy); }
 
     // let_go_of_wire lets the wire go (must be called holding mu): at once, unless sending's taken, as a step that
     // waited: then the wire's left to let_go(), so its next holder finds sending free. It returns whether it's gone.

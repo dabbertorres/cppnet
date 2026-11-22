@@ -11,14 +11,6 @@
 #include "io/io.hpp"
 #include "io/writer.hpp"
 
-namespace
-{
-
-// busy is what an operation of a reader or writer that's taken by another (waiting) makes.
-net::io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
-
-}
-
 namespace net::io
 {
 
@@ -60,7 +52,7 @@ coro::task<result> buffered_writer::write_through(std::span<const std::byte> dat
             through_written = available;
             return impl->write(std::span<const std::byte>{buf});
         },
-        &busy);
+        &busy_result);
 }
 
 coro::step<result, result> buffered_writer::write_rest()
@@ -114,7 +106,7 @@ std::span<std::byte> buffered_writer::prepare(std::size_t size)
 coro::task<result> buffered_writer::flush()
 {
     if (buf.empty()) return coro::ready_task<result>();
-    if (writing.is_claimed()) return coro::ready_task<result>(busy());
+    if (writing.is_claimed()) return coro::ready_task<result>(busy_result());
 
     // usually, the writes don't wait (e.g. a socket with room for it all): then it needs no coroutine, nor writing,
     // which finishes one that has to wait (see flush_waiting()).
@@ -139,7 +131,7 @@ coro::task<result> buffered_writer::flush_waiting(coro::task<result> inner, std:
             written = total;
             return std::move(inner);
         },
-        &busy);
+        &busy_result);
 }
 
 result buffered_writer::flushed(std::size_t total, const result& last) noexcept

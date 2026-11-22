@@ -223,9 +223,7 @@ coro::task<net::io::result> socket::read(std::span<std::byte> data) noexcept
     if (auto res = try_read(data); res.has_value()) return coro::ready_task<io::result>(*res);
 
     // the scheduler reads, once the socket's ready (see read_operation).
-    if (!reading.claim(data))
-        return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+    if (!reading.claim(data)) return coro::ready_task<io::result>(io::result{.count = 0, .err = io::busy_error()});
 
     return coro::operation_task(reading);
 }
@@ -239,8 +237,7 @@ coro::task<io::result> socket::read_from(std::span<std::byte> data, detail::sock
     if (auto res = try_read(data, &from); res.has_value()) return coro::ready_task<io::result>(*res);
 
     if (!reading.claim(data, &from))
-        return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+        return coro::ready_task<io::result>(io::result{.count = 0, .err = io::busy_error()});
 
     return coro::operation_task(reading);
 }
@@ -255,8 +252,7 @@ coro::task<io::result> socket::write_to(std::span<const std::byte> data, const d
     if (auto res = try_write(data, written, &to); res.has_value()) return coro::ready_task<io::result>(*res);
 
     if (!writing.claim(data, written, &to))
-        return coro::ready_task<io::result>(
-            io::result{.count = written, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+        return coro::ready_task<io::result>(io::result{.count = written, .err = io::busy_error()});
 
     return coro::operation_task(writing);
 }
@@ -272,8 +268,7 @@ coro::task<io::result> socket::write(std::span<const std::byte> data) noexcept
 
     // the scheduler writes the rest, once the socket's ready (see write_operation).
     if (!writing.claim(data, written))
-        return coro::ready_task<io::result>(
-            io::result{.count = written, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+        return coro::ready_task<io::result>(io::result{.count = written, .err = io::busy_error()});
 
     return coro::operation_task(writing);
 }
@@ -287,9 +282,7 @@ coro::task<io::result> socket::wait_writable() noexcept
     if (auto res = poll_writable(); res.has_value()) return coro::ready_task<io::result>(*res);
 
     // the scheduler asks again each time the socket's reported writable (see write_operation::perform()).
-    if (!writing.claim_writable())
-        return coro::ready_task<io::result>(
-            io::result{.count = 0, .err = std::make_error_code(std::errc::device_or_resource_busy)});
+    if (!writing.claim_writable()) return coro::ready_task<io::result>(io::result{.count = 0, .err = io::busy_error()});
 
     return coro::operation_task(writing);
 }

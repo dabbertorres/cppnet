@@ -110,7 +110,7 @@ public:
 
         // the body's read usually finishes without a coroutine (what's buffered): then so does this, and one that waits
         // is reading's, rather than a coroutine's.
-        return reading.adapt([this, data] { return body->read(data); }, &busy);
+        return reading.adapt([this, data] { return body->read(data); }, &net::io::busy_result);
     }
 
     using net::io::reader::read;
@@ -126,9 +126,6 @@ public:
     bool set_priority(const net::http::priority& /*p*/) override { return false; }
 
 private:
-    // busy is a read's result while another waits.
-    static net::io::result busy() noexcept { return {.err = std::make_error_code(std::errc::device_or_resource_busy)}; }
-
     // after_read keeps account of what a read of the body read (finishing once it's all been read, or a read fails).
     net::io::result after_read(net::io::result res) noexcept
     {
