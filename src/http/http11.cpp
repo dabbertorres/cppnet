@@ -35,6 +35,7 @@
 #include "io/reader.hpp"
 #include "io/util.hpp"
 #include "io/writer.hpp"
+#include "span_appender.hpp"
 #include "url.hpp"
 #include "util/string_util.hpp"
 
@@ -55,6 +56,7 @@ using net::http::protocol_version;
 using net::http::request_method;
 using net::http::server_request;
 using net::http::status;
+using net::http::detail::span_appender;
 using net::io::buffered_reader;
 
 std::error_code invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
@@ -510,20 +512,6 @@ std::size_t fields_size(fields_view fields) noexcept
 
     return size;
 }
-
-// span_appender appends to a span, as std::string::append does to a string: the span must be long enough.
-struct span_appender
-{
-    std::span<std::byte> out;
-    std::size_t          size = 0;
-
-    span_appender& append(std::string_view str) noexcept
-    {
-        std::ranges::copy(std::as_bytes(std::span{str}), out.subspan(size).begin());
-        size += str.size();
-        return *this;
-    }
-};
 
 // append_fields appends a field line for each of the values in fields: joining a field's values with commas would
 // change fields that aren't lists (e.g. Set-Cookie).

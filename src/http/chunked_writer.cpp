@@ -1,6 +1,5 @@
 #include "http/chunked_writer.hpp"
 
-#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
@@ -17,11 +16,14 @@
 #include "io/buffered_writer.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
+#include "span_appender.hpp"
 
 namespace
 {
 
 using namespace std::string_view_literals;
+
+using net::http::detail::span_appender;
 
 // write_full writes all of data, as a chunk's size has already promised it.
 net::coro::task<net::io::result> write_full(net::io::writer* out, std::span<const std::byte> data)
@@ -72,20 +74,6 @@ void append_last_chunk(auto& out, net::http::fields_view trailers)
 
     out.append("\r\n"sv);
 }
-
-// span_appender appends to a span, as std::string::append does to a string: the span must be long enough.
-struct span_appender
-{
-    std::span<std::byte> out;
-    std::size_t          size = 0;
-
-    span_appender& append(std::string_view str) noexcept
-    {
-        std::ranges::copy(std::as_bytes(std::span{str}), out.subspan(size).begin());
-        size += str.size();
-        return *this;
-    }
-};
 
 // write_last_chunk writes the last chunk, with trailers' allowed fields, when it can't be formatted into the writer's
 // buffer (see finish()).
