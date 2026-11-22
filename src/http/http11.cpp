@@ -58,10 +58,9 @@ using net::http::server_request;
 using net::http::status;
 using net::http::detail::span_appender;
 using net::io::buffered_reader;
+using net::util::is_digit_ascii;
 
 std::error_code invalid() noexcept { return std::make_error_code(std::errc::invalid_argument); }
-
-constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 
 // head_reader reads the lines of a message's head (its start line and fields), which are limited in size altogether.
 //
@@ -104,7 +103,8 @@ struct head_reader
 // parse_http_version parses exactly "HTTP/" DIGIT "." DIGIT (RFC 9112, section 2.3).
 std::optional<protocol_version> parse_http_version(std::string_view str) noexcept
 {
-    if (str.size() != 8 || !str.starts_with("HTTP/"sv) || !is_digit(str[5]) || str[6] != '.' || !is_digit(str[7]))
+    if (str.size() != 8 || !str.starts_with("HTTP/"sv) || !is_digit_ascii(str[5]) || str[6] != '.'
+        || !is_digit_ascii(str[7]))
         return std::nullopt;
 
     return protocol_version{
@@ -121,7 +121,7 @@ std::error_code parse_status_line(std::string_view line, client_response& resp) 
     if (!version.has_value() || line.size() < 12 || line[8] != ' ') return invalid();
 
     auto code = line.substr(9, 3);
-    if (!std::ranges::all_of(code, is_digit) || code[0] < '1' || code[0] > '5') return invalid();
+    if (!std::ranges::all_of(code, is_digit_ascii) || code[0] < '1' || code[0] > '5') return invalid();
     if (line.size() > 12 && line[12] != ' ') return invalid();
     if (!net::http::is_valid_field_value(line.substr(12))) return invalid();
 

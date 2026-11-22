@@ -28,13 +28,13 @@ using net::http::request_target;
 
 // Character classes from RFC 3986, section 2.
 
-constexpr bool is_alpha(char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
-constexpr bool is_hex_digit(char c) noexcept { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+using net::util::is_alpha_ascii;
+using net::util::is_digit_ascii;
+using net::util::is_hex_digit_ascii;
 
 constexpr bool is_unreserved(char c) noexcept
 {
-    return is_alpha(c) || is_digit(c) || c == '-' || c == '.' || c == '_' || c == '~';
+    return is_alpha_ascii(c) || is_digit_ascii(c) || c == '-' || c == '.' || c == '_' || c == '~';
 }
 
 constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.contains(c); }
@@ -53,7 +53,7 @@ bool is_valid(std::string_view str, Allowed allowed) noexcept
     {
         if (str[i] == '%')
         {
-            if (str.size() - i < 3 || !is_hex_digit(str[i + 1]) || !is_hex_digit(str[i + 2])) return false;
+            if (str.size() - i < 3 || !is_hex_digit_ascii(str[i + 1]) || !is_hex_digit_ascii(str[i + 2])) return false;
             i += 2;
         }
         else if (!allowed(str[i]))
@@ -103,7 +103,7 @@ std::string remove_dot_segments(std::string_view path)
 
 bool parse_port(std::string_view port, request_target& out)
 {
-    if (port.empty() || port.size() > 5 || !std::ranges::all_of(port, is_digit)) return false;
+    if (port.empty() || port.size() > 5 || !std::ranges::all_of(port, is_digit_ascii)) return false;
 
     unsigned value = 0;
     std::from_chars(port.data(), port.data() + port.size(), value);

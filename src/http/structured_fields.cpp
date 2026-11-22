@@ -11,19 +11,21 @@
 #include <utility>
 #include <variant>
 
+#include "util/string_util.hpp"
 #include "util/utf8.hpp"
 
 namespace
 {
 
-constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+using net::util::is_alpha_ascii;
+using net::util::is_digit_ascii;
+
 constexpr bool is_lcalpha(char c) noexcept { return c >= 'a' && c <= 'z'; }
-constexpr bool is_alpha(char c) noexcept { return is_lcalpha(c) || (c >= 'A' && c <= 'Z'); }
 
 // is_tchar is whether c is one of a token's characters (RFC 9110, section 5.6.2).
 constexpr bool is_tchar(char c) noexcept
 {
-    if (is_alpha(c) || is_digit(c)) return true;
+    if (is_alpha_ascii(c) || is_digit_ascii(c)) return true;
     switch (c)
     {
     case '!':
@@ -48,7 +50,7 @@ constexpr bool is_tchar(char c) noexcept
 // is_key_char is whether c may follow a key's first character (RFC 9651, section 3.1.2).
 constexpr bool is_key_char(char c) noexcept
 {
-    return is_lcalpha(c) || is_digit(c) || c == '_' || c == '-' || c == '.' || c == '*';
+    return is_lcalpha(c) || is_digit_ascii(c) || c == '_' || c == '-' || c == '.' || c == '*';
 }
 
 // is_visible is whether c is in what a String or Display String may have unescaped: %x20-7E.
@@ -57,7 +59,7 @@ constexpr bool is_visible(char c) noexcept { return c >= 0x20 && c <= 0x7e; }
 // lchex is a lowercase hex digit's value (as a Display String's percent-encoding must be), or -1.
 constexpr int lchex(char c) noexcept
 {
-    if (is_digit(c)) return c - '0';
+    if (is_digit_ascii(c)) return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     return -1;
 }
@@ -67,7 +69,7 @@ constexpr int base64(char c) noexcept
 {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (is_lcalpha(c)) return c - 'a' + 26;
-    if (is_digit(c)) return c - '0' + 52;
+    if (is_digit_ascii(c)) return c - '0' + 52;
     if (c == '+') return 62;
     if (c == '/') return 63;
     return -1;
@@ -86,7 +88,7 @@ void skip_ows(std::string_view& in) noexcept
 // read_digits reads the digits at the start of in into value, adding them to count: false if that's more than most.
 bool read_digits(std::string_view& in, std::int64_t& value, std::size_t& count, std::size_t most) noexcept
 {
-    while (!in.empty() && is_digit(in.front()))
+    while (!in.empty() && is_digit_ascii(in.front()))
     {
         if (++count > most) return false;
         value = (value * 10) + (in.front() - '0');
@@ -121,7 +123,7 @@ public:
             negative = true;
             in.remove_prefix(1);
         }
-        if (in.empty() || !is_digit(in.front())) return false;
+        if (in.empty() || !is_digit_ascii(in.front())) return false;
 
         std::int64_t whole      = 0;
         std::size_t  whole_size = 0;
@@ -175,7 +177,7 @@ public:
     // read_token is section 4.2.6.
     static bool read_token(std::string_view& in, bare_item& out) noexcept
     {
-        if (in.empty() || (!is_alpha(in.front()) && in.front() != '*')) return false;
+        if (in.empty() || (!is_alpha_ascii(in.front()) && in.front() != '*')) return false;
         std::size_t i = 1;
         while (i < in.size() && (is_tchar(in[i]) || in[i] == ':' || in[i] == '/')) ++i;
         out.type = item_type::token;
@@ -263,9 +265,9 @@ public:
         out = {};
         if (in.empty()) return false;
         const char c = in.front();
-        if (c == '-' || is_digit(c)) return read_integer_or_decimal(in, out);
+        if (c == '-' || is_digit_ascii(c)) return read_integer_or_decimal(in, out);
         if (c == '"') return read_string(in, out);
-        if (is_alpha(c) || c == '*') return read_token(in, out);
+        if (is_alpha_ascii(c) || c == '*') return read_token(in, out);
         if (c == ':') return read_byte_sequence(in, out);
         if (c == '?') return read_boolean(in, out);
         if (c == '@') return read_date(in, out);

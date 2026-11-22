@@ -11,16 +11,11 @@
 #include <system_error>
 #include <utility>
 
+#include "encoding/hex.hpp"
+#include "util/string_util.hpp"
+
 namespace
 {
-
-std::optional<int> hex_digit_value(char c) noexcept
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return std::nullopt;
-}
 
 using namespace std::string_view_literals;
 
@@ -28,15 +23,14 @@ using net::url;
 using net::url_parse_failure;
 using net::url_parse_state;
 
-constexpr bool is_alpha(char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+using net::util::is_alpha_ascii;
+using net::util::is_digit_ascii;
+using net::util::is_hex_digit_ascii;
 
 constexpr bool is_unreserved(char c) noexcept
 {
-    return is_alpha(c) || is_digit(c) || c == '-' || c == '.' || c == '_' || c == '~';
+    return is_alpha_ascii(c) || is_digit_ascii(c) || c == '-' || c == '.' || c == '_' || c == '~';
 }
-
-constexpr bool is_hex_digit(char c) noexcept { return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
 // is_valid_zone checks a percent-encoded zone ID, including its "%25" prefix.
 constexpr bool is_valid_zone(std::string_view zone) noexcept
@@ -47,7 +41,8 @@ constexpr bool is_valid_zone(std::string_view zone) noexcept
     {
         if (zone[i] == '%')
         {
-            if (zone.size() - i < 3 || !is_hex_digit(zone[i + 1]) || !is_hex_digit(zone[i + 2])) return false;
+            if (zone.size() - i < 3 || !is_hex_digit_ascii(zone[i + 1]) || !is_hex_digit_ascii(zone[i + 2]))
+                return false;
             i += 2;
         }
         else if (!is_unreserved(zone[i]))
@@ -62,7 +57,7 @@ constexpr bool is_valid_zone(std::string_view zone) noexcept
 constexpr bool is_sub_delim(char c) noexcept { return "!$&'()*+,;="sv.contains(c); }
 constexpr bool is_scheme_char(char c) noexcept
 {
-    return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.';
+    return is_alpha_ascii(c) || is_digit_ascii(c) || c == '+' || c == '-' || c == '.';
 }
 
 // Characters that may appear unencoded in each part (RFC 3986).
@@ -113,7 +108,7 @@ void append_encoded(std::string& out, std::string_view str, Allowed allowed)
 {
     for (std::size_t i = 0; i < str.size(); ++i)
     {
-        if (str[i] == '%' && str.size() - i > 2 && is_hex_digit(str[i + 1]) && is_hex_digit(str[i + 2]))
+        if (str[i] == '%' && str.size() - i > 2 && is_hex_digit_ascii(str[i + 1]) && is_hex_digit_ascii(str[i + 2]))
         {
             out += str[i];
             out += str[i + 1];
@@ -133,7 +128,7 @@ std::optional<url_parse_failure> parse_port(std::string_view port, std::size_t o
 {
     // RFC 3986 allows an empty port.
     unsigned value = 0;
-    if (port.size() > 5 || !std::ranges::all_of(port, is_digit)
+    if (port.size() > 5 || !std::ranges::all_of(port, is_digit_ascii)
         || (!port.empty() && (std::from_chars(port.data(), port.data() + port.size(), value), value > 65'535)))
         return url_parse_failure{.failed_at = url_parse_state::port, .index = offset};
 
@@ -170,7 +165,7 @@ std::optional<url_parse_failure> parse_authority(std::string_view authority, std
         auto address = literal.substr(0, zone);
         // (an IPv6 address always has at least two colons, which is also how build() knows to bracket it.)
         if (std::ranges::count(address, ':') < 2
-            || !std::ranges::all_of(address, [](char c) { return is_hex_digit(c) || c == ':' || c == '.'; })
+            || !std::ranges::all_of(address, [](char c) { return is_hex_digit_ascii(c) || c == ':' || c == '.'; })
             || (zone != std::string_view::npos && !is_valid_zone(literal.substr(zone))))
             return url_parse_failure{.failed_at = url_parse_state::host, .index = offset};
 
@@ -215,7 +210,7 @@ std::expected<reference, url_parse_failure> split(std::string_view input, readin
     std::size_t pos = 0;
 
     // scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"
-    if (auto colon = input.find(':'); colon != std::string_view::npos && colon > 0 && is_alpha(input.front())
+    if (auto colon = input.find(':'); colon != std::string_view::npos && colon > 0 && is_alpha_ascii(input.front())
                                       && std::ranges::all_of(input.substr(0, colon), is_scheme_char))
     {
         out.scheme = input.substr(0, colon);
@@ -427,12 +422,12 @@ void url::decode_append(std::string& out, std::string_view str) noexcept
     {
         if (str[i] == '%' && str.size() - i > 2)
         {
-            auto high = hex_digit_value(str[i + 1]);
-            auto low  = hex_digit_value(str[i + 2]);
+            const int high = net::encoding::hex::digit_value(str[i + 1]);
+            const int low  = net::encoding::hex::digit_value(str[i + 2]);
 
-            if (high && low)
+            if (high >= 0 && low >= 0)
             {
-                out.push_back(static_cast<char>((*high << 4) | *low));
+                out.push_back(static_cast<char>((high << 4) | low));
                 i += 2;
                 continue;
             }

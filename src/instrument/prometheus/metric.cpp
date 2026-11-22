@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +15,7 @@
 #include "coro/task.hpp"
 #include "io/io.hpp"
 #include "io/writer.hpp"
+#include "util/string_util.hpp"
 
 namespace net::instrument::prometheus
 {
@@ -83,8 +83,8 @@ namespace detail
 
     void validate_name(std::string_view name)
     {
-        auto valid_first = [](char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == ':'; };
-        auto valid_rest  = [&](char c) { return valid_first(c) || std::isdigit(static_cast<unsigned char>(c)); };
+        auto valid_first = [](char c) { return net::util::is_alpha_ascii(c) || c == '_' || c == ':'; };
+        auto valid_rest  = [&](char c) { return valid_first(c) || net::util::is_digit_ascii(c); };
 
         if (name.empty() || !valid_first(name.front()) || !std::ranges::all_of(name.substr(1), valid_rest))
         {
@@ -94,8 +94,8 @@ namespace detail
 
     metric_labels normalize_labels(metric_labels labels)
     {
-        auto valid_first = [](char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_'; };
-        auto valid_rest  = [&](char c) { return valid_first(c) || std::isdigit(static_cast<unsigned char>(c)); };
+        auto valid_first = [](char c) { return net::util::is_alpha_ascii(c) || c == '_'; };
+        auto valid_rest  = [&](char c) { return valid_first(c) || net::util::is_digit_ascii(c); };
 
         for (const auto& [key, _] : labels)
         {

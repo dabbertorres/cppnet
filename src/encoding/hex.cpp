@@ -8,13 +8,6 @@
 #include <string>
 #include <vector>
 
-namespace
-{
-
-bool is_hex_char(char c) { return ('0' <= c && c <= '9') || ('A' <= c && c <= 'F') || ('a' <= c && c <= 'f'); }
-
-}
-
 namespace net::encoding::hex
 {
 
@@ -55,20 +48,7 @@ void encode_to(std::byte data, std::string& out, std::size_t offset) noexcept
     out[offset + 1] = lo;
 }
 
-std::byte decode(char hi, char lo) noexcept
-{
-    constexpr auto ensure_uppercase = [](char c) { return c > 'F' ? static_cast<char>(c - ('a' - 'A')) : c; };
-
-    constexpr auto parse = [](char c) { return static_cast<std::uint8_t>(c >= 'A' ? c - 'A' + 0xA : c - '0'); };
-
-    hi = ensure_uppercase(hi);
-    lo = ensure_uppercase(lo);
-
-    auto upper = parse(hi);
-    auto lower = parse(lo);
-
-    return static_cast<std::byte>((upper << 4) | lower);
-}
+std::byte decode(char hi, char lo) noexcept { return static_cast<std::byte>((digit_value(hi) << 4) | digit_value(lo)); }
 
 std::optional<std::vector<std::byte>> decode(std::span<const char> data) noexcept
 {
@@ -90,7 +70,7 @@ bool decode_to(std::span<const char> data, std::span<std::byte> out) noexcept
         auto hi = data[(i * 2) + 0];
         auto lo = data[(i * 2) + 1];
 
-        if (!is_hex_char(hi) || !is_hex_char(lo)) return false;
+        if (digit_value(hi) < 0 || digit_value(lo) < 0) return false;
 
         out[i] = decode(hi, lo);
     }

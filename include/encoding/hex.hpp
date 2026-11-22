@@ -13,6 +13,15 @@ namespace net::encoding::hex
 constexpr std::size_t encoded_size(std::size_t input_size) noexcept { return input_size * 2; }
 constexpr std::size_t decoded_size(std::size_t input_size) noexcept { return input_size / 2; }
 
+// digit_value is a hex digit's value (in either case), or -1 if c isn't one.
+constexpr int digit_value(char c) noexcept
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 std::array<char, 2> encode(std::byte b) noexcept;
 std::string         encode(std::span<const std::byte> data) noexcept;
 

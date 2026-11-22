@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "coro/task.hpp"
+#include "encoding/hex.hpp"
 #include "http/headers.hpp"
 #include "http/http11.hpp"
 #include "io/io.hpp"
@@ -30,14 +31,6 @@ std::error_code truncated(std::error_code err) noexcept
 {
     if (err == net::io::errc::end_of_stream) return std::make_error_code(std::errc::connection_aborted);
     return err;
-}
-
-int hex_digit_value(char c) noexcept
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
 }
 
 }
@@ -58,7 +51,7 @@ namespace
         std::size_t digits = 0;
         for (; digits < line.size(); ++digits)
         {
-            auto value = hex_digit_value(line[digits]);
+            auto value = net::encoding::hex::digit_value(line[digits]);
             if (value < 0) break;
 
             if (size > (std::numeric_limits<std::size_t>::max() >> 4U)) return std::nullopt;

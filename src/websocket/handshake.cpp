@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstddef>
 #include <expected>
 #include <iterator>
@@ -107,11 +106,11 @@ std::optional<origin> parse_origin(std::string_view text)
     const auto separator = text.find("://"sv);
     if (separator == std::string_view::npos || separator == 0) return std::nullopt;
 
-    const auto scheme       = text.substr(0, separator);
-    const auto valid_scheme = std::ranges::all_of(
-        scheme,
-        [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '+' || c == '-' || c == '.'; });
-    if (!valid_scheme || std::isalpha(static_cast<unsigned char>(scheme.front())) == 0) return std::nullopt;
+    const auto scheme = text.substr(0, separator);
+    const auto valid_scheme =
+        std::ranges::all_of(scheme,
+                            [](char c) { return net::util::is_alnum_ascii(c) || c == '+' || c == '-' || c == '.'; });
+    if (!valid_scheme || !net::util::is_alpha_ascii(scheme.front())) return std::nullopt;
 
     // parse_host checks the host and port (as a Host field's): split_authority finds the same parts, as views.
     const auto rest = text.substr(separator + 3);

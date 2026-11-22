@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <initializer_list>
 #include <iterator>
@@ -10,6 +9,8 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+
+#include "encoding/hex.hpp"
 
 namespace net::util
 {
@@ -113,6 +114,14 @@ constexpr CharT to_lower_ascii(CharT c) noexcept
 {
     return c >= 'A' && c <= 'Z' ? static_cast<CharT>(c - 'A' + 'a') : c;
 }
+
+// is_alpha_ascii, is_digit_ascii, is_alnum_ascii and is_hex_digit_ascii say what kind of character c is, as ASCII:
+// unlike std::isalpha and the others, they don't depend on the locale (or call into the C library), as protocols'
+// syntax is ASCII.
+constexpr bool is_alpha_ascii(char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+constexpr bool is_digit_ascii(char c) noexcept { return c >= '0' && c <= '9'; }
+constexpr bool is_alnum_ascii(char c) noexcept { return is_alpha_ascii(c) || is_digit_ascii(c); }
+constexpr bool is_hex_digit_ascii(char c) noexcept { return encoding::hex::digit_value(c) >= 0; }
 
 // equal_ignore_case compares lhs and rhs, ignoring the case of ASCII letters.
 template<typename CharT  = char,

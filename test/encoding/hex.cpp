@@ -135,3 +135,42 @@ TEST_CASE("decode_to needs exactly enough input", "[encoding][hex]")
     REQUIRE(net::encoding::hex::decode_to(input, out));
     CHECK(out == std::array{std::byte{0xab}, std::byte{0xcd}});
 }
+
+TEST_CASE("a hex digit's value", "[encoding][hex][digit_value]")
+{
+    struct test_case
+    {
+        char c{};
+        int  expected{};
+    };
+
+    const auto tc = GENERATE(test_case{.c = '0', .expected = 0},
+                             test_case{.c = '9', .expected = 9},
+                             test_case{.c = 'a', .expected = 10},
+                             test_case{.c = 'f', .expected = 15},
+                             test_case{.c = 'A', .expected = 10},
+                             test_case{.c = 'F', .expected = 15},
+                             test_case{.c = 'g', .expected = -1},
+                             test_case{.c = 'G', .expected = -1},
+                             test_case{.c = '/', .expected = -1},
+                             test_case{.c = ':', .expected = -1},
+                             test_case{.c = '@', .expected = -1},
+                             test_case{.c = '`', .expected = -1},
+                             test_case{.c = ' ', .expected = -1},
+                             test_case{.c = '\0', .expected = -1},
+                             test_case{.c = '\x80', .expected = -1},
+                             test_case{.c = '\xff', .expected = -1});
+
+    CHECK(net::encoding::hex::digit_value(tc.c) == tc.expected);
+
+    // usable in a constant expression.
+    static_assert(net::encoding::hex::digit_value('c') == 12);
+}
+
+TEST_CASE("decode_to refuses what isn't hex", "[encoding][hex]")
+{
+    std::array<std::byte, 2> out{};
+    CHECK_FALSE(net::encoding::hex::decode_to(std::string_view{"abcg"}, out));
+    CHECK_FALSE(net::encoding::hex::decode_to(std::string_view{"gbcd"}, out));
+    CHECK_FALSE(net::encoding::hex::decode_to(std::string_view{"ab:d"}, out));
+}

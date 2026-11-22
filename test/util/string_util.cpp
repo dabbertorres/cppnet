@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 using namespace std::literals::string_view_literals;
 
@@ -223,4 +224,47 @@ TEST_CASE("sequential", "[util][replace]")
     auto actual = net::util::replace("barbar"sv, "bar"sv, "foo"sv);
 
     REQUIRE("foofoo"sv == actual);
+}
+
+TEST_CASE("ASCII character classes", "[util][ascii][classes]")
+{
+    struct test_case
+    {
+        char c{};
+        bool alpha{};
+        bool digit{};
+        bool alnum{};
+        bool hex{};
+    };
+
+    const auto tc = GENERATE(test_case{.c = 'a', .alpha = true, .alnum = true, .hex = true},
+                             test_case{.c = 'f', .alpha = true, .alnum = true, .hex = true},
+                             test_case{.c = 'F', .alpha = true, .alnum = true, .hex = true},
+                             test_case{.c = 'g', .alpha = true, .alnum = true},
+                             test_case{.c = 'z', .alpha = true, .alnum = true},
+                             test_case{.c = 'Z', .alpha = true, .alnum = true},
+                             test_case{.c = '0', .digit = true, .alnum = true, .hex = true},
+                             test_case{.c = '9', .digit = true, .alnum = true, .hex = true},
+                             test_case{.c = '/'},
+                             test_case{.c = ':'},
+                             test_case{.c = '@'},
+                             test_case{.c = '['},
+                             test_case{.c = '`'},
+                             test_case{.c = '{'},
+                             test_case{.c = '_'},
+                             test_case{.c = ' '},
+                             test_case{.c = '\0'},
+                             // not ASCII at all (a locale may call some of these letters, as in Latin-1).
+                             test_case{.c = '\xe9'},
+                             test_case{.c = '\xc4'},
+                             test_case{.c = '\x80'},
+                             test_case{.c = '\xff'});
+
+    CHECK(net::util::is_alpha_ascii(tc.c) == tc.alpha);
+    CHECK(net::util::is_digit_ascii(tc.c) == tc.digit);
+    CHECK(net::util::is_alnum_ascii(tc.c) == tc.alnum);
+    CHECK(net::util::is_hex_digit_ascii(tc.c) == tc.hex);
+
+    // usable in a constant expression.
+    static_assert(net::util::is_alpha_ascii('q') && !net::util::is_digit_ascii('q'));
 }

@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "coro/task.hpp"
+#include "encoding/hex.hpp"
 #include "http/request.hpp"
 #include "http/response.hpp"
 
@@ -17,22 +18,14 @@ using net::http::detail::hash_byte;
 using net::http::detail::hash_start;
 using net::http::detail::mix;
 
-constexpr int hex_value(char c) noexcept
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 // decode_next decodes the byte at encoded[i], advancing i past it: as url::decode does, a '%' that isn't followed by
 // two hex digits is kept as it is.
 constexpr char decode_next(std::string_view encoded, std::size_t& i) noexcept
 {
     if (encoded[i] == '%' && encoded.size() - i > 2)
     {
-        const int high = hex_value(encoded[i + 1]);
-        const int low  = hex_value(encoded[i + 2]);
+        const int high = net::encoding::hex::digit_value(encoded[i + 1]);
+        const int low  = net::encoding::hex::digit_value(encoded[i + 2]);
         if (high >= 0 && low >= 0)
         {
             i += 3;
