@@ -45,9 +45,8 @@ Field* find_field(Field* first, std::size_t count, std::string_view key) noexcep
 // until it returns false.
 //
 // NOTE: a free function in this namespace, rather than a member, so its instantiations are local to this file, and
-// clang
-//       inlines each into its one caller (a member's, with a lambda from a member of the class template, would have
-//       external linkage, and wasn't inlined).
+// clang inlines each into its one caller (a member's, with a lambda from a member of the class template, would have
+// external linkage, and wasn't inlined).
 template<typename F>
 void for_each_element(const net::http::header_field* field, F visit)
 {
