@@ -35,10 +35,7 @@ constexpr net::io::handle invalid_fd = -1;
 std::expected<net::io::handle, std::error_code>
 listener::open(io::scheduler* scheduler, const std::string& host, const std::string& port, network net, protocol proto)
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wmissing-field-initializers"
-    addrinfo hints = {.ai_flags = 0};
-#pragma clang diagnostic pop
+    addrinfo hints{};
 
     switch (proto)
     {
