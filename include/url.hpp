@@ -45,8 +45,8 @@ constexpr std::string_view url_parse_state_to_string(url_parse_state s) noexcept
 
 struct url_parse_failure
 {
-    url_parse_state failed_at;
-    std::size_t     index;
+    url_parse_state failed_at{};
+    std::size_t     index{};
 };
 
 class url

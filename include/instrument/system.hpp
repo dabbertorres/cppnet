@@ -52,20 +52,20 @@ std::expected<std::size_t, std::error_code> process_threads() noexcept;
 // process_info is the process' resource usage, as getrusage() reports it.
 struct process_info
 {
-    std::chrono::duration<double> user_cpu_time;
-    std::chrono::duration<double> system_cpu_time;
+    std::chrono::duration<double> user_cpu_time{};
+    std::chrono::duration<double> system_cpu_time{};
 
     // in bytes (on every platform: Linux reports kilobytes, and macOS bytes).
-    std::size_t max_resident_set_size;
+    std::size_t max_resident_set_size{};
 
     // minor page faults (those that didn't need I/O), and major (those that did).
-    std::size_t page_reclaims;
-    std::size_t page_faults;
-    std::size_t swap_count;
-    std::size_t num_blocking_input_ops;
-    std::size_t num_blocking_output_ops;
-    std::size_t num_voluntary_context_switches;
-    std::size_t num_involuntary_context_switches;
+    std::size_t page_reclaims{};
+    std::size_t page_faults{};
+    std::size_t swap_count{};
+    std::size_t num_blocking_input_ops{};
+    std::size_t num_blocking_output_ops{};
+    std::size_t num_voluntary_context_switches{};
+    std::size_t num_involuntary_context_switches{};
 };
 
 std::expected<process_info, std::error_code> process_usage() noexcept;

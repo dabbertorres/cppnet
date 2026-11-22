@@ -8,8 +8,8 @@ namespace net::http
 
 struct protocol_version
 {
-    std::uint32_t major;
-    std::uint32_t minor;
+    std::uint32_t major{};
+    std::uint32_t minor{};
 
     friend bool operator==(protocol_version lhs, protocol_version rhs) noexcept = default;
 };
