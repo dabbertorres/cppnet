@@ -569,13 +569,6 @@ namespace
         }
     }
 
-    // to_lower lower-cases host in place: DNS names are case-insensitive, and so are hosts files' to the C libraries,
-    // so a lookup holds one string, lower-cased, which its key views.
-    void to_lower(std::string& host) noexcept
-    {
-        std::ranges::transform(host, host.begin(), [](char c) { return util::to_lower_ascii(c); });
-    }
-
     // join joins the lookup of host (lower-cased) in flight, or starts one (spawning its task), for a caller: a
     // resolution, if watching. It throws only if it can't allocate, before joining.
     std::shared_ptr<lookup> join(io::scheduler*                                 scheduler,
@@ -633,7 +626,9 @@ namespace
                                       std::string                             host,
                                       resolve_options                         options)
     {
-        to_lower(host);
+        // DNS names are case-insensitive, and so are hosts files' to the C libraries, so a lookup holds one string,
+        // lower-cased, which its key views.
+        util::to_lower_ascii_in_place(host);
 
         auto chosen = choose_for(*resolver, host);
         if (!chosen.has_value()) co_return std::unexpected(chosen.error());
@@ -784,7 +779,7 @@ resolver::start_resolving(io::scheduler* scheduler, std::string host, protocol p
         return detail::resolution{std::move(**result)};
     }
 
-    to_lower(host);
+    util::to_lower_ascii_in_place(host);
 
     auto chosen = choose_for(*state, host);
     if (!chosen.has_value()) return std::unexpected(chosen.error());

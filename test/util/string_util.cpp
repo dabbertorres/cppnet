@@ -268,3 +268,22 @@ TEST_CASE("ASCII character classes", "[util][ascii][classes]")
     // usable in a constant expression.
     static_assert(net::util::is_alpha_ascii('q') && !net::util::is_digit_ascii('q'));
 }
+
+TEST_CASE("lowercasing a string in place", "[util][ascii][lower]")
+{
+    struct test_case
+    {
+        std::string input{};
+        std::string expected{};
+    };
+
+    const auto tc = GENERATE(test_case{.input = "", .expected = ""},
+                             test_case{.input = "Example.COM", .expected = "example.com"},
+                             test_case{.input = "already lower 123", .expected = "already lower 123"},
+                             test_case{.input = "@AZ[`az{", .expected = "@az[`az{"},
+                             test_case{.input = "\xc4\xb0I\xff", .expected = "\xc4\xb0i\xff"});
+
+    auto str = tc.input;
+    net::util::to_lower_ascii_in_place(str);
+    CHECK(str == tc.expected);
+}

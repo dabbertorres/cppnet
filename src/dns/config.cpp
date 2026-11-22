@@ -89,7 +89,7 @@ std::string domain(std::string_view name)
     if (name.ends_with('.')) name.remove_suffix(1);
 
     std::string out{name};
-    std::ranges::transform(out, out.begin(), [](char c) { return net::util::to_lower_ascii(c); });
+    net::util::to_lower_ascii_in_place(out);
     return out;
 }
 

@@ -122,7 +122,7 @@ std::error_code append_fields(const basic_headers<N>&    from,
         if (section == field_section::trailers && !trailer_allowed(name)) continue;
 
         auto& lowered = names.emplace_back(name);
-        std::ranges::transform(lowered, lowered.begin(), [](char c) { return util::to_lower_ascii(c); });
+        util::to_lower_ascii_in_place(lowered);
 
         for (const auto& value : values)
         {

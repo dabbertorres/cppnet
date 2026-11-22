@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <compare>
@@ -31,6 +30,7 @@
 #include "io/scheduler.hpp"
 #include "tcp.hpp"
 #include "util/defer.hpp"
+#include "util/string_util.hpp"
 
 #ifdef NET_HAS_TLS
 #    include <variant>
@@ -117,7 +117,7 @@ connection_pool::~connection_pool()
 std::string connection_pool::make_key(const std::string& scheme, const std::string& host, const std::string& port)
 {
     std::string key = scheme + "://" + host;
-    std::ranges::transform(key, key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    util::to_lower_ascii_in_place(key);
     return key + " " + port;
 }
 

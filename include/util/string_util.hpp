@@ -123,6 +123,12 @@ constexpr bool is_digit_ascii(char c) noexcept { return c >= '0' && c <= '9'; }
 constexpr bool is_alnum_ascii(char c) noexcept { return is_alpha_ascii(c) || is_digit_ascii(c); }
 constexpr bool is_hex_digit_ascii(char c) noexcept { return encoding::hex::digit_value(c) >= 0; }
 
+// to_lower_ascii_in_place lowercases the ASCII letters of str, as to_lower_ascii does one.
+inline void to_lower_ascii_in_place(std::string& str) noexcept
+{
+    std::ranges::transform(str, str.begin(), [](char c) { return to_lower_ascii(c); });
+}
+
 // equal_ignore_case compares lhs and rhs, ignoring the case of ASCII letters.
 template<typename CharT  = char,
          typename Traits = std::char_traits<CharT>,
