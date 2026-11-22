@@ -3,6 +3,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -237,6 +239,31 @@ task<net::io::result> write(net::socket* sock, std::span<const std::byte> data)
     co_return co_await sock->write(data);
 }
 
+}
+
+TEST_CASE("a socket is non-blocking, and isn't inherited by child processes", "[socket][nonblocking]")
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd != -1);
+
+    const net::socket sock{nullptr, fd};
+
+    CHECK((::fcntl(fd, F_GETFL) & O_NONBLOCK) != 0);
+    CHECK((::fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+}
+
+TEST_CASE("a socket over a descriptor that can't be made non-blocking throws", "[socket][nonblocking]")
+{
+    // not a descriptor that's open (nor one that could be).
+    try
+    {
+        const net::socket sock{nullptr, INT_MAX};
+        FAIL("the socket was made");
+    }
+    catch (const std::system_error& err)
+    {
+        CHECK(err.code() == std::errc::bad_file_descriptor);
+    }
 }
 
 TEST_CASE("wait_writable returns at once on a socket that's writable", "[socket][wait-writable]")

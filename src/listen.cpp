@@ -11,7 +11,6 @@
 #include <system_error>
 #include <utility>
 
-#include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -25,6 +24,7 @@
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
 #include "ip_addr.hpp"
+#include "nonblocking.hpp"
 #include "tcp.hpp"
 
 namespace net
@@ -91,10 +91,8 @@ listener::open(io::scheduler* scheduler, const std::string& host, const std::str
 
     // accept() must never block (the scheduler only says a connection may be ready), and the socket shouldn't leak into
     // child processes.
-    int flags = ::fcntl(fd, F_GETFL);
-    if (flags == -1 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1 || ::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+    if (const int err = detail::make_nonblocking_cloexec(fd); err != 0)
     {
-        auto err = errno;
         ::close(fd);
         return std::unexpected(std::error_code{err, std::system_category()});
     }

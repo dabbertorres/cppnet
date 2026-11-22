@@ -15,7 +15,6 @@
 #include <system_error>
 #include <utility>
 
-#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -30,6 +29,7 @@
 #include "io/io.hpp"
 #include "io/poll.hpp"
 #include "io/scheduler.hpp"
+#include "nonblocking.hpp"
 #include "sockaddr.hpp"
 
 namespace
@@ -86,10 +86,8 @@ socket::socket(io::scheduler* scheduler, io::handle fd)
 
     // The scheduler only says when the socket is ready, so reads and writes must never block. Also, don't leak the
     // socket into child processes.
-    int flags = ::fcntl(fd, F_GETFL);
-    if (flags == -1 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1 || ::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+    if (const int err = detail::make_nonblocking_cloexec(fd); err != 0)
     {
-        auto err = errno;
         ::close(fd);
         throw system_error_from_errno(err, "failed to make socket non-blocking");
     }
